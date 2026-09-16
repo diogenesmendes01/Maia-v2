@@ -64,7 +64,12 @@
  * `tests/unit/runtime/conversation-control-claim-contract.spec.ts`.
  */
 import { sql, type SQL } from 'drizzle-orm';
-import { agent_turns, conversation_controls, engine_runs } from '../schema.js';
+import {
+  agent_turns,
+  conversation_controls,
+  engine_runs,
+  engine_tool_calls,
+} from '../schema.js';
 
 /**
  * A linha devolvida pelos dois construtores. Eles selecionam EXATAMENTE as
@@ -287,4 +292,208 @@ export function humanControlProbe(input: {
        AND alvo.stream_key IS NOT NULL
        AND controle.mode <> 'bot'
      LIMIT 1`;
+}
+
+// ─── P04.5b.2a — O DESCARTE ADMINISTRATIVO DE BACKLOG (§8.2.5) ──────────────
+
+/**
+ * Estados de origem do descarte, na ordem em que a spec os enumera.
+ *
+ * O §8.2.5 diz "turnos `received/queued/retryable` retidos pelo controle". Os
+ * dois primeiros chegam aqui pela tabela AUTOMÁTICA ou pela MANUAL conforme o
+ * caso (`received → ignored` é automática desde o #503; `queued` e `retryable`
+ * ganharam aresta manual no P04.5b.1).
+ *
+ * **`running` está deliberadamente FORA**, e essa ausência é a metade que
+ * importa: ele TEM aresta automática para `ignored`, então um conjunto montado
+ * por `sourceStatusesFor('ignored', { manual: true })` o traria junto — e
+ * cancelar administrativamente um turno EM EXECUÇÃO é o oposto do "sem
+ * execução/efeito pendente" que a spec exige. `outbound_pending` também fica de
+ * fora, pela cláusula seguinte: "turnos antes executados ou `outbound_pending`
+ * seguem conciliação específica; não apagar seu resultado/efeito para fazê-los
+ * caber no descarte do backlog".
+ */
+export const ESTADOS_DESCARTAVEIS_DO_BACKLOG = [
+  'received',
+  'queued',
+  'retryable',
+] as const;
+
+/**
+ * Estados em que uma chamada de tool NÃO está liquidada — ela ainda pode
+ * produzir efeito.
+ *
+ * É o conjunto do índice parcial `engine_tool_calls_unsettled_idx` (migration
+ * 140), com `effect_unknown` dentro porque uma call de efeito incerto continua
+ * bloqueadora (§5.7.4 item 9).
+ *
+ * ⚠️ **Já existem duas cópias desta lista no repositório** —
+ * `ESTADOS_EM_VOO` em `conversation-control-repo.ts` e
+ * `ESTADOS_QUE_OCUPAM_A_VAGA` em `engine-repos.ts`. Esta é a terceira, e eu a
+ * escrevo sabendo disso em vez de fingir que não vi: unificá-las é mudança em
+ * três módulos de donos diferentes, sem teste que a cubra, e fazê-la no meio
+ * desta fatia seria refatoração de arrasto. Fica NOMEADA aqui para ganhar
+ * vermelho próprio na fatia de fiação — o risco real é o índice parcial da 140
+ * mudar e só uma das cópias acompanhar.
+ */
+export const ESTADOS_DE_CALL_EM_VOO = [
+  'received',
+  'dispatching',
+  'handler_started',
+  'effect_unknown',
+] as const;
+
+/**
+ * Os estados como LITERAIS SQL, não como parâmetros.
+ *
+ * ⚠️ **A justificativa aqui foi CORRIGIDA depois de medir.** A primeira versão
+ * deste comentário copiava a de `stream-head-sql.ts` — "literais para o
+ * planejador provar a implicação e escolher o índice parcial". Rodei `EXPLAIN`
+ * contra o Postgres real e a afirmação é FALSA para estas consultas:
+ * `engine_tool_calls_unsettled_idx` **não** é escolhido; o plano usa
+ * `engine_tool_calls_ordinal_uq` com `Filter`. E a causa não é o `OR` da
+ * evidência — é que aquele índice é chaveado por
+ * `(tenant_id, agent_id, run_id, ordinal)` e esta consulta filtra por
+ * **`turn_id`**, que não está nele. Nenhum rearranjo do predicado tornaria a
+ * frase verdadeira; só um índice novo por turno, que é migration e não pertence
+ * a esta fatia.
+ *
+ * O que continua VERDADEIRO e é a razão de manter literais:
+ *
+ *  1. o texto fica idêntico ao do predicado do índice parcial da migration 140,
+ *     de modo que uma divergência de vocabulário (um estado novo num lado só)
+ *     salta aos olhos em vez de virar plano ruim silencioso;
+ *  2. `status = ANY ('{...}')` resolvido no texto não depende de o planejador
+ *     ter substituído parâmetros, então o plano não muda entre a execução custom
+ *     e a genérica — que é a degradação difícil de flagrar do `stream-head-sql`.
+ *
+ * O plano completo medido está no V-043. Registrar a limitação é melhor do que
+ * herdar uma justificativa que soa bem e não se aplica.
+ *
+ * Seguro por construção: os valores vêm de `as const` deste arquivo, nunca de
+ * entrada externa. A guarda abaixo existe para que isso continue verdadeiro se
+ * alguém acrescentar um estado.
+ */
+function literais(valores: readonly string[]): SQL {
+  for (const v of valores) {
+    if (!/^[a-z_]+$/.test(v)) {
+      throw new Error(
+        `conversation-control-sql: '${v}' não é identificador simples e não pode ser ` +
+          'inlinado como literal SQL.',
+      );
+    }
+  }
+  return sql.raw(valores.map((v) => `'${v}'`).join(', '));
+}
+
+/**
+ * `TRUE` quando o turno alvo **não** tem execução nem efeito pendente.
+ *
+ * ─── Por que um predicado NOVO, e não a consulta de drenagem que já existe ──
+ *
+ * `reconcilePauseTx` já compõe evidência de efeito, mas escopada pelo
+ * CONTROLE: ela responde "esta CONVERSA tem algo em voo?". A pergunta do
+ * §8.2.5 é outra — "este TURNO tem execução ou efeito pendente?" — e conflatar
+ * as duas teria consequência concreta nos dois sentidos: um único run aberto em
+ * qualquer turno impediria o descarte de TODO o backlog, e um backlog inteiro
+ * sem efeito nenhum ficaria preservado por causa de um turno alheio.
+ *
+ * ─── O que ele prova, e o que NÃO prova ───────────────────────────────────
+ *
+ * PROVA, pelas três fontes que o C42 declara como composição (o "journal de
+ * efeitos/admissão" que o §8.2.3 pressupõe não existe): não há run aberto para
+ * o turno, não há call em estado não liquidado, e nenhuma call carrega
+ * evidência de efeito `unknown`.
+ *
+ * NÃO PROVA ausência de efeito de origem NÃO-engine. `outbound_messages` só
+ * alcança o turno, e egresso produzido por caminhos legados (outbox drain,
+ * relayer, lembretes) não passa por run nenhum — é o C43, e a cobertura dele é
+ * a unidade dos fences do §8.2.4, não esta. Quem lê este predicado como "o
+ * turno não produziu efeito algum" está lendo mais do que ele diz.
+ */
+export function turnWithoutPendingEffectSql(input: {
+  tenant: SQL;
+  agent: SQL;
+  alvo: SQL;
+}): SQL {
+  return sql`(
+     NOT EXISTS (
+          SELECT 1
+            FROM ${engine_runs} r
+           WHERE r.tenant_id = ${input.tenant} AND r.agent_id = ${input.agent}
+             AND r.turn_id = ${input.alvo}.id
+             AND r.phase <> 'closed'
+        )
+     AND NOT EXISTS (
+          SELECT 1
+            FROM ${engine_tool_calls} c
+           WHERE c.tenant_id = ${input.tenant} AND c.agent_id = ${input.agent}
+             AND c.turn_id = ${input.alvo}.id
+             AND (c.state IN (${literais(ESTADOS_DE_CALL_EM_VOO)})
+                  OR c.effect_evidence = 'unknown')
+        )
+  )`;
+}
+
+/**
+ * A SELEÇÃO do backlog retido que o `resume` vai descartar, trancada para
+ * escrita e em ordem determinística.
+ *
+ * ─── As três conjunções do §8.2.5, e nenhuma a mais ───────────────────────
+ *
+ *  1. **retidos pelo controle** — a stream vem da linha de controle, nunca de
+ *     um `stream_key` passado pelo caller. Deixá-la entrar de fora permitiria
+ *     descartar o backlog de uma conversa com o comando de outra;
+ *  2. **sem execução/efeito pendente** — `turnWithoutPendingEffectSql`, com os
+ *     limites que o cabeçalho dele declara;
+ *  3. **anteriores ou iguais ao watermark** — `<=`, porque o watermark é o
+ *     último ingresso RETIDO e ele próprio entra no descarte; `<` deixaria
+ *     exatamente uma mensagem para trás. `IS NOT NULL` é explícito: turno sem
+ *     sequência (caminho de compatibilidade, C50) não é ordenável por ingresso,
+ *     e `NULL <= x` já o excluiria — a guarda existe para que a exclusão seja
+ *     DECISÃO legível, e não efeito colateral da semântica de NULL que alguém
+ *     "simplifica" depois.
+ *
+ * ─── A ordem de lock ──────────────────────────────────────────────────────
+ *
+ * `ORDER BY t.id` + `FOR UPDATE OF t` é a "ordem determinística de turnos" que
+ * o §8.2.3 passo 3 exige dentro da ordem global (controle → stream → turnos →
+ * efeito/outbox). O precedente é `recoverExpiredStreamClaims`, e o comentário
+ * dele explica o porquê: sem `ORDER BY`, duas transações que toquem a mesma
+ * stream adquirem o conjunto em ordens diferentes e podem fechar ciclo.
+ *
+ * **`FOR UPDATE OF t`, nunca `FOR UPDATE` pelado** — a consulta junta
+ * `conversation_controls`, e um lock pelado trancaria o controle por um SEGUNDO
+ * caminho, que é o "ordenamento incompatível" do §8.2.3 passo 3. É a mesma
+ * cláusula que o caso 5 deste módulo já prende para o lock por run.
+ *
+ * Projeção mínima: `id` e `state_version`, porque a transição de cada turno é
+ * compare-and-swap e ler a versão numa segunda consulta abriria a janela em que
+ * o turno muda entre as duas. `stream_key` NÃO sai da consulta — ela aparece no
+ * JOIN, que é onde a comparação acontece, e a issue-mãe da #505 a restringe a
+ * log protegido.
+ */
+export function heldBacklogForCancellationSql(input: {
+  tenant_id: string;
+  agent_id: string;
+  control_id: string;
+  /** Decimal em string: `resume_after_ingress_seq` é `bigint` (§8.3.2). */
+  watermark: string;
+}): SQL {
+  const tenant = sql`${input.tenant_id}`;
+  const agent = sql`${input.agent_id}`;
+  return sql`
+    SELECT t.id, t.state_version
+      FROM ${agent_turns} t
+      JOIN ${conversation_controls} c
+        ON  c.tenant_id  = t.tenant_id AND c.agent_id = t.agent_id
+        AND c.stream_key = t.stream_key
+     WHERE c.tenant_id = ${tenant} AND c.agent_id = ${agent}
+       AND c.id = ${input.control_id}
+       AND t.status IN (${literais(ESTADOS_DESCARTAVEIS_DO_BACKLOG)})
+       AND t.last_ingress_seq IS NOT NULL
+       AND t.last_ingress_seq <= ${input.watermark}::bigint
+       AND ${turnWithoutPendingEffectSql({ tenant, agent, alvo: sql`t` })}
+     ORDER BY t.id
+       FOR UPDATE OF t`;
 }

@@ -116,6 +116,8 @@ sequência P00–P12 do capítulo 10 da spec.
 
 | C50-nota | **Resposta à pergunta que a C50 deixou aberta**, por medição: de 10.957 turnos, 124 têm stream e **ZERO** têm stream sem sequência — porque `createReceivedTurnTx` grava `stream_key` e `ingress_seq` juntos ou nenhum. Dentro de uma stream a ordem é TOTAL; os não-ordenáveis são exatamente os turnos sem `stream_key`, e como a seleção do backlog é POR STREAM eles ficam fora **por construção**, sem precisar de regra nova. Isso não reduz a C50 (turnos sem stream existem aos milhares: 10.833) — responde ao "precisam de outra regra, ou de exclusão explícita" | consulta direta ao banco local | A exclusão é estrutural; o U-P04.5b pode documentá-la em vez de inventar critério |
 
+| C53 | **O watermark do §8.2.5 não tem LEITOR — `future_only` é imposto SÓ pelo cancelamento.** O §8.2.5 descreve o watermark como o mecanismo ("o próximo inbound **após** watermark pode criar execução nova"), o que sugere um caminho que o consulta antes de admitir trabalho. Esse caminho não existe: `resume_after_ingress_seq` é ESCRITO pelo `resumeConversationTx` e lido apenas pelo próprio ramo idempotente dele, para devolvê-lo no resultado | `grep resume_after_ingress_seq` em `src/` e `migrations/`: aparece no schema (4249), no construtor de seleção (C-C-sql.ts:480), e em `conversation-control-repo.ts` (589, 605, 651, 663, 735) — **nenhuma ocorrência** em `turn-repos.ts`, `lifecycle.ts`, `claim.ts` ou `stream-*`; o C48 já registrava a coluna como sem escritor nem leitor, e o P04.5a deu-lhe apenas o escritor | **Consequência que DECIDIU um desenho, e não é preferência:** eu ia pôr `LIMIT` na seleção do backlog, seguindo a convenção de lote 200 da casa e o receio de segurar N locks na transação do resume. Com o watermark inerte, cancelar parcialmente deixaria o RESTO do backlog reivindicável no instante em que o modo voltasse a `bot` — buraco de CORREÇÃO, não troca de desempenho. Daí também a atomicidade: conflito num turno obriga rollback de tudo, inclusive do resume, que é a regra que `completeRecoveredOutboundTurnInTx` já prescreve para primitivas `...InTx`. ⚠️ **O que fica em aberto:** enquanto não houver leitor, a promessa "o próximo inbound após o watermark pode criar execução nova" é cumprida por ausência (o backlog anterior foi descartado), não por verificação — um turno retido que escapasse do descarte (sem `stream_key`, ou criado entre a captura e o commit) NÃO seria barrado por nada. Medido: turnos sem `stream_key` nunca estiveram retidos, porque o hold de admissão é fail-open para eles; e a janela entre captura e commit não existe, porque o controle está trancado. Mas a garantia depende dessas duas contingências, e não de um predicado — registrado para a unidade dos fences do §8.2.4 decidir se o claim deve passar a consultar o watermark |
+
 ## 4. Ambiente e ferramentas (verificado em 2026-09-15)
 
 | Item | Estado |
@@ -463,6 +465,23 @@ sequência P00–P12 do capítulo 10 da spec.
   resume, precedente de lote em `recoverExpiredStreamClaims`, transição pelo contrato via
   `completeRecoveredOutboundTurnInTx`, referência ao comando na trilha em vez de coluna nova, e a prova
   de drenagem precisando de variante por TURNO).
+- `U-P04.5b.2a` — **concluída e verificada**: os construtores PUROS do descarte de backlog —
+  `heldBacklogForCancellationSql` (seleção do backlog retido, com CTE trancada em `ORDER BY t.id` +
+  `FOR UPDATE OF t`) e `turnWithoutPendingEffectSql` (evidência de efeito ancorada no TURNO, não no
+  controle). 8 casos novos, vermelho forte, **14 hipóteses de mutação e 14 mortas**.
+  ⚠️ Duas tentativas da rodada 1 não produziram resultado, ambas por defeito meu: uma PULADA por
+  âncora ambígua (C47 de novo) e uma sobrevivente por mutação defeituosa que só ACRESCENTAVA texto.
+  Refeitas, ambas morreram.
+  ⚠️ **O `EXPLAIN` contra o Postgres real me desmentiu**: escrevi que os literais fariam o planejador
+  escolher o índice parcial, e o plano medido mostra que não — o índice é chaveado por `run_id` e a
+  consulta filtra por `turn_id`. Corrigi o comentário, não o código.
+  ⚠️ **Uma medição descartou o `LIMIT`** que eu ia pôr na seleção: `resume_after_ingress_seq` **não
+  tem leitor** (nem claim, nem recovery, nem promoção o consultam), logo `future_only` é imposto SÓ
+  pelo cancelamento — capar a seleção deixaria o resto do backlog reivindicável e seria buraco de
+  correção, não troca de desempenho. Ver C53.
+  Gates `tsc`/`eslint` 0, guarda do C51 em 103/103, regressão `51 | 10291 | 1272 (11614)` fechando
+  exata. **Os construtores estão INERTES** — sem call site de produção; a fiação é a fatia seguinte.
+  Ver V-043.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado

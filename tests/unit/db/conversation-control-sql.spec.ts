@@ -36,9 +36,12 @@
  */
 import { describe, it, expect } from "vitest";
 import { PgDialect } from "drizzle-orm/pg-core";
+import { sql as raw } from "drizzle-orm";
 import {
+  heldBacklogForCancellationSql,
   lockControlByIdSql,
   lockControlByRunSql,
+  turnWithoutPendingEffectSql,
 } from "@/db/repositories/conversation-control-sql.js";
 
 const dialect = new PgDialect();
@@ -148,5 +151,153 @@ describe("P04.3a — os dois construtores concordam no que produzem", () => {
       .not.toContain("*");
     expect(compilar(lockControlByRunSql({ ...ESCOPO, run_id: RUN_ID })).sql)
       .not.toContain("*");
+  });
+});
+
+// ─── P04.5b.2a — a SELEÇÃO do backlog a cancelar, e a evidência POR TURNO ────
+//
+// O §8.2.5 fixa o mapeamento: "turnos `received/queued/retryable` retidos pelo
+// controle, **sem execução/efeito pendente** e **anteriores ou iguais ao
+// watermark**, terminam em `ignored` + `operator_cancelled`".
+//
+// São três conjunções, e cada uma tem caso próprio abaixo. A terceira é a que
+// mais engana: a prova de drenagem que já existe (`reconcilePauseTx`) é escopada
+// por CONTROLE — ela responde "esta CONVERSA tem algo em voo?", não "este TURNO
+// tem efeito pendente?". Reusá-la aqui conflataria as duas perguntas, e é por
+// isso que existe um construtor novo em vez de uma chamada à consulta antiga.
+
+const WATERMARK = "42";
+
+describe("P04.5b.2a — seleção do backlog retido", () => {
+  const q = () =>
+    compilar(
+      heldBacklogForCancellationSql({
+        ...ESCOPO,
+        control_id: CONTROL_ID,
+        watermark: WATERMARK,
+      }),
+    );
+
+  it("8. tranca em ordem DETERMINÍSTICA: `ORDER BY` + `FOR UPDATE OF t`", () => {
+    // O §8.2.3 passo 3 manda "turnos em ordem determinística" dentro da ordem
+    // global de locks. O precedente da casa é `recoverExpiredStreamClaims`, que
+    // documenta por quê: sem `ORDER BY` two transações que toquem a mesma stream
+    // adquirem conjuntos em ordens diferentes e podem fechar ciclo.
+    //
+    // `FOR UPDATE OF t` e não `FOR UPDATE` pelado pela MESMA razão do caso 5:
+    // a consulta junta `conversation_controls`, e um lock pelado trancaria o
+    // controle de novo por um segundo caminho — o "ordenamento incompatível".
+    const { sql } = q();
+    expect(sql).toContain("ORDER BY");
+    expect(sql).toContain("FOR UPDATE OF");
+    expect(sql).not.toMatch(/FOR UPDATE\s*$/);
+  });
+
+  it("9. os três estados de origem entram como LITERAIS, e `running` fica de FORA", () => {
+    // Literais, e não parâmetros, pela razão que `stream-head-sql.ts` documenta:
+    // o planejador só prova que a cláusula implica o predicado de um índice
+    // parcial quando os dois lados são `Const`.
+    //
+    // E `running` FORA é a metade que importa: ele tem aresta AUTOMÁTICA para
+    // `ignored`, então um conjunto montado por `sourceStatusesFor('ignored',
+    // {manual:true})` o traria junto — e cancelar administrativamente um turno
+    // EM EXECUÇÃO é o oposto do "sem execução/efeito pendente" da spec. O caso
+    // do contrato (P04.5b.1) prende a origem da pegadinha; este prende a
+    // consequência no SQL que de fato roda.
+    const { sql } = q();
+    for (const estado of ["'received'", "'queued'", "'retryable'"]) {
+      expect(sql).toContain(estado);
+    }
+    for (const proibido of ["'running'", "'claimed'", "'outbound_pending'"]) {
+      expect(sql).not.toContain(proibido);
+    }
+  });
+
+  it("10. a stream vem do CONTROLE, e o escopo entra como PARÂMETRO nos dois eixos", () => {
+    // O caller passa `control_id`, nunca `stream_key`: deixar a stream vir de
+    // fora permitiria cancelar o backlog de uma conversa com o comando de outra.
+    // Afirmo sobre PARÂMETRO, e não sobre texto, pela lição do caso 4 — presença
+    // de palavra sobrevive a mutação, parâmetro interpolado não.
+    const { sql, params } = q();
+    expect(params).toContain("acme");
+    expect(params).toContain("financeiro");
+    expect(params).toContain(CONTROL_ID);
+    expect(params).not.toContain("stream_key");
+    expect(sql).toContain("conversation_controls");
+  });
+
+  it("11. o watermark é `<=` e EXIGE sequência: turno sem ingresso fica de fora", () => {
+    // `future_only` compara ingressos. Um turno sem sequência (caminho de
+    // compatibilidade, C50) não é "anterior" nem "posterior" ao watermark — e
+    // `NULL <= 42` é NULL, que já o excluiria. A guarda explícita existe para
+    // que a exclusão seja uma DECISÃO legível, e não um efeito colateral da
+    // semântica de NULL que alguém "simplifica" depois.
+    const { sql, params } = q();
+    expect(sql).toMatch(/last_ingress_seq\s*<=/);
+    expect(sql).toMatch(/last_ingress_seq IS NOT NULL/);
+    expect(params).toContain(WATERMARK);
+    // E nunca `<`: o watermark é o último ingresso RETIDO, então ele próprio
+    // entra no descarte. `<` deixaria exatamente uma mensagem para trás.
+    expect(sql).not.toMatch(/last_ingress_seq\s*<[^=]/);
+  });
+
+  it("12. projeção MÍNIMA: só o que o CAS precisa, e nunca a `stream_key`", () => {
+    // `state_version` vem junto porque a transição é compare-and-swap por turno;
+    // lê-la numa segunda consulta abriria a janela em que o turno muda entre as
+    // duas. `stream_key` é restrita a log protegido pela issue-mãe da #505 —
+    // ela aparece no JOIN, mas não pode SAIR da consulta.
+    const { sql } = q();
+    const projecao = sql.slice(0, sql.toLowerCase().indexOf(" from "));
+    expect(projecao).toContain("id");
+    expect(projecao).toContain("state_version");
+    expect(projecao).not.toContain("stream_key");
+    expect(sql).not.toContain("*");
+  });
+});
+
+describe("P04.5b.2a — evidência de efeito POR TURNO", () => {
+  const alvo = { tenant: raw`${"acme"}`, agent: raw`${"financeiro"}`, alvo: raw`t` };
+  const p = () => compilar(turnWithoutPendingEffectSql(alvo));
+
+  it("13. é `NOT EXISTS` sobre run ABERTO, call NÃO liquidada e evidência `unknown`", () => {
+    // As três fontes que a reconciliação já usa (C42), aqui reancoradas ao
+    // TURNO. O journal de efeitos que o §8.2.3 pressupõe não existe; esta é a
+    // composição que dá para provar hoje, e ela é declarada como composição.
+    const { sql } = p();
+    expect(sql).toContain("NOT EXISTS");
+    expect(sql).toContain("engine_runs");
+    expect(sql).toContain("engine_tool_calls");
+    expect(sql).toMatch(/phase <> 'closed'/);
+    expect(sql).toMatch(/effect_evidence = 'unknown'/);
+  });
+
+  it("14. o predicado é ancorado no TURNO, não no controle", () => {
+    // ESTA é a distinção que justifica o construtor existir. A consulta de
+    // drenagem da reconciliação filtra por `r.control_id`, respondendo sobre a
+    // CONVERSA inteira; se este predicado fizesse o mesmo, um único run aberto
+    // em qualquer turno da conversa impediria o cancelamento de TODO o backlog —
+    // e, pior, um backlog sem efeito nenhum seria preservado por causa de um
+    // turno alheio. A âncora é `turn_id`, e `control_id` não aparece.
+    const { sql } = p();
+    expect(sql).toMatch(/turn_id\s*=\s*t\.id/);
+    expect(sql).not.toContain("control_id");
+  });
+
+  it("15. a seleção USA o predicado — uma definição, não duas", () => {
+    // A regra da casa, repetida em `turn-fence-sql.ts` e `stream-head-sql.ts`:
+    // duas cópias do mesmo predicado divergem, e a divergência só aparece no
+    // caminho que ninguém exercita. Se a seleção montasse a evidência à mão, a
+    // correção de uma delas deixaria a outra para trás.
+    const selecao = compilar(
+      heldBacklogForCancellationSql({
+        ...ESCOPO,
+        control_id: CONTROL_ID,
+        watermark: WATERMARK,
+      }),
+    ).sql;
+    const predicado = p().sql;
+    // O núcleo do predicado tem de aparecer LITERALMENTE dentro da seleção.
+    const nucleo = predicado.slice(predicado.indexOf("NOT EXISTS"));
+    expect(selecao).toContain(nucleo.slice(0, 60));
   });
 });
