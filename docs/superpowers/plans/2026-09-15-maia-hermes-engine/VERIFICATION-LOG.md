@@ -1248,13 +1248,98 @@ transporte, as ações de auditoria que o §8.2.3 passo 4 exige e que ainda não
 (C22), e os fences nas dez fronteiras de egresso do §8.2.4. Aqui só o schema — nenhum caminho vivo foi
 tocado.
 
+### V-033 · P04.2 — o vocabulário que eu inventei, e a spec que já o nomeava
+
+**A unidade.** Cinco ações acrescentadas a `AUDIT_ACTIONS`, sem as quais o §8.2.3 passo 4 ("comando e
+auditoria durável na MESMA transação", via `auditTx`) é inexequível: `auditTx` recebe
+`acao: AuditAction`, união FECHADA, e não havia termo para tomada/retomada humana. Resolve o C22.
+
+**O defeito, e por que nenhum sinal interno podia pegá-lo.** A primeira versão INVENTOU quatro nomes
+(`conversation_paused`, `conversation_pause_drained`, `conversation_resumed`,
+`conversation_control_command_conflicted`). Ela passou em `eslint`, `typecheck`, no spec de contrato
+5/5 e em seis mutações, cinco delas mortas. Todos esses sinais medem **coerência interna**; o defeito
+era de **procedência**. A spec já nomeava dez eventos na linha **2480** (§8.6.1, "NOVOS eventos de
+audit tipados") — verificado como o ÚNICO ponto da especificação inteira que nomeia evento de
+auditoria, sem vocabulário concorrente, e nenhum dos dez existia no `AUDIT_ACTIONS`.
+
+**O erro de fundo não era lexical.** A spec separa `conversation_resume_requested` de
+`conversation_automation_resumed`; eu colapsei os dois DEPOIS de argumentar, para a pausa, que pedido
+e efeito são fatos distintos. O §8.3.2 exige que o resume "recuse enquanto houver efeitos/entregas não
+conciliados" — logo o estado "o operador pediu e a automação ainda NÃO voltou" existe, e colapsá-lo o
+tornava invisível. Apliquei uma régua de um lado e a apaguei do outro, e nenhum teste meu percebia.
+
+**Correção:** os cinco nomes normativos (`conversation_pause_requested`,
+`conversation_control_acquired`, `conversation_resume_requested`, `conversation_automation_resumed`,
+`conversation_control_conflict`). As outras cinco do mesmo §8.6.1 (`engine_cancel_requested`,
+`engine_cancel_reconciled`, `engine_result_fenced`, `engine_quota_denied`, `operator_reply_committed`)
+ficam **nomeadas como pendentes** de P05/P06/P07 e do composer do §8.3.4 — acrescentá-las agora seria
+vocabulário sem emissor, defeito que o próprio arquivo já registra em `llm_circuit_opened/closed`.
+
+**Primeira rodada de mutação — dois achados sobre os TESTES, não sobre o código.** (a) M5 (apagar a
+citação de §8.2.1) **sobreviveu**: não era buraco de cobertura, era redundância de ocorrência — o
+comentário cita a seção em vários pontos e o `toContain` seguia achando. Atribuído por mutação
+COMBINADA, no padrão do P03.7b. (b) O caso 5 era **VACUOSO**: iterava os literais escritos no próprio
+spec contra um regex, então nenhuma mudança de código conseguia derrubá-lo — provado por M6, que
+renomeou a ação no fonte, matou os casos 1 e 3 e deixou o 5 passando. Corrigido o TESTE (passou a
+varrer `AUDIT_ACTIONS` de verdade, com piso de contagem para não voltar a ser vacuoso), nunca a
+asserção enfraquecida.
+
+**Segunda rodada: 9 mutações, 9 MORTAS.** M1–M5 removem cada ação. As que provam os consertos:
+**M4** (apagar `conversation_automation_resumed`) mata o caso da simetria — a separação do resume
+passou a ser exigida pelo teste, não só afirmada por mim; **M6** (colapsar de volta no nome inventado)
+mata a guarda de reintrodução; **M7** mata o caso 5, que na rodada anterior sobrevivia; **M8/M9**
+(combinadas, apagando as 2 e 3 ocorrências de §8.6.1 e §8.2.1) matam o caso de procedência.
+
+**Correção de número, minha.** Eu havia afirmado "303 membros" no C22 e no docstring — nunca medido.
+A contagem real, em runtime e com zero duplicados, é **300 antes e 305 depois**. Uma contagem minha
+por regex chegou a dizer 337 porque o arquivo tem um SEGUNDO array, `ACTION_KEYS`, com 32 entradas:
+305 + 32 = 337, conta fechada e nada sem atribuição.
+
+**Gates.** `typecheck` 0, `lint` 0, `check:node` 0, `docs:ai:check` 0, `config:check:drift` 0,
+`audit:exceptions:check` 0 (desta vez EXECUTADO — em sessão anterior eu o registrei como não
+executado por errar o nome do script) e `migrate:reservations:check` 0 (148 reservas / 148 migrations).
+⚠️ `commit:trailers:check` saiu com exit 0 mas **PULADO** ("GITHUB_EVENT_PATH não está definido"): só
+roda dentro do GitHub Actions. Pela régua da casa, pulado NÃO é passou — fica como **não executado**.
+⚠️ `lint` acusa 483 warnings contra 481 da baseline do V-032; os meus dois arquivos produzem **0**
+warnings cada, então o delta **não é atribuível a esta unidade** e permanece sem explicação.
+`prettier` continua NÃO sendo gate: não existe configuração no repositório em nenhum formato
+(`--find-config-path` erra), e **705 arquivos de `src/` reprovam** — rodar `--write` no meu arquivo
+converteria 900 linhas alheias de aspas simples para duplas (medido: 367/332).
+
+**Regressão:** `50 failed | 10261 passed | 1217 skipped (11528)` contra `50 | 10255 | 1217 (11522)` do
+V-032. Falhos, pulados e os mesmos 20 arquivos INALTERADOS; passados e total sobem **exatamente +6**,
+que são os seis casos do spec, puro e portanto na lane unitária. Nenhuma falha cita meus módulos.
+Regressão dirigida dos consumidores do vocabulário: 103 passados, 0 falhos, 10 pulados.
+`test:leak` **NÃO executado**, deliberadamente: nenhum caminho de produção mudou — a unidade só
+acrescenta membros a uma união de tipos — e rodá-lo produziria marca de verificação sem significado,
+como no P03.8a.
+
+**Achado de processo, e o mais importante daqui.** Mutação prova que o teste morde o **código**; não
+prova que o código corresponde à **especificação**. Antes de fechar uma unidade é preciso varrer a
+spec INTEIRA pelos identificadores que ela introduz, não só o capítulo em que se está trabalhando —
+aqui o capítulo do vocabulário (§8.6) é outro que não o do comportamento (§8.2), e o achado só
+apareceu porque li o capítulo 8 completo para preparar a unidade seguinte. Registrado como C24.
+
+**Contradição de processo encontrada nesta unidade, e NÃO resolvida por mim.** O `AGENTS.md` (seção
+Coautoria) diz em letras que a regra do `Co-Authored-By:` de IA foi removida e que "isto é **gate, não
+convenção**" — `scripts/check-commit-trailers.ts` roda no job bloqueante e reprova a PR inteira se
+qualquer commit trouxer o trailer. Meu próprio C08 já registrava que `AGENTS.md` prevalece. Ainda
+assim, **6 dos 26 commits desta branch levam o trailer**. Deste commit em diante ele não é mais
+escrito; os 6 anteriores **ficam como estão**, porque corrigi-los exige reescrever histórico, que é
+operação destrutiva fora da minha autorização (§2) e decisão do dono.
+
+**O que esta unidade NÃO faz, e é o resto do P04:** `pauseConversationTx`, o serviço puro de
+transporte (placement em C23), os fences nas dez fronteiras de egresso do §8.2.4,
+`resumePolicy='future_only'` (§8.2.5) e a tabela `conversation_handoff_requests`. Aqui só o
+vocabulário — nenhum caminho vivo foi tocado, e nenhuma ação tem produtor ainda.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10255 | 50 | 1217 | Medido de novo em P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| unit (`npm test`, workers default) | 10261 | 50 | 1217 | Medido de novo em P04.2: passados 10255 → **10261** e total 11522 → **11528**, **+6 = exatamente os seis casos** do spec de vocabulário, que rodam na lane unitária por ser puro; falhos (50), pulados (1217) e os **mesmos 20 arquivos** INALTERADOS, e nenhuma falha cita `audit-actions` nem `conversation-control`. Histórico de P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
 | integração real-db (procedimento local de 2 passos) | 184 | 0 | — | Agora com `hermes-control-commands-real-db` (17 de P04.1). Detalhe anterior: | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
 | `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a e P03.7b, com perfil IDÊNTICO nas três vezes** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
