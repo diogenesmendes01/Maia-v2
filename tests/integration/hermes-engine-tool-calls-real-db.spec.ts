@@ -31,6 +31,7 @@ import pg from "pg";
 import { randomUUID } from "node:crypto";
 import { runWithTenantContext } from "@/db/tenant-context.js";
 import { engineRunsRepo } from "@/db/repositories/engine-repos.js";
+import { canonicalDigest } from "@/integrations/hermes/canonical-json.js";
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL &&
@@ -456,5 +457,365 @@ d("engine-repos — admissão de tool call contra Postgres real", () => {
       [run_id],
     );
     expect(Number(n.rows[0]?.c)).toBe(0);
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 11-16 (P03.3b): `markToolDispatching` e `freezeToolIdentity`.
+  //
+  // `markToolDispatching` existe porque o §5.6.4 EXIGE `state='dispatching'` com
+  // `dispatch_token` igual como pré-condição de `markToolHandlerStarted` — e a
+  // tabela do §5.6.3 nunca nomeou quem atribui esse token (ver C14). É também
+  // onde entram as duas recusas que o §5.6.4 manda fazer ANTES de chegar ao
+  // marcador de handler: classe nula e orçamento insuficiente.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** Admite a call 0 e devolve o run pronto para despachar. */
+  async function runComCallAdmitida(): Promise<{
+    run_id: string;
+    turno: { turn_id: string; claim_token: string; attempt: number };
+    call_id: string;
+  }> {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = await runRodando(turno, control_id);
+    await noEscopo(() =>
+      engineRunsRepo.admitToolCall({
+        ...chamada(run_id),
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+      }),
+    );
+    return { run_id, turno, call_id: `${run_id}:0` };
+  }
+
+  const classificacao = {
+    side_effect: "write" as const,
+    effect_class: "non_interruptible" as const,
+    sensitive: false,
+    legacy_irreversible_invoked: false,
+  };
+
+  it("11. `received` → `dispatching`: atribui dispatch_token e persiste a classificação do registry", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: classificacao,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.dispatch_token).toMatch(/^[0-9a-f-]{36}$/);
+
+    const row = await pool.query<{
+      state: string;
+      dispatch_token: string | null;
+      side_effect: string | null;
+      effect_class: string | null;
+      effect_evidence: string;
+    }>(
+      "SELECT state, dispatch_token, side_effect, effect_class, effect_evidence FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("dispatching");
+    expect(row.rows[0]?.dispatch_token).not.toBeNull();
+    expect(row.rows[0]?.side_effect).toBe("write");
+    expect(row.rows[0]?.effect_class).toBe("non_interruptible");
+    // Ainda NÃO há evidência de efeito: o handler nem foi chamado.
+    expect(row.rows[0]?.effect_evidence).toBe("none");
+  });
+
+  it("12. `effect_class` nulo é recusado — classe nula nunca autoriza handler", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: { ...classificacao, effect_class: null },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("effect_class_required");
+
+    const row = await pool.query<{ state: string }>(
+      "SELECT state FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("received");
+  });
+
+  it("13. prazo abaixo do mínimo da classe é recusado ANTES de despachar", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+
+    // `non_interruptible` exige 250 + 1500 = 1750ms. Deixar 300ms de prazo: o
+    // run ainda não venceu (o fence passa), mas não há orçamento para começar
+    // algo que pode não ter repetição segura.
+    await pool.query(
+      "UPDATE engine_runs SET deadline_at = clock_timestamp() + interval '300 milliseconds' WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: classificacao,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("insufficient_budget");
+
+    const row = await pool.query<{ state: string }>(
+      "SELECT state FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("received");
+  });
+
+  it("14. uma call não pode entrar em `dispatching` duas vezes", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+    const args = {
+      run_id,
+      turn_id: turno.turn_id,
+      origin_claim_token: turno.claim_token,
+      call_id,
+      expected_row_version: 0,
+      classification: classificacao,
+    };
+    const primeiro = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching(args),
+    );
+    expect(primeiro.ok).toBe(true);
+
+    const segundo = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching(args),
+    );
+    expect(segundo.ok).toBe(false);
+    if (!segundo.ok) expect(segundo.reason).toBe("state_conflict");
+  });
+
+  it("15. congela a identidade, e o que fica gravado REPRODUZ o `args_hash`", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+    await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: classificacao,
+      }),
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.freezeToolIdentity({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        idempotency_key: "k-" + "0".repeat(60),
+        idempotency_payload_hash: "v2:" + "c".repeat(64),
+        normalized_args: { texto: "oi" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    // A invariante do C15: o objeto gravado é a forma canônica sobre a qual o
+    // `args_hash` foi computado. Redigerir tem de reproduzir o hash.
+    const row = await pool.query<{
+      args_hash: string;
+      normalized_args_json: unknown;
+      idempotency_key: string;
+    }>(
+      "SELECT args_hash, normalized_args_json, idempotency_key FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.idempotency_key).toBe("k-" + "0".repeat(60));
+    expect(canonicalDigest(row.rows[0]?.normalized_args_json)).toBe(
+      row.rows[0]?.args_hash,
+    );
+  });
+
+  it("16. identidade NÃO muda em replay: igual é idempotente, diferente é conflito", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+    await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: classificacao,
+      }),
+    );
+    const identidade = {
+      run_id,
+      turn_id: turno.turn_id,
+      origin_claim_token: turno.claim_token,
+      call_id,
+      idempotency_key: "k-" + "1".repeat(60),
+      idempotency_payload_hash: "v2:" + "d".repeat(64),
+      normalized_args: { texto: "oi" },
+    };
+    const primeiro = await noEscopo(() =>
+      engineRunsRepo.freezeToolIdentity(identidade),
+    );
+    expect(primeiro.ok).toBe(true);
+
+    const replay = await noEscopo(() =>
+      engineRunsRepo.freezeToolIdentity(identidade),
+    );
+    expect(replay.ok).toBe(true);
+
+    const outra = await noEscopo(() =>
+      engineRunsRepo.freezeToolIdentity({
+        ...identidade,
+        idempotency_key: "k-" + "9".repeat(60),
+      }),
+    );
+    expect(outra.ok).toBe(false);
+    if (!outra.ok) expect(outra.reason).toBe("identity_conflict");
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 17-20: CIRÚRGICOS, um predicado por vez — de novo.
+  //
+  // O caso 14 chama `markToolDispatching` duas vezes com a MESMA
+  // `expected_row_version`. Depois do primeiro sucesso a linha está em
+  // `dispatching` E com `row_version` 1, então as duas guardas do CAS recusam a
+  // segunda chamada. Apagar qualquer uma delas deixa a outra recusando, e a
+  // varredura mostrou as DUAS sobrevivendo. Mesmo padrão dos casos 25-28 do
+  // spec do journal: cenário realista prova a garantia, não prova qual
+  // predicado a sustenta.
+  //
+  // Os casos 19 e 20 são outra coisa: cobrem caminhos que NENHUM teste tocava
+  // (a invariante do C15 e a exigência de `dispatching` no freeze).
+  // ══════════════════════════════════════════════════════════════════════════
+
+  it("17. estado diferente de `received` com a MESMA versão: só a guarda de ESTADO recusa", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+
+    // Estado muda por fora SEM mexer em `row_version`. A 140 permite: só
+    // `handler_chk` e `terminal_chk` exigem colunas extras, e `dispatching` não
+    // está em nenhum dos dois.
+    await pool.query(
+      "UPDATE engine_tool_calls SET state = 'dispatching', dispatch_token = gen_random_uuid() WHERE call_id = $1",
+      [call_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: classificacao,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("state_conflict");
+  });
+
+  it("18. ainda em `received` com a versão MOVIDA: só a guarda de VERSÃO recusa", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+
+    await pool.query(
+      "UPDATE engine_tool_calls SET row_version = row_version + 1 WHERE call_id = $1",
+      [call_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: classificacao,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "version_conflict") {
+      expect(r.current_row_version).toBe(1);
+    } else if (!r.ok) {
+      throw new Error(`esperado version_conflict, veio ${r.reason}`);
+    }
+  });
+
+  it("19. `normalized_args` que não reproduz o `args_hash` é recusado, e nada é gravado", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+    await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: classificacao,
+      }),
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.freezeToolIdentity({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        idempotency_key: "k-" + "2".repeat(60),
+        idempotency_payload_hash: "v2:" + "e".repeat(64),
+        // Não é a forma canônica sobre a qual o `args_hash` foi computado.
+        normalized_args: { texto: "OUTRA COISA" },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("normalized_args_mismatch");
+
+    const row = await pool.query<{
+      idempotency_key: string | null;
+      normalized_args_json: unknown;
+    }>(
+      "SELECT idempotency_key, normalized_args_json FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.idempotency_key).toBeNull();
+    expect(row.rows[0]?.normalized_args_json).toBeNull();
+  });
+
+  it("20. congelar identidade antes de `dispatching` é recusado", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+
+    // A call está em `received`: o dispatcher nem foi cogitado ainda. Os args
+    // batem com o hash de propósito — o que tem de recusar aqui é o ESTADO.
+    const r = await noEscopo(() =>
+      engineRunsRepo.freezeToolIdentity({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        idempotency_key: "k-" + "3".repeat(60),
+        idempotency_payload_hash: "v2:" + "f".repeat(64),
+        normalized_args: { texto: "oi" },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("state_conflict");
+
+    const row = await pool.query<{ idempotency_key: string | null }>(
+      "SELECT idempotency_key FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.idempotency_key).toBeNull();
   });
 });

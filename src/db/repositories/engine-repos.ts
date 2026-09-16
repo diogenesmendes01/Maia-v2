@@ -56,6 +56,11 @@ import type {
   Json,
 } from "@/runtime/engines/contracts.js";
 import { engineTerminalProposalV1Schema } from "@/runtime/engines/schemas.js";
+import {
+  classifyToolCancellation,
+  minimumBudgetMs,
+  type ToolEffectClass,
+} from "@/tools/effect-class.js";
 import { db, withTx } from "../client.js";
 import {
   agent_turns,
@@ -558,6 +563,49 @@ export type ToolCallAdmission =
       ok: false;
       reason: "run_not_authorized";
       current_phase: EngineRunPhaseV1;
+    };
+
+/** Classificação que vem do registry Maia — nunca do modelo (§5.7.4 item 5). */
+export type ToolClassification = {
+  side_effect: "none" | "read" | "write" | "communication";
+  /** `null` NUNCA autoriza handler (§4.1); a operação recusa. */
+  effect_class: ToolEffectClass | null;
+  sensitive: boolean;
+  legacy_irreversible_invoked: boolean;
+};
+
+export type ToolDispatchingResult =
+  | { ok: true; dispatch_token: string; row_version: number }
+  | TurnFenceConflict
+  | ControlConflict
+  | NotFound
+  | { ok: false; reason: "run_not_authorized"; current_phase: EngineRunPhaseV1 }
+  /** Sem classe não se chega ao UPDATE de handler (§5.6.4). */
+  | { ok: false; reason: "effect_class_required" }
+  /** Prazo restante abaixo do mínimo que a CLASSE exige para começar. */
+  | {
+      ok: false;
+      reason: "insufficient_budget";
+      required_ms: number;
+      remaining_ms: number;
+    }
+  | { ok: false; reason: "state_conflict"; current_state: string }
+  | { ok: false; reason: "version_conflict"; current_row_version: number };
+
+export type FreezeIdentityResult =
+  /** `frozen: false` = já estava congelada com os MESMOS valores (replay). */
+  | { ok: true; frozen: boolean }
+  | TurnFenceConflict
+  | ControlConflict
+  | NotFound
+  | { ok: false; reason: "state_conflict"; current_state: string }
+  /** A identidade não muda em replay (§5.6.3). */
+  | { ok: false; reason: "identity_conflict"; current_idempotency_key: string }
+  /** Invariante C15: o objeto gravado tem de reproduzir o `args_hash`. */
+  | {
+      ok: false;
+      reason: "normalized_args_mismatch";
+      expected_args_hash: string;
     };
 
 export const engineRunsRepo = {
@@ -1422,6 +1470,305 @@ export const engineRunsRepo = {
         call_id: input.call.call_id,
         ordinal: input.call.ordinal,
       };
+    });
+  },
+
+  /**
+   * `received` → `dispatching` (§5.7.4 item 5), a transição que a tabela do
+   * §5.6.3 não nomeia mas o §5.6.4 pressupõe: o UPDATE de `markToolHandlerStarted`
+   * exige `state='dispatching'` com `dispatch_token` IGUAL, e alguém tem de ter
+   * atribuído esse token. Ver C14 nos checkpoints.
+   *
+   * Duas recusas acontecem AQUI, antes de o dispatcher existir na história:
+   *
+   *   * `effect_class` nulo — "null NUNCA autoriza handler" (§4.1). Uma tool sem
+   *     classificação confiável fica fora da coorte; não vira `read` por default;
+   *   * prazo restante abaixo de `minimumBudgetMs(classe)` — §5.6.4 é explícito:
+   *     "sem orçamento mínimo da classe, não chegar a esse UPDATE". Começar algo
+   *     `non_interruptible` com 300ms de prazo é fabricar um efeito incerto.
+   */
+  async markToolDispatching(input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    call_id: string;
+    expected_row_version: number;
+    classification: ToolClassification;
+  }): Promise<ToolDispatchingResult> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<ToolDispatchingResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("dispatching", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const fence = await lockTurnAndCheckFence(tx, {
+        turn_id: input.turn_id,
+        origin_claim_token: input.origin_claim_token,
+      });
+      if (!fence.ok) {
+        conta("dispatching", fence.reason);
+        return fence;
+      }
+
+      const rows = linhas<
+        RunSnapshotRow & RunFenceRow & { restante_ms: string | number }
+      >(
+        await tx.execute(sql`
+          SELECT ${SNAPSHOT_COLS}, ${FENCE_COLS},
+                 EXTRACT(EPOCH FROM (deadline_at - clock_timestamp())) * 1000 AS restante_ms
+            FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           FOR UPDATE`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("dispatching", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const recusa = checarFenceDoRun({
+        run,
+        turno: fence.turno,
+        origin_claim_token: input.origin_claim_token,
+        controle,
+      });
+      if (recusa) {
+        conta("dispatching", recusa.reason);
+        return recusa;
+      }
+      const fase = run.phase as EngineRunPhaseV1;
+      if (fase !== "running") {
+        // Só `running` libera dispatcher. O callback adiantado pode ter
+        // journalado `received`, mas despachar exige o aceite persistido.
+        conta("dispatching", "run_not_authorized");
+        return { ok: false, reason: "run_not_authorized", current_phase: fase };
+      }
+
+      const classe = input.classification.effect_class;
+      if (classe === null) {
+        conta("dispatching", "effect_class_required");
+        return { ok: false, reason: "effect_class_required" };
+      }
+      const exigido = minimumBudgetMs(classe);
+      const restante = Number(run.restante_ms);
+      if (restante < exigido) {
+        conta("dispatching", "insufficient_budget");
+        return {
+          ok: false,
+          reason: "insufficient_budget",
+          required_ms: exigido,
+          remaining_ms: Math.trunc(restante),
+        };
+      }
+
+      const atualizado = linhas<{
+        dispatch_token: string;
+        row_version: string | number;
+      }>(
+        await tx.execute(sql`
+          UPDATE ${engine_tool_calls}
+             SET state = 'dispatching',
+                 dispatch_token = gen_random_uuid(),
+                 side_effect = ${input.classification.side_effect},
+                 effect_class = ${classe},
+                 sensitive = ${input.classification.sensitive},
+                 legacy_irreversible_invoked = ${input.classification.legacy_irreversible_invoked},
+                 row_version = row_version + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+             AND state = 'received'
+             AND row_version = ${input.expected_row_version}
+           RETURNING dispatch_token::text AS dispatch_token, row_version`),
+      );
+      const call = atualizado[0];
+      if (!call) {
+        const atual = linhas<{ state: string; row_version: string | number }>(
+          await tx.execute(sql`
+            SELECT state, row_version FROM ${engine_tool_calls}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+               AND run_id = ${input.run_id} AND call_id = ${input.call_id}`),
+        );
+        const linha = atual[0];
+        if (!linha) {
+          conta("dispatching", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        if (linha.state !== "received") {
+          conta("dispatching", "state_conflict");
+          return {
+            ok: false,
+            reason: "state_conflict",
+            current_state: linha.state,
+          };
+        }
+        conta("dispatching", "version_conflict");
+        return {
+          ok: false,
+          reason: "version_conflict",
+          current_row_version: Number(linha.row_version),
+        };
+      }
+
+      const seq = linhas<{ last_event_sequence: string | number }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           RETURNING last_event_sequence`),
+      );
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(seq[0]?.last_event_sequence ?? 1),
+        dedupe_key: `tool_state:${input.call_id}:dispatching`,
+        event_type: "tool_state",
+        actor_kind: "turn_owner",
+        actor_turn_attempt: Number(fence.turno.attempt_count),
+        metadata: {
+          call_id: input.call_id,
+          state: "dispatching",
+          side_effect: input.classification.side_effect,
+          effect_class: classe,
+          sensitive: input.classification.sensitive,
+          // O que a classe implica para um cancelamento tardio — registrado no
+          // journal para quem for reconciliar não ter de reinferir.
+          cancellation_outcome: classifyToolCancellation(classe).outcome,
+        },
+      });
+
+      conta("dispatching", "ok");
+      return {
+        ok: true,
+        dispatch_token: call.dispatch_token,
+        row_version: Number(call.row_version),
+      };
+    });
+  },
+
+  /**
+   * Congela a identidade de idempotência ANTES de o dispatcher usá-la
+   * (§5.6.3, §5.7.4 item 6). "Não muda em replay" é literal: um segundo freeze
+   * com os mesmos valores é no-op; com valores diferentes é conflito.
+   *
+   * A invariante do C15 é VERIFICADA, não assumida: `normalized_args_json` tem
+   * de ser a forma canônica sobre a qual o `args_hash` foi computado. Confiar
+   * no chamador aqui deixaria o journal com um objeto que não corresponde ao
+   * hash ao lado dele — e quem reconcilia não teria como saber qual dos dois
+   * está certo.
+   */
+  async freezeToolIdentity(input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    call_id: string;
+    idempotency_key: string;
+    idempotency_payload_hash: string;
+    normalized_args: Json;
+  }): Promise<FreezeIdentityResult> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<FreezeIdentityResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("freeze_identity", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const fence = await lockTurnAndCheckFence(tx, {
+        turn_id: input.turn_id,
+        origin_claim_token: input.origin_claim_token,
+      });
+      if (!fence.ok) {
+        conta("freeze_identity", fence.reason);
+        return fence;
+      }
+      const rows = linhas<RunSnapshotRow & RunFenceRow>(
+        await tx.execute(sql`
+          SELECT ${SNAPSHOT_COLS}, ${FENCE_COLS} FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           FOR UPDATE`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("freeze_identity", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const recusa = checarFenceDoRun({
+        run,
+        turno: fence.turno,
+        origin_claim_token: input.origin_claim_token,
+        controle,
+      });
+      if (recusa) {
+        conta("freeze_identity", recusa.reason);
+        return recusa;
+      }
+
+      const calls = linhas<{
+        state: string;
+        args_hash: string;
+        idempotency_key: string | null;
+        idempotency_payload_hash: string | null;
+      }>(
+        await tx.execute(sql`
+          SELECT state, args_hash, idempotency_key, idempotency_payload_hash
+            FROM ${engine_tool_calls}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+           FOR UPDATE`),
+      );
+      const call = calls[0];
+      if (!call) {
+        conta("freeze_identity", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      if (call.state !== "dispatching") {
+        conta("freeze_identity", "state_conflict");
+        return {
+          ok: false,
+          reason: "state_conflict",
+          current_state: call.state,
+        };
+      }
+
+      // C15, verificado: redigerir o que vai ser gravado reproduz o hash.
+      if (canonicalDigest(input.normalized_args) !== call.args_hash) {
+        conta("freeze_identity", "normalized_args_mismatch");
+        return {
+          ok: false,
+          reason: "normalized_args_mismatch",
+          expected_args_hash: call.args_hash,
+        };
+      }
+
+      if (call.idempotency_key !== null) {
+        const igual =
+          call.idempotency_key === input.idempotency_key &&
+          call.idempotency_payload_hash === input.idempotency_payload_hash;
+        if (!igual) {
+          conta("freeze_identity", "identity_conflict");
+          return {
+            ok: false,
+            reason: "identity_conflict",
+            current_idempotency_key: call.idempotency_key,
+          };
+        }
+        conta("freeze_identity", "replay");
+        return { ok: true, frozen: false };
+      }
+
+      await tx.execute(sql`
+        UPDATE ${engine_tool_calls}
+           SET idempotency_key = ${input.idempotency_key},
+               idempotency_payload_hash = ${input.idempotency_payload_hash},
+               normalized_args_json = ${JSON.stringify(input.normalized_args)}::jsonb,
+               row_version = row_version + 1,
+               updated_at = clock_timestamp()
+         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+           AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+           AND idempotency_key IS NULL`);
+
+      conta("freeze_identity", "ok");
+      return { ok: true, frozen: true };
     });
   },
 };

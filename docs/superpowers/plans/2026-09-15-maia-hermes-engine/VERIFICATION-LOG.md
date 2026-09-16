@@ -573,14 +573,58 @@ Uma consequência registrada: seguir o item 3 à risca faz um redelivery com `it
 `payload_conflict`. É mais estrito que tratar `iteration` como telemetria, e é o que o texto normativo
 manda; está comentado no código para quem reavaliar.
 
+### V-021 · P03.3b — `markToolDispatching` e `freezeToolIdentity`
+
+Duas operações e duas decisões registradas antes de codar (C14 e C15), porque nenhuma das duas estava
+resolvida no texto:
+
+* **C14** — a tabela do §5.6.3 nunca nomeia a transição `received → dispatching`, mas o §5.6.4 a
+  pressupõe: o UPDATE de `markToolHandlerStarted` exige `state='dispatching'` com `dispatch_token`
+  IGUAL, e alguém tem de ter atribuído esse token. Virou operação própria em vez de ser embutida no
+  freeze (outra responsabilidade) ou na admissão (que não pode classificar — a classificação vem do
+  registry, fora do journal).
+* **C15** — `normalized_args_json` não tinha significado definido em lugar nenhum, e a função da casa
+  com esse nome (`normalizePayload`) devolve um HASH, não JSON, e ainda aplica transformações de
+  domínio (`valor`→`valor_centavos` etc.) que distorceriam args arbitrários de engine. A coluna passou
+  a guardar a forma canônica sobre a qual o `args_hash` é computado — e a operação **verifica** isso
+  em vez de confiar no chamador: `normalized_args_mismatch` se redigerir não reproduzir o hash.
+
+**Recusas que acontecem antes de o dispatcher existir na história** (§5.6.4): `effect_class` nulo
+(§4.1: "null NUNCA autoriza handler") e prazo restante abaixo de `minimumBudgetMs(classe)` — 250ms
+para `abort_safe`, 1750ms para as demais, reusando a função da casa em vez de um número inventado.
+Começar algo `non_interruptible` com 300ms de prazo é fabricar efeito incerto.
+
+**Mutação — 7 mutantes, e a previsão quase fechou.** Eu previ 4 mortes e 3 sobreviventes; o placar real
+da primeira rodada foi 3 mortes e **4 sobreviventes**. O erro foi o BM3 (guarda de `state='received'`
+no CAS da call), que eu disse que morreria pelo caso 14. Diagnóstico: o caso 14 chama a operação duas
+vezes com a MESMA `expected_row_version`, então depois do primeiro sucesso a linha está em
+`dispatching` **e** com `row_version` 1 — as duas guardas recusam a segunda chamada, e apagar qualquer
+uma delas deixa a outra recusando. É o mesmo padrão dos casos 25-28 do spec do journal, um nível mais
+fundo: eu tinha até desambiguado o literal contra o `markSubmitting`, mas não percebi a redundância
+ENTRE os dois predicados do mesmo CAS. Os outros três sobreviventes (BM4, BM5, BM7) eram o que eu
+esperava, e dois deles não eram redundância e sim **ausência de teste**: nada exercitava a invariante
+do C15 nem o freeze a partir de um estado que não fosse `dispatching`.
+
+Os casos 17-20 isolam um predicado cada — estado sem versão, versão sem estado, args que não batem
+com o hash, freeze antes de `dispatching`. Com eles, **os sete morrem**.
+
+**Estado final:** 20 casos no spec de tool calls (10 de P03.3a + 10 desta unidade), verdes.
+`prettier --check`, `typecheck` (projeto) e `eslint` em 0. **Regressão:** `50 failed | 10233 passed |
+1093 skipped (11376)`, os MESMOS 20 arquivos de sempre, nenhuma falha citando `engine-repos` ou
+`tool-calls`, e os pulados subindo exatamente os 10 casos novos (`↓ 20 tests | 20 skipped`).
+
+**O que NÃO está feito:** `markToolHandlerStarted` (P03.3c) e `settleToolCall` (P03.3d) — ou seja,
+`reservation_token` e `approval_claim_token` ainda não são persistidos por ninguém, e `effect_evidence`
+continua `none` em toda call. Também segue sem teste de concorrência real.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1083 | Medido de novo em P03.3a: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 50 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019) + `hermes-engine-tool-calls-real-db` (10, P03.3a). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1093 | Medido de novo em P03.3b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 60 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019) + `hermes-engine-tool-calls-real-db` (20: 10 de P03.3a + 10 de P03.3b). As demais specs de integração seguem **não executadas** (Redis) |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 
@@ -608,4 +652,9 @@ manda; está comentado no código para quem reavaliar.
   atribuídos a esta branch; o catálogo do V-007 passa a ser tratado como PARCIAL. Continua não medido:
   a baseline no commit base com catálogo completo — só isso encerraria o assunto em definitivo.
 - `engineRunsRepo` ainda **não** é reexportado pelo barril `src/db/repositories.ts`. Não quebra nada
-  hoje (nada o consome fora do teste), mas P07 vai precisar disso quando o supervisor o usar.
+  hoje (nada o consome fora dos testes), mas P07 vai precisar disso quando o supervisor o usar — e a
+  adição não é a linha trivial que parecia: o barril usa `export * from './repositories/<arquivo>.js'`,
+  então reexportar `engine-repos` jogaria nomes GENÉRICOS (`NotFound`, `TurnFenceConflict`,
+  `ControlConflict`, `ToolClassification`) numa superfície importada por meio repositório. Antes de
+  adicionar, conferir colisão e, se houver, ou renomear os tipos ou reexportar só os nomes
+  necessários. Registrado agora para quem fizer P07 não descobrir isso no meio de outra coisa.
