@@ -704,6 +704,37 @@ export type RevokeCapabilitiesResult =
       run_origin_claim_token: string;
     };
 
+/** Quem bloqueia: dono, recuperador ou operador (mesmo vocabulário dos eventos). */
+export type BlockActor =
+  | { kind: "turn_owner"; origin_claim_token: string }
+  | { kind: "recovery" | "operator"; actor_ref: string };
+
+/**
+ * Teto da evidência serializada. `engine_run_events.metadata_json` tem CHECK de
+ * 16 KiB na 140, e a evidência vem de fora — sem este limite, uma evidência
+ * grande viraria violação de CHECK dentro da TX, trocando recusa TIPADA por
+ * exceção. Mesmo raciocínio do hash do receipt em P03.3d.
+ */
+const EVIDENCIA_MAX_BYTES = 8192;
+
+export type MarkRunBlockedResult =
+  | { ok: true; row_version: number; already_blocked: boolean }
+  | TurnFenceConflict
+  | NotFound
+  | { ok: false; reason: "already_closed" }
+  | { ok: false; reason: "evidence_too_large"; max_bytes: number };
+
+export type ResolveBlockedRunResult =
+  | { ok: true; row_version: number }
+  | NotFound
+  | { ok: false; reason: "phase_conflict"; current_phase: EngineRunPhaseV1 }
+  | { ok: false; reason: "version_conflict"; current_row_version: number }
+  /** §5.6.3: decisão HUMANA. Sem identidade do operador não se resolve. */
+  | { ok: false; reason: "operator_required" }
+  /** §5.7.2: "operador apresenta decisão/evidência suficiente". Vazio não é. */
+  | { ok: false; reason: "evidence_required" }
+  | { ok: false; reason: "evidence_too_large"; max_bytes: number };
+
 export const engineRunsRepo = {
   /**
    * TX A do §5.7.3: fixa o motor no turno e cria o run `prepared`.
@@ -2436,6 +2467,237 @@ export const engineRunsRepo = {
         revoked_at: linha.capabilities_revoked_at,
         already: false,
       };
+    });
+  },
+
+  /**
+   * Bloqueia o run (§5.7.2: "efeito, submit ou resultado não reconciliável").
+   *
+   * O que `blocked` faz que `closed` não faria: **preserva a trava**. A unique
+   * parcial da 140 cobre `phase <> 'closed'`, então um run bloqueado continua
+   * ocupando a vaga do turno e ninguém abre outra deliberação por baixo — é o
+   * invariante 7 do §5.6.2, e vale mesmo se o turno já foi para dead letter.
+   *
+   * `row_version` É incrementado aqui, ao contrário da revogação: bloquear É
+   * transição de fase, e invalidar o CAS de quem estava em voo é justamente o
+   * efeito desejado.
+   */
+  async markRunBlocked(input: {
+    run_id: string;
+    turn_id: string;
+    actor: BlockActor;
+    error_code: string;
+    evidence: Record<string, Json>;
+  }): Promise<MarkRunBlockedResult> {
+    const { tenant_id, agent_id } = scope();
+
+    const evidenciaJson = JSON.stringify(input.evidence);
+    if (Buffer.byteLength(evidenciaJson, "utf8") > EVIDENCIA_MAX_BYTES) {
+      conta("block", "evidence_too_large");
+      return {
+        ok: false,
+        reason: "evidence_too_large",
+        max_bytes: EVIDENCIA_MAX_BYTES,
+      };
+    }
+
+    return withTx(async (tx): Promise<MarkRunBlockedResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("block", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      let actor_turn_attempt: number | null = null;
+      if (input.actor.kind === "turn_owner") {
+        const fence = await lockTurnAndCheckFence(tx, {
+          turn_id: input.turn_id,
+          origin_claim_token: input.actor.origin_claim_token,
+        });
+        if (!fence.ok) {
+          conta("block", fence.reason);
+          return fence;
+        }
+        actor_turn_attempt = Number(fence.turno.attempt_count);
+      }
+
+      const atualizado = linhas<{
+        row_version: string | number;
+        last_event_sequence: string | number;
+      }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET phase = 'blocked',
+                 last_error_code = ${input.error_code},
+                 row_version = row_version + 1,
+                 last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND id = ${input.run_id}
+             AND phase <> 'closed'
+           RETURNING row_version, last_event_sequence`),
+      );
+      const linha = atualizado[0];
+      if (!linha) {
+        const atual = linhas<{ phase: string }>(
+          await tx.execute(sql`
+            SELECT phase FROM ${engine_runs}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}`),
+        );
+        if (!atual[0]) {
+          conta("block", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        // Um run fechado não volta a ser bloqueado: reabrir a trava depois do
+        // fechamento inventaria uma geração que já foi encerrada.
+        conta("block", "already_closed");
+        return { ok: false, reason: "already_closed" };
+      }
+
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(linha.last_event_sequence),
+        dedupe_key: `reconcile_decision:blocked:${Number(linha.row_version)}`,
+        event_type: "reconcile_decision",
+        actor_kind: input.actor.kind,
+        actor_turn_attempt,
+        metadata: {
+          decision: "blocked",
+          error_code: input.error_code,
+          actor_ref:
+            input.actor.kind === "turn_owner" ? null : input.actor.actor_ref,
+          evidence: input.evidence,
+        },
+      });
+
+      conta("block", "ok");
+      return {
+        ok: true,
+        row_version: Number(linha.row_version),
+        already_blocked: false,
+      };
+    });
+  },
+
+  /**
+   * A PORTA OPERACIONAL (§5.7.2: "operador apresenta decisão/evidência
+   * suficiente → closed/manual_resolved; só então replay explicitamente
+   * autorizado").
+   *
+   * Não existe liberação por TTL, e isso é estrutural: não há parâmetro de
+   * tempo nesta assinatura e nenhum caminho fecha sem `operator_ref` e
+   * `evidence` não-vazios. "Nenhuma liberação automática por TTL" (§5.6.3) vira
+   * impossibilidade de escrever a chamada, não convenção de runbook.
+   *
+   * `capabilities_revoked_at` entra por `COALESCE`: a 140 exige a coluna
+   * preenchida em toda linha `closed`, e o COALESCE preserva o carimbo original
+   * de quem já tinha revogado (P03.4) em vez de sobrescrevê-lo.
+   */
+  async resolveBlockedRun(input: {
+    run_id: string;
+    turn_id: string;
+    operator_ref: string;
+    decision: "manual_resolved";
+    evidence: Record<string, Json>;
+    expected_row_version?: number;
+  }): Promise<ResolveBlockedRunResult> {
+    const { tenant_id, agent_id } = scope();
+
+    // As duas recusas acontecem ANTES de qualquer lock: não faz sentido tomar
+    // lock de controle para descobrir que ninguém assinou a decisão.
+    if (input.operator_ref.trim().length === 0) {
+      conta("resolve_blocked", "operator_required");
+      return { ok: false, reason: "operator_required" };
+    }
+    const evidenciaJson = JSON.stringify(input.evidence);
+    if (Object.keys(input.evidence).length === 0) {
+      conta("resolve_blocked", "evidence_required");
+      return { ok: false, reason: "evidence_required" };
+    }
+    if (Buffer.byteLength(evidenciaJson, "utf8") > EVIDENCIA_MAX_BYTES) {
+      conta("resolve_blocked", "evidence_too_large");
+      return {
+        ok: false,
+        reason: "evidence_too_large",
+        max_bytes: EVIDENCIA_MAX_BYTES,
+      };
+    }
+
+    return withTx(async (tx): Promise<ResolveBlockedRunResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("resolve_blocked", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      const versaoEsperada =
+        input.expected_row_version === undefined
+          ? sql`TRUE`
+          : sql`row_version = ${input.expected_row_version}`;
+
+      const fechado = linhas<{
+        row_version: string | number;
+        last_event_sequence: string | number;
+      }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET phase = 'closed',
+                 closed_at = clock_timestamp(),
+                 closed_reason = ${input.decision},
+                 capabilities_revoked_at = COALESCE(capabilities_revoked_at, clock_timestamp()),
+                 row_version = row_version + 1,
+                 last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND id = ${input.run_id}
+             AND phase = 'blocked'
+             AND ${versaoEsperada}
+           RETURNING row_version, last_event_sequence`),
+      );
+      const linha = fechado[0];
+      if (!linha) {
+        const atual = linhas<{ phase: string; row_version: string | number }>(
+          await tx.execute(sql`
+            SELECT phase, row_version FROM ${engine_runs}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}`),
+        );
+        const row = atual[0];
+        if (!row) {
+          conta("resolve_blocked", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        if (row.phase !== "blocked") {
+          conta("resolve_blocked", "phase_conflict");
+          return {
+            ok: false,
+            reason: "phase_conflict",
+            current_phase: row.phase as EngineRunPhaseV1,
+          };
+        }
+        conta("resolve_blocked", "version_conflict");
+        return {
+          ok: false,
+          reason: "version_conflict",
+          current_row_version: Number(row.row_version),
+        };
+      }
+
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(linha.last_event_sequence),
+        dedupe_key: `closed:${input.decision}:${Number(linha.row_version)}`,
+        event_type: "closed",
+        actor_kind: "operator",
+        actor_turn_attempt: null,
+        metadata: {
+          decision: input.decision,
+          operator_ref: input.operator_ref,
+          evidence: input.evidence,
+        },
+      });
+
+      conta("resolve_blocked", "ok");
+      return { ok: true, row_version: Number(linha.row_version) };
     });
   },
 };

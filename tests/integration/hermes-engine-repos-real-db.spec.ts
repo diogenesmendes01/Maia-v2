@@ -1423,4 +1423,368 @@ d("engine-repos — journal de execução contra Postgres real", () => {
       antes.rows[0]?.capabilities_revoked_at,
     );
   });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 36-42 (P03.5): `markRunBlocked` e `resolveBlockedRun`.
+  //
+  // Contrato normativo mínimo (ver C17): §5.6.3 "guarda evidência, auditoria e
+  // decisão humana; nenhuma liberação automática por TTL"; §5.7.2 "operador
+  // apresenta decisão/evidência suficiente → closed/manual_resolved; só então
+  // replay explicitamente autorizado".
+  //
+  // A regra que dá sentido a `blocked`: ela PRESERVA a trava contra nova
+  // geração (§5.6.2 invariante 7) — um run bloqueado continua ocupando a unique
+  // parcial, então ninguém abre outra deliberação no mesmo turno por baixo.
+  //
+  // Os casos 41 e 42 são cirúrgicos DE SAÍDA, escritos antes da varredura: o
+  // cenário "resolver duas vezes" moveria fase e versão juntas, que é como
+  // BM3/BM4, CM7 e EM3 sobreviveram.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  it("36. bloqueia um run aberto, guardando o motivo e o evento", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: { call_id: `${run_id}:0`, motivo: "handler sem resultado" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{ phase: string; last_error_code: string }>(
+      "SELECT phase, last_error_code FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.phase).toBe("blocked");
+    expect(row.rows[0]?.last_error_code).toBe("effect_unreconciled");
+
+    const ev = await pool.query<{ event_type: string; actor_kind: string }>(
+      "SELECT event_type, actor_kind FROM engine_run_events WHERE run_id = $1 ORDER BY sequence_no DESC LIMIT 1",
+      [run_id],
+    );
+    expect(ev.rows[0]?.event_type).toBe("reconcile_decision");
+    expect(ev.rows[0]?.actor_kind).toBe("recovery");
+  });
+
+  it("37. `blocked` PRESERVA a trava: nenhuma geração nova no mesmo turno", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+    await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: { motivo: "efeito incerto" },
+      }),
+    );
+
+    // A unique parcial da 140 cobre `phase <> 'closed'`, e `blocked` não é
+    // `closed` — é isso que impede abrir outra deliberação por baixo.
+    const control_id = await mkControle();
+    const outro = await noEscopo(() =>
+      engineRunsRepo.pinEngineAndPrepareRun(
+        pedido(randomUUID(), turno, control_id),
+      ),
+    );
+    expect(outro.ok).toBe(false);
+    if (!outro.ok) expect(outro.reason).toBe("run_already_open");
+  });
+
+  it("38. resolver EXIGE decisão e evidência do operador — sem elas, recusa", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+    await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: { motivo: "efeito incerto" },
+      }),
+    );
+
+    const semDecisao = await noEscopo(() =>
+      engineRunsRepo.resolveBlockedRun({
+        run_id,
+        turn_id: turno.turn_id,
+        operator_ref: "",
+        decision: "manual_resolved",
+        evidence: { conferido: true },
+      }),
+    );
+    expect(semDecisao.ok).toBe(false);
+    if (!semDecisao.ok) expect(semDecisao.reason).toBe("operator_required");
+
+    const semEvidencia = await noEscopo(() =>
+      engineRunsRepo.resolveBlockedRun({
+        run_id,
+        turn_id: turno.turn_id,
+        operator_ref: "operador-1",
+        decision: "manual_resolved",
+        evidence: {},
+      }),
+    );
+    expect(semEvidencia.ok).toBe(false);
+    if (!semEvidencia.ok) expect(semEvidencia.reason).toBe("evidence_required");
+
+    // Nada de liberação por tempo: o run segue bloqueado.
+    const row = await pool.query<{ phase: string }>(
+      "SELECT phase FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.phase).toBe("blocked");
+  });
+
+  it("39. com operador e evidência, fecha em `manual_resolved` — e a 140 exige revogação junto", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+    await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: { motivo: "efeito incerto" },
+      }),
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.resolveBlockedRun({
+        run_id,
+        turn_id: turno.turn_id,
+        operator_ref: "operador-1",
+        decision: "manual_resolved",
+        evidence: { conferido_em: "destino", resultado: "efeito confirmado" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{
+      phase: string;
+      closed_reason: string | null;
+      closed_at: string | null;
+      capabilities_revoked_at: string | null;
+    }>(
+      `SELECT phase, closed_reason, closed_at::text AS closed_at,
+              capabilities_revoked_at::text AS capabilities_revoked_at
+         FROM engine_runs WHERE id = $1`,
+      [run_id],
+    );
+    expect(row.rows[0]?.phase).toBe("closed");
+    expect(row.rows[0]?.closed_reason).toBe("manual_resolved");
+    // O CHECK da 140 exige os três juntos: fechar sem revogar é impossível.
+    expect(row.rows[0]?.closed_at).not.toBeNull();
+    expect(row.rows[0]?.capabilities_revoked_at).not.toBeNull();
+  });
+
+  it("40. resolver um run que NÃO está bloqueado é recusado", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.resolveBlockedRun({
+        run_id,
+        turn_id: turno.turn_id,
+        operator_ref: "operador-1",
+        decision: "manual_resolved",
+        evidence: { conferido: true },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("phase_conflict");
+  });
+
+  it("41. fase errada com a versão CERTA: só a guarda de FASE recusa", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+    await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: { motivo: "x" },
+      }),
+    );
+    const v = await pool.query<{ row_version: string }>(
+      "SELECT row_version FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+
+    // Sai de `blocked` SEM mexer em `row_version`.
+    await pool.query(
+      "UPDATE engine_runs SET phase = 'reconciling' WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.resolveBlockedRun({
+        run_id,
+        turn_id: turno.turn_id,
+        operator_ref: "operador-1",
+        decision: "manual_resolved",
+        evidence: { conferido: true },
+        expected_row_version: Number(v.rows[0]?.row_version),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("phase_conflict");
+  });
+
+  it("42. versão errada com a fase CERTA: só a guarda de VERSÃO recusa", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+    await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: { motivo: "x" },
+      }),
+    );
+    const v = await pool.query<{ row_version: string }>(
+      "SELECT row_version FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+
+    await pool.query(
+      "UPDATE engine_runs SET row_version = row_version + 1 WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.resolveBlockedRun({
+        run_id,
+        turn_id: turno.turn_id,
+        operator_ref: "operador-1",
+        decision: "manual_resolved",
+        evidence: { conferido: true },
+        expected_row_version: Number(v.rows[0]?.row_version),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "version_conflict") {
+      expect(r.current_row_version).toBe(Number(v.rows[0]?.row_version) + 1);
+    } else if (!r.ok) {
+      throw new Error(`esperado version_conflict, veio ${r.reason}`);
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 43-45: os três mutantes que a varredura mostrou SOBREVIVENDO — e os
+  // três eram caminho SEM TESTE, não redundância.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** Bloqueia e resolve, deixando o run em `closed`. */
+  async function runFechadoPorOperador(): Promise<{
+    run_id: string;
+    turno: { turn_id: string; claim_token: string; attempt: number };
+  }> {
+    const { run_id, turno } = await runRodandoParaRevogar();
+    await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: { motivo: "efeito incerto" },
+      }),
+    );
+    const r = await noEscopo(() =>
+      engineRunsRepo.resolveBlockedRun({
+        run_id,
+        turn_id: turno.turn_id,
+        operator_ref: "operador-1",
+        decision: "manual_resolved",
+        evidence: { conferido: true },
+      }),
+    );
+    if (!r.ok) throw new Error("setup: resolveBlockedRun falhou");
+    return { run_id, turno };
+  }
+
+  it("43. run já FECHADO não volta a ser bloqueado", async () => {
+    const { run_id, turno } = await runFechadoPorOperador();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "operator", actor_ref: "operador-2" },
+        error_code: "effect_unreconciled",
+        evidence: { motivo: "tentativa tardia" },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("already_closed");
+
+    // Reabrir a trava depois do fechamento inventaria uma geração encerrada.
+    const row = await pool.query<{ phase: string; closed_reason: string }>(
+      "SELECT phase, closed_reason FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.phase).toBe("closed");
+    expect(row.rows[0]?.closed_reason).toBe("manual_resolved");
+  });
+
+  it("44. evidência acima do teto é recusada TIPADA, não estourando a TX", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+
+    // `engine_run_events.metadata_json` tem CHECK de 16 KiB na 140. Sem o teto
+    // na operação, isto viraria violação de CHECK DENTRO da transação — recusa
+    // tipada trocada por exceção, o mesmo defeito que o hash do receipt tinha.
+    const enorme = { dump: "x".repeat(9000) };
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: enorme,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("evidence_too_large");
+
+    const row = await pool.query<{ phase: string }>(
+      "SELECT phase FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.phase).not.toBe("blocked");
+  });
+
+  it("45. bloquear AVANÇA `row_version` — é o que invalida um CAS em voo", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+    const antes = await pool.query<{ row_version: string }>(
+      "SELECT row_version FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        error_code: "effect_unreconciled",
+        evidence: { motivo: "efeito incerto" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.row_version).toBe(Number(antes.rows[0]?.row_version) + 1);
+    }
+
+    // O ponto não é contabilidade: quem estava com a versão velha em voo tem de
+    // perder o CAS depois que o run foi bloqueado embaixo dele.
+    const casEmVoo = await noEscopo(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        expected_row_version: Number(antes.rows[0]?.row_version),
+      }),
+    );
+    expect(casEmVoo.ok).toBe(false);
+  });
 });

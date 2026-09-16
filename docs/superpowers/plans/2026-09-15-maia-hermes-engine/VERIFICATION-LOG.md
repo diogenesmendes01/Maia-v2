@@ -759,14 +759,63 @@ os pulados subindo exatamente os 7 casos novos (`↓ 35 tests | 35 skipped`).
 **O que falta em P03:** `adoptTerminalResult`, `closeRunAfterHandoff`, `markRunBlocked`/
 `resolveBlockedRun`, varredura/manutenção e recovery. E segue sem teste de concorrência real.
 
+### V-025 · P03.5 — `markRunBlocked` e `resolveBlockedRun`, a porta operacional
+
+Contrato normativo mínimo (C17): quatro fragmentos, nenhuma seção. A forma de "evidência" e "decisão"
+foi definida aqui e registrada, em vez de inferida em silêncio.
+
+**O que `blocked` faz que `closed` não faria:** preserva a trava. A unique parcial da 140 cobre
+`phase <> 'closed'`, e bloqueado não é fechado — então o run continua ocupando a vaga do turno e
+ninguém abre outra deliberação por baixo (§5.6.2 invariante 7), mesmo com o turno em dead letter. O
+caso 37 prende isso pelo comportamento: tentar preparar outro run no mesmo turno devolve
+`run_already_open`.
+
+**"Nenhuma liberação automática por TTL" virou impossibilidade, não convenção.** Não existe parâmetro
+de tempo na assinatura de `resolveBlockedRun`, e nenhum caminho fecha sem `operator_ref` não-vazio E
+evidência não-vazia — as duas recusas acontecem ANTES de qualquer lock, porque não faz sentido travar
+o controle para descobrir que ninguém assinou a decisão. Um runbook dizendo "confira antes" é
+exatamente o tipo de garantia que falha às três da manhã; aqui a chamada não é escrevível.
+
+**Interação deliberada com P03.4:** fechar exige `capabilities_revoked_at` (CHECK da 140 em toda linha
+`closed`), e o `COALESCE(capabilities_revoked_at, clock_timestamp())` preenche sem sobrescrever o
+carimbo monotônico de quem já havia revogado. O mutante FM6 prova a necessidade: sem o COALESCE, um
+run nunca revogado estoura o CHECK DENTRO da transação.
+
+**Mutação: 8 mutantes, previsão exata.** Previ FM2-FM6 mortos e FM1/FM7/FM8 sobreviventes, e foi isso.
+Diferente das unidades anteriores, os três sobreviventes **não eram redundância** — eram caminho sem
+teste nenhum: run já fechado (`already_closed` inalcançável), teto de evidência e o bump de
+`row_version` ao bloquear. Os casos 43-45 fecham os três, e o 45 prende o bump pelo COMPORTAMENTO
+(um CAS com a versão velha passa a perder) e não pela contagem.
+
+**Ambiguidade de harness evitada ANTES de medir**, aplicando a lição que custou caro em P03.3b/c:
+`SET phase = 'blocked'` aparece 2x no módulo (o `recordStartObservation` também bloqueia, em conflito
+de `remote_run_id`), `AND phase <> 'closed'` 3x e `row_version = row_version + 1` 11x. Mutar qualquer
+um desses literais soltos mediria outra operação. Todos foram ancorados em blocos multi-linha únicos —
+o que distingue o `markRunBlocked` é a linha seguinte com `last_error_code` PARAMETRIZADO, contra o
+literal `'remote_id_conflict'` do outro sítio.
+
+**Defeito meu, corrigido:** o título do caso 43 saiu com um "не" cirílico no lugar de "não". Corrigido,
+e uma varredura por qualquer caractere cirílico/grego nos dois specs e no módulo voltou **limpa** —
+era caso isolado, não contaminação sistemática de digitação.
+
+**Estado final:** 45 casos no spec de runs, verdes; 8 mutantes, **todos mortos**.
+`prettier --check`, `typecheck` (projeto) e `eslint` em 0. **Regressão:** `50 failed | 10233 passed |
+1128 skipped (11411)`, os MESMOS 20 arquivos, nenhuma falha citando `engine-repos` ou `tool-calls`, e
+os pulados subindo exatamente os 10 casos novos (`↓ 45 tests | 45 skipped`).
+
+**O que falta em P03:** `adoptTerminalResult`, `closeRunAfterHandoff` (os dois dependem de estado de
+outbound/entrega e vão juntos), varredura/manutenção (`enumerateDueScopes`, `listDueRuns`,
+`reserveMaintenanceObservation`/`recordMaintenanceObservation`) e recovery. E segue sem teste de
+concorrência real em todo o módulo.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1118 | Medido de novo em P03.4: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 85 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (35: 28 do caminho de start + 7 de P03.4) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1128 | Medido de novo em P03.5: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 95 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (45: 28 do caminho de start + 7 de P03.4 + 10 de P03.5) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 
