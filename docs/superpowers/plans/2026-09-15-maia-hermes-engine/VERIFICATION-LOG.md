@@ -321,6 +321,42 @@ erro óbvio; a janela de contexto está fixa em 64.000 porque o frame `start` n�
 estratégia de descritores (duplicar o FD 1 e mandar stdout para stderr) **não foi validada contra um
 spawn real do Node no Windows** — isso é parte do P00.4.
 
+### V-016 · P00.4 — SPIKE com o `AIAgent` REAL (provider stub), gate G-ABI
+
+`tests/reliability/hermes-worker-spike.spec.ts`, executado com o venv do checkout pinado:
+
+```
+MAIA_HERMES_WORKER_PYTHON=<upstream>/.venv/Scripts/python.exe
+MAIA_HERMES_UPSTREAM=<upstream>
+vitest run tests/reliability/hermes-worker-spike.spec.ts
+→ Test Files 1 passed · Tests 6 passed (21.3 s)
+```
+
+O que rodou DE VERDADE: o worker Python como processo separado, importando o `AIAgent` do SHA
+`5d59366…`, com o registry real, o loop real e o caminho real de cancelamento. Um turno inteiro
+atravessou o protocolo: `start` → `ready` → `tool.request`/`tool.result` → `result` → `result_ack`.
+
+| Caso | Evidência |
+|---|---|
+| **T53** superfície efetiva | `ready.effective_tool_names` é EXATAMENTE `[maia_fixture_echo]`, e as requisições capturadas no stub trazem exatamente a mesma lista em `tools` — igualdade, não subconjunto. Sem `tools.tool_search.enabled: "off"` a superfície viraria `tool_search/tool_describe/tool_call` |
+| Ida e volta de ferramenta | `tool.request` com `call_seq: 0` e `args` intactos; resultado devolvido pelo pipe volta ao modelo; `observed_tool_call_seqs: [0]` |
+| **T28** tool forjada | o modelo pediu `terminal_exec`; **zero** `tool.request` saíram e `observed_tool_call_seqs` ficou vazio |
+| **T54** isolamento | `HERMES_HOME` apontando para o perfil pessoal do Hermes Desktop → exit code **2**, nenhum frame emitido, nada escrito lá |
+| **T55** home efêmero | depois do turno o home tem `state.db` e `config.yaml`, e o inventário sai no stderr — `session_db=None` não é promessa de zero persistência |
+| Cancelamento | `cancel` no meio do round-trip devolve `cancel_ack` e o desfecho NÃO é `reply` |
+| Credencial | a chave curta de inferência chegou por **header** (redigido no registro do stub) e não aparece no corpo do request |
+
+**O que este spike NÃO prova, e não pode ser reportado como se provasse:** qualidade de resposta,
+custo, latência ou compatibilidade com um provedor real — o modelo é um **stub local roteirizado**
+(§11.3.2 exige dizer isso explicitamente). O smoke com provider pago segue bloqueado por D02
+(orçamento). Também não prova isolamento de sistema operacional: processo separado não é sandbox
+(D01).
+
+A spec pede a estratégia de descritores validada na plataforma de deploy (§6.4.2). Aqui ela foi
+validada **no Windows, com spawn real do Node**: o worker duplica o FD 1 e manda stdout para stderr
+antes de importar o Hermes, e nenhum `print` do motor corrompeu uma linha NDJSON em 6 execuções.
+Em Linux (alvo de produção) continua não verificado.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |

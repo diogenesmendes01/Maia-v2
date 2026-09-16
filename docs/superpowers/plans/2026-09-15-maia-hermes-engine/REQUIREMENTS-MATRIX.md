@@ -53,7 +53,7 @@
 
 | PR | Entrega verificável | Estado |
 |---|---|---|
-| P00 | Wire/JSON Schema TS+Python, normalização de histórico, execução sintética real com AIAgent, superfície após compressão e cleanup | **em andamento**: P00.1 (contrato wire TS + canônico + fixtures), P00.2 (pacote Python `services/hermes_worker`, 166 testes, mesma fixture compartilhada) e P00.3 (normalizador de histórico) concluídos e verificados. Falta **P00.4** — a execução sintética com `AIAgent` real, superfície após compressão e cleanup do home efêmero |
+| P00 | Wire/JSON Schema TS+Python, normalização de histórico, execução sintética real com AIAgent, superfície após compressão e cleanup | **concluído para o que é verificável sem provider pago**: P00.1 (contrato wire + canônico + fixtures), P00.2 (pacote Python, 166 testes), P00.3 (normalizador) e P00.4 (spike com `AIAgent` real, 6 casos — V-016). **Pendente**: superfície APÓS COMPRESSÃO (a compressão está desligada no config do worker, então o caso não foi exercitado) e o smoke com provider real (D02) |
 | P01 | Caracterização do comportamento local (matriz de delivery, role/pending/report/sensitive, pós-turno) | **concluído e verificado** — `tests/unit/react-loop-characterization.spec.ts` (57 casos), primeira suíte unitária de `runReActLoop`; 10 mutações do implementador + 3 minhas, independentes, todas detectadas |
 | P02 | `AgentEnginePortV1`, `MaiaEngine`, assembler, output coordinator; default local | **em andamento**: P02.0 (contratos + schemas) e P02.1 (`MaiaEngine` com raciocínio injetado) concluídos e verificados; falta ligar o laço real (P02.2), o assembler e o coordenador de saída |
 | P03 | Binding/run/tool journal/eventos/projeções, CAS/constraints/imutabilidade, recovery sem rerun | **em andamento**: P03.1 (migrations 139/140 + espelho Drizzle + 12 casos contra Postgres real, incluindo triggers de imutabilidade e append-only) concluído; `engine-repos` e recovery pendentes |
@@ -107,7 +107,7 @@
 | T25 | Segurança | P05/P08 | — | não iniciado |
 | T26 | Segurança | P03/P05 | — | não iniciado |
 | T27 | Segurança | P03/P05 | — | não iniciado |
-| T28 | Segurança | P00/P07 | — | não iniciado |
+| T28 | Segurança | P00/P07 | spike: modelo pede `terminal_exec` e nenhum `tool.request` sai (o registry real não a conhece) | **parcial** — falta o lado do dispatcher Maia (P05) |
 | T29 | Segurança | P02/P05 | — | não iniciado |
 | T30 | Segurança | P05 | — | não iniciado |
 | T31 | Segurança | P05 | — | não iniciado |
@@ -132,9 +132,9 @@
 | T50 | Aprendizado | P09 | — | não iniciado |
 | T51 | Aprendizado | P08 | — | não iniciado |
 | T52 | Aprendizado | P09 | — | não iniciado |
-| T53 | Hermes | P00/P07 | — | não iniciado |
-| T54 | Hermes | P00/P07 | — | não iniciado |
-| T55 | Hermes | P00/P07 | — | não iniciado |
+| T53 | Hermes | P00/P07 | `tests/reliability/hermes-worker-spike.spec.ts` — igualdade exata entre manifest, `agent.tools`/`valid_tool_names` e a lista `tools` que chega ao provider | **verificado** com motor real (provider stub) |
+| T54 | Hermes | P00/P07 | mesmo arquivo — `HERMES_HOME` do perfil pessoal recusado com exit 2, sem frames e sem escrita | **verificado** |
+| T55 | Hermes | P00/P07 | mesmo arquivo — inventário do home efêmero após o turno (`state.db`, `config.yaml`) | **verificado** (o worker inventaria; a retenção/limpeza é do supervisor, P07) |
 | T56 | Custo | P06 | — | não iniciado |
 | T57 | Custo | P06 | — | não iniciado |
 | T58 | Custo | P06 | — | não iniciado |
@@ -155,7 +155,7 @@
 
 | Gate | Estado |
 |---|---|
-| G-ABI | não iniciado |
+| G-ABI | **atingido com provider stub**: loop real, registry real, tools/limites/contexto/cleanup compatíveis com o SHA pinado, cancelamento exercitado (V-016). Falta o smoke com provider real (D02) e a validação em Linux |
 | G-AUTH | não iniciado |
 | G-LIFE | não iniciado |
 | G-HUMAN | não iniciado |

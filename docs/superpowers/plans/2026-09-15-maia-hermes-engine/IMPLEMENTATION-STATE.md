@@ -80,8 +80,11 @@ sequência P00–P12 do capítulo 10 da spec.
 
 - `U-P00.2` (merge `cda8263e`): pacote Python `services/hermes_worker` — espelho do contrato wire (mesma fixture compartilhada, md5 idêntico), `WorkerBinding` imutável, closures de handler com recusa por `task_id`/allowlist, cliente IPC com `call_seq` sob lock, projeção de resultado com a precedência do §6.8 e bootstrap que **recusa** `HERMES_HOME` ausente ou apontando para o perfil pessoal. 166 testes; revisado e re-executado por mim, com cinco mutações minhas (uma sobreviveu e virou correção de cobertura — ver V-015).
 
+- `U-P02.2` (commit `609cc189`): a iteração do ReAct deixou de despachar — registra o candidato e o envio virou fachada pós-laço. Caracterização 57/57 e suíte completa 10283/53/1039 contra 10093/54/1027 do baseline, com o MESMO conjunto de arquivos em falha (todos preexistentes).
+- `U-P00.4`: spike sintético com o `AIAgent` REAL do SHA pinado contra provider **stub** local — 6 casos (superfície efetiva exata, ida e volta de ferramenta, tool forjada recusada, home pessoal recusado, inventário do home, cancelamento). Ver V-016 para o que ele **não** prova.
+
 ### Em andamento
-- `U-P02.2` — extração da deliberação em `react-loop.ts` (despacho movido para a fachada de saída), verificada pelos 57 casos de caracterização; falta commitar junto da comparação com o baseline da suíte completa.
+- Nenhuma unidade aberta no momento; a próxima é `U-P03.2` (repositórios do journal).
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
