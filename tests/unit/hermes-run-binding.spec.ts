@@ -32,6 +32,7 @@ import {
   checkFrameCorrelation,
   collectResourceRefs,
   authorizeResourceRefs,
+  MAX_REF_DEPTH,
   workerBindingProjection,
   type RunBindingV1,
 } from '@/integrations/hermes/run-binding.js';
@@ -47,6 +48,13 @@ const CONVERSA_A = '33333333-3333-4333-8333-333333333333';
 const ENTIDADE_A = '44444444-4444-4444-8444-444444444444';
 const ENTIDADE_B = '55555555-5555-4555-8555-555555555555';
 const HEX64 = 'a'.repeat(64);
+
+/** Embrulha a folha em `niveis` objetos por uma chave que NÃO é seletor. */
+function aninhar(folha: Record<string, unknown>, niveis: number): Record<string, unknown> {
+  let atual: Record<string, unknown> = folha;
+  for (let i = 0; i < niveis; i++) atual = { dados: atual };
+  return atual;
+}
 
 function bruto(over: Record<string, unknown> = {}): Record<string, unknown> {
   return {
@@ -182,12 +190,49 @@ describe('P05 — T24: ACL de recurso decide por PERTENCIMENTO', () => {
   });
 
   it('13. id ANINHADO fora da ACL é visto e recusado (§6.9.1 item 5)', () => {
-    const refs = collectResourceRefs(
+    const varredura = collectResourceRefs(
       { filtro: { alvos: [{ entidade_id: ENTIDADE_A }, { entidade_id: ENTIDADE_B }] } },
       seletores,
     );
-    expect(refs.length).toBe(2);
-    expect(authorizeResourceRefs(binding(), refs).kind).toBe('deny');
+    expect(varredura.refs.length).toBe(2);
+    // O par do 13c: um payload raso NÃO pode ser reportado como truncado, senão
+    // "fail-closed" viraria "recusa tudo" e a ACL deixaria de decidir nada.
+    expect(varredura.truncated).toBeNull();
+    expect(authorizeResourceRefs(binding(), varredura).kind).toBe('deny');
+  });
+
+  it('13b. id de recurso no LIMITE de profundidade ainda é ENXERGADO', () => {
+    // O par do 13c. A ACL só decide sobre o que a varredura enxerga, então o
+    // teto precisa estar preso pelos DOIS lados: aqui ele ainda enxerga.
+    const dentro = authorizeResourceRefs(
+      binding(),
+      collectResourceRefs(aninhar({ entidade_id: ENTIDADE_A }, MAX_REF_DEPTH), seletores),
+    );
+    expect(dentro.kind).toBe('allow');
+    const fora = authorizeResourceRefs(
+      binding(),
+      collectResourceRefs(aninhar({ entidade_id: ENTIDADE_B }, MAX_REF_DEPTH), seletores),
+    );
+    expect(fora.kind).toBe('deny');
+    if (fora.kind !== 'deny') return;
+    expect(fora.reason).toBe('out_of_acl');
+  });
+
+  it('13c. ACIMA do teto a ACL recusa — visão parcial não autoriza', () => {
+    // Achado do coordenador: `collectResourceRefs` desistia em silêncio e
+    // devolvia lista vazia, e lista vazia significa "nada a autorizar" — ou
+    // seja, um id de recurso de OUTRO cliente, aninhado fundo, nunca virava
+    // `ResourceRefV1` e nunca chegava à decisão de pertencimento. Fail-OPEN
+    // exatamente no invariante que esta função existe para sustentar (INV-01).
+    for (const niveis of [MAX_REF_DEPTH + 1, MAX_REF_DEPTH + 2, 40]) {
+      const d = authorizeResourceRefs(
+        binding(),
+        collectResourceRefs(aninhar({ entidade_id: ENTIDADE_B }, niveis), seletores),
+      );
+      expect(d.kind, `niveis=${niveis}`).toBe('deny');
+      if (d.kind !== 'deny') continue;
+      expect(d.reason, `niveis=${niveis}`).toBe('scan_truncated');
+    }
   });
 
   it('14. `pessoa_id` legítimo só SELECIONA dentro da ACL (§6.9.1 item 3)', () => {
@@ -207,14 +252,14 @@ describe('P05 — T24: ACL de recurso decide por PERTENCIMENTO', () => {
   });
 
   it('16. nenhum recurso pedido é permitido — não há o que autorizar', () => {
-    expect(authorizeResourceRefs(binding(), []).kind).toBe('allow');
+    expect(authorizeResourceRefs(binding(), { refs: [], truncated: null }).kind).toBe('allow');
   });
 
   it('17. campo que NÃO é seletor declarado não vira recurso', () => {
     // O contrário faria qualquer string com cara de uuid virar pedido de ACL, e a
     // ACL passaria a depender de heurística de nome de campo.
-    const refs = collectResourceRefs({ observacao: ENTIDADE_B }, seletores);
-    expect(refs).toEqual([]);
+    const varredura = collectResourceRefs({ observacao: ENTIDADE_B }, seletores);
+    expect(varredura.refs).toEqual([]);
   });
 });
 

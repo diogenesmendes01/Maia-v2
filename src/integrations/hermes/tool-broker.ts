@@ -218,26 +218,64 @@ export const RESERVED_ARGUMENT_KEYS: ReadonlySet<string> = new Set([
 
 export type ArgScreenResultV1 =
   | { kind: 'ok' }
-  | { kind: 'reject'; reason: 'reserved_argument' | 'unknown_argument'; field: string };
+  | {
+      kind: 'reject';
+      reason: 'reserved_argument' | 'unknown_argument' | 'too_deep';
+      field: string;
+    };
 
-const MAX_ARG_DEPTH = 16;
+/**
+ * O resultado da varredura por chave reservada. São TRÊS estados, e o terceiro é
+ * a correção de um defeito real: a versão anterior devolvia `string | null`, e
+ * `null` querendo dizer ao mesmo tempo "varri tudo e está limpo" e "desisti por
+ * profundidade" é fail-OPEN — um `tenant_id` abaixo do teto atravessava como se
+ * o payload tivesse sido conferido.
+ *
+ * Com três estados o tipo não consegue mais confundir as duas coisas: quem
+ * consome é obrigado a decidir o que fazer com `too_deep`.
+ */
+type VarreduraReservadaV1 =
+  | { kind: 'clean' }
+  | { kind: 'found'; field: string }
+  | { kind: 'too_deep'; field: string };
 
-function encontraChaveReservada(valor: unknown, caminho: string, profundidade: number): string | null {
-  if (profundidade > MAX_ARG_DEPTH || valor === null || typeof valor !== 'object') return null;
+export const MAX_ARG_DEPTH = 16;
+
+/**
+ * Varre em busca de chave reservada. Estourar o teto é RECUSA, não silêncio.
+ *
+ * O teto continua existindo — ele protege a pilha, e subi-lo não consertaria
+ * nada: 1000 níveis teria o mesmo defeito mais fundo. O que muda é a POSTURA no
+ * limite. Note também que o teto daqui (16) é deliberadamente mais estrito que o
+ * do wire (`WIRE_LIMITS.max_json_depth`, 32): existia portanto uma FAIXA — entre
+ * 17 e 32 — em que o frame passava no P00 e esta varredura desistia calada. Era
+ * exatamente a faixa explorável.
+ *
+ * A guarda de profundidade vem DEPOIS da checagem de tipo de propósito: um
+ * escalar fundo não esconde nada abaixo de si, então recusá-lo seria recusar
+ * payload legítimo sem ganho. O que dispara a recusa é estrutura NÃO VARRIDA.
+ */
+function encontraChaveReservada(
+  valor: unknown,
+  caminho: string,
+  profundidade: number,
+): VarreduraReservadaV1 {
+  if (valor === null || typeof valor !== 'object') return { kind: 'clean' };
+  if (profundidade > MAX_ARG_DEPTH) return { kind: 'too_deep', field: caminho || '$' };
   if (Array.isArray(valor)) {
     for (const [i, v] of valor.entries()) {
-      const achado = encontraChaveReservada(v, `${caminho}[${i}]`, profundidade + 1);
-      if (achado) return achado;
+      const r = encontraChaveReservada(v, `${caminho}[${i}]`, profundidade + 1);
+      if (r.kind !== 'clean') return r;
     }
-    return null;
+    return { kind: 'clean' };
   }
   for (const [chave, v] of Object.entries(valor as Record<string, unknown>)) {
     const caminhoFilho = caminho ? `${caminho}.${chave}` : chave;
-    if (RESERVED_ARGUMENT_KEYS.has(chave)) return caminhoFilho;
-    const achado = encontraChaveReservada(v, caminhoFilho, profundidade + 1);
-    if (achado) return achado;
+    if (RESERVED_ARGUMENT_KEYS.has(chave)) return { kind: 'found', field: caminhoFilho };
+    const r = encontraChaveReservada(v, caminhoFilho, profundidade + 1);
+    if (r.kind !== 'clean') return r;
   }
-  return null;
+  return { kind: 'clean' };
 }
 
 /**
@@ -257,8 +295,16 @@ export function screenToolArgs(
   declared: readonly string[],
   args: unknown,
 ): ArgScreenResultV1 {
-  const reservada = encontraChaveReservada(args, '', 0);
-  if (reservada) return { kind: 'reject', reason: 'reserved_argument', field: reservada };
+  const varredura = encontraChaveReservada(args, '', 0);
+  if (varredura.kind === 'found') {
+    return { kind: 'reject', reason: 'reserved_argument', field: varredura.field };
+  }
+  if (varredura.kind === 'too_deep') {
+    // Fail-closed: a recusa não afirma "achei algo ruim", afirma "não consigo
+    // certificar este payload". Um payload fundo demais e inocente também morre,
+    // e é deliberado — o contrário seria dar por conferido o que não foi varrido.
+    return { kind: 'reject', reason: 'too_deep', field: varredura.field };
+  }
 
   if (args !== null && typeof args === 'object' && !Array.isArray(args)) {
     const permitidas = new Set(declared);
@@ -293,6 +339,12 @@ export const BROKER_REFUSAL_REASONS = [
   'tool_not_in_surface',
   'reserved_argument',
   'unknown_argument',
+  /**
+   * O payload é fundo demais para a varredura garantir o que ela afirma —
+   * de chave reservada (§6.9.1 item 3) ou de id de recurso (item 5). Um membro
+   * só para os dois porque o FATO é o mesmo: visão parcial não autoriza.
+   */
+  'too_deep',
   'resource_out_of_acl',
   'shadow_write_blocked',
 ] as const;
@@ -332,8 +384,11 @@ export function refusalWireCode(reason: BrokerRefusalReason): BrokerWireRefusalC
     case 'tool_not_in_surface':
     case 'shadow_write_blocked':
       return 'tool_not_allowed';
+    // `too_deep` é erro de PROTOCOLO, e o P00 já usa esse nome para o mesmo fato
+    // no wire (`WireErrorCode`). Não inventei código novo.
     case 'reserved_argument':
     case 'unknown_argument':
+    case 'too_deep':
       return 'protocol_error';
     default: {
       const _never: never = reason;
@@ -446,10 +501,16 @@ export function decideToolCall(input: ToolCallDecisionInputV1): ToolAdmissionV1 
   }
 
   // 5. ACL de recurso, inclusive ids aninhados.
-  const refs = collectResourceRefs(frame.args, input.selectors);
-  const acl = authorizeResourceRefs(binding, refs);
+  const varreduraRecursos = collectResourceRefs(frame.args, input.selectors);
+  const acl = authorizeResourceRefs(binding, varreduraRecursos);
   if (acl.kind === 'deny') {
-    return recusa('resource_out_of_acl', `campo ${acl.field} (${acl.reason})`);
+    // `scan_truncated` NÃO é "o recurso não é seu" — é "não enxerguei o payload
+    // inteiro". Reportá-lo como `resource_out_of_acl` afirmaria uma decisão de
+    // pertencimento que ninguém tomou.
+    return recusa(
+      acl.reason === 'scan_truncated' ? 'too_deep' : 'resource_out_of_acl',
+      `campo ${acl.field} (${acl.reason})`,
+    );
   }
 
   // 6. Modo (INV-10): "nenhum efeito externo […] é alterado por um run shadow".

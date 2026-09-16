@@ -36,6 +36,7 @@ import {
   SURFACE_AXES,
   BROKER_REFUSAL_REASONS,
   RESERVED_ARGUMENT_KEYS,
+  MAX_ARG_DEPTH,
   computeEffectiveToolSurface,
   refusalWireCode,
   screenToolArgs,
@@ -58,6 +59,18 @@ const HEX64 = 'a'.repeat(64);
 const HEX40 = 'b'.repeat(40);
 
 const NOME = 'read_turn_context';
+
+/**
+ * Embrulha a folha em `niveis` objetos, sempre pela MESMA chave — e a chave é
+ * `dados`, DECLARADA no schema da ferramenta, porque é essa a forma que atravessa
+ * as duas peneiras: a de campo desconhecido só olha o topo, e no topo está um
+ * campo legítimo.
+ */
+function aninhar(folha: Record<string, unknown>, niveis: number): Record<string, unknown> {
+  let atual: Record<string, unknown> = folha;
+  for (let i = 0; i < niveis; i++) atual = { dados: atual };
+  return atual;
+}
 
 // ─── fixtures ───────────────────────────────────────────────────────────────
 
@@ -320,6 +333,41 @@ describe('P05 — T20: campos de autoridade nos args são recusados', () => {
     }
   });
 
+  it('13b. reservado no LIMITE de profundidade ainda é ACHADO', () => {
+    // O par do 13c, e o que prende o teto pelos dois lados: sem este caso,
+    // endurecer o limite (`>` virando `>=`) faria a triagem recusar cedo demais
+    // e nenhum teste notaria.
+    const r = screenToolArgs(['dados'], aninhar({ tenant_id: 'x' }, MAX_ARG_DEPTH));
+    expect(r.kind).toBe('reject');
+    if (r.kind !== 'reject') return;
+    expect(r.reason).toBe('reserved_argument');
+  });
+
+  it('13c. ACIMA do teto a triagem RECUSA — estourar não pode ser silêncio', () => {
+    // O defeito que a varredura por OPERADOR expôs (achado do coordenador): o
+    // termo de profundidade fazia o varredor DESISTIR e devolver "nada
+    // encontrado", que é fail-OPEN. Acima do teto o `tenant_id` atravessava as
+    // DUAS peneiras — a de reservado (que desistia) e a de desconhecido (que só
+    // olha o TOPO, e no topo estava a chave declarada `dados`).
+    for (const niveis of [MAX_ARG_DEPTH + 1, MAX_ARG_DEPTH + 2, 40]) {
+      const r = screenToolArgs(['dados'], aninhar({ tenant_id: 'x' }, niveis));
+      expect(r.kind, `niveis=${niveis}`).toBe('reject');
+      if (r.kind !== 'reject') continue;
+      expect(r.reason, `niveis=${niveis}`).toBe('too_deep');
+    }
+  });
+
+  it('13d. o teto recusa mesmo SEM nada reservado embaixo', () => {
+    // Fail-closed de verdade: a recusa não é "achei algo ruim", é "não consigo
+    // certificar este payload". Um payload fundo demais e inocente também morre,
+    // e isso é deliberado — o contrário seria afirmar uma garantia que a
+    // varredura não deu.
+    const r = screenToolArgs(['dados'], aninhar({ texto: 'inocente' }, 40));
+    expect(r.kind).toBe('reject');
+    if (r.kind !== 'reject') return;
+    expect(r.reason).toBe('too_deep');
+  });
+
   it('14. declarar o campo reservado no schema NÃO o legaliza (par do 13)', () => {
     // "Rejeitar campos de identidade/proveniência/aprovação" é absoluto: um
     // schema de tool que declarasse `approved` seria o próprio bug.
@@ -426,6 +474,17 @@ describe('P05 — a decisão por chamada segue a ordem do §6.9.1', () => {
     expect(d.kind).toBe('refuse');
     if (d.kind !== 'refuse') return;
     expect(d.reason).toBe('reserved_argument');
+  });
+
+  it('25b. T20 ponta a ponta: payload fundo demais RECUSA a chamada', () => {
+    // O defeito não pode morrer só na função interna: a porta que o gateway vai
+    // chamar é esta, e era por ela que o `tenant_id` a 17+ níveis entrava.
+    const d = decisao({
+      frame: { run_id: RUN_A, name: NOME, args: aninhar({ tenant_id: 'x' }, 40), call_seq: 0 },
+    });
+    expect(d.kind).toBe('refuse');
+    if (d.kind !== 'refuse') return;
+    expect(d.reason).toBe('too_deep');
   });
 
   it('26. T24 ponta a ponta: recurso de outro cliente recusa a chamada', () => {

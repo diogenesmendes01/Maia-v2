@@ -184,11 +184,26 @@ export interface ResourceRefV1 {
   field: string;
 }
 
+/**
+ * O resultado de uma varredura de recursos. `truncated` não é diagnóstico: é o
+ * que faz `authorizeResourceRefs` RECUSAR.
+ *
+ * A varredura e a decisão viajam juntas de propósito. Se `collectResourceRefs`
+ * devolvesse só a lista, o fail-closed dependeria de cada call site lembrar de
+ * conferir o truncamento — e um call site que esquece produz exatamente o
+ * defeito que isto corrige: autorizar com visão parcial.
+ */
+export interface ResourceScanV1 {
+  refs: ResourceRefV1[];
+  /** Caminho onde a varredura PAROU por profundidade; `null` = varreu até o fim. */
+  truncated: string | null;
+}
+
 export type ResourceAclDecisionV1 =
   | { kind: 'allow' }
-  | { kind: 'deny'; reason: 'out_of_acl' | 'empty_acl'; field: string };
+  | { kind: 'deny'; reason: 'out_of_acl' | 'empty_acl' | 'scan_truncated'; field: string };
 
-const MAX_REF_DEPTH = 16;
+export const MAX_REF_DEPTH = 16;
 
 /**
  * Colhe os ids de recurso dos argumentos, em QUALQUER profundidade — §6.9.1 item
@@ -206,10 +221,18 @@ const MAX_REF_DEPTH = 16;
 export function collectResourceRefs(
   args: unknown,
   selectors: Readonly<Record<string, ResourceKind>>,
-): ResourceRefV1[] {
-  const out: ResourceRefV1[] = [];
+): ResourceScanV1 {
+  const refs: ResourceRefV1[] = [];
+  let truncated: string | null = null;
   const visitar = (valor: unknown, caminho: string, profundidade: number): void => {
-    if (profundidade > MAX_REF_DEPTH || valor === null || typeof valor !== 'object') return;
+    if (valor === null || typeof valor !== 'object') return;
+    // Estourar o teto REGISTRA a desistência em vez de voltar calado. A ACL não
+    // pode recusar o que não enxerga, então uma varredura que para no meio tem
+    // de contaminar a decisão — e não devolver uma lista que parece completa.
+    if (profundidade > MAX_REF_DEPTH) {
+      truncated ??= caminho || '$';
+      return;
+    }
     if (Array.isArray(valor)) {
       valor.forEach((v, i) => visitar(v, `${caminho}[${i}]`, profundidade + 1));
       return;
@@ -218,14 +241,14 @@ export function collectResourceRefs(
       const caminhoFilho = caminho ? `${caminho}.${chave}` : chave;
       const kind = selectors[chave];
       if (kind && typeof v === 'string') {
-        out.push({ kind, id: v, field: caminhoFilho });
+        refs.push({ kind, id: v, field: caminhoFilho });
         continue;
       }
       visitar(v, caminhoFilho, profundidade + 1);
     }
   };
   visitar(args, '', 0);
-  return out;
+  return { refs, truncated };
 }
 
 /**
@@ -247,9 +270,16 @@ export function collectResourceRefs(
  */
 export function authorizeResourceRefs(
   binding: RunBindingV1,
-  refs: readonly ResourceRefV1[],
+  scan: ResourceScanV1,
 ): ResourceAclDecisionV1 {
-  for (const ref of refs) {
+  // PRIMEIRA guarda, antes de qualquer pertencimento: uma varredura truncada não
+  // sabe o que deixou de ver, e "não vi nada" jamais pode significar "não há
+  // nada". É o par exato do `empty_acl` — os dois são o mesmo princípio
+  // (G-AUTH), um sobre contexto vazio e outro sobre visão incompleta.
+  if (scan.truncated !== null) {
+    return { kind: 'deny', reason: 'scan_truncated', field: scan.truncated };
+  }
+  for (const ref of scan.refs) {
     const permitidos =
       ref.kind === 'pessoa'
         ? binding.acl.pessoa_ids
