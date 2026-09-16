@@ -42,6 +42,8 @@ import pg from "pg";
 import { randomUUID } from "node:crypto";
 import { runWithTenantContext } from "@/db/tenant-context.js";
 import { conversationControlRepo } from "@/db/repositories/conversation-control-repo.js";
+import { withTx } from "@/db/client.js";
+import { renderPrometheus, _resetForTests } from "@/lib/metrics.js";
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL &&
@@ -130,6 +132,58 @@ async function mkTurnoRetido(
     [turn_id, tenant, agente, status, mensagem_id, stream_key, ingress_seq],
   );
   return turn_id;
+}
+
+async function lerTurno(
+  id: string,
+): Promise<{ status: string; outcome: string | null }> {
+  const r = await pool.query(
+    `SELECT status, outcome FROM agent_turns WHERE id = $1`,
+    [id],
+  );
+  return r.rows[0];
+}
+
+/**
+ * Um run ABERTO (`phase <> 'closed'`) preso ao turno — a forma de efeito
+ * pendente que `turnWithoutPendingEffectSql` enxerga. Vinte e quatro colunas
+ * porque a 140 as exige NOT NULL; o que importa para o teste são `turn_id` e
+ * `phase`.
+ */
+async function mkRunAberto(turn_id: string, control_id: string): Promise<void> {
+  // O binding vem ANTES por FK (`engine_runs_binding_fk`): a 140 exige que todo
+  // run aponte para um turno já vinculado a um motor. Sem esta linha o INSERT
+  // seguinte falha — e falharia como "teste vermelho", escondendo que o defeito
+  // era da fixture.
+  await pool.query(
+    `INSERT INTO engine_turn_bindings
+       (tenant_id, agent_id, turn_id, engine, adapter_revision,
+        configuration_digest, protocol_version, max_generations)
+     VALUES ($1,$2,$3,'hermes','rev-1',$4,1,1)
+     ON CONFLICT DO NOTHING`,
+    [TENANT, AGENT, turn_id, "c".repeat(64)],
+  );
+  await pool.query(
+    `INSERT INTO engine_runs
+       (id, tenant_id, agent_id, turn_id, generation_no, origin_turn_attempt,
+        origin_claim_token, origin_worker_id, control_id, control_epoch, mode,
+        manifest_digest, phase, request_key, remote_instance_id, request_json,
+        request_hash, host_context_json, host_context_hash, deadline_at,
+        reconcile_deadline_at)
+     VALUES ($1,$2,$3,$4,1,1,$5,'w-1',$6,1,'live',$7,'running',$8,'inst-1',
+             '{}'::jsonb,$7,'{}'::jsonb,$7, now()+interval '5 min',
+             now()+interval '15 min')`,
+    [
+      randomUUID(),
+      TENANT,
+      AGENT,
+      turn_id,
+      randomUUID(),
+      control_id,
+      "d".repeat(64),
+      randomUUID(),
+    ],
+  );
 }
 
 async function lerControle(id: string): Promise<{
@@ -366,7 +420,12 @@ d("resumeConversationTx — a devolução da automação", () => {
   });
 
   it("10. replay da mesma chave: mesmo comando, sem segundo epoch nem audit novo", async () => {
-    const { control_id } = await mkControleHumano();
+    const { control_id, stream_key } = await mkControleHumano();
+    // Um turno retido de propósito: sem ele o replay descartaria 0 por não ter
+    // o que descartar, e a asserção sobre `backlog_cancelled` seria vácua nos
+    // DOIS lados. Com ele, o primeiro comando fecha 1 e o replay tem de fechar
+    // 0 — que é a diferença entre "idempotente" e "repetido".
+    await mkTurnoRetido(stream_key, 1);
     const p = pedido(control_id);
     const a = await noEscopo(() =>
       conversationControlRepo.resumeConversationTx(p),
@@ -378,6 +437,8 @@ d("resumeConversationTx — a devolução da automação", () => {
     if (!a.ok || !b.ok) return;
     expect(b.idempotent).toBe(true);
     expect(b.command_id).toBe(a.command_id);
+    expect(a.backlog_cancelled).toBe(1);
+    expect(b.backlog_cancelled).toBe(0);
     expect((await lerControle(control_id)).control_epoch).toBe("2");
     expect(await contarAuditoria("conversation_automation_resumed", control_id)).toBe(1);
   });
@@ -482,5 +543,152 @@ d("resumeConversationTx — a devolução da automação", () => {
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     expect(r.resume_after_ingress_seq).toBe("5");
+  });
+
+  // ─── P04.5b.2c — a FIAÇÃO: o resume descarta o backlog retido ────────────
+  //
+  // Até aqui `future_only` era promessa: o watermark era gravado e ninguém o
+  // lia (C53), e os construtores do descarte existiam sem call site. Estes
+  // casos são o que torna a política EXECUTADA em vez de declarada.
+
+  it("15. o resume DESCARTA o backlog retido — `future_only` cumprido", async () => {
+    const { control_id, stream_key } = await mkControleHumano();
+    const a = await mkTurnoRetido(stream_key, 1);
+    const b = await mkTurnoRetido(stream_key, 2);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(pedido(control_id)),
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.backlog_cancelled).toBe(2);
+    for (const id of [a, b]) {
+      const t = await lerTurno(id);
+      expect(t.status).toBe("ignored");
+      expect(t.outcome).toBe("operator_cancelled");
+    }
+  });
+
+  it("16. turno `running` NÃO é descartado, e o resume conclui mesmo assim", async () => {
+    // O §8.2.5 é explícito: "turnos antes executados seguem conciliação
+    // específica; não apagar seu resultado/efeito para fazê-los caber no
+    // descarte do backlog". A recusa tem de ser por SELEÇÃO — o turno fica
+    // fora do conjunto —, nunca por exceção que derrube a retomada.
+    const { control_id, stream_key } = await mkControleHumano();
+    const vivo = await mkTurnoRetido(stream_key, 1, "running");
+    const morto = await mkTurnoRetido(stream_key, 2);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(pedido(control_id)),
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.backlog_cancelled).toBe(1);
+    expect((await lerTurno(vivo)).status).toBe("running");
+    expect((await lerTurno(morto)).status).toBe("ignored");
+  });
+
+  it("17. turno com EFEITO pendente não é descartado", async () => {
+    const { control_id, stream_key } = await mkControleHumano();
+    const comEfeito = await mkTurnoRetido(stream_key, 1);
+    const limpo = await mkTurnoRetido(stream_key, 2);
+    await mkRunAberto(comEfeito, control_id);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(pedido(control_id)),
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.backlog_cancelled).toBe(1);
+    expect((await lerTurno(comEfeito)).status).toBe("queued");
+    expect((await lerTurno(limpo)).status).toBe("ignored");
+  });
+
+  it("18. backlog de OUTRA stream do mesmo agente fica intacto", async () => {
+    const { control_id, stream_key } = await mkControleHumano();
+    const meu = await mkTurnoRetido(stream_key, 1);
+    // Mesmo tenant, mesmo agente, outra conversa: o descarte é escopado pela
+    // stream do CONTROLE, não pelo par tenant/agente.
+    const alheio = await mkTurnoRetido(`v1:${randomUUID().replace(/-/g, "").repeat(2)}`, 1);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(pedido(control_id)),
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.backlog_cancelled).toBe(1);
+    expect((await lerTurno(meu)).status).toBe("ignored");
+    expect((await lerTurno(alheio)).status).toBe("queued");
+  });
+
+  it("19. resume RECUSADO não descarta nada — o descarte é ATÔMICO com a retomada", async () => {
+    // ⚠️ Este caso PASSA no vermelho, e isso está registrado de propósito: sem
+    // implementação nada descarta, então a garantia vale trivialmente. Ele só
+    // vira prova pela MUTAÇÃO — a que move o descarte para antes da checagem de
+    // epoch tem de matá-lo. Contado como cobertura só depois disso.
+    const { control_id, stream_key } = await mkControleHumano();
+    const t = await mkTurnoRetido(stream_key, 1);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(control_id, { expected_epoch: "999" }),
+      ),
+    );
+    expect(r.ok).toBe(false);
+    expect((await lerTurno(t)).status).toBe("queued");
+    expect((await lerControle(control_id)).mode).toBe("human");
+  });
+
+  it("20. `...InTx` NÃO emite a métrica; a de transação própria emite", async () => {
+    // Mesma assimetria de `completeRecoveredOutboundTurnInTx`: quem partilha a
+    // transação do caller não pode publicar contador, porque o commit ainda não
+    // aconteceu e um rollback faria a métrica contar descarte que não houve.
+    _resetForTests();
+    const um = await mkControleHumano();
+    await mkTurnoRetido(um.stream_key, 1);
+    await noEscopo(() =>
+      withTx((tx) =>
+        conversationControlRepo.resumeConversationInTx(tx, pedido(um.control_id)),
+      ),
+    );
+    expect(await renderPrometheus()).not.toContain(
+      'outcome="operator_cancelled"',
+    );
+
+    const dois = await mkControleHumano();
+    await mkTurnoRetido(dois.stream_key, 1);
+    await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(pedido(dois.control_id)),
+    );
+    expect(await renderPrometheus()).toContain('outcome="operator_cancelled"');
+  });
+
+  it("21. turno sem sequência de ingresso não é descartado (C50)", async () => {
+    // O predicado exige `last_ingress_seq IS NOT NULL`. Um turno do caminho de
+    // compatibilidade não é ordenável pelo watermark, e descartá-lo seria
+    // decidir por ele sem critério — a regra que o C50 mandou não inventar.
+    const { control_id, stream_key } = await mkControleHumano();
+    const ordenavel = await mkTurnoRetido(stream_key, 3);
+    const mensagem_id = randomUUID();
+    await pool.query(
+      `INSERT INTO mensagens (id, tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata, created_at)
+       VALUES ($1,$2,$3,NULL,'in','texto','oi','{}'::jsonb, now())`,
+      [mensagem_id, TENANT, AGENT],
+    );
+    const semSeq = randomUUID();
+    await pool.query(
+      `INSERT INTO agent_turns (id, tenant_id, agent_id, status, representative_message_id)
+       VALUES ($1,$2,$3,'queued',$4)`,
+      [semSeq, TENANT, AGENT, mensagem_id],
+    );
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(pedido(control_id)),
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.backlog_cancelled).toBe(1);
+    expect((await lerTurno(ordenavel)).status).toBe("ignored");
+    expect((await lerTurno(semSeq)).status).toBe("queued");
   });
 });

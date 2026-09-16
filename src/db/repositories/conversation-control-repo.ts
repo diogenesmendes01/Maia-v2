@@ -49,7 +49,19 @@
 import { sql } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
 import { getCurrentAgent, getCurrentTenant } from '../tenant-context.js';
-import { lockControlByIdSql } from './conversation-control-sql.js';
+import {
+  heldBacklogForCancellationSql,
+  lockControlByIdSql,
+} from './conversation-control-sql.js';
+// P04.5b.2c — a fiação do descarte do §8.2.5. A primitiva mora em
+// `turn-repos.ts` porque quem é dono da transição de turno é ele: este
+// repositório não escreve `status` direto, pela mesma regra que vale para todo
+// caller. Não há ciclo — `turn-repos.ts` importa o módulo SQL do controle, não
+// este arquivo.
+import {
+  cancelHeldBacklogTurnInTx,
+  recordBacklogCancellationCommitted,
+} from './turn-repos.js';
 import { statusList } from './turn-fence-sql.js';
 import { OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES } from '@/runtime/outbound/recovery-contract.js';
 import { auditTx } from '@/governance/audit.js';
@@ -587,6 +599,13 @@ export type ResumeConversationResult =
       epoch: string;
       /** Decimal em string: a coluna é bigint (§8.3.2). */
       resume_after_ingress_seq: string;
+      /**
+       * Quantos turnos retidos o §8.2.5 descartou nesta retomada. É `number` e
+       * não `string` porque é contagem de linhas desta transação, não valor de
+       * coluna bigint. Num replay idempotente vale 0: o descarte já aconteceu
+       * no comando original e repeti-lo apagaria turnos novos.
+       */
+      backlog_cancelled: number;
       updated_at: Date;
     }
   | {
@@ -661,6 +680,11 @@ async function resumeInTx(
       mode: atual?.mode ?? 'bot',
       epoch: existente.result_epoch ?? '0',
       resume_after_ingress_seq: atual?.resume_after_ingress_seq ?? '0',
+      // Replay NÃO redescarta. O backlog do comando original já foi fechado, e
+      // turnos que chegaram depois são justamente o "future" que a política
+      // preserva — descartá-los aqui transformaria um retry de rede em perda
+      // de mensagem.
+      backlog_cancelled: 0,
       updated_at: existente.updated_at,
     };
   }
@@ -743,6 +767,38 @@ async function resumeInTx(
 
   if (!atualizado) return { ok: false, reason: 'control_not_found' };
 
+  // ─── §8.2.5: fechar a obrigação de automação do backlog retido ───────────
+  //
+  // Vem DEPOIS do `UPDATE` de propósito. Se o controle não transicionou — epoch
+  // obsoleto, modo errado, linha alheia — a função já retornou acima e nenhum
+  // turno foi tocado: o descarte é atômico com a retomada e não acontece sem
+  // ela. A ordem de lock é a do §8.2.3 passo 3: o controle já está trancado
+  // desde `lockControlByIdSql`, e só agora se tranca `agent_turns`, em
+  // `ORDER BY t.id` dentro do próprio construtor.
+  //
+  // O laço é sequencial por ESCOLHA: cada turno passa pelo CONTRATO de
+  // transição, não por um `UPDATE ... WHERE id = ANY(...)`. Um update em massa
+  // pularia `assertTurnTransition` e o CAS por linha — as duas guardas que
+  // impedem descartar um turno que andou entre a seleção e a escrita. O
+  // conjunto é o backlog de UMA conversa, não uma varredura global.
+  const retidos = linhas<{ id: string; state_version: number }>(
+    await tx.execute(
+      heldBacklogForCancellationSql({
+        tenant_id,
+        agent_id,
+        control_id: input.control_id,
+        watermark: wm.watermark,
+      }),
+    ),
+  );
+  for (const turno of retidos) {
+    await cancelHeldBacklogTurnInTx(tx, {
+      turn_id: turno.id,
+      expected_version: Number(turno.state_version),
+    });
+  }
+  const backlog_cancelled = retidos.length;
+
   const comando = linhas<ComandoRow>(
     await tx.execute(sql`
       INSERT INTO conversation_control_commands
@@ -786,6 +842,10 @@ async function resumeInTx(
       epoch_after: atualizado.control_epoch,
       resume_policy: input.resume_policy,
       resume_after_ingress_seq: atualizado.resume_after_ingress_seq,
+      // Quantos turnos a política fechou. Sem isto a trilha diria que a
+      // automação voltou sem dizer que mensagens do cliente foram descartadas
+      // por decisão do operador — o fato mais consequente da operação.
+      backlog_cancelled,
     },
   });
 
@@ -797,6 +857,7 @@ async function resumeInTx(
     mode: atualizado.mode,
     epoch: atualizado.control_epoch,
     resume_after_ingress_seq: atualizado.resume_after_ingress_seq,
+    backlog_cancelled,
     updated_at: atualizado.updated_at,
   };
 }
@@ -863,10 +924,23 @@ export const conversationControlRepo = {
   async resumeConversationTx(
     input: ResumeConversationInput,
   ): Promise<ResumeConversationResult> {
-    return withTx((tx) => resumeInTx(tx, input));
+    const r = await withTx((tx) => resumeInTx(tx, input));
+    // DEPOIS do commit, nunca dentro. É a mesma regra de
+    // `recordRecoveredOutboundTurnCommitted`: um contador emitido na transação
+    // registraria descartes que o rollback desfez, e mentiria exatamente no
+    // incidente em que alguém o consultaria.
+    if (r.ok) recordBacklogCancellationCommitted({ cancelados: r.backlog_cancelled });
+    return r;
   },
 
-  /** A MESMA retomada, na transação de quem chama. */
+  /**
+   * A MESMA retomada, na transação de quem chama.
+   *
+   * NÃO emite a métrica, e a assimetria com a variante acima é deliberada: aqui
+   * o commit é de quem chamou, e só ele sabe se aconteceu. O caller que usar
+   * esta porta é responsável por chamar `recordBacklogCancellationCommitted`
+   * com `backlog_cancelled` depois de comitar.
+   */
   async resumeConversationInTx(
     tx: Executor,
     input: ResumeConversationInput,
