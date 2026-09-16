@@ -124,7 +124,7 @@ sequência P00–P12 do capítulo 10 da spec.
   todos mortos. A varredura achou um defeito REAL: uma call com o marcador já carimbado caía em
   `version_conflict` com a versão IGUAL à pedida — motivo que sugere "releia e tente de novo" onde a
   resposta certa é "não recomece". Virou razão própria, `already_started`, com o caso 29 a prendendo.
-- `U-P03.3d` — **concluída e verificada**: `settleToolCall`. CAS por `dispatch_token` **mais** fence do
+- `U-P03.3d` (commit `14d9f5c6`) — **concluída e verificada**: `settleToolCall`. CAS por `dispatch_token` **mais** fence do
   turno ATUAL (§5.7.4 item 8: o token da call sozinho não autoriza adotar resultado tardio), e
   `cancelled` só para `abort_safe` — nas demais classes a resposta honesta é `effect_unknown`, que
   continua bloqueadora mesmo com HTTP 200 depois (item 9). A evidência de efeito respeita o gatilho
@@ -136,6 +136,20 @@ sequência P00–P12 do capítulo 10 da spec.
   `markCompletedWithEffect`) foi DESCARTADO por C16** e não deve ser retomado sem ler aquele registro:
   aquela fachada abre a própria `withTx`, e chamá-la de dentro do settle pegaria outra conexão — o
   acoplamento seria afirmação falsa. O §5.7.4 item 8 contempla explicitamente a ligação não existir.
+- `U-P03.4` — **concluída e verificada**: `revokeRunCapabilities`. Monotônica (repetir devolve
+  `already: true` com o carimbo ORIGINAL; nenhum caminho desfaz a revogação), com ator **assimétrico**:
+  o dono prova posse pelo `origin_claim_token` DO RUN, enquanto `recovery`/`operator` não provam —
+  porque o cenário que mais precisa de revogação é justamente o do dono que sumiu, e exigir o token
+  dele ali deixaria capacidades vivas indefinidamente. **Não** passa pelo gate de controle da conversa:
+  revogar é o que se quer quando um humano assume, e exigir `mode='bot'` tornaria o botão de parada
+  inútil na única situação em que ele importa. 35 casos no spec de runs; 5 mutantes, 3 mortos e **2
+  registrados como NÃO-MATÁVEIS** por serem defesa em profundidade e não comportamento observável
+  (ver V-024 — o caso 35 falhou em matar um deles, e a causa é que um terceiro caminho produz a mesma
+  resposta).
+  Corrigiu também um defeito MEU que a varredura expôs: o retorno de recusa preenchia
+  `current_status`/`current_state_version` com `"unknown"` e `0` — estado INVENTADO apresentado como
+  leitura, em um caminho que para `recovery`/`operator` nem lê o turno. Virou razão própria,
+  `not_run_origin`, que não promete o que não mediu.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado

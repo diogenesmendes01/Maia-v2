@@ -1154,4 +1154,273 @@ d("engine-repos — journal de execução contra Postgres real", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("control_epoch_changed");
   });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 29-33 (P03.4): `revokeRunCapabilities`.
+  //
+  // §5.6.3: "Revogação monotônica; ator dono/recovery/operador autorizado. Não
+  // renova por callback ou poll." §5.7.2: lease perdida, prazo, shutdown ou
+  // cancelamento autenticado revogam as capacidades.
+  //
+  // Decisão deliberada, com teste: a revogação **não** passa pelo gate de
+  // controle da conversa. Revogar é justamente o que se quer quando um humano
+  // assume — exigir `mode='bot'` aqui tornaria o botão de parada inútil na
+  // única situação em que ele importa.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  async function runRodandoParaRevogar(): Promise<{
+    run_id: string;
+    turno: { turn_id: string; claim_token: string; attempt: number };
+  }> {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = randomUUID();
+    await noEscopo(() =>
+      engineRunsRepo.pinEngineAndPrepareRun(pedido(run_id, turno, control_id)),
+    );
+    await noEscopo(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        expected_row_version: 0,
+      }),
+    );
+    return { run_id, turno };
+  }
+
+  it("29. o dono revoga: carimba `capabilities_revoked_at` e escreve o evento", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "turn_owner", origin_claim_token: turno.claim_token },
+        reason_code: "lease_lost",
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.already).toBe(false);
+
+    const row = await pool.query<{ capabilities_revoked_at: string | null }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.capabilities_revoked_at).not.toBeNull();
+
+    const ev = await pool.query<{ event_type: string; actor_kind: string }>(
+      "SELECT event_type, actor_kind FROM engine_run_events WHERE run_id = $1 ORDER BY sequence_no DESC LIMIT 1",
+      [run_id],
+    );
+    expect(ev.rows[0]?.event_type).toBe("capabilities_revoked");
+    expect(ev.rows[0]?.actor_kind).toBe("turn_owner");
+  });
+
+  it("30. revogação é MONOTÔNICA: a segunda não re-carimba", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+    const args = {
+      run_id,
+      turn_id: turno.turn_id,
+      actor: {
+        kind: "turn_owner" as const,
+        origin_claim_token: turno.claim_token,
+      },
+      reason_code: "lease_lost",
+    };
+    const primeira = await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities(args),
+    );
+    expect(primeira.ok).toBe(true);
+
+    const antes = await pool.query<{ capabilities_revoked_at: string }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+
+    const segunda = await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities(args),
+    );
+    expect(segunda.ok).toBe(true);
+    // Idempotente e SEM re-carimbar: o instante da primeira revogação é o que
+    // vale para quem for reconciliar.
+    if (segunda.ok) expect(segunda.already).toBe(true);
+
+    const depois = await pool.query<{ capabilities_revoked_at: string }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    // `::text` na query, e não anotação de tipo, é o que torna isto uma
+    // comparação de STRING: o driver do Postgres devolve `timestamptz` como
+    // `Date`, e dois `Date` do mesmo instante falham em `toBe` (Object.is) com
+    // a mensagem mais confusa que existe — "expected X to be X". Anotar a
+    // coluna como `string` no genérico não muda o que vem do banco; só mente
+    // para o compilador.
+    expect(depois.rows[0]?.capabilities_revoked_at).toBe(
+      antes.rows[0]?.capabilities_revoked_at,
+    );
+  });
+
+  it("31. dono com token errado não revoga", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "turn_owner", origin_claim_token: randomUUID() },
+        reason_code: "lease_lost",
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("stale_claim");
+
+    const row = await pool.query<{ capabilities_revoked_at: string | null }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.capabilities_revoked_at).toBeNull();
+  });
+
+  it("32. recovery revoga SEM o token de origem — é outro ator, legítimo", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+
+    // O turno foi re-reivindicado: o dono antigo sumiu. Quem reconcilia precisa
+    // conseguir revogar, senão as capacidades ficam vivas para sempre.
+    await pool.query(
+      `UPDATE agent_turns SET claim_token = $2, attempt_count = attempt_count + 1
+        WHERE id = $1`,
+      [turno.turn_id, randomUUID()],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        reason_code: "lease_lost",
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{ capabilities_revoked_at: string | null }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.capabilities_revoked_at).not.toBeNull();
+
+    const ev = await pool.query<{ actor_kind: string }>(
+      "SELECT actor_kind FROM engine_run_events WHERE run_id = $1 ORDER BY sequence_no DESC LIMIT 1",
+      [run_id],
+    );
+    expect(ev.rows[0]?.actor_kind).toBe("recovery");
+  });
+
+  it("33. revogação MORDE: depois dela o submit é recusado", async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = randomUUID();
+    await noEscopo(() =>
+      engineRunsRepo.pinEngineAndPrepareRun(pedido(run_id, turno, control_id)),
+    );
+
+    await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "operator", actor_ref: "operador-1" },
+        reason_code: "operator_stop",
+      }),
+    );
+
+    const submit = await noEscopo(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        expected_row_version: 0,
+      }),
+    );
+    expect(submit.ok).toBe(false);
+    if (!submit.ok) expect(submit.reason).toBe("capabilities_revoked");
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 34-35: fecham dois mutantes que a varredura mostrou SOBREVIVENDO.
+  //
+  // O caso 31 passa um token aleatório, então `lockTurnAndCheckFence` recusa
+  // ANTES de a checagem de origem do run rodar — ela nunca era exercida. E o
+  // retorno antecipado de "já revogado" era coberto só pelo caso 30, onde a
+  // guarda `IS NULL` do UPDATE também recusa.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  it("34. dono do TURNO que não é a origem do RUN não revoga", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+
+    // Re-claim: o turno agora tem dono novo e legítimo. Ele passa no fence do
+    // turno — e é exatamente por isso que este caso isola a checagem de origem.
+    const novoToken = randomUUID();
+    await pool.query(
+      `UPDATE agent_turns SET claim_token = $2, attempt_count = attempt_count + 1
+        WHERE id = $1`,
+      [turno.turn_id, novoToken],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "turn_owner", origin_claim_token: novoToken },
+        reason_code: "lease_lost",
+      }),
+    );
+    expect(r.ok).toBe(false);
+    // NÃO é `stale_claim`: quem chamou é dono do turno. O que falta é ser a
+    // origem do run — e a razão não promete estado de turno que não foi lido.
+    if (!r.ok) expect(r.reason).toBe("not_run_origin");
+
+    const row = await pool.query<{ capabilities_revoked_at: string | null }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.capabilities_revoked_at).toBeNull();
+  });
+
+  it("35. carimbo posto por outro escritor: o retorno antecipado devolve o instante ORIGINAL", async () => {
+    const { run_id, turno } = await runRodandoParaRevogar();
+
+    // Alguém revogou por fora (outro processo, um incidente no psql). O UPDATE
+    // com `IS NULL` casaria zero linhas de qualquer jeito; quem responde aqui é
+    // a leitura antecipada — e ela tem de devolver o carimbo que já existe.
+    await pool.query(
+      "UPDATE engine_runs SET capabilities_revoked_at = now() - interval '1 hour' WHERE id = $1",
+      [run_id],
+    );
+    const antes = await pool.query<{ capabilities_revoked_at: string }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "turn_owner", origin_claim_token: turno.claim_token },
+        reason_code: "lease_lost",
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) {
+      expect(r.already).toBe(true);
+      expect(r.revoked_at).toBe(antes.rows[0]?.capabilities_revoked_at);
+    }
+
+    const depois = await pool.query<{ capabilities_revoked_at: string }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(depois.rows[0]?.capabilities_revoked_at).toBe(
+      antes.rows[0]?.capabilities_revoked_at,
+    );
+  });
 });

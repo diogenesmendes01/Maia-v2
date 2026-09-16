@@ -671,6 +671,39 @@ export type SettleToolCallResult =
   /** Receipt é par: ou os dois campos, ou nenhum (140). */
   | { ok: false; reason: "invalid_receipt" };
 
+/**
+ * Quem revoga (§5.6.3: "ator dono/recovery/operador autorizado").
+ *
+ * O dono prova posse pelo `origin_claim_token` DO RUN. `recovery` e `operator`
+ * NÃO provam — e é proposital: o cenário em que mais se precisa revogar é
+ * justamente aquele em que o dono sumiu e o turno foi re-reivindicado. Exigir o
+ * token de origem deles deixaria capacidades vivas para sempre.
+ */
+export type RevokeActor =
+  | { kind: "turn_owner"; origin_claim_token: string }
+  | { kind: "recovery" | "operator"; actor_ref: string };
+
+export type RevokeCapabilitiesResult =
+  /** `already: true` = já estava revogado; o carimbo original é preservado. */
+  | { ok: true; revoked_at: string; already: boolean }
+  | TurnFenceConflict
+  | NotFound
+  /**
+   * Quem chamou é dono do TURNO, mas não é a origem DESTE run.
+   *
+   * Razão própria, e não `stale_claim`, por um motivo de honestidade: o
+   * `TurnFenceConflict` promete `current_status`/`current_state_version` do
+   * turno, e neste caminho não há turno lido para `recovery`/`operator` — a
+   * versão anterior preenchia esses campos com `"unknown"` e `0`, que é estado
+   * INVENTADO apresentado como leitura. Um motivo que não promete o que não
+   * mediu é melhor que um motivo bonito com campos falsos.
+   */
+  | {
+      ok: false;
+      reason: "not_run_origin";
+      run_origin_claim_token: string;
+    };
+
 export const engineRunsRepo = {
   /**
    * TX A do §5.7.3: fixa o motor no turno e cria o run `prepared`.
@@ -2255,6 +2288,153 @@ export const engineRunsRepo = {
         state: input.outcome.kind as EngineToolCallStateV1,
         effect_evidence: evidencia,
         row_version: Number(liquidada.row_version),
+      };
+    });
+  },
+
+  /**
+   * Revoga as capacidades do run (§5.6.3, §5.7.2).
+   *
+   * Três propriedades, e cada uma existe por um motivo:
+   *
+   *  1. **Monotônica.** O `UPDATE` só age com `capabilities_revoked_at IS NULL`.
+   *     Repetir é no-op que devolve `already: true` com o carimbo ORIGINAL —
+   *     porque quem reconcilia precisa saber quando as capacidades morreram, e
+   *     re-carimbar apagaria esse instante. Nenhum caminho aqui desfaz a
+   *     revogação: "não renova por callback ou poll" é literal.
+   *  2. **Ator assimétrico.** O dono prova posse; `recovery`/`operator` não. O
+   *     cenário que mais precisa de revogação é o do dono que sumiu — exigir o
+   *     token dele ali deixaria as capacidades vivas indefinidamente.
+   *  3. **Não passa pelo gate de controle da conversa.** Revogar é exatamente o
+   *     que se quer quando um humano assume; exigir `mode='bot'` tornaria o
+   *     botão de parada inútil na única situação em que ele importa. O lock do
+   *     controle continua sendo tomado — a ordem de locks não muda —, mas o
+   *     modo/epoch dele não decide nada aqui.
+   *
+   * `row_version` NÃO é incrementado: revogar não é transição de fase, e mexer
+   * na versão transformaria `capabilities_revoked` em `version_conflict` para
+   * quem estivesse com um CAS em voo — trocando a causa real por uma genérica.
+   */
+  async revokeRunCapabilities(input: {
+    run_id: string;
+    turn_id: string;
+    actor: RevokeActor;
+    reason_code: string;
+  }): Promise<RevokeCapabilitiesResult> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<RevokeCapabilitiesResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("revoke", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      let actor_turn_attempt: number | null = null;
+      if (input.actor.kind === "turn_owner") {
+        const fence = await lockTurnAndCheckFence(tx, {
+          turn_id: input.turn_id,
+          origin_claim_token: input.actor.origin_claim_token,
+        });
+        if (!fence.ok) {
+          conta("revoke", fence.reason);
+          return fence;
+        }
+        actor_turn_attempt = Number(fence.turno.attempt_count);
+      }
+
+      const rows = linhas<
+        RunFenceRow & { capabilities_revoked_at: string | null }
+      >(
+        await tx.execute(sql`
+          SELECT ${FENCE_COLS}, capabilities_revoked_at::text AS capabilities_revoked_at
+            FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           FOR UPDATE`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("revoke", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      // O dono precisa ser a ORIGEM deste run, não só dono do turno.
+      if (
+        input.actor.kind === "turn_owner" &&
+        run.origin_claim_token !== input.actor.origin_claim_token
+      ) {
+        conta("revoke", "not_run_origin");
+        return {
+          ok: false,
+          reason: "not_run_origin",
+          run_origin_claim_token: run.origin_claim_token,
+        };
+      }
+
+      if (run.capabilities_revoked_at !== null) {
+        conta("revoke", "already");
+        return {
+          ok: true,
+          revoked_at: run.capabilities_revoked_at,
+          already: true,
+        };
+      }
+
+      const revogado = linhas<{ capabilities_revoked_at: string }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET capabilities_revoked_at = clock_timestamp(),
+                 last_event_sequence = last_event_sequence + 1,
+                 last_error_code = ${input.reason_code},
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND id = ${input.run_id}
+             AND capabilities_revoked_at IS NULL
+           RETURNING capabilities_revoked_at::text AS capabilities_revoked_at,
+                     last_event_sequence`),
+      );
+      const linha = revogado[0] as
+        | {
+            capabilities_revoked_at: string;
+            last_event_sequence: string | number;
+          }
+        | undefined;
+      if (!linha) {
+        // Corrida: outro ator revogou entre a leitura e o UPDATE. Monotônico
+        // significa que isso é sucesso, não conflito.
+        const relido = linhas<{ capabilities_revoked_at: string | null }>(
+          await tx.execute(sql`
+            SELECT capabilities_revoked_at::text AS capabilities_revoked_at
+              FROM ${engine_runs}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}`),
+        );
+        const agora = relido[0]?.capabilities_revoked_at ?? null;
+        if (agora === null) {
+          conta("revoke", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        conta("revoke", "already");
+        return { ok: true, revoked_at: agora, already: true };
+      }
+
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(linha.last_event_sequence),
+        dedupe_key: `capabilities_revoked:${input.run_id}`,
+        event_type: "capabilities_revoked",
+        actor_kind: input.actor.kind,
+        actor_turn_attempt,
+        metadata: {
+          reason_code: input.reason_code,
+          actor_ref:
+            input.actor.kind === "turn_owner" ? null : input.actor.actor_ref,
+        },
+      });
+
+      conta("revoke", "ok");
+      return {
+        ok: true,
+        revoked_at: linha.capabilities_revoked_at,
+        already: false,
       };
     });
   },

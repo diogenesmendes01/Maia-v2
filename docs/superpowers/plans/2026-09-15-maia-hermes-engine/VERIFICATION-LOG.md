@@ -713,14 +713,60 @@ curto.
 `adoptTerminalResult`, `closeRunAfterHandoff`, `markRunBlocked`/`resolveBlockedRun` e recovery. E
 segue sem teste de concorrência real em todo o módulo.
 
+### V-024 · P03.4 — `revokeRunCapabilities`, e dois mutantes que eu NÃO matei
+
+Revogação monotônica (§5.6.3, §5.7.2), com três propriedades deliberadas: o carimbo original é
+preservado em repetição (`already: true`), nenhum caminho desfaz a revogação, e o ator é
+**assimétrico** — o dono prova posse pelo `origin_claim_token` DO RUN, `recovery`/`operator` não
+provam. A assimetria não é frouxidão: o cenário que mais precisa de revogação é o do dono que sumiu, e
+exigir o token dele ali deixaria capacidades vivas indefinidamente. A operação também **não** passa
+pelo gate de controle da conversa, e isso está comentado no código e coberto pelo caso 33: revogar é
+o que se quer quando um humano assume, e exigir `mode='bot'` tornaria o botão de parada inútil na
+única situação em que ele importa.
+
+**Um defeito MEU, do tipo que o §6 proíbe nominalmente.** O retorno de recusa preenchia
+`current_status: "unknown"` e `current_state_version: 0` para caber no shape de `TurnFenceConflict` —
+estado **inventado**, apresentado como se tivesse sido lido, num caminho que para `recovery`/`operator`
+nem chega a ler o turno. Varredura confirmou que era o único sítio do módulo assim: os outros cinco
+preenchem o shape a partir do turno REAL. Corrigido com razão própria, `not_run_origin`, que devolve o
+`origin_claim_token` do run e não promete nada que não mediu.
+
+**Dois mutantes registrados como NÃO-MATÁVEIS, com o motivo.** Previ 3 mortes e 2 sobreviventes;
+o placar da primeira rodada foi 2 e 3 — errei em EM3, que eu disse que morreria. Causa: o caso 31
+passa um token aleatório, então `lockTurnAndCheckFence` recusa ANTES de a checagem de origem do run
+rodar; ela nunca era exercida. O caso 34 constrói o input que faltava (turno re-reivindicado, chamador
+com o token NOVO: dono do turno, não origem do run) e mata EM3.
+
+EM1 (guarda `IS NULL` no UPDATE) e EM2 (retorno antecipado de já-revogado) continuam vivos, e o caso 35
+— escrito exatamente para matar EM2 — **não matou**. A razão importa mais que o placar: existe um
+TERCEIRO caminho, o re-read do ramo `if (!linha)`, que devolve `{ok, already: true, revoked_at}`
+idêntico. Os três se substituem mutuamente; qualquer um sozinho produz o contrato observável. Uma
+suíte sequencial não consegue separá-los porque eles diferem em QUAL caminho responde, não no que o
+chamador vê — e a guarda `IS NULL` existe para a corrida leitura→escrita, que este rig não alcança.
+Fabricar um caso que os distinguisse seria testar o roteamento interno, não o contrato. Ficam
+registrados como defesa em profundidade e lacuna conhecida, em vez de contados como cobertos.
+
+**Outro defeito meu, no teste:** o caso 30 comparava dois `timestamptz` com `toBe` e falhava com
+`expected X to be X`. O driver devolve `Date`, e dois `Date` do mesmo instante não são `Object.is`
+iguais — a anotação `<{ ...: string }>` no genérico mentia para o compilador sem mudar o que vem do
+banco. Resolvido com `::text` na query.
+
+**Estado final:** 35 casos no spec de runs, verdes; 5 mutantes, 3 mortos e 2 documentados acima.
+`prettier --check`, `typecheck` (projeto) e `eslint` em 0. **Regressão:** `50 failed | 10233 passed |
+1118 skipped (11401)`, os MESMOS 20 arquivos, nenhuma falha citando `engine-repos` ou `tool-calls`, e
+os pulados subindo exatamente os 7 casos novos (`↓ 35 tests | 35 skipped`).
+
+**O que falta em P03:** `adoptTerminalResult`, `closeRunAfterHandoff`, `markRunBlocked`/
+`resolveBlockedRun`, varredura/manutenção e recovery. E segue sem teste de concorrência real.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1111 | Medido de novo em P03.3d: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 78 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1118 | Medido de novo em P03.4: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 85 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (35: 28 do caminho de start + 7 de P03.4) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 
