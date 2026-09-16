@@ -60,7 +60,7 @@ por construção, a metade pura de cada caso.
 
 | Caso | Situação | O que está coberto | A metade que FALTA |
 |---|---|---|---|
-| **T18** | **PARCIAL** | Grant ausente/expirado/audience errada → recusa sanitizada e indistinguível (401); revogado → `run_revoked` (403); autenticação **antes** de qualquer código que afirme algo sobre o run; motivo de auditoria separado do corpo; corpo sem ids/audience/instante | "**Canal inválido**" — a autenticação de TRANSPORTE (posse da conexão/credencial restrita, §6.10 item 7) não existe: é do supervisor (P07). E o *lookup* do grant pela hash da credencial é banco. Minha função recebe o grant **já resolvido** |
+| **T18** | **PARCIAL** | Grant ausente/expirado/audience errada → recusa sanitizada e indistinguível (401); revogado → `run_revoked` (403); autenticação **antes** de qualquer código que afirme algo sobre o run; motivo de auditoria separado do corpo; corpo sem ids/audience/instante; instante ILEGÍVEL falha fechada (`NaN` não vira "não expirou") | "**Canal inválido**" — a autenticação de TRANSPORTE (posse da conexão/credencial restrita, §6.10 item 7) não existe: é do supervisor (P07). E o *lookup* do grant pela hash da credencial é banco. Minha função recebe o grant **já resolvido** |
 | **T56** | **PARCIAL** | Falha com possível cobrança **não zera custo**: exposição estimada sobrevive; stream parcial sem usage vira `unknown` (não zero); evidência nova ajusta por evento compensatório sem apagar a cobrança original; três tentativas cobradas somam as três (§6.10 item 5) | "**Retry limitado**" não é exercitado: é comportamento do relay (§9.1 item 7, "sem retry oculto no relay"), e não há HTTP nesta fatia. Nenhum 429/stream parcial REAL foi observado — os eventos são sintéticos |
 | **T57** | **PARCIAL** | Evento repetido conta uma vez; a dobra é comutativa e estável sob N repetições; mesmo `event_id` com conteúdo divergente é conflito explícito, nunca overwrite silencioso (§9.2) | A idempotência DURÁVEL (unique de `event_id` em `engine_usage_events`) não existe — hoje a garantia só vale dentro da dobra pura. E a regra de dashboard do §9.2 ("**proibir somar as duas projeções** do mesmo request") não foi implementada nem testada |
 | **T58** | **PARCIAL** | A decisão de admissão sob limite: 10 pedidos de 30 com teto 100 admitem **3**; reservado **e** liquidado contam juntos; fronteira exata (exposição == limite admite, +1 recusa); store indisponível recusa; `guarantee: 'admission_only'` em TODA decisão | **A ATOMICIDADE não está verificada.** Meu teste modela a serialização que o lock do §9.2 imporia — ele não prova que duas transações concorrentes serializam. Isso exige Postgres e a tabela `engine_budget_accounts`. Também não modelei `period_start_utc` nem a virada do dia UTC |
@@ -89,7 +89,7 @@ Node `v22.23.2`.
 | Lint | `npx eslint` nos 5 arquivos desta fatia | **0** |
 | Unit | `npx vitest run tests/unit/hermes-inference-gateway-contract.spec.ts tests/unit/hermes-cost-accounting.spec.ts --no-coverage` | **0** |
 
-Resultado do runner, na íntegra: `executados=91 falharam=0 **pulados=0**` — 52
+Resultado do runner, na íntegra: `executados=94 falharam=0 **pulados=0**` — 55
 casos no spec do gateway e 39 no de custo. Nenhum `describe.skip`, nenhum teste
 pulado: pulado não é passou.
 
@@ -103,8 +103,10 @@ pulado: pulado não é passou.
 
 ## 4. Verificação por mutação
 
-**41 mutantes distintos, 41 mortos** (42 aplicações, contando um mutante de
-controle re-executado). Cada mutante quebra deliberadamente UM predicado que
+**44 mutantes distintos, 44 mortos** (45 aplicações, contando um mutante de
+controle re-executado). Os três últimos (M42–M44) **não são meus**: vieram da
+revisão independente desta fatia — ver o achado 4, que é o mais importante da
+lista. Cada mutante quebra deliberadamente UM predicado que
 sustenta uma garantia; "morto" = algum caso falhou.
 
 | Alvo | Mutantes | Resultado |
@@ -114,6 +116,7 @@ sustenta uma garantia; "morto" = algum caso falhou.
 | `cost-accounting` / T56-T57-T59 | M18–M26 | 9 mortos (M23 só depois do reforço) |
 | `cost-reservation` / T58 | M27–M36 | 10 mortos |
 | Schema da resposta | M37–M41 | 5 mortos |
+| Guarda de instante ilegível (`expirou`) | M42–M44 | 3 mortos — **achados pela revisão**, não por mim |
 
 **Os três achados honestos desta varredura** — o valor dela está aqui, não no
 placar:
@@ -136,6 +139,21 @@ placar:
    desconhecido) e o teto de tools passou a exigir `payload_too_large` (com só
    "invalid", o `.max()` do Zod recusava por outro caminho e o mutante
    sobrevivia).
+
+4. **A varredura da revisão achou o que a minha não olhou.** Os meus 41 mutantes
+   foram escolhidos À MÃO, e nenhum deles tocou `expirou()`
+   (`inference-gateway.ts:446-451`). Uma varredura independente gerada por
+   OPERADOR (`&&`↔`||`, `>=`→`>`, `===`→`!==`) encontrou a guarda de fail-closed
+   **sem cobertura nenhuma**: remover a guarda INTEIRA sobrevivia, apesar de seis
+   casos do spec exercitarem `expires_at`. O código estava CERTO — o defeito era
+   de cobertura. Mas sem cobertura nada impediria um refactor de apagá-la, e a
+   consequência seria grave: `Date.parse` de data corrompida é `NaN`, `NaN > fim`
+   é `false`, e um grant inválido passaria como **válido** — recusa autenticada
+   virando aceite, o oposto exato do que o T18 cobra. Corrigido em `5736e296`
+   com três casos (28b-d), um para cada metade do `||` e um para o conjunto; com
+   a guarda removida os três falham e os outros 52 continuam passando.
+   **Lição registrada:** mutante escolhido à mão cobre o que o autor já suspeita;
+   mutante gerado por operador cobre o que ele não pensou em olhar.
 
 **Redundância deliberada, nomeada:** o `.strict()` do objeto de topo do pedido é
 inalcançável, porque a varredura de chaves roda antes e sempre recusa primeiro.
