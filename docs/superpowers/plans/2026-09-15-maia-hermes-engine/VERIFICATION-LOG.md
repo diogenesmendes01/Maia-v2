@@ -1333,6 +1333,63 @@ transporte (placement em C23), os fences nas dez fronteiras de egresso do §8.2.
 `resumePolicy='future_only'` (§8.2.5) e a tabela `conversation_handoff_requests`. Aqui só o
 vocabulário — nenhum caminho vivo foi tocado, e nenhuma ação tem produtor ainda.
 
+### V-034 · P07 (agente paralelo) — validação PESSOAL do trabalho, não aceite por resumo
+
+**Contexto.** Primeira vez nesta épica que uso o paralelismo que o §7 autoriza: três frentes
+independentes (P05 broker, P06 gateway/custo, P07 supervisor), cada uma em worktree e branch próprios,
+com propriedade de arquivos declarada. O P07 foi o primeiro a terminar. O §7 exige que eu valide diff e
+evidência pessoalmente — "um resumo dizendo 'concluído' não basta" —, e é isso que este registro é.
+
+**Entrega:** `claude/mh-p07-supervisor`, commits `a1c3de3a` (módulo + 60 casos) e `5627eda0`
+(relatório), base `7993e563`. `src/integrations/hermes/supervisor-policy.ts`, 561 linhas: os três verbos
+do §5.3.1 como funções TOTAIS sobre instantâneos explícitos, a escada `min(deadline, lease)` do §5.8.1
+e o gate de rollback do §6.11.
+
+**O que EU conferi, e como.**
+- **Propriedade de arquivos:** `git diff --name-only` contra a lista proibida → nenhum acerto. Três
+  arquivos, todos novos.
+- **Pureza:** o único import do módulo é `import type { CancelFrame }`, apagado na compilação. Meu
+  `grep` por `child_process|spawn|setTimeout|fetch|db\.|sql\`` acusou três linhas, todas COMENTÁRIO ou
+  o campo `spawned` — verificadas uma a uma, nenhuma chamada real.
+- **Gates reexecutados por mim** (exit relatado por quem implementa não é evidência): `tsc --noEmit` 0,
+  `eslint` 0, `vitest` 0 com `executados=60 falharam=0 pulados=0`.
+- **Trailer:** `git log --format=%B | grep -c Co-Authored-By` = 0. Obedeceu ao `AGENTS.md`, e chegou
+  ao mesmo conflito que o C08 de forma independente.
+- **Árvore limpa** antes e depois da minha varredura.
+
+**Varredura de mutação INDEPENDENTE minha.** Gerada por OPERADOR (`&&`↔`||`, `>=`→`>`, `<=`→`<`,
+`===`→`!==`), sem eu escolher o texto, com controle antes (fonte intacto passa) e depois (restauração
+byte a byte + 60/60). Resultado: **6 aplicadas, 6 MORTAS, zero sobreviventes.**
+⚠️ **O que isto prova e o que não prova:** corrobora, não replica. O agente aplicou 33 mutações
+escolhidas à mão; o meu gerador é por operador e encontrou 6 alvos. Seis de seis mortos é sinal forte
+e independente, mas **não é verificação das 33 dele** — essas continuam sendo afirmação dele.
+⚠️ **Duas tentativas anteriores minhas de rodar esta varredura falharam por defeito do MEU harness**
+(variáveis exportadas depois do primeiro `node -e`; laço rodou zero vezes e devolveu "0 mortos, 0
+sobreviventes", que eu quase li como resultado). Resolvido movendo o laço inteiro para um único
+processo node com `execSync`, em vez de trocar estado entre `bash` e `node`. Fica registrado porque um
+resultado nulo com cara de resultado é a forma mais fácil de fabricar evidência sem querer.
+
+**Dois achados do agente que eu VERIFIQUEI e adotei como meus.**
+1. **A1 → C25:** o journal não distingue "admitido sem spawn" de "spawn com ACK perdido". Conferi no
+   schema real: `engine_runs` não tem coluna de spawn/pid/processo, `remote_run_id` é nullable e só é
+   atribuído no aceite, e a DDL da 140 não tem nada do gênero. É **lacuna do meu P03**, e o mapeamento
+   conservador `spawned = (phase !== 'prepared')` é sustentado pelo JSDoc que eu mesmo escrevi em
+   `markSubmitting` — mas é inferência, não fato durável.
+2. **tsconfig → C26:** `npm run typecheck` nunca cobriu teste algum. Provado empiricamente: plantei
+   `const x: number = "isto e uma string"` em `tests/unit/`, e `tsc --noEmit` saiu **exit 0 com zero
+   menções**. Vale para as seis specs que eu escrevi nesta épica; todo `typecheck 0` dos registros
+   anteriores é verdadeiro para `src/` e silencioso sobre `tests/`.
+
+**Correção de método minha, encontrada no caminho:** meus `grep` por
+`export async function markSubmitting|recordStartObservation` voltavam vazios e eu quase concluí que a
+citação do agente era falsa. O padrão é que estava errado — são métodos de `export const
+engineRunsRepo` (`engine-repos.ts:946`). O código estava certo; a minha busca é que não estava.
+
+**O que NÃO foi integrado.** O código do P07 permanece na branch dele, **fora** desta. Por isso as
+linhas T09–T16 e T65/T66 da matriz seguem como estavam: o agente marcou todas PARCIAIS e nenhuma
+COBERTO, e declarou **G-LIFE NÃO CUMPRIDO** — o gate exige ledger (banco) e crash (processo), e a fatia
+não toca nenhum dos dois. Reivindicar cobertura que esta branch não tem seria overclaim.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
