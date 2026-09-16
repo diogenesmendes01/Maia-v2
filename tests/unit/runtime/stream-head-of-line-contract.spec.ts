@@ -167,13 +167,21 @@ describe('#626 — contrato do head-of-line', () => {
 
   // ─── Vocabulário centralizado ────────────────────────────────────────────
 
-  it('os cinco códigos da issue existem, mais o `stream_poisoned` da #629', () => {
-    // A #629 (fatia F) ACRESCENTOU um sexto: `stream_poisoned`. Acrescentar não
-    // é o mesmo que redefinir — nenhuma série existente mudou de significado, e
-    // a nova é semeada em zero como as outras. O que continua proibido é grafar
-    // um dos códigos de outro jeito, ou ter dois nomes para o mesmo fato.
+  it('os cinco códigos da issue existem, mais `stream_poisoned` (#629) e `conversation_human_control` (P04.6)', () => {
+    // A #629 (fatia F) ACRESCENTOU um sexto: `stream_poisoned`. O P04.6 da
+    // épica maia-hermes acrescentou um SÉTIMO: `conversation_human_control`,
+    // cujo nome vem literalmente do §8.2.4 da spec ("retornar motivo fechado
+    // `conversation_human_control`"). Acrescentar não é o mesmo que redefinir —
+    // nenhuma série existente mudou de significado, e as novas são semeadas em
+    // zero como as outras. O que continua proibido é grafar um dos códigos de
+    // outro jeito, ou ter dois nomes para o mesmo fato.
+    //
+    // Este teste falhar ao acrescentar um código é o DESENHO, não um obstáculo:
+    // é o pedágio que obriga quem acrescenta a escrever por que o código novo
+    // não é apelido de nenhum dos que já existem.
     expect([...STREAM_SCHEDULING_RESULTS].sort()).toEqual(
       [
+        'conversation_human_control',
         'eligible',
         'not_head',
         'promoted',

@@ -92,6 +92,17 @@ import {
   streamPoisonProbe,
   streamSuccessorCandidate,
 } from './stream-head-sql.js';
+// P04.6 (spec maia-hermes §8.2.4, §8.2.5) — o HOLD de CONTROLE HUMANO, no
+// módulo que é dono de `conversation_controls`. Os QUATRO consumidores neste
+// arquivo — o `WHERE` do claim, o filtro do recovery, o dispatcher cross-tenant
+// e a eleição da promoção — chamam esta função; nenhum monta predicado próprio,
+// pela mesma razão que vale para a regra FIFO e para o poison.
+// `tests/unit/runtime/conversation-control-claim-contract.spec.ts` conta as
+// chamadas e proíbe que `conversation_controls` seja nomeada aqui dentro.
+import {
+  humanControlProbe,
+  streamNotHumanControlled,
+} from './conversation-control-sql.js';
 // #628 — a FRONTEIRA do batch de debounce, no mesmo formato e pela mesma razão
 // do módulo acima: SQL puro, compilável sem banco, com a borda escrita num
 // lugar só. `armDebounceWindowTx` e `closeDueDebounceBatchTx` são os únicos
@@ -1685,6 +1696,13 @@ export const agentTurnsRepo = {
           // recuperação, e o `limit` da varredura consumido por conversas que
           // nenhum worker pode destravar.
           streamNotPoisoned(escopoSql(tenant_id, agent_id)),
+          // P04.6 — e a conversa sob CONTROLE HUMANO também não tem trabalho
+          // recuperável. O §8.2.5 é literal: "todos os scans de recovery/claim
+          // devem excluir holds". Sem isto o varredor rearma a cada ciclo um
+          // turno que o claim vai recusar — o "retry storm de jobs bloqueados"
+          // que o §8.2.4 proíbe por escrito, com o `limit` da varredura
+          // consumido por conversas que nenhum worker deve destravar.
+          streamNotHumanControlled(escopoSql(tenant_id, agent_id)),
         ),
       )
       .orderBy(asc(agent_turns.created_at))
@@ -1782,6 +1800,14 @@ export const agentTurnsRepo = {
           // CROSS-TENANT, pela mesma razão do fragmento acima: o escopo sai das
           // COLUNAS da linha. Espelha `findRecoverableTurns` — um par só é
           // enumerado quando o inner de fato teria trabalho.
+          tenant: sql`${agent_turns}.tenant_id`,
+          agent: sql`${agent_turns}.agent_id`,
+          alvo: sql`${agent_turns}`,
+        })}
+        AND ${streamNotHumanControlled({
+          // P04.6 — idem: o par cujo único trabalho está retido por controle
+          // humano não deve ser enumerado, ou o dispatcher acorda o inner a
+          // cada varredura para ele devolver lista vazia.
           tenant: sql`${agent_turns}.tenant_id`,
           agent: sql`${agent_turns}.agent_id`,
           alvo: sql`${agent_turns}`,
@@ -2462,6 +2488,18 @@ async function promoteStreamSuccessor(
        -- assim acordaria o sucessor -- um wake-up para um turno que o claim vai
        -- recusar, e a metrica promoted deixaria de significar 'a fila andou'.
        AND ${streamNotPoisoned(alvo)}
+       -- P04.6 -- a conversa sob CONTROLE HUMANO tambem NAO promove ninguem.
+       -- E o consumidor menos obvio do predicado, e foi MEDIDO antes de existir:
+       -- o caso 12 de hermes-claim-hold-real-db viu promoted_at carimbado no
+       -- sucessor de uma conversa em modo human. O 8.2.4 e explicito --
+       -- "recovery/promotion nao podem fabricar tentativa nova que ignore a
+       -- pausa" --, e o defeito seria quase invisivel: a promocao acorda o
+       -- sucessor, o claim o recusa com conversation_human_control, e o unico
+       -- sintoma e um promoted que nao corresponde a fila nenhuma.
+       -- SEM CRASE NESTE BLOCO, de proposito: ele vive dentro de um template
+       -- literal, e uma crase aqui encerra o template. Ja custou seis TS1005 em
+       -- cascata uma vez (C45) e custou de novo ao escrever esta fatia.
+       AND ${streamNotHumanControlled(alvo)}
     RETURNING u.id, u.representative_message_id, u.conversa_id,
               sucessor.status AS status_before, u.status AS status_after
   `);
@@ -3032,6 +3070,16 @@ async function claimWithinStreamExclusion(
        -- fatia e TURN_POISON_BLOCK_CATEGORIES= (vazio), que impede NOVOS
        -- bloqueios de nascer -- nunca desrespeita os que existem.
        AND ${streamNotPoisoned(escopo)}
+       -- P04.6 -- A CONVERSA ESTA SOB CONTROLE HUMANO? Predicado INCONDICIONAL,
+       -- sem flag, pela MESMA razao do de poison logo acima: uma linha de
+       -- controle fora do modo bot e uma decisao ja tomada, auditada e visivel
+       -- no console, e uma flag que a ignorasse faria a plataforma voltar a
+       -- responder numa conversa que um humano assumiu. Retem pausing E human:
+       -- pausing e a janela entre a barreira comitada e a drenagem confirmada,
+       -- e deixa-la de fora permitiria INICIAR um turno depois do clique de
+       -- pausa. O kill switch desta fatia e nao criar controles -- nunca
+       -- desrespeitar os que existem.
+       AND ${streamNotHumanControlled(escopo)}
     RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
               claimed_by, claimed_at, lease_expires_at, state_version,
               -- #629 -- a ESPERA deste turno, do relogio do BANCO. E o que
@@ -3130,6 +3178,44 @@ async function explainClaimRejection(
   if (!encontrado) {
     incCounter('maia_turn_claim_total', { result: 'not_found' });
     return { ok: false, reason: 'not_found', ...trail };
+  }
+
+  // P04.6 — A CONVERSA ESTÁ SOB CONTROLE HUMANO? Verificado ANTES do poison, e
+  // a ordem merece justificativa porque as duas param a conversa.
+  //
+  // Esta é a decisão CORRENTE e reversível por comando (`resume`, §8.2.5);
+  // `stream_poisoned` é dívida operacional esperando desbloqueio manual. Com as
+  // duas valendo ao mesmo tempo, responder "um humano está no controle"
+  // descreve o que o operador vê no console; responder `stream_poisoned` o
+  // mandaria desbloquear uma conversa que alguém está atendendo. Nenhuma das
+  // duas esconde a outra: ambas persistem, o claim segue recusado até as duas
+  // saírem, e o operador que resolver esta encontra a outra na tentativa
+  // seguinte.
+  //
+  // Não devolve `head_block`: quem retém não é um TURNO anterior, é uma linha
+  // de `conversation_controls`. Preencher o campo com um turno qualquer faria o
+  // operador procurar um bloqueador que não existe — e o `control_id` não entra
+  // no resultado porque `ClaimResult` é vocabulário de ESCALONAMENTO, não a
+  // tela de atendimento.
+  //
+  // Custa uma consulta, e só no caminho que JÁ falhou — como o resto deste
+  // diagnóstico.
+  const hold = await tx.execute<{ control_id: string; mode: string }>(
+    humanControlProbe({
+      tenant: escopo.tenant,
+      agent: escopo.agent,
+      turn_id: args.turn_id,
+    }),
+  );
+  const controle = (
+    hold.rows as unknown as Array<{ control_id: string; mode: string }>
+  )[0];
+  if (controle) {
+    incCounter('maia_turn_claim_total', {
+      result: 'conversation_human_control',
+    });
+    recordStreamBlocked('conversation_human_control');
+    return { ok: false, reason: 'conversation_human_control', ...trail };
   }
 
   // #629 — A CONVERSA ESTÁ INTERDITADA? Verificado ANTES de tudo o mais, e a

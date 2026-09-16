@@ -44,9 +44,27 @@
  * Este módulo NÃO executa, NÃO abre transação e NÃO lê o escopo do ALS. Quem
  * chama passa `tenant_id`/`agent_id` já resolvidos e roda o SQL no seu próprio
  * executor — deliberadamente, para que ele continue puro e testável sem boot.
+ *
+ * ─── P04.6: o módulo passou a ter uma SEGUNDA responsabilidade ─────────────
+ *
+ * Além do LOCK (escrita), ele agora hospeda o predicado de ELEGIBILIDADE que o
+ * caminho do turno consulta em quatro lugares (`streamNotHumanControlled`) e a
+ * sonda que explica a recusa (`humanControlProbe`). As duas moram aqui pela
+ * razão nº 1 acima, aplicada de novo: elas nomeiam `conversation_controls`, e
+ * uma segunda cópia do predicado divergiria em silêncio.
+ *
+ * A alternativa considerada foi `stream-head-sql.ts`, que já hospeda
+ * `streamNotPoisoned` — também um predicado de elegibilidade que não é sobre
+ * ordem. O argumento é real e fica registrado: um leitor que pergunte "o que
+ * pode barrar um claim?" passa a ter dois arquivos a abrir. Escolhi aqui para
+ * não fazer o módulo dono da ORDEM DO TURNO (#626) importar o schema de controle
+ * do P04, invertendo a mesma dependência que a razão nº 2 rejeitou. O que torna
+ * a escolha segura em qualquer dos dois casos não é a pasta: é a contagem de
+ * consumidores afirmada em
+ * `tests/unit/runtime/conversation-control-claim-contract.spec.ts`.
  */
 import { sql, type SQL } from 'drizzle-orm';
-import { conversation_controls, engine_runs } from '../schema.js';
+import { agent_turns, conversation_controls, engine_runs } from '../schema.js';
 
 /**
  * A linha devolvida pelos dois construtores. Eles selecionam EXATAMENTE as
@@ -64,8 +82,32 @@ export type ConversationControlLockRow = {
   control_epoch: string;
 };
 
-/** As três colunas do contrato acima, num só lugar. */
-const COLUNAS = sql`c.id, c.mode, c.control_epoch::text AS control_epoch`;
+/**
+ * As três colunas do contrato acima, num só lugar.
+ *
+ * É FUNÇÃO, e não constante, e a diferença não é estilo — é a regra que
+ * `src/runtime/turns/stream-metrics.ts` já declara no cabeçalho dele: **um
+ * módulo importado por um repositório não pode ter efeito no import.**
+ *
+ * Medido, não suposto. Enquanto isto era `const COLUNAS = sql\`…\`` no escopo de
+ * módulo, o `sql` era avaliado no momento do IMPORT. Enquanto este arquivo só
+ * era alcançado por `engine-repos.ts` ninguém notou; quando o P04.6 o pôs no
+ * grafo de `turn-repos.ts`, oito specs que fazem `vi.mock('drizzle-orm')` com
+ * fábrica PARCIAL passaram a estourar na carga — "No \`sql\` export is defined on
+ * the drizzle-orm mock" — levando 74 testes a vermelho e impedindo três arquivos
+ * de sequer carregar. O stack apontava para este arquivo, na linha desta
+ * constante, a partir do import novo.
+ *
+ * Adiar a avaliação para dentro das funções resolve na RAIZ: o mock parcial
+ * nunca precisa de `sql` no import, e o SQL produzido é byte a byte o mesmo.
+ * Consertar as oito specs seria tratar o sintoma em oito lugares alheios.
+ *
+ * `engine-repos.ts` tem o mesmo padrão em `SNAPSHOT_COLS`/`FENCE_COLS` e hoje
+ * não machuca ninguém, porque não está no grafo dessas specs. Fica registrado
+ * como armadilha latente, não corrigido aqui: mexer nele é mudança de outro
+ * módulo, sem teste que a cobre e fora do escopo desta unidade.
+ */
+const COLUNAS = (): SQL => sql`c.id, c.mode, c.control_epoch::text AS control_epoch`;
 
 /**
  * Tranca o controle POR ID — a forma usada quando o run ainda não existe
@@ -78,7 +120,7 @@ export function lockControlByIdSql(input: {
   control_id: string;
 }): SQL {
   return sql`
-    SELECT ${COLUNAS}
+    SELECT ${COLUNAS()}
       FROM ${conversation_controls} c
      WHERE c.tenant_id = ${input.tenant_id} AND c.agent_id = ${input.agent_id}
        AND c.id = ${input.control_id}
@@ -106,11 +148,143 @@ export function lockControlByRunSql(input: {
   run_id: string;
 }): SQL {
   return sql`
-    SELECT ${COLUNAS}
+    SELECT ${COLUNAS()}
       FROM ${conversation_controls} c
       JOIN ${engine_runs} r
         ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id AND r.control_id = c.id
      WHERE r.tenant_id = ${input.tenant_id} AND r.agent_id = ${input.agent_id}
        AND r.id = ${input.run_id}
      FOR UPDATE OF c`;
+}
+
+// ─── P04.6 — O HOLD DE ADMISSÃO/CLAIM (§8.2.4, §8.2.5) ──────────────────────
+
+/**
+ * **A REGRA.** `TRUE` quando a conversa do alvo **não** está sob controle
+ * humano — isto é, quando a automação ainda pode trabalhar nela.
+ *
+ * ─── Que cláusula isto executa ────────────────────────────────────────────
+ *
+ * §8.2.5, primeiro bullet: mensagens retidas "podem permanecer em estado
+ * operacional não terminal sob hold de controle, mas **todos os scans de
+ * recovery/claim devem excluir holds**; não usar TTL Redis como fonte desse
+ * hold". E o §8.2.4, na linha de `turn-repos.ts`/`claim.ts`/`message-recovery.ts`:
+ * "Admission/claim deve consultar controle, retornar motivo fechado
+ * `conversation_human_control`; recovery/promotion não podem fabricar tentativa
+ * nova que ignore a pausa."
+ *
+ * A fonte do hold é esta LINHA, no PostgreSQL — não um TTL de Redis, não um
+ * sinal de pubsub. É o que a spec exige por escrito, e é o que faz o hold
+ * sobreviver a um restart do transporte.
+ *
+ * ─── `mode <> 'bot'`, e não `mode = 'human'` ─────────────────────────────
+ *
+ * A decisão mais importante do predicado. `pausing` é estado REAL (migration
+ * 140: "entre a barreira e a drenagem confirmada existe I/O em voo que ninguém
+ * pode declarar morto") e é exatamente a janela entre o clique do operador e a
+ * parada confirmada. Escrevê-lo como `= 'human'` deixaria essa janela aberta a
+ * claims NOVOS — o bot começando um turno DEPOIS do clique de pausa, que é o
+ * defeito que a fatia inteira existe para impedir. Perguntar "não é do bot?" em
+ * vez de "é do humano?" também erra para o lado seguro se um quarto modo for
+ * acrescentado ao CHECK: o modo desconhecido RETÉM, em vez de liberar por
+ * omissão.
+ *
+ * ─── Por que INCONDICIONAL, sem flag ─────────────────────────────────────
+ *
+ * Mesma razão que o predicado de poison (#629): uma linha de controle não-`bot`
+ * é uma decisão já tomada, auditada e visível ao operador no console. Uma flag
+ * que a ignorasse faria a plataforma voltar a responder numa conversa que um
+ * humano assumiu — que é precisamente o dano que o P04 existe para impedir. O
+ * "kill switch" desta fatia é não criar controles, nunca desrespeitar os que
+ * existem.
+ *
+ * ─── O escape, e por que ele não é fail-open ─────────────────────────────
+ *
+ * `stream_key IS NULL` devolve `TRUE`, como em `streamHeadOfLineNotExists` e
+ * `streamNotPoisoned`. Um turno sem identidade de stream não pertence a conversa
+ * nenhuma, e o controle é endereçado POR STREAM
+ * (`conversation_controls_stream_uq`): não existe controle que possa alcançá-lo.
+ * Recusá-lo tornaria inclaimável todo turno anterior ao protocolo. Medição neste
+ * banco: 10.833 dos 10.957 turnos não têm stream — e ZERO turnos têm stream sem
+ * sequência, porque `createReceivedTurnTx` grava as duas colunas juntas ou
+ * nenhuma. O fail-closed de verdade acontece no INGRESSO (`requireStreamIdentity`),
+ * não aqui.
+ *
+ * ─── Custo ───────────────────────────────────────────────────────────────
+ *
+ * A subconsulta é um lookup no índice único `conversation_controls_stream_uq`
+ * `(tenant_id, agent_id, stream_key)` (migration 140). O escopo entra como
+ * FRAGMENTO, e não como string, porque os quatro consumidores escopam de formas
+ * diferentes: o claim, o recovery e a promoção têm o par do ALS como parâmetro;
+ * o dispatcher cross-tenant correlaciona com as colunas da própria linha. Um
+ * `string` obrigaria o dispatcher a montar o predicado à mão — a segunda cópia
+ * que este módulo existe para impedir.
+ */
+export function streamNotHumanControlled(input: {
+  tenant: SQL;
+  agent: SQL;
+  alvo: SQL;
+}): SQL {
+  return sql`(
+        ${input.alvo}.stream_key IS NULL
+     OR NOT EXISTS (
+          SELECT 1
+            FROM ${conversation_controls} AS controle
+           WHERE controle.tenant_id  = ${input.tenant}
+             AND controle.agent_id   = ${input.agent}
+             AND controle.stream_key = ${input.alvo}.stream_key
+             AND controle.mode <> 'bot'
+        )
+  )`;
+}
+
+/**
+ * A SONDA de diagnóstico: qual controle está retendo a conversa deste turno, e
+ * em que modo.
+ *
+ * Só o caminho de FRACASSO do claim a usa (`explainClaimRejection`), e é ela que
+ * torna possível cumprir a exigência de "motivo FECHADO" do §8.2.4: sem ela a
+ * recusa cairia no `not_eligible` genérico, que fala do TURNO ("este aqui não
+ * pode ser reivindicado agora") quando o fato é sobre a CONVERSA ("um humano
+ * está no controle"). São diagnósticos com remediações opostas.
+ *
+ * O `mode` vem junto porque `pausing` e `human` são leituras operacionais
+ * diferentes — "estamos parando, há I/O em voo" e "um humano está atendendo" — e
+ * o console decide o que mostrar com base nisso.
+ *
+ * ─── O que ela NÃO projeta, e por quê ────────────────────────────────────
+ *
+ * `stream_key`: a issue-mãe da #505 a restringe a log protegido. Ela aparece no
+ * JOIN, que é onde a comparação acontece; o que não pode é SAIR da consulta —
+ * mesma regra de `streamPoisonProbe`.
+ *
+ * `owner_app_user_id`, `reason_code`, `reason_ref`: quem recusa um claim precisa
+ * saber que HÁ hold, não quem o colocou nem por quê. O dono e o motivo são dados
+ * de atendimento, e o console os lê pela sua própria porta, com a sua própria
+ * ACL. Trazê-los para o caminho do claim os poria a um `logger.info` de
+ * distância de virar campo de log de rotina.
+ *
+ * O alvo entra como JOIN (`agent_turns AS alvo`) em vez de valores lidos antes:
+ * ler `stream_key` numa consulta e compará-la na seguinte abriria a janela em
+ * que o turno muda entre as duas, e a explicação do fracasso passaria a
+ * descrever um estado que já não existe.
+ */
+export function humanControlProbe(input: {
+  tenant: SQL;
+  agent: SQL;
+  turn_id: string;
+}): SQL {
+  return sql`
+    SELECT controle.id AS control_id, controle.mode AS mode
+      FROM ${agent_turns} AS alvo
+      JOIN ${conversation_controls} AS controle
+        ON  controle.tenant_id  = ${input.tenant}
+        AND controle.agent_id   = ${input.agent}
+        AND controle.stream_key = alvo.stream_key
+     WHERE alvo.tenant_id = ${input.tenant}
+       AND alvo.agent_id  = ${input.agent}
+       AND alvo.id        = ${input.turn_id}
+       AND alvo.stream_key IS NOT NULL
+       AND controle.mode <> 'bot'
+     LIMIT 1`;
 }

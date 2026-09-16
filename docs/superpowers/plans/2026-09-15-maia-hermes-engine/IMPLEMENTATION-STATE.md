@@ -108,6 +108,14 @@ sequência P00–P12 do capítulo 10 da spec.
 
 | C50 | **O caminho de compatibilidade do ingresso não aloca sequência, e o `future_only` não consegue ordenar o que não tem número.** Só `createReceivedTurnTx` chama `allocateIngressSeq`; `ensureTurnForMessage` — declarada como "rede de compatibilidade para caminhos de ingresso que persistiram a mensagem antes desta issue (deploy rolling, row recuperada pelo sweep)" e usada pelo backfill — invoca `createTurnForMessage` **sem** o argumento `stream`, então o turno nasce com `stream_key`, `first_ingress_seq` e `last_ingress_seq` NULOS | `src/db/repositories/turn-repos.ts:413` (`createReceivedTurnTx`, aloca), `:545` (`ensureTurnForMessage`, não aloca), `:3253` (`allocateIngressSeq`); `agent_turns_stream_shadow_chk` permite o trio inteiro nulo | **Consequência para o §8.2.5:** o watermark é um número de ingresso, e um turno sem número não é "anterior" nem "posterior" a ele — fica fora da ordenação por construção. A captura do watermark **não pode falhar** por causa disso (o caso 13 do spec de retomada prende exatamente essa tolerância), mas o descarte administrativo do backlog (U-P04.5b) **não poderá usar o watermark como único critério**: turnos sem sequência precisam de outra regra, ou de exclusão explícita, e inventá-la em silêncio seria o erro que o C18 me obrigou a corrigir. Registrado agora para que a fatia do backlog já nasça sabendo |
 
+| C51 | **Avaliar `sql` no escopo de MÓDULO é efeito no import — e um import novo torna a armadilha alcançável.** `conversation-control-sql.ts` tinha `const COLUNAS = sql\`…\`` no topo desde o P04.3a. Enquanto só `engine-repos.ts` o alcançava, ninguém notou; ao pô-lo no grafo de `turn-repos.ts` (P04.6), **oito specs que fazem `vi.mock('drizzle-orm')` com fábrica PARCIAL passaram a estourar na carga** (`No "sql" export is defined on the drizzle-orm mock`), levando **74 testes a vermelho** e impedindo 3 arquivos de carregar | stack apontando `conversation-control-sql.ts:86` a partir de `turn-repos.ts:102`; os 8 isolados somam 74 falhas; a casa já tem a regra escrita em `src/runtime/turns/stream-metrics.ts` ("um módulo importado por um repositório não pode ter efeito no import"), e `stream-head-sql.ts` a obedece | **Corrigido na RAIZ** (`COLUNAS` virou função; SQL idêntico byte a byte), não nas oito specs alheias — os 8 voltaram a 103/103. ⚠️ **O que importa é COMO foi encontrado:** nenhum teste meu pegou (os 7 importadores diretos verdes, `tsc` 0, `eslint` 0, real-db 16/16). Pegou a aritmética da regressão não fechar, e só depois de eu medir a baseline NO HEAD em vez de citar a registrada — sem esse par, eu teria arquivado 74 falhas como "ambiente". `engine-repos.ts` tem o mesmo padrão (`SNAPSHOT_COLS`, `FENCE_COLS`) e hoje não machuca ninguém porque não está no grafo dessas specs: fica NOMEADO como armadilha latente, **não** corrigido aqui, por ser outro módulo e fora do escopo desta unidade |
+
+| C52 | **Guarda de cardinalidade que testa a string inteira confunde NOME de label com VALOR.** `stream-fairness-metrics.spec.ts` proibia `/stream_key\|remote_jid\|turn_id\|conversa\|tenant\|agent_id/` em qualquer posição do blob de labels, mas o item 3 do cabeçalho dela diz que a proibição é sobre a série CARREGAR esses labels — isto é, sobre NOMES. O valor `conversation_human_control` (vocabulário FECHADO, cinco valores, cardinalidade zero) trombava pelo pedaço "convers-a-tion" | a falha real na suíte: `expected 'reason="conversation_human_control"' not to match /stream_key\|…/` | **Ancorado na posição de nome** (`(^|,)(…)\w*=`), o que ENDURECE em vez de afrouxar: passa a pegar também `conversa_id=`, `tenant_id=` e `agent_id=`. Renomear o valor seria o conserto errado — a #626 centralizou o vocabulário justamente para não haver dois nomes para o mesmo fato, e o nome vem do §8.2.4. **Provado por mutação, não afirmado:** injetei um label `stream_key` na semeadura de `maia_stream_blocked_total` e o caso REPROVOU; restaurado, 9/9. Sem essa prova eu teria apenas relaxado um teste alheio para ficar verde |
+
+| C49-nota | **Complemento medido, não correção** — a C49 está certa como escrita. O fato novo: o CHECK `agent_turns_status_outcome_chk` (migrations 097:128-131 e 115) **já aceita** `ignored` + `operator_cancelled`, então o U-P04.5b **não precisa de migration** — só das duas arestas manuais que a C49 nomeia. Registrado como nota porque eu quase abri uma contradição nova acusando a C49 de algo que ela não diz | migrations 097/115; `contract.ts:122,125,170` | Nenhuma ação; evita que a próxima fatia procure migration que não existe |
+
+| C50-nota | **Resposta à pergunta que a C50 deixou aberta**, por medição: de 10.957 turnos, 124 têm stream e **ZERO** têm stream sem sequência — porque `createReceivedTurnTx` grava `stream_key` e `ingress_seq` juntos ou nenhum. Dentro de uma stream a ordem é TOTAL; os não-ordenáveis são exatamente os turnos sem `stream_key`, e como a seleção do backlog é POR STREAM eles ficam fora **por construção**, sem precisar de regra nova. Isso não reduz a C50 (turnos sem stream existem aos milhares: 10.833) — responde ao "precisam de outra regra, ou de exclusão explícita" | consulta direta ao banco local | A exclusão é estrutural; o U-P04.5b pode documentá-la em vez de inventar critério |
+
 ## 4. Ambiente e ferramentas (verificado em 2026-09-15)
 
 | Item | Estado |
@@ -416,6 +424,25 @@ sequência P00–P12 do capítulo 10 da spec.
   o escreve; sem ele o watermark cairia a 0 e `future_only` reabriria o backlog inteiro.
   O sobrevivente remanescente (fence de modo no `UPDATE`) está atribuído por mutação combinada à
   redundância com o lock. Regressão fechando exata (+14, falhas e passados inalterados). Ver V-040.
+- `U-P04.6` — **concluída e verificada**: o HOLD DE ADMISSÃO/CLAIM sob controle humano (§8.2.4,
+  §8.2.5 primeiro bullet). **Não estava no meu plano** — eu ia fazer o U-P04.5b e, ao inspecionar o
+  código, descobri que **nada retinha o backlog**: nem o `WHERE` do claim nem o filtro do recovery
+  consultavam `conversation_controls`, e a única barreira existente guarda o RUN DO MOTOR, não o turno.
+  Sob controle humano, o caminho baseline continuava podendo reivindicar e executar. Entregue:
+  `streamNotHumanControlled` + `humanControlProbe` no módulo puro; `conversation_human_control` nas três
+  listas de vocabulário; QUATRO consumidores (claim, recovery, dispatcher cross-tenant, promoção) e o
+  ramo de recusa fechada em `explainClaimRejection`; runbook §6.2 e §11.3. **16 casos** real-db e **12**
+  de contrato; vermelho forte — 8 recusas vermelhas contra 5 concessões verdes, com `promoted_at`
+  carimbado no sucessor de uma conversa em `human` antes de existir implementação.
+  **18 mutações, 15 mortas, 1 sobrevivente atribuído, ZERO puladas.** Um sobrevivente virou o caso 14:
+  eu ia chamá-lo de redundante e a sonda é alcançável com a conversa em `bot`, bastando o claim falhar
+  por fila — era lacuna de cobertura.
+  ⚠️ **Causei uma regressão e só a achei por medição pareada** (124 falhas contra 51): o módulo puro
+  avaliava `sql` no escopo de MÓDULO, e pô-lo no grafo de `turn-repos.ts` quebrou 8 specs com mock
+  parcial de `drizzle-orm` — 74 testes. Medi a baseline NO HEAD (`50 | 10268 | 1256`), a diferença
+  fechou em 74, corrigi na raiz e os 8 voltaram a 103/103. Ver C51.
+  Regressão final `51 | 10279 | 1272 (11602)`: total +28, pulados +16, e o resíduo de +1 falha
+  atribuído ao flake de `check-commit-trailers` por medição NOVA (isolado 13/13 duas vezes). Ver V-041.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
