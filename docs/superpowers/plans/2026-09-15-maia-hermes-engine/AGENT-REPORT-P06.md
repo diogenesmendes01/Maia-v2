@@ -89,7 +89,7 @@ Node `v22.23.2`.
 | Lint | `npx eslint` nos 5 arquivos desta fatia | **0** |
 | Unit | `npx vitest run tests/unit/hermes-inference-gateway-contract.spec.ts tests/unit/hermes-cost-accounting.spec.ts --no-coverage` | **0** |
 
-Resultado do runner, na íntegra: `executados=94 falharam=0 **pulados=0**` — 55
+Resultado do runner, na íntegra: `executados=100 falharam=0 **pulados=0**` — 61
 casos no spec do gateway e 39 no de custo. Nenhum `describe.skip`, nenhum teste
 pulado: pulado não é passou.
 
@@ -103,10 +103,24 @@ pulado: pulado não é passou.
 
 ## 4. Verificação por mutação
 
-**44 mutantes distintos, 44 mortos** (45 aplicações, contando um mutante de
-controle re-executado). Os três últimos (M42–M44) **não são meus**: vieram da
-revisão independente desta fatia — ver o achado 4, que é o mais importante da
-lista. Cada mutante quebra deliberadamente UM predicado que
+**44 mutantes distintos escolhidos À MÃO, 44 mortos** (45 aplicações, contando um
+mutante de controle re-executado). Os três últimos (M42–M44) **não são meus**:
+vieram da revisão independente desta fatia — ver o achado 4, que é o mais
+importante da lista.
+
+**Mais 35 mutantes GERADOS POR OPERADOR**, depois que o achado 4 provou que
+mutante escolhido à mão cobre só o que o autor já suspeita. O gerador aplica, uma
+ocorrência por vez a partir do fonte original, ` && `↔` || `, `>=`→`>`, `<=`→`<` e
+`===`↔`!==`: 22 em `inference-gateway.ts` (19 mortos), 7 em `cost-accounting.ts`
+(7 mortos) e 6 em `cost-reservation.ts` (6 mortos) — os dois módulos de custo até
+então só tinham mutantes escolhidos à mão.
+
+**Os 3 sobreviventes foram classificados um a um, e nenhum é garantia:** dois são
+`issue?.path.join('.') || 'body'`, rótulo do campo de erro (a revisão provou por
+mutação COMBINADA que trocar os dois juntos não quebra a suíte, como deve), e o
+terceiro é a guarda de tipo do corpo na L303, redundante com a validação do Zod
+logo abaixo. Mutar rótulo não prova nada — por isso são absolvidos explicitamente
+em vez de contados como cobertura. Cada mutante quebra deliberadamente UM predicado que
 sustenta uma garantia; "morto" = algum caso falhou.
 
 | Alvo | Mutantes | Resultado |
@@ -117,6 +131,8 @@ sustenta uma garantia; "morto" = algum caso falhou.
 | `cost-reservation` / T58 | M27–M36 | 10 mortos |
 | Schema da resposta | M37–M41 | 5 mortos |
 | Guarda de instante ilegível (`expirou`) | M42–M44 | 3 mortos — **achados pela revisão**, não por mim |
+| Pares tool_call/tool_result (§9.1 val. 3) | 4 sítios novos | 4 mortos, dentro do sweep por operador |
+| Sweep por OPERADOR, arquivo inteiro (3 arquivos) | 35 gerados | 32 mortos + 3 sobreviventes classificados e absolvidos |
 
 **Os três achados honestos desta varredura** — o valor dela está aqui, não no
 placar:
@@ -215,12 +231,28 @@ request" — **não foi feita e não podia ser**: `cost-ledger.ts` está na minh
 de arquivos proibidos. K-18 continua bloqueado, agora com a incompatibilidade de
 unidade nomeada além do `ON CONFLICT`.
 
-**C26 — pares tool_call/tool_result NÃO são validados.** O §9.1 validação 3 manda
-"validar … **pares de tool call/result**". Isso é invariante CRUZADA entre
-mensagens (todo `tool.tool_call_id` tem de corresponder a um `tool_calls[].id` de
-um `assistant` anterior), e o schema por mensagem não alcança. Validei a FORMA de
-cada mensagem e **não** a correspondência dos pares. É puro, cabe numa unidade
-própria, e deixo NOMEADO em vez de meio-feito.
+**C26 — pares tool_call/tool_result: metade implementada, metade DEFERIDA.** O
+§9.1 validação 3 manda "validar … **pares de tool call/result**". Isso é
+invariante CRUZADA entre mensagens, que o schema por mensagem não alcança.
+
+> **STATUS (atualizado após a revisão).** A metade "para frente" — todo
+> `tool_call_id` de uma mensagem `role:'tool'` corresponde a um `tool_calls[].id`
+> de um `assistant` **anterior** — foi autorizada na revisão e está implementada
+> em `99845c94`, com 6 casos novos e cobertura confirmada por sweep de operador.
+>
+> A metade "para trás" — `tool_calls[].id` do assistant que fica sem resposta —
+> **continua deferida**, e a omissão é a decisão. Responder a ela exigiria saber
+> se um pedido pode legitimamente carregar uma call ainda pendente, e isso é
+> semântica de sequenciamento do §5.7.4 itens 4-5 (piloto sequencial, uma call
+> pendente por run, callback adiantado devolvendo `in_progress`). A leitura
+> plausível — "o cliente não emitiria nova inferência com uma call em aberto" —
+> viraria decisão sem procedência, que é o erro que o C18 obrigou a corrigir no
+> P03. Fica para o P07, quando o sequenciamento for fixado. Pela mesma régua, id
+> anunciado duas vezes ou respondido duas vezes toca a redelivery do §5.7.4 item
+> 3 e também não é julgado.
+>
+> Numeração **deliberadamente inalterada**: o remapeamento C23–C27 → C28–C32 é da
+> integração, não meu.
 
 **C27 — o §9.1 não dá código de erro para resposta do PROVIDER malformada.** A
 lista de erros do §9.1 é toda sobre o pedido do cliente. Escolhi
