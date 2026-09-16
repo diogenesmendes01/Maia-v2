@@ -55,6 +55,8 @@ sequência P00–P12 do capítulo 10 da spec.
 
 | C19 | O §5.6.3 exige que `enumerateDueScopes` devolva "pares escopados **e cursor**" e o §5.8.4 item 2 manda atribuir "próxima **janela finita** de observação" — mas a spec não define NEM a forma do cursor NEM o tamanho da janela, e a casa não tem precedente: `pessoasRepo.listTenantAgentPairsWithActiveOwner`, o único enumerador cross-tenant de pares, não tem limite nem cursor | spec §5.6.3 linha 1137, §5.8.4 item 2; `src/db/repositories/pessoa-repos.ts:169`; índices REAIS conferidos no banco: `engine_runs_due_dispatch_idx (next_poll_at, tenant_id, agent_id)` e `engine_runs_due_idx (tenant_id, agent_id, next_poll_at, id)` | **Cursor = keyset na ORDEM DO ÍNDICE**, nunca offset: `(next_poll_at, tenant_id, agent_id)` na varredura cross-tenant e `(next_poll_at, id)` sob ALS. Offset num varredor concorrente PULA linhas quando o conjunto muda entre páginas — o defeito clássico, e aqui o conjunto muda por construção, já que a própria manutenção reescreve `next_poll_at`. **A janela entra como PARÂMETRO da chamada**, não como constante deste módulo: a spec não dá o número, e escolhê-lo aqui seria política minha disfarçada de leitura — o mesmo erro que o C18 teve de corrigir. **Consequência para os testes:** o mundo é POLUÍDO (4 escopos e 6447 runs vencidos já no banco local, e `tests/setup.ts` não trunca), então as asserções da varredura cross-tenant são de INCLUSÃO e de invariante de paginação (sem lacuna, sem duplicata), nunca de igualdade de conjunto; `listDueRuns` usa tenant dedicado por caso para ter visão limpa sob ALS |
 
+| C20 | O §5.8.4 exige uma operação de **manutenção de metadata** que grave "somente reconciliação de metadata/prova do run", mas o vocabulário FECHADO de `engine_run_events.event_type` não tem termo para ela: os dez valores (`prepared`, `submit_started`, `submit_observed`, `tool_state`, `terminal_observed`, `capabilities_revoked`, `reconcile_decision`, `output_handoff`, `closed`, `projection`) param aí, e nenhuma migration posterior à 140 os estende — conferido no banco, não só no arquivo | spec §5.8.4 itens 2 e 4, §5.6.3 linha 1138; `migrations/140:414-416`; CHECK vigente lido de `pg_constraint` | **Reusar `reconcile_decision`**, que é o termo mais próximo ("o que fazer com uma linha incerta") e já é usado por `markRunBlocked` com `dedupe_key = reconcile_decision:blocked:<row_version>`; a manutenção usa `reconcile_decision:maintenance:<row_version>`, sem colisão porque o dedupe é único por `(run, chave)`. **Isto é decisão minha, não leitura da spec** — a alternativa seria uma migration para acrescentar `maintenance_observed` ao CHECK, o que é mudança de schema e não cabe numa unidade de repositório. Registrado para que P08/P09, que também vão querer emitir eventos novos, decidam de uma vez se o vocabulário cresce |
+
 ## 4. Ambiente e ferramentas (verificado em 2026-09-15)
 
 | Item | Estado |
@@ -194,7 +196,7 @@ sequência P00–P12 do capítulo 10 da spec.
   cinco morrem em `loadConfig` por o config local pular o `globalSetup` (controle sob o config do
   projeto: 51/51 verdes) e uma (`turn-context-batch-repos`) fica como **item aberto sem controle em
   HEAD**, não atribuível a esta branch por construção. Ver V-027.
-- `U-P03.7a` — **concluída e verificada**: `enumerateDueScopes` + `listDueRuns`, as duas metades
+- `U-P03.7a` (commit `4b9daed3`) — **concluída e verificada**: `enumerateDueScopes` + `listDueRuns`, as duas metades
   OPOSTAS da varredura, e a oposição é o que as torna corretas juntas. A primeira é a ÚNICA operação
   do módulo que roda CROSS-TENANT e **sem ALS** — não pode chamar `scope()`, porque
   `getCurrentTenant()` LANÇA fora de contexto e a pergunta "quem tem trabalho vencido?" não tem tenant
@@ -210,6 +212,22 @@ sequência P00–P12 do capítulo 10 da spec.
   Corrigido de quebra um defeito meu do P03.6b: eu havia duplicado à mão o helper `statusList` da casa
   (`turn-fence-sql.ts:61`); substituído, com P03.6b revalidado em 74/74. `test:leak` reexecutado com
   perfil IDÊNTICO (mesmos 6 arquivos, `outbound-leak` verde). Ver V-028 e C19.
+- `U-P03.7b` — **concluída e verificada**: `reserveMaintenanceObservation` + `recordMaintenanceObservation`.
+  Nenhuma das duas passa por `lockTurnAndCheckFence`, e não podem: o §5.8.4 existe para quando o turno
+  já NÃO é reivindicável. O fence é a `row_version` devolvida ("não é claim token de turno"), e a
+  reserva dispensa coluna nova porque empurrar `next_poll_at` É a exclusão. `owner_alive` tem duas
+  condições separadas em casos próprios (20/21/22), de modo que `outbound_pending` com lease viva
+  segue manutenível — ali manda o delivery, não o reasoner. Evento como `reconcile_decision` por
+  ausência de termo no vocabulário fechado (C20).
+  30 casos; 13 mutantes, **9 mortos e 4 sobreviventes DOCUMENTADOS**, não varridos para baixo do
+  tapete: mutação COMBINADA provou que são pares carregados (CB1/CB3/CB4 morrem). E CB2 **refutou uma
+  hipótese minha enunciada antes de medir** — `lockControl` NÃO é o enforcer do isolamento; há dois
+  enforcers independentes e cada um basta sozinho, então não existe buraco.
+  **Defeito meu que o guard de baseline pegou:** o spec vazava ~20 escopos vencidos por rodada e
+  quebrou a si mesmo ao passar de 254. A primeira correção (apagar) foi recusada pelo trigger
+  append-only de `engine_run_events`; a certa distingue journal (imutável) de agendamento (não), e o
+  `afterAll` passou a APOSENTAR o que cria. Provado com duas rodadas consecutivas e contagem estável.
+  Ver V-029.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
@@ -226,7 +244,16 @@ sequência P00–P12 do capítulo 10 da spec.
 > retomada da seção 9 apontavam para binário, data dir e nome de banco errados e consumiram um desvio
 > inteiro de diagnóstico nesta sessão. Manter esta lista viva é parte do trabalho, não enfeite.
 
-1. `U-P03.7b` — **manutenção** (§5.8.4 itens 2 e 4), agora que a enumeração (7a) está concluída:
+1. `U-P03.8` — **recovery do journal**, a última unidade do P03. Compõe o que já existe em vez de
+   reimplementar: a varredura (7a) descobre o trabalho, a manutenção (7b) reserva a janela,
+   `revokeRunCapabilities` (P03.4) revoga de forma monotônica e `closeRunAfterHandoff` (P03.6b) fecha
+   com prova. O que falta é a POLÍTICA que encadeia os quatro — §5.8.4 item 5 ("com prova de outbound,
+   terminal íntegro e calls conciliadas, fechar `handed_to_outbox` por CAS e evento
+   `actor_kind=recovery`; se só existe turno terminal sem prova suficiente, manter blocked/triagem,
+   não inventar entrega nem `safe_to_retry`") e item 6 (`dead_letter` com efeito desconhecido continua
+   bloqueado). Atenção ao que NÃO é escopo: reexecução de graph iniciado segue proibida sem
+   idempotência própria.
+   Descrição da etapa 7b, mantida como contexto histórico: **manutenção** (§5.8.4 itens 2 e 4):
    `reserveMaintenanceObservation`/`recordMaintenanceObservation`. Reserva curta por CAS de
    `row_version` com `next_poll_at <= clock_timestamp()`, onde **a versão devolvida É o fence e NÃO é
    claim token de turno**; a gravação só vale com a reserva ainda vigente, uma manutenção atrasada não

@@ -46,6 +46,15 @@ const sob = <T>(
   fn: () => Promise<T>,
 ): Promise<T> => runWithTenantContext(e, fn);
 
+/**
+ * Tudo que este spec semeou, para o `afterAll` aposentar depois.
+ *
+ * Registrar na criação (e não varrer por prefixo no fim) mantém a limpeza
+ * restrita ao que ESTA execução fez: um prefixo alcançaria fixtures de uma
+ * rodada concorrente e apagaria trabalho alheio.
+ */
+const escoposCriados: Array<{ tenant_id: string; agent_id: string }> = [];
+
 async function seedEscopo(e: {
   tenant_id: string;
   agent_id: string;
@@ -58,6 +67,7 @@ async function seedEscopo(e: {
     "INSERT INTO agents(id, tenant_id, nome) VALUES ($1,$2,$1) ON CONFLICT (id) DO NOTHING",
     [e.agent_id, e.tenant_id],
   );
+  escoposCriados.push({ tenant_id: e.tenant_id, agent_id: e.agent_id });
 }
 
 async function mkControle(e: {
@@ -157,7 +167,46 @@ d("engine-repos — varredura do journal contra Postgres real", () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 4 });
   });
+  /**
+   * REMOVE o que este spec criou.
+   *
+   * Não é higiene opcional: sem isto o spec VAZA ~20 escopos por rodada, e como
+   * `enumerateDueScopes` é cross-tenant, o conjunto que o caso 5 pagina cresce
+   * monotonicamente. Descobri isso da pior maneira — o baseline da varredura de
+   * mutação ficou vermelho quando os escopos vencidos passaram de 254, e o caso
+   * 5 estourou o teto de páginas. Um teste que envenena o próprio ambiente a
+   * cada execução é um teste que um dia falha por motivo nenhum.
+   *
+   * A ordem segue as FKs (`ON DELETE RESTRICT` em toda a cadeia do journal) e o
+   * alvo é SÓ o que `seedEscopo` registrou — tenants de outras specs não são
+   * tocados, e a poluição ALHEIA continua existindo, que é justamente o que os
+   * casos cross-tenant precisam enfrentar.
+   */
   afterAll(async () => {
+    // APOSENTA o que este spec criou, em vez de APAGAR.
+    //
+    // Apagar é impossível por projeto, e a primeira versão desta limpeza morreu
+    // provando isso: `engine_run_events` tem trigger append-only ("spec 5.6.2")
+    // que recusa DELETE, e a FK RESTRICT dos eventos prende `engine_runs`
+    // junto. O journal é imutável de propósito — desativar o gatilho para
+    // limpar seria contornar exatamente a invariante que o P03.1 verificou.
+    //
+    // O AGENDAMENTO, porém, não é imutável: empurrar `next_poll_at` tira a
+    // linha do conjunto "vencido", que é o que poluía `enumerateDueScopes`. O
+    // journal fica inteiro e auditável; só deixa de pedir trabalho.
+    //
+    // Sem isto o spec vazava ~20 escopos VENCIDOS por rodada, e o caso 5 —
+    // cross-tenant, paginando o mundo — começou a estourar o teto de páginas
+    // depois de 254 escopos acumulados. Um teste que envenena o próprio
+    // ambiente a cada execução falha um dia por motivo nenhum.
+    for (const e of escoposCriados) {
+      await pool.query(
+        `UPDATE engine_runs
+            SET next_poll_at = clock_timestamp() + interval '100 years'
+          WHERE tenant_id = $1 AND agent_id = $2`,
+        [e.tenant_id, e.agent_id],
+      );
+    }
     await pool.end();
   });
 
@@ -173,7 +222,14 @@ d("engine-repos — varredura do journal contra Postgres real", () => {
     let cursor = null as Awaited<
       ReturnType<typeof engineRunsRepo.enumerateDueScopes>
     >["next_cursor"];
-    for (let i = 0; i < 200; i++) {
+    // O teto é ANTI-LOOP-INFINITO, não um limite de tamanho do mundo: com
+    // `limite = 1` o número de páginas é o número de escopos vencidos do banco
+    // INTEIRO, que não está sob controle deste spec. Um teto apertado
+    // transforma "o vizinho tem muitos escopos" em falha deste teste — foi
+    // exatamente o que aconteceu com 200. A mensagem diz o que foi visto, para
+    // que a próxima falha seja diagnóstico e não adivinhação.
+    const TETO_DE_PAGINAS = 5000;
+    for (let i = 0; i < TETO_DE_PAGINAS; i++) {
       const pagina = await engineRunsRepo.enumerateDueScopes({
         limit: limite,
         cursor,
@@ -182,7 +238,9 @@ d("engine-repos — varredura do journal contra Postgres real", () => {
       if (!pagina.next_cursor) return tudo;
       cursor = pagina.next_cursor;
     }
-    throw new Error("paginação não terminou em 200 páginas");
+    throw new Error(
+      `paginação não terminou em ${TETO_DE_PAGINAS} páginas (limite=${limite}, vistos=${tudo.length})`,
+    );
   }
 
   it("1. enumera o par com trabalho vencido (inclusão, mundo poluído)", async () => {
@@ -385,5 +443,452 @@ d("engine-repos — varredura do journal contra Postgres real", () => {
     expect(vistos).toEqual(
       expect.arrayContaining([a.run_id, b.run_id, c.run_id]),
     );
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 16-28: MANUTENÇÃO (P03.7b) — §5.8.4 itens 2 e 4.
+  //
+  // A assimetria que define esta metade: `recordStartObservation` carimba
+  // observação SEMPRE no caminho do DONO, com fence de turno. A manutenção é o
+  // oposto — o §5.8.4 existe justamente para quando o turno JÁ NÃO É
+  // REIVINDICÁVEL, então exigir fence de turno tornaria a operação impossível
+  // no único cenário em que ela serve. O fence dela é a `row_version`
+  // RESERVADA, que "não é claim token de turno" (item 2, literal).
+  //
+  // E a reserva não precisa de coluna nova: empurrar `next_poll_at` para a
+  // frente É o mecanismo de exclusão — quem vier depois vê a linha fora da
+  // janela e não reserva. Os casos 17/18 prendem isso.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  const JANELA_MS = 30_000;
+
+  async function matarLease(turn_id: string): Promise<void> {
+    await pool.query(
+      "UPDATE agent_turns SET lease_expires_at = now() - interval '1 minute' WHERE id = $1",
+      [turn_id],
+    );
+  }
+
+  it("16. reserva devolve a versão, empurra a janela e conta o poll", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(turn_id);
+
+    const r = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{
+      row_version: string;
+      poll_count: number;
+      vencida: boolean;
+    }>(
+      `SELECT row_version, poll_count, (next_poll_at <= clock_timestamp()) AS vencida
+         FROM engine_runs WHERE id = $1`,
+      [run_id],
+    );
+    if (r.ok)
+      expect(Number(row.rows[0]?.row_version)).toBe(r.reserved_row_version);
+    expect(row.rows[0]?.poll_count).toBe(1);
+    // A janela empurrada é o que tira a linha do conjunto "vencido".
+    expect(row.rows[0]?.vencida).toBe(false);
+  });
+
+  it("17. a linha reservada SAI da varredura (a janela é a exclusão)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(turn_id);
+    await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+
+    const lista = await sob(e, () =>
+      engineRunsRepo.listDueRuns({ limit: 100 }),
+    );
+    expect(lista.runs.map((x) => x.run_id)).not.toContain(run_id);
+  });
+
+  it("18. segunda reserva dentro da janela é recusada", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(turn_id);
+    const ator = { kind: "recovery" as const, actor_ref: "scanner-1" };
+    await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: ator,
+      }),
+    );
+
+    const segunda = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-2" },
+      }),
+    );
+    expect(segunda.ok).toBe(false);
+    if (!segunda.ok) expect(segunda.reason).toBe("not_due");
+  });
+
+  it("19. run FECHADO não reserva", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e);
+    await matarLease(turn_id);
+    await pool.query(
+      `UPDATE engine_runs SET phase='closed', closed_at=now(), closed_reason='discarded',
+              capabilities_revoked_at=now() WHERE id=$1`,
+      [run_id],
+    );
+
+    const r = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "phase_conflict") {
+      expect(r.current_phase).toBe("closed");
+    } else if (!r.ok) {
+      throw new Error(`esperado phase_conflict, veio ${r.reason}`);
+    }
+  });
+
+  it("20. DONO VIVO: adia em vez de disputar (§5.8.4 item 2)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    // Turno `running` com lease VIVA — o dono está em operação.
+    const { run_id } = await criarRunDevido(e);
+
+    const r = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("owner_alive");
+  });
+
+  it("21. lease MORTA com turno recuperável: reserva (cirúrgico do 20)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e);
+    // Só a LEASE muda em relação ao caso 20. O status segue `running`.
+    await matarLease(turn_id);
+
+    const r = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it("22. lease VIVA mas turno `outbound_pending`: reserva (a outra metade)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    // Só o STATUS muda em relação ao caso 20; a lease continua VIVA. Quem manda
+    // num turno `outbound_pending` é o delivery worker, não o reasoner — então
+    // não há "dono em operação" disputando o JOURNAL. Este par com o 21 separa
+    // as duas metades do predicado; um cenário só provaria a garantia sem dizer
+    // qual delas a sustenta.
+    const { run_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+
+    const r = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+  });
+
+  it("23. grava a observação com a reserva vigente, e journala o evento", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(turn_id);
+    const reserva = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    if (!reserva.ok) throw new Error("setup: reserva falhou");
+
+    const r = await sob(e, () =>
+      engineRunsRepo.recordMaintenanceObservation({
+        run_id,
+        reserved_row_version: reserva.reserved_row_version,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        observation: { code: "outbox_confirmado", detail: { artefatos: 1 } },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const ev = await pool.query<{ n: number }>(
+      `SELECT count(*)::int AS n FROM engine_run_events
+        WHERE run_id = $1 AND event_type = 'reconcile_decision' AND actor_kind = 'recovery'`,
+      [run_id],
+    );
+    expect(ev.rows[0]?.n).toBe(1);
+  });
+
+  it("24. manutenção ATRASADA não sobrescreve outra (§5.8.4 item 4)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(turn_id);
+    const primeira = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    if (!primeira.ok) throw new Error("setup: reserva falhou");
+    // Alguém mexeu na linha entre a reserva e a gravação.
+    await pool.query(
+      "UPDATE engine_runs SET row_version = row_version + 1 WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await sob(e, () =>
+      engineRunsRepo.recordMaintenanceObservation({
+        run_id,
+        reserved_row_version: primeira.reserved_row_version,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        observation: { code: "tarde_demais", detail: {} },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "reservation_stale") {
+      expect(r.current_row_version).toBe(primeira.reserved_row_version + 1);
+    } else if (!r.ok) {
+      throw new Error(`esperado reservation_stale, veio ${r.reason}`);
+    }
+  });
+
+  it("25. gravar NÃO transiciona o turno (só metadata do journal)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(turn_id);
+    const antes = await pool.query<{ status: string; state_version: string }>(
+      "SELECT status, state_version FROM agent_turns WHERE id = $1",
+      [turn_id],
+    );
+    const reserva = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    if (!reserva.ok) throw new Error("setup: reserva falhou");
+    await sob(e, () =>
+      engineRunsRepo.recordMaintenanceObservation({
+        run_id,
+        reserved_row_version: reserva.reserved_row_version,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        observation: { code: "ok", detail: {} },
+      }),
+    );
+
+    const depois = await pool.query<{ status: string; state_version: string }>(
+      "SELECT status, state_version FROM agent_turns WHERE id = $1",
+      [turn_id],
+    );
+    // "qualquer transição de negócio de `agent_turns` permanece na porta atual
+    // autorizada" — a manutenção altera observação, nunca o turno.
+    expect(depois.rows[0]?.status).toBe(antes.rows[0]?.status);
+    expect(depois.rows[0]?.state_version).toBe(antes.rows[0]?.state_version);
+  });
+
+  it("26. reservar NÃO revoga capacidades (revogar é operação própria)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(turn_id);
+
+    await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+
+    const row = await pool.query<{ t: string | null }>(
+      "SELECT capabilities_revoked_at::text AS t FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    // O §5.8.4 item 3 manda revogar, mas como operação SEPARADA e monotônica
+    // (P03.4). Embutir aqui esconderia a revogação dentro de uma reserva.
+    expect(row.rows[0]?.t).toBeNull();
+  });
+
+  it("27. run inexistente: `not_found` tipado nas duas operações", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const fantasma = randomUUID();
+
+    const a = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id: fantasma,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    expect(a.ok).toBe(false);
+    if (!a.ok) expect(a.reason).toBe("not_found");
+
+    const b = await sob(e, () =>
+      engineRunsRepo.recordMaintenanceObservation({
+        run_id: fantasma,
+        reserved_row_version: 1,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        observation: { code: "x", detail: {} },
+      }),
+    );
+    expect(b.ok).toBe(false);
+    if (!b.ok) expect(b.reason).toBe("not_found");
+  });
+
+  it("28. reserva de OUTRO escopo é invisível (isolamento sob ALS)", async () => {
+    const meu = novoEscopo();
+    const outro = novoEscopo();
+    await seedEscopo(meu);
+    await seedEscopo(outro);
+    const alheio = await criarRunDevido(outro, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(alheio.turn_id);
+
+    // Tentar reservar o run do vizinho ESTANDO no meu escopo tem de ser
+    // `not_found`, não sucesso: o id existe, mas não para mim.
+    const r = await sob(meu, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id: alheio.run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("not_found");
+  });
+
+  it("29. gravar CARIMBA `last_observed_at` (era nulo antes)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(turn_id);
+
+    // `criarRunDevido` para no prepare, e só `recordStartObservation` carimbaria
+    // — então aqui a coluna nasce NULA e a transição NULL → carimbo é atribuível
+    // a esta operação e a mais nenhuma.
+    const antes = await pool.query<{ t: string | null }>(
+      "SELECT last_observed_at::text AS t FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(antes.rows[0]?.t).toBeNull();
+
+    const reserva = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    if (!reserva.ok) throw new Error("setup: reserva falhou");
+    await sob(e, () =>
+      engineRunsRepo.recordMaintenanceObservation({
+        run_id,
+        reserved_row_version: reserva.reserved_row_version,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+        observation: { code: "ok", detail: {} },
+      }),
+    );
+
+    const depois = await pool.query<{ t: string | null }>(
+      "SELECT last_observed_at::text AS t FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(depois.rows[0]?.t).not.toBeNull();
+  });
+
+  it("30. GRAVAR em outro escopo é invisível (o par do caso 28)", async () => {
+    const meu = novoEscopo();
+    const outro = novoEscopo();
+    await seedEscopo(meu);
+    await seedEscopo(outro);
+    const alheio = await criarRunDevido(outro, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await matarLease(alheio.turn_id);
+    // Reserva LEGÍTIMA, no escopo dono — para que a versão exista de verdade e
+    // o caso meça isolamento, não uma versão inventada.
+    const reserva = await sob(outro, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id: alheio.run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    if (!reserva.ok) throw new Error("setup: reserva falhou");
+
+    // O caso 28 cobre a metade que LÊ; esta é a metade que ESCREVE. Duas
+    // consultas distintas, dois predicados de escopo distintos — um só caso
+    // deixaria o segundo sem prova.
+    const r = await sob(meu, () =>
+      engineRunsRepo.recordMaintenanceObservation({
+        run_id: alheio.run_id,
+        reserved_row_version: reserva.reserved_row_version,
+        actor: { kind: "recovery", actor_ref: "intruso" },
+        observation: { code: "x", detail: {} },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("not_found");
   });
 });

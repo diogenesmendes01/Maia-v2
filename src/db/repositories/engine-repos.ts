@@ -896,6 +896,36 @@ export type EnumerateDueScopesResult = {
   next_cursor: DueScopeCursor | null;
 };
 
+/**
+ * Quem faz MANUTENÇÃO. Não há `turn_owner` aqui, e a ausência é o contrato: o
+ * §5.8.4 existe para quando o turno já não é reivindicável, então o dono é
+ * precisamente quem NÃO executa esta operação. Um `turn_owner` nesta união
+ * convidaria o caminho do dono a fechar journal por fora da porta dele.
+ */
+export type MaintenanceActor = {
+  kind: "recovery" | "operator";
+  actor_ref: string;
+};
+
+/** Cópia em `Set` para o predicado de "dono ainda em operação". */
+const TURNOS_RECUPERAVEIS = new Set<string>(RECOVERABLE_TURN_STATUSES);
+
+export type ReserveMaintenanceResult =
+  /** `reserved_row_version` É o fence — e NÃO é claim token de turno (§5.8.4). */
+  | { ok: true; reserved_row_version: number; next_poll_at: string }
+  | NotFound
+  | { ok: false; reason: "phase_conflict"; current_phase: EngineRunPhaseV1 }
+  /** Fora da janela: outra manutenção reservou e ainda não devolveu. */
+  | { ok: false; reason: "not_due"; next_poll_at: string }
+  /** "Se há dono vivo ainda em operação, maintenance pode ADIAR." */
+  | { ok: false; reason: "owner_alive"; turn_status: string };
+
+export type RecordMaintenanceResult =
+  | { ok: true; row_version: number }
+  | NotFound
+  /** A reserva expirou ou alguém moveu a linha: reler, nunca payload cego. */
+  | { ok: false; reason: "reservation_stale"; current_row_version: number };
+
 export type DueRunCursor = { next_poll_at: string; run_id: string };
 
 export type DueRun = {
@@ -3420,6 +3450,218 @@ export const engineRunsRepo = {
 
     conta("list_due", "ok");
     return { runs, next_cursor };
+  },
+
+  /**
+   * Reserva uma janela curta de manutenção (§5.8.4 item 2).
+   *
+   * **A assimetria que define esta metade do módulo:** todas as operações do
+   * caminho do dono passam por `lockTurnAndCheckFence`. Esta NÃO passa, e não
+   * pode: o §5.8.4 existe exatamente para quando o turno já não é
+   * reivindicável, então exigir fence de turno tornaria a operação impossível
+   * no único cenário em que ela serve. O fence dela é a `row_version`
+   * devolvida — que a spec qualifica em letras: "não é claim token de turno".
+   *
+   * **A reserva não precisa de coluna nova, e é isso que a torna barata:**
+   * empurrar `next_poll_at` para a frente É o mecanismo de exclusão. Quem vier
+   * depois encontra a linha fora da janela e recebe `not_due`. Uma coluna de
+   * "dono da reserva" seria um segundo lease para manter vivo, com o mesmo
+   * problema de expiração que o primeiro já tem.
+   *
+   * `owner_alive` tem DUAS condições e elas não são a mesma pergunta: lease
+   * viva responde "o processo ainda está lá?", e `RECOVERABLE_TURN_STATUSES`
+   * responde "o turno ainda é dele?". Um turno `outbound_pending` com lease
+   * viva pertence ao delivery worker, não ao reasoner — e o journal dele pode
+   * ser mantido sem disputar nada.
+   *
+   * O lock é `FOR UPDATE OF r`: trava o run, NUNCA o turno. Travar `agent_turns`
+   * aqui poria a manutenção na frente do caminho de negócio, que é o oposto de
+   * "adiar em vez de disputar".
+   */
+  async reserveMaintenanceObservation(input: {
+    run_id: string;
+    window_ms: number;
+    actor: MaintenanceActor;
+  }): Promise<ReserveMaintenanceResult> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<ReserveMaintenanceResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("reserve_maintenance", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      const rows = linhas<{
+        phase: string;
+        next_poll_at: string;
+        vencido: boolean;
+        turn_status: string;
+        lease_viva: boolean;
+      }>(
+        await tx.execute(sql`
+          SELECT r.phase, r.next_poll_at::text AS next_poll_at,
+                 (r.next_poll_at <= clock_timestamp()) AS vencido,
+                 t.status AS turn_status,
+                 (t.lease_expires_at IS NOT NULL
+                    AND t.lease_expires_at > clock_timestamp()) AS lease_viva
+            FROM ${engine_runs} r
+            JOIN ${agent_turns} t
+              ON t.tenant_id = r.tenant_id AND t.agent_id = r.agent_id AND t.id = r.turn_id
+           WHERE r.tenant_id = ${tenant_id} AND r.agent_id = ${agent_id}
+             AND r.id = ${input.run_id}
+           FOR UPDATE OF r`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("reserve_maintenance", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      if (run.phase === "closed") {
+        conta("reserve_maintenance", "phase_conflict");
+        return {
+          ok: false,
+          reason: "phase_conflict",
+          current_phase: run.phase as EngineRunPhaseV1,
+        };
+      }
+
+      if (run.lease_viva && TURNOS_RECUPERAVEIS.has(run.turn_status)) {
+        conta("reserve_maintenance", "owner_alive");
+        return {
+          ok: false,
+          reason: "owner_alive",
+          turn_status: run.turn_status,
+        };
+      }
+
+      if (!run.vencido) {
+        conta("reserve_maintenance", "not_due");
+        return { ok: false, reason: "not_due", next_poll_at: run.next_poll_at };
+      }
+
+      const reservado = linhas<{
+        row_version: string | number;
+        next_poll_at: string;
+      }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET next_poll_at = clock_timestamp()
+                   + make_interval(secs => ${input.window_ms} / 1000.0),
+                 poll_count = poll_count + 1,
+                 row_version = row_version + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND id = ${input.run_id}
+             AND phase <> 'closed'
+             AND next_poll_at <= clock_timestamp()
+           RETURNING row_version, next_poll_at::text AS next_poll_at`),
+      );
+      const linha = reservado[0];
+      if (!linha) {
+        conta("reserve_maintenance", "not_due");
+        return { ok: false, reason: "not_due", next_poll_at: run.next_poll_at };
+      }
+
+      // `capabilities_revoked_at` NÃO é tocado aqui de propósito: o §5.8.4 item
+      // 3 manda revogar, mas como operação SEPARADA e monotônica (P03.4).
+      // Embutir a revogação numa reserva a esconderia dentro de um passo que o
+      // operador leria como "só agendei uma observação".
+      conta("reserve_maintenance", "ok");
+      return {
+        ok: true,
+        reserved_row_version: Number(linha.row_version),
+        next_poll_at: linha.next_poll_at,
+      };
+    });
+  },
+
+  /**
+   * Grava a observação de manutenção (§5.8.4 item 4).
+   *
+   * "Gravar observação somente com row_version reservada ainda vigente. Uma
+   * manutenção atrasada não sobrescreve outra; falha de CAS exige nova leitura,
+   * não payload cego." O CAS por `row_version` É essa frase em SQL.
+   *
+   * Grava METADATA e nada mais: `last_observed_at` e o evento. Não transiciona
+   * `agent_turns` — "qualquer transição de negócio de `agent_turns` permanece
+   * na porta atual autorizada" —, não muda `phase` e não fecha nada. Fechar tem
+   * porta própria com prova própria (`closeRunAfterHandoff`).
+   *
+   * O evento sai como `reconcile_decision`, e isso é DECISÃO registrada em C20,
+   * não leitura: o vocabulário fechado de `engine_run_events.event_type` não tem
+   * termo para manutenção, e acrescentar um exigiria migration — mudança de
+   * schema que não cabe numa unidade de repositório. `markRunBlocked` já usa o
+   * mesmo tipo com outra `dedupe_key`, então não há colisão.
+   */
+  async recordMaintenanceObservation(input: {
+    run_id: string;
+    reserved_row_version: number;
+    actor: MaintenanceActor;
+    observation: { code: string; detail: Record<string, Json> };
+  }): Promise<RecordMaintenanceResult> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<RecordMaintenanceResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("record_maintenance", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      const gravado = linhas<{
+        row_version: string | number;
+        last_event_sequence: string | number;
+      }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET last_observed_at = clock_timestamp(),
+                 row_version = row_version + 1,
+                 last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND id = ${input.run_id}
+             AND row_version = ${input.reserved_row_version}
+           RETURNING row_version, last_event_sequence`),
+      );
+      const linha = gravado[0];
+      if (!linha) {
+        const atual = linhas<{ row_version: string | number }>(
+          await tx.execute(sql`
+            SELECT row_version FROM ${engine_runs}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+               AND id = ${input.run_id}`),
+        );
+        const row = atual[0];
+        if (!row) {
+          conta("record_maintenance", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        conta("record_maintenance", "reservation_stale");
+        return {
+          ok: false,
+          reason: "reservation_stale",
+          current_row_version: Number(row.row_version),
+        };
+      }
+
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(linha.last_event_sequence),
+        dedupe_key: `reconcile_decision:maintenance:${Number(linha.row_version)}`,
+        event_type: "reconcile_decision",
+        actor_kind: input.actor.kind,
+        actor_turn_attempt: null,
+        metadata: {
+          decision: "maintenance",
+          code: input.observation.code,
+          actor_ref: input.actor.actor_ref,
+          detail: input.observation.detail,
+        },
+      });
+
+      conta("record_maintenance", "ok");
+      return { ok: true, row_version: Number(linha.row_version) };
+    });
   },
 };
 

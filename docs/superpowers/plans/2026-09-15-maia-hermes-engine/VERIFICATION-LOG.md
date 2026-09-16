@@ -1002,15 +1002,82 @@ arquivos, e `outbound-leak` passando com 10 casos. Acrescentar uma varredura sem
 na suíte de vazamento. As seis falhas continuam classificadas como em V-027, incluindo
 `turn-context-batch-repos` como item aberto sem controle em HEAD.
 
+### V-029 · P03.7b — manutenção, e quatro sobreviventes que precisaram de prova
+
+`reserveMaintenanceObservation` e `recordMaintenanceObservation` são o OPOSTO do caminho do dono.
+Nenhuma das duas chama `lockTurnAndCheckFence`, e não podem chamar: o §5.8.4 existe exatamente para
+quando o turno já não é reivindicável, então exigir fence de turno tornaria a operação impossível no
+único cenário em que ela serve. O fence é a `row_version` devolvida — que a spec qualifica em letras:
+"não é claim token de turno".
+
+**A reserva não precisou de coluna nova**, e isso é desenho, não economia: empurrar `next_poll_at` para
+a frente É o mecanismo de exclusão, e quem chegar dentro da janela recebe `not_due` (caso 18). Uma
+coluna de "dono da reserva" seria um segundo lease para manter vivo, com o mesmo problema de expiração
+do primeiro. `owner_alive` tem DUAS condições que não são a mesma pergunta — lease viva ("o processo
+ainda está lá?") e `RECOVERABLE_TURN_STATUSES` ("o turno ainda é dele?") — e os casos 20/21/22 as
+separam: um turno `outbound_pending` com lease VIVA continua manutenível, porque ali quem manda é o
+delivery worker, não o reasoner.
+
+**C20 registrado antes de implementar:** o vocabulário FECHADO de `engine_run_events.event_type` não
+tem termo para manutenção, e nenhuma migration posterior à 140 o estende (conferido em
+`pg_constraint`, não no arquivo). O evento sai como `reconcile_decision`, com `dedupe_key` própria.
+Isso é decisão minha; a alternativa seria migration, que é mudança de schema e não cabe numa unidade
+de repositório.
+
+**Varredura: 13 mutantes, 9 mortos e 4 SOBREVIVENTES.** Não reporto "13/13". Os quatro são
+`!run.vencido` e a guarda de janela do UPDATE, mais os dois predicados de escopo de tenant. Em vez de
+declará-los redundantes por dedução, medi com mutação COMBINADA:
+
+* **CB1 (ambas as guardas de janela) MORREU.** O par é carga real; cada membro sobrevive sozinho só
+  porque o outro recusa. Sob `FOR UPDATE` os dois veem o mesmo estado, então nenhum teste
+  single-threaded consegue atribuir a garantia a um deles — é a mesma situação dos dois mutantes
+  documentados de P03.4, agora comprovada em vez de suposta.
+* **CB2 (escopo do `lockControl` sozinho) SOBREVIVEU — e isso REFUTOU minha hipótese**, que eu havia
+  enunciado ANTES de medir: eu disse que `lockControl` era o verdadeiro enforcer do isolamento e que
+  os `WHERE` internos eram decorativos. Está errado. Tirar o escopo do `lockControl` deixa os 30
+  casos verdes.
+* **CB3 e CB4 (`lockControl` + o `WHERE` interno de cada operação) MORRERAM.** Conclusão correta: o
+  isolamento de tenant tem **dois enforcers independentes, cada um suficiente sozinho**. Não há
+  buraco — há defesa em profundidade que o teste prova como conjunto e não sabe atribuir. Registrar
+  isso importa mais que o placar: um leitor que visse "sobreviveu" numa mutação de isolamento sem a
+  evidência combinada concluiria, com razão, que havia vazamento.
+
+**Um defeito MEU de teste, encontrado pelo guard de baseline do harness.** A primeira tentativa de
+varredura abortou com `1 failed | 29 passed`, na mesma suíte que passara 30/30 minutos antes. Causa:
+o spec VAZAVA ~20 escopos vencidos por rodada, e como `enumerateDueScopes` é cross-tenant, o conjunto
+que o caso 5 pagina crescia monotonicamente; ao passar de 254 escopos o teto de páginas estourou.
+Sem o guard, 13 vereditos teriam saído contaminados.
+
+A primeira correção que escrevi estava ERRADA e o banco a recusou: `DELETE` em `engine_run_events`
+esbarra no trigger append-only ("spec 5.6.2", `BEFORE DELETE OR UPDATE`), e a FK RESTRICT dos eventos
+prende `engine_runs` junto — a transação inteira reverteu, sem apagar nada. Desativar o gatilho para
+limpar seria contornar a invariante que o próprio P03.1 verificou. A correção certa distingue o que é
+imutável do que não é: **o journal é imutável, o AGENDAMENTO não**. O `afterAll` passou a APOSENTAR o
+que cria (empurra `next_poll_at`), deixando o journal inteiro e auditável. Provado por duas execuções
+consecutivas verdes com a contagem de escopos vencidos ESTÁVEL em 4 nas três medições — não por
+afirmação. O passivo de 366 runs acumulados foi estancado do mesmo modo, sem remover linha alguma.
+
+**Estado final:** 30 casos no spec de varredura/manutenção, verdes, e estáveis em execução repetida.
+`typecheck`, `lint` (481 warnings, idêntico à baseline), `check:node`, `docs:ai:check`,
+`config:check:drift` e `audit:exceptions:check` todos em **exit 0**.
+
+**Regressão:** `50 failed | 10233 passed | 1187 skipped (11470)` contra `50 | 10233 | 1172 (11455)` do
+V-028. Passados e falhos INALTERADOS, os mesmos 20 arquivos, nenhuma falha citando meus módulos por
+nome exato; pulados e total sobem exatamente +15, que são os casos novos.
+
+**`test:leak` reexecutado:** perfil IDÊNTICO pela terceira unidade seguida — `8 failed | 120 passed |
+23 skipped (151)`, os mesmos 6 arquivos, `outbound-leak` verde. Classificação inalterada em relação ao
+V-027, incluindo `turn-context-batch-repos` como item aberto sem controle em HEAD.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1172 | Medido de novo em P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 139 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
-| `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a com perfil IDÊNTICO** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
+| unit (`npm test`, workers default) | 10233 | 50 | 1187 | Medido de novo em P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 154 | 0 | — | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
+| `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a e P03.7b, com perfil IDÊNTICO nas três vezes** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 
