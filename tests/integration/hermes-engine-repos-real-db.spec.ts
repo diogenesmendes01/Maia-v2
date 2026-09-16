@@ -1787,4 +1787,264 @@ d("engine-repos — journal de execução contra Postgres real", () => {
     );
     expect(casEmVoo.ok).toBe(false);
   });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 46-52 (P03.6a): `adoptTerminalResult`.
+  //
+  // O `engine_runs_adopted_chk` diz no próprio comentário o que está em jogo:
+  // entregar ou concluir sem resposta exige terminal E dono que adotou — "é o
+  // que impede 'fechei o run' virar sinônimo de 'alguém decidiu o desfecho'".
+  //
+  // A ASSIMETRIA que distingue esta operação de `revokeRunCapabilities`: adotar
+  // é do dono ATUAL, não da origem do run. O §5.8.2 é explícito na linha
+  // "terminal externo persistido, sem output" — o novo owner valida
+  // política/calls/contexto e adota, em vez de pagar outra deliberação. Por isso
+  // `adopted_by_turn_attempt` existe: registra QUAL tentativa adotou.
+  //
+  // Os casos 51 e 52 são cirúrgicos, escritos antes da varredura.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** Run em `result_ready`, com terminal aceito — o estado de onde se adota. */
+  async function runComTerminal(): Promise<{
+    run_id: string;
+    turno: { turn_id: string; claim_token: string; attempt: number };
+    p: ReturnType<typeof pedido>;
+  }> {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = randomUUID();
+    const p = pedido(run_id, turno, control_id);
+    await noEscopo(() => engineRunsRepo.pinEngineAndPrepareRun(p));
+    await noEscopo(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        expected_row_version: 0,
+      }),
+    );
+    await noEscopo(() =>
+      engineRunsRepo.recordStartObservation({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        observation: { kind: "accepted", remote_run_id: `w-${randomUUID()}` },
+      }),
+    );
+    const r = await noEscopo(() =>
+      engineRunsRepo.recordTerminalProposal({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        proposal: {
+          version: 1,
+          run_id,
+          request_key: p.request_key,
+          stop: { kind: "reply", raw_text: "resposta" },
+          iterations: 1,
+          observed_tool_call_ids: [],
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_microusd: null,
+            source: "engine_reported",
+          },
+        },
+      }),
+    );
+    if (!r.ok) throw new Error("setup: recordTerminalProposal falhou");
+    return { run_id, turno, p };
+  }
+
+  const preparacao = { texto: "resposta", canal: "whatsapp" };
+
+  it("46. o dono atual adota: registra a tentativa e a preparação", async () => {
+    const { run_id, turno } = await runComTerminal();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.adoptTerminalResult({
+        run_id,
+        turn_id: turno.turn_id,
+        claim_token: turno.claim_token,
+        output_preparation: preparacao,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.adopted_by_turn_attempt).toBe(turno.attempt);
+
+    const row = await pool.query<{
+      adopted_by_turn_attempt: number | null;
+      output_preparation_json: unknown;
+      phase: string;
+    }>(
+      "SELECT adopted_by_turn_attempt, output_preparation_json, phase FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(Number(row.rows[0]?.adopted_by_turn_attempt)).toBe(turno.attempt);
+    expect(row.rows[0]?.output_preparation_json).toEqual(preparacao);
+    // Adotar NÃO fecha o run: fechar é outra operação, com outra prova.
+    expect(row.rows[0]?.phase).toBe("result_ready");
+  });
+
+  it("47. o NOVO dono adota — é a assimetria contra `revokeRunCapabilities`", async () => {
+    const { run_id, turno } = await runComTerminal();
+
+    // Re-claim: o worker antigo morreu e o turno tem dono novo. §5.8.2 manda
+    // adotar o terminal já persistido em vez de pagar outra deliberação.
+    const novoToken = randomUUID();
+    await pool.query(
+      `UPDATE agent_turns SET claim_token = $2, attempt_count = attempt_count + 1,
+              lease_expires_at = now() + interval '5 minutes'
+        WHERE id = $1`,
+      [turno.turn_id, novoToken],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.adoptTerminalResult({
+        run_id,
+        turn_id: turno.turn_id,
+        claim_token: novoToken,
+        output_preparation: preparacao,
+      }),
+    );
+    expect(r.ok).toBe(true);
+    // Registra a tentativa que ADOTOU (a nova), não a que originou o run.
+    if (r.ok) expect(r.adopted_by_turn_attempt).toBe(turno.attempt + 1);
+
+    const row = await pool.query<{ adopted_by_turn_attempt: number }>(
+      "SELECT adopted_by_turn_attempt FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(Number(row.rows[0]?.adopted_by_turn_attempt)).toBe(
+      turno.attempt + 1,
+    );
+  });
+
+  it("48. sem posse viva do turno não se adota", async () => {
+    const { run_id, turno } = await runComTerminal();
+    await pool.query(
+      "UPDATE agent_turns SET lease_expires_at = now() - interval '1 minute' WHERE id = $1",
+      [turno.turn_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.adoptTerminalResult({
+        run_id,
+        turn_id: turno.turn_id,
+        claim_token: turno.claim_token,
+        output_preparation: preparacao,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("stale_claim");
+
+    const row = await pool.query<{ adopted_by_turn_attempt: number | null }>(
+      "SELECT adopted_by_turn_attempt FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.adopted_by_turn_attempt).toBeNull();
+  });
+
+  it("49. adotar exige `result_ready` — sem terminal não há o que adotar", async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = randomUUID();
+    await noEscopo(() =>
+      engineRunsRepo.pinEngineAndPrepareRun(pedido(run_id, turno, control_id)),
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.adoptTerminalResult({
+        run_id,
+        turn_id: turno.turn_id,
+        claim_token: turno.claim_token,
+        output_preparation: preparacao,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("phase_conflict");
+  });
+
+  it("50. adotar NÃO reautoriza callbacks antigos: a revogação continua de pé", async () => {
+    const { run_id, turno } = await runComTerminal();
+    await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: { kind: "turn_owner", origin_claim_token: turno.claim_token },
+        reason_code: "deadline",
+      }),
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.adoptTerminalResult({
+        run_id,
+        turn_id: turno.turn_id,
+        claim_token: turno.claim_token,
+        output_preparation: preparacao,
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    // §5.6.3: "sem reautorizar callbacks antigos". Adotar o RESULTADO não
+    // devolve autoridade de tool a ninguém.
+    const row = await pool.query<{ capabilities_revoked_at: string | null }>(
+      "SELECT capabilities_revoked_at::text AS capabilities_revoked_at FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.capabilities_revoked_at).not.toBeNull();
+  });
+
+  it("51. preparação acima do teto da coluna é recusada TIPADA, não estoura o CHECK", async () => {
+    const { run_id, turno } = await runComTerminal();
+
+    // `output_preparation_json` tem CHECK de 256 KiB na 140. Sem teto na
+    // operação, isto viraria violação dentro da TX.
+    const enorme = { dump: "x".repeat(300_000) };
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.adoptTerminalResult({
+        run_id,
+        turn_id: turno.turn_id,
+        claim_token: turno.claim_token,
+        output_preparation: enorme,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("preparation_too_large");
+
+    const row = await pool.query<{ adopted_by_turn_attempt: number | null }>(
+      "SELECT adopted_by_turn_attempt FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.adopted_by_turn_attempt).toBeNull();
+  });
+
+  it("52. versão errada com a fase CERTA: só a guarda de VERSÃO recusa", async () => {
+    const { run_id, turno } = await runComTerminal();
+    const v = await pool.query<{ row_version: string }>(
+      "SELECT row_version FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    await pool.query(
+      "UPDATE engine_runs SET row_version = row_version + 1 WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.adoptTerminalResult({
+        run_id,
+        turn_id: turno.turn_id,
+        claim_token: turno.claim_token,
+        output_preparation: preparacao,
+        expected_row_version: Number(v.rows[0]?.row_version),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "version_conflict") {
+      expect(r.current_row_version).toBe(Number(v.rows[0]?.row_version) + 1);
+    } else if (!r.ok) {
+      throw new Error(`esperado version_conflict, veio ${r.reason}`);
+    }
+  });
 });

@@ -808,14 +808,64 @@ outbound/entrega e vão juntos), varredura/manutenção (`enumerateDueScopes`, `
 `reserveMaintenanceObservation`/`recordMaintenanceObservation`) e recovery. E segue sem teste de
 concorrência real em todo o módulo.
 
+### V-026 · P03.6a — `adoptTerminalResult`, e a assimetria que só ela tem
+
+**O fence aqui é do turno ATUAL, não da origem do run** — e é a primeira operação do módulo em que
+isso é certo. Todo o resto exige `origin_claim_token` porque autoriza EFEITO: despachar tool, marcar
+handler, liquidar. Adotar não autoriza efeito nenhum — pega um terminal já persistido e diz quem
+assume a saída. O §5.8.2, na linha "terminal externo persistido, sem output", manda o NOVO owner
+validar política/calls/contexto e adotar, em vez de pagar outra deliberação porque um worker foi
+reenfileirado. `adopted_by_turn_attempt` existe para registrar QUAL tentativa assumiu, e o caso 47
+prende exatamente isso: depois de um re-claim, quem adota é a tentativa nova, e o número gravado é o
+dela.
+
+O `engine_runs_adopted_chk` diz no próprio comentário o que está em jogo: entregar ou concluir sem
+resposta exige terminal E dono que adotou, "é o que impede 'fechei o run' virar sinônimo de 'alguém
+decidiu o desfecho'". Por isso adotar **não** fecha o run (fechar é 6b, com prova própria), **não**
+reautoriza callbacks antigos (`capabilities_revoked_at` fica intacto) e **não** transiciona
+`agent_turns` — o §5.7.2 lembra que `phase` não substitui `status`, e um run fechado convive com turno
+`outbound_pending`.
+
+**Mutação: 5 mutantes, previsão exata, todos mortos.** Ambiguidade tratada ANTES de medir, aplicando a
+lição acumulada: `AND ${versaoEsperada}` já aparece 2x no módulo e `if (!fence.ok) {` aparece **12x**.
+Literal solto mediria outra operação; as âncoras multi-linha usam a linha `AND phase = 'result_ready'`
+e a linha `conta("adopt", ...)`, que são únicas.
+
+**Um caso sem mutante, registrado em vez de inflado:** o caso 50 (adotar não reautoriza callbacks) não
+tem alvo de mutação, porque o código simplesmente **não toca** em `capabilities_revoked_at` — não há
+literal a mutar. Ele guarda uma regressão futura, não comportamento presente, e contá-lo como "coberto
+pela varredura" seria inflar o placar. Fica como guarda declarada.
+
+**Correção do C18, achada ao preparar o 6b.** O registro anterior dizia que `sent`/`unknown` eram a
+prova de outbound. **Errado para o caminho durável:** o marcador de convergência desta casa é
+`status='completed'` (`outbound-recovery-repo.ts:289`), e `delivered` é intermediário que um CAS
+promove (`:817-824`). Fechar `handed_to_outbox` por `sent` teria declarado handoff sobre linhas que a
+casa ainda considera em voo. O predicado de RESOLVIDO é `OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES`
+(exportado, `['completed','failed_terminal','cancelled','dead_letter']`), deliberadamente mais estrito
+que `MULTIPART_RESOLVED_STATUSES` porque `delivered` libera a próxima parte mas "não prova
+convergência". Reusar o exportado, não recriar o conjunto.
+
+**Estado final:** 52 casos no spec de runs, verdes; 5 mutantes, todos mortos.
+`prettier --check`, `typecheck` (projeto) e `eslint` em 0. **Regressão:** `50 failed | 10233 passed |
+1135 skipped (11418)`, os MESMOS 20 arquivos, nenhuma falha citando `engine-repos` ou `tool-calls`, e
+os pulados subindo exatamente os 7 casos novos (`↓ 52 tests | 52 skipped`).
+
+**Para o 6b, já levantado:** semear outbound em teste exige a linha durável COMPLETA — o
+`outbound_messages_durable_row_complete_check` exige `sequence_in_turn`, `payload_version`,
+`payload_type`, `payload_json`, `payload_hash`, `logical_dedupe_key`, `provider_idempotency_key` e
+`next_attempt_at` assim que `turn_id` existe. A fixture deve DERIVAR as chaves com
+`deriveLogicalDedupeKey`/`deriveProviderIdempotencyKey`/`computePayloadHash` do contrato, não inventar
+literais. E `safe_to_retry` exige ausência de outbound **e** de efeito não reconciliado (invariante 7),
+então também consulta `effect_evidence`/estados não conciliados de `engine_tool_calls`.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1128 | Medido de novo em P03.5: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 95 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (45: 28 do caminho de start + 7 de P03.4 + 10 de P03.5) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1135 | Medido de novo em P03.6a: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 102 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (52: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 

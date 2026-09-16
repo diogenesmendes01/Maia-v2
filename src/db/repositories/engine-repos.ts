@@ -735,6 +735,22 @@ export type ResolveBlockedRunResult =
   | { ok: false; reason: "evidence_required" }
   | { ok: false; reason: "evidence_too_large"; max_bytes: number };
 
+/**
+ * Teto de `output_preparation_json` — a 140 tem CHECK de 256 KiB na coluna.
+ * Recusar aqui mantém a resposta TIPADA; deixar passar trocaria recusa por
+ * transação estourada, o mesmo defeito que o hash do receipt e o teto de
+ * evidência já corrigiram.
+ */
+const PREPARACAO_MAX_BYTES = 262_144;
+
+export type AdoptTerminalResultResult =
+  | { ok: true; adopted_by_turn_attempt: number; row_version: number }
+  | TurnFenceConflict
+  | NotFound
+  | { ok: false; reason: "phase_conflict"; current_phase: EngineRunPhaseV1 }
+  | { ok: false; reason: "version_conflict"; current_row_version: number }
+  | { ok: false; reason: "preparation_too_large"; max_bytes: number };
+
 export const engineRunsRepo = {
   /**
    * TX A do §5.7.3: fixa o motor no turno e cria o run `prepared`.
@@ -2698,6 +2714,139 @@ export const engineRunsRepo = {
 
       conta("resolve_blocked", "ok");
       return { ok: true, row_version: Number(linha.row_version) };
+    });
+  },
+
+  /**
+   * O dono ATUAL adota o resultado terminal (§5.6.3, §5.8.2).
+   *
+   * **A assimetria que distingue esta operação de todas as anteriores:** aqui o
+   * fence é do turno ATUAL, não da origem do run. Todo o resto deste módulo
+   * exige `origin_claim_token` porque autoriza EFEITO — despachar tool, marcar
+   * handler, liquidar. Adotar não autoriza efeito nenhum: pega um terminal que
+   * já está persistido e diz quem assume a saída. O §5.8.2 é explícito na linha
+   * "terminal externo persistido, sem output": o novo owner valida
+   * política/calls/contexto e adota, em vez de pagar outra deliberação por um
+   * worker ter sido reenfileirado. `adopted_by_turn_attempt` existe justamente
+   * para registrar QUAL tentativa assumiu.
+   *
+   * O que adotar NÃO faz, e o `engine_runs_adopted_chk` explica por quê ("é o
+   * que impede 'fechei o run' virar sinônimo de 'alguém decidiu o desfecho'"):
+   *
+   *   * não fecha o run — fechar é `closeRunAfterHandoff`, com prova própria;
+   *   * não reautoriza callbacks antigos: `capabilities_revoked_at` não é
+   *     tocado (§5.6.3, e o caso 50 prende isso);
+   *   * não transiciona `agent_turns` — o §5.7.2 lembra que `phase` não
+   *     substitui `status`, e um run fechado convive com turno
+   *     `outbound_pending`.
+   */
+  async adoptTerminalResult(input: {
+    run_id: string;
+    turn_id: string;
+    claim_token: string;
+    output_preparation: Record<string, Json>;
+    expected_row_version?: number;
+  }): Promise<AdoptTerminalResultResult> {
+    const { tenant_id, agent_id } = scope();
+
+    const preparacaoJson = JSON.stringify(input.output_preparation);
+    if (Buffer.byteLength(preparacaoJson, "utf8") > PREPARACAO_MAX_BYTES) {
+      conta("adopt", "preparation_too_large");
+      return {
+        ok: false,
+        reason: "preparation_too_large",
+        max_bytes: PREPARACAO_MAX_BYTES,
+      };
+    }
+
+    return withTx(async (tx): Promise<AdoptTerminalResultResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("adopt", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      // Fence do turno ATUAL: posse viva e `running`. Sem `origin_turn_attempt`
+      // de propósito — quem adota pode ser uma tentativa posterior.
+      const fence = await lockTurnAndCheckFence(tx, {
+        turn_id: input.turn_id,
+        origin_claim_token: input.claim_token,
+      });
+      if (!fence.ok) {
+        conta("adopt", fence.reason);
+        return fence;
+      }
+      const attempt = Number(fence.turno.attempt_count);
+
+      const versaoEsperada =
+        input.expected_row_version === undefined
+          ? sql`TRUE`
+          : sql`row_version = ${input.expected_row_version}`;
+
+      const adotado = linhas<{
+        row_version: string | number;
+        last_event_sequence: string | number;
+      }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET adopted_by_turn_attempt = ${attempt},
+                 output_preparation_json = ${preparacaoJson}::jsonb,
+                 row_version = row_version + 1,
+                 last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND id = ${input.run_id}
+             AND phase = 'result_ready'
+             AND ${versaoEsperada}
+           RETURNING row_version, last_event_sequence`),
+      );
+      const linha = adotado[0];
+      if (!linha) {
+        const atual = linhas<{ phase: string; row_version: string | number }>(
+          await tx.execute(sql`
+            SELECT phase, row_version FROM ${engine_runs}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}`),
+        );
+        const row = atual[0];
+        if (!row) {
+          conta("adopt", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        if (row.phase !== "result_ready") {
+          conta("adopt", "phase_conflict");
+          return {
+            ok: false,
+            reason: "phase_conflict",
+            current_phase: row.phase as EngineRunPhaseV1,
+          };
+        }
+        conta("adopt", "version_conflict");
+        return {
+          ok: false,
+          reason: "version_conflict",
+          current_row_version: Number(row.row_version),
+        };
+      }
+
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(linha.last_event_sequence),
+        dedupe_key: `output_handoff:adopted:${attempt}`,
+        event_type: "output_handoff",
+        actor_kind: "turn_owner",
+        actor_turn_attempt: attempt,
+        metadata: {
+          adopted_by_turn_attempt: attempt,
+          preparation_bytes: Buffer.byteLength(preparacaoJson, "utf8"),
+        },
+      });
+
+      conta("adopt", "ok");
+      return {
+        ok: true,
+        adopted_by_turn_attempt: attempt,
+        row_version: Number(linha.row_version),
+      };
     });
   },
 };
