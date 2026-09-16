@@ -389,6 +389,39 @@ describe('T18 — grant ausente/expirado/audience errada: recusa sanitizada', ()
     });
   });
 
+  it('28b. `now` ILEGÍVEL recusa — NaN não pode virar "não expirou"', () => {
+    // Sem a guarda de fail-closed, `Date.parse('não-é-data')` é NaN e
+    // `NaN > fim` é FALSE: o grant passaria como válido. Recusa autenticada
+    // viraria aceite, que é o oposto exato do que o T18 cobra.
+    expect(validateInferenceGrant(grant(), ctx({ now: 'não-é-data' }))).toMatchObject({
+      kind: 'refused',
+      code: 'invalid_inference_grant',
+      audit_reason: 'expired',
+    });
+  });
+
+  it('28c. `expires_at` ILEGÍVEL recusa', () => {
+    // Isola a SEGUNDA metade da guarda: aqui `now` parseia e só `expires_at`
+    // não — se a condição checasse apenas `agora`, este caso passaria direto.
+    expect(
+      validateInferenceGrant(grant({ expires_at: '2026-13-45T99:99:99Z' }), ctx()),
+    ).toMatchObject({
+      kind: 'refused',
+      code: 'invalid_inference_grant',
+      audit_reason: 'expired',
+    });
+  });
+
+  it('28d. os DOIS instantes ilegíveis recusam', () => {
+    expect(
+      validateInferenceGrant(grant({ expires_at: 'lixo' }), ctx({ now: '' })),
+    ).toMatchObject({
+      kind: 'refused',
+      code: 'invalid_inference_grant',
+      audit_reason: 'expired',
+    });
+  });
+
   it('29. a recusa dos TRÊS casos do T18 é INDISTINGUÍVEL no fio', () => {
     const casos = [
       validateInferenceGrant(null, ctx()),
