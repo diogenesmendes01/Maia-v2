@@ -357,22 +357,208 @@ validada **no Windows, com spawn real do Node**: o worker duplica o FD 1 e manda
 antes de importar o Hermes, e nenhum `print` do motor corrompeu uma linha NDJSON em 6 execuções.
 Em Linux (alvo de produção) continua não verificado.
 
+### V-017 · P03.2 — `engine-repos.ts`, o caminho de START do journal
+
+Unidade: `src/db/repositories/engine-repos.ts` (novo) + `tests/integration/hermes-engine-repos-real-db.spec.ts`
+(novo, 10 casos). Cobre quatro das operações do §5.6.3: `pinEngineAndPrepareRun`, `markSubmitting`,
+`recordStartObservation`, `recordTerminalProposal`.
+
+**Gates estáticos** — o conjunto que o `AGENTS.md` exige antes de cada commit, não só os dois que eu
+vinha rodando: `check:node` exit 0; `docs:ai:check` exit 0; `config:check:drift` exit 0 (confirma de
+fora que C11 não deixou dívida de configuração: nenhum artefato gerado ficou desatualizado);
+`typecheck` (projeto inteiro) exit 0; `lint` COMPLETO exit 0 com **481 warnings — o mesmo número da
+baseline**, ou seja, esta unidade não acrescentou nenhum; `audit:exceptions:check` exit 0.
+`prettier --check` **reprovou** nos dois arquivos novos; corrigido com `--write` restrito a eles (nunca
+`npm run format`, que reescreveria `src/` inteiro). Depois da reformatação, typecheck, lint e os 10
+casos foram re-executados, e a varredura de mutação foi refeita — prettier rewrapa linhas, e o harness
+casa texto LITERAL, então a evidência anterior não valeria para os arquivos novos.
+
+**Contra Postgres REAL** (rig local 16.2, procedimento de dois passos — ver V-005):
+
+| Caso | O que prende |
+|---|---|
+| 1 | `prepared` sob posse viva fixa o pin, aloca geração 1 e escreve o evento `prepared` com `actor_kind='turn_owner'` |
+| 2 | claim divergente, tentativa divergente e **lease vencida** recusam como `stale_claim`; turno fora de `running` recusa como `state_mismatch` — a prioridade do §5.6.4 (posse antes de estado) |
+| 3 | segundo run aberto no mesmo turno é recusado pelo REPOSITÓRIO com motivo, não por violação de constraint |
+| 4 | `markSubmitting` é CAS: versão obsoleta devolve `version_conflict` com a versão corrente |
+| 5 | `remote_run_id` é atribuído UMA vez; o MESMO id redelivered é idempotente; id diferente vira `remote_id_conflict` **e leva o run a `blocked`** (invariante 3 do §5.6.2) |
+| 6 | submit sem prova de aceite vira `submission_unknown`, preservando a MESMA `request_key` e mantendo `remote_run_id` NULL |
+| 7 | terminal com chamada em voo é recusado (`calls_unsettled`); conciliada a chamada, o terminal entra e o run vai a `result_ready` |
+| 8 | terminal que AFIRMA uma chamada inexistente no journal é `observed_calls_mismatch` (§5.3.4: o journal confronta a alegação do motor) |
+| 9 | cross-tenant: o run de outro escopo é `not_found` — o escopo vem do ALS, nunca do argumento |
+| 10 | CAS de versão com a fase ainda `prepared` (ver abaixo) |
+
+**Verificação por mutação — e o defeito que ela encontrou em MIM.** Seis mutações, com `--retry=0`.
+Na primeira rodada **M6 SOBREVIVEU**: trocar `row_version = <esperada>` por `row_version >= 0` no CAS
+de `markSubmitting` não quebrava teste nenhum, porque o caso 4 era carregado inteiro pela guarda de
+fase (depois do primeiro submit a fase já não é `prepared`). Ou seja: `expected_row_version` não
+estava sendo exercido por ninguém. O caso 10 foi escrito exatamente para o cenário em que a guarda de
+fase NÃO basta — uma reserva de poll move `row_version` sem mover a fase — e depois dele as seis
+mutações morrem (M1 lease ignorada, M2 prioridade invertida, M3 id divergente como redelivery,
+M4 terminal com chamada em voo, M5 segundo run aberto, M6 CAS sem versão). Arquivo restaurado
+byte-a-byte ao fim da varredura.
+
+> **CORREÇÃO (V-018): a frase acima superdeclara o que foi provado.** O que eu rotulei de "M2 —
+> prioridade invertida" trocava apenas os DOIS LITERAIS `reason` um pelo outro. A inversão de verdade
+> — subir o teste de `status !== 'running'` para ANTES do teste de posse — é um mutante bem mais forte,
+> e eu confirmei pessoalmente que ele **SOBREVIVE 10/10**. Ou seja: a suíte prende o TEXTO do motivo,
+> não a REGRA de prioridade do §5.6.4. "6/6 mortas" vale para as seis que rodei; não vale como prova
+> da regra de prioridade. A lição é a mesma da segunda lição acima, um nível mais fundo: um mutante
+> precisa ser conferido pelo que ele MUDA no comportamento, não pelo nome que eu dei a ele.
+
+**Segunda lição, do mesmo harness.** Depois do `prettier --write` a varredura foi REFEITA, e o harness
+acusou `ERRO-HARNESS` em M2: o prettier trocou aspas simples por duplas no fonte, e o par literal
+`reason: 'stale_claim',` deixou de casar. Um harness que casa TEXTO é frágil a reformatação, e o modo
+de falha é o pior que existe — silencioso, e do lado errado: a mutação simplesmente não é aplicada, o
+teste passa, e a linha lida como se a mutação tivesse sobrevivido (ou passa despercebida, se ninguém
+reler a saída). Reancorado em `reason: "stale_claim",` — literal que ocorre uma vez só, já que a união
+de tipos escreve `"stale_claim" | "state_mismatch"` —, as seis voltam a morrer, com baseline 10/10 e
+arquivo restaurado idêntico. Consequência de método, registrada para as próximas unidades: **a
+varredura de mutação roda DEPOIS do formatador, nunca antes**, e a saída do harness precisa ser lida
+linha a linha — "sem sobreviventes" só vale se as seis tiverem sido de fato APLICADAS
+(`ocorrencias=1` em cada).
+
+**Suíte unitária completa** (`npm test`, workers default): `10233 passed | 50 failed | 1055 skipped`
+em 924 arquivos, 20 arquivos em falha. **Nenhuma das 50 é atribuível a esta unidade**, e a razão não é
+opinião: `engine-repos.ts` não é importado por NADA em `src/` nem em `tests/` além do próprio spec
+desta unidade (verificado por varredura), e um teste que nunca carrega o módulo não pode mudar de
+comportamento por causa dele. Dezesseis dos 20 arquivos batem com o catálogo do V-007. Quatro **não**
+batem — `runtime/outbound-trava-envio-direto` (2), `scripts/audit-exceptions` (6), `scripts/check-node`
+(1) e `ops/privacy-export-sweeper` (8 contra 7) — e foram rodados isolados: falham por ambiente
+Windows (o inventário do #634 compara caminhos POSIX com `src\agent\...` e por isso falha nos DOIS
+sentidos ao mesmo tempo; symlink/hard link dá EPERM). **Correção de uma afirmação minha:** eu havia
+escrito que `scripts/audit-exceptions` falha porque "`npm audit` não roda aqui" — isso está ERRADO. O
+gate `npm run audit:exceptions:check` passa neste ambiente (2 lockfiles auditados, relatório válido,
+0 advisories). A causa real das 6 falhas daquele spec **não foi determinada**, e enquanto não for ela
+não é atribuída a ninguém. Ver risco aberto
+abaixo. E aqui vale corrigir uma leitura apressada minha: **"fora do catálogo do V-007" não significa
+"novo"**. O próprio V-007 declara 54 falhas mas itemiza só 15 arquivos, que somam 40 — ou seja, 14
+falhas nunca foram itemizadas lá. Os quatro arquivos em questão somam exatamente 10 falhas, que cabem
+dentro dessa lacuna. A hipótese mais provável, portanto, é catálogo incompleto na baseline, não
+regressão. E como hipótese não é medição, a rodada foi REFEITA com as flags do V-007
+(`npm test -- --maxWorkers=3`): resultado **byte a byte idêntico** ao da rodada com workers default —
+`20 failed | 770 passed | 134 skipped` em arquivos, `50 | 10233 | 1055` em testes, com o MESMO conjunto
+de arquivos. Duas contagens iguais sob concorrências diferentes significam que essas falhas são
+**determinísticas**, e não inflação por paralelismo. Somando as três evidências — nada importa
+`engine-repos.ts` fora do próprio spec, as falhas são determinísticas sob duas configurações, e as 10
+falhas dos quatro arquivos cabem nas 14 que o V-007 nunca itemizou — a conclusão é que elas não vêm
+desta branch. O que continua NÃO medido é a baseline no commit base com o catálogo completo; por isso
+o V-007 passa a ser tratado como lista PARCIAL, e não como lista fechada.
+
+**O que esta unidade NÃO prova:** nada sobre concorrência REAL (as corridas são exercidas por snapshot
+obsoleto, não por duas transações simultâneas disputando o mesmo run — ver T17, marcado parcial);
+nada sobre `admitToolCall`/`settleToolCall`/recovery/varredura, que não existem ainda; nada que dependa
+de Redis/BullMQ; e nenhum CI rodou sobre este código.
+
+**Revisão independente por subagente:** em curso no momento desta escrita, com acesso à spec, à DDL,
+ao código e às evidências (não ao meu resumo). O resultado e as correções entram nesta entrada
+**antes** do commit.
+
+### V-018 · Revisão independente de P03.2 — **REPROVADA**, unidade em rework
+
+Subagente adversarial com acesso à spec (§5.6.1–5.6.4, §5.7.1–5.7.3), à DDL da 140, ao código e às
+evidências — **não** ao meu resumo. Trabalhou read-only, montando um harness de módulo-sombra no
+scratchpad para rodar mutações sem tocar na árvore. Confirmou 10/10 contra Postgres real e os gates
+estáticos; **derrubou** a alegação de mutação e achou dois BLOCKERs.
+
+**O que eu verifiquei PESSOALMENTE antes de aceitar** (§7 — resumo de subagente não basta):
+
+| Achado | Minha verificação |
+|---|---|
+| **BLOCKER 1** — `recordStartObservation` e `recordTerminalProposal` nunca se prendem ao `origin_claim_token` DO RUN | **Confirmado por leitura**: o predicado SQL existe numa linha só (`:644`, em `markSubmitting`). Nas outras duas o token só é passado para `lockTurnAndCheckFence`, que pergunta "você é o dono do TURNO?", nunca "você é a origem DESTE run". Depois de um re-claim (`turn-repos.ts` roda `claim_token = gen_random_uuid()` junto com `attempt_count + 1`), o **novo** dono passa no fence com o token dele e pode atribuir `remote_run_id` e gravar `terminal_json`/`result_ready` no run do dono ANTIGO — enquanto `origin_claim_token` continua, por trigger, apontando para o antigo. §5.7.1 permite ao novo dono consultar/cancelar/reconciliar, e proíbe exatamente isto: adotar o run em voo como nova autoridade |
+| **BLOCKER 2** — gate de controle de conversa ausente em duas das quatro operações | **Confirmado por leitura**: `:429-435` e `:607-613` checam `mode !== 'bot'`; `:693-697` e `:886-890` checam só se a linha existe. Com o operador no controle (`mode='human'`, epoch++), um terminal ainda entra em `result_ready` — o estado que a adoção consome para produzir texto de saída. E `ControlConflict` está declarado no tipo de retorno das duas, sem nenhum caminho que o produza |
+| **M2 era um mutante fraco** | **Confirmado por execução minha**: a inversão REAL de prioridade (estado antes de posse) **sobrevive 10/10**. Ver a correção inserida no V-017 |
+| 14 de 15 mutações adicionais sobrevivem | Aceito como direção (o relatório traz linha e razão de cada uma); vou reproduzir as que virarem teste, uma a uma, em vez de confiar na tabela |
+
+**Outros achados relevantes:** redelivery de terminal IDÊNTICO devolve `phase_conflict` em vez de ser
+idempotente — e a guarda `AND terminal_hash IS NULL` é **código morto**, porque o gate de fase já
+recusa toda fase em que `terminal_hash` poderia ser não-nulo (o padrão certo já existe neste mesmo
+arquivo, no caminho de `remote_run_id`); `origin_turn_attempt` fencado em 1 de 4 operações, contra o
+`t.attempt_count = r.origin_turn_attempt` normativo do §5.6.4; `classificarConflitoDeRun` devolve
+`version_conflict` para falha de posse, que o §5.6.4 manda ser `stale_claim`; `dedupe_key` pode
+estourar (`remote_run_id` aceita 512 chars, `dedupe_key` só 256) e transformar justo o
+`remote_id_conflict` em exceção; `mode` é gravado e nunca lido (coerente com C12, mas registrado).
+
+**Consequência:** `U-P03.2` **não é dada por concluída e nada foi commitado**. O rework vai em três
+frentes — (A) fencing: ligar as duas operações ao `origin_claim_token` do run, fencar
+`origin_turn_attempt`, aplicar mode+epoch, corrigir a classificação; (B) semântica do terminal:
+redelivery idêntico idempotente e `dedupe_key` limitado; (C) testes que mordam, começando pelos
+mutantes que sobreviveram (`handler_started` tratado como conciliado, terminal aceito de
+`prepared`/`submitting`, isolamento por AGENTE dentro do mesmo tenant, e a inversão de prioridade).
+Teste que falha primeiro, em cada um.
+
+**O valor da revisão, registrado sem suavizar:** meus 10 casos passavam, todos os gates estáticos
+passavam, a varredura de mutação dizia "sem sobreviventes" — e ainda assim duas operações aceitavam
+escrita de quem não era dono do run. Suíte verde não é evidência de fence; só teste que constrói o
+cenário do atacante é.
+
+### V-019 · P03.2 — rework depois da reprovação, e a lição sobre teste de CENÁRIO
+
+**Correções aplicadas** (cada uma com teste que falha ANTES):
+
+| Achado | Correção | Caso que a prende |
+|---|---|---|
+| BLOCKER 1 — operação não se prende à origem do run | `checarFenceDoRun`, chamado nas duas operações sob a linha já travada por `FOR UPDATE`. Uma checagem cobre TODOS os ramos (aceite, unknown, bloqueio, terminal), em vez de espalhar predicado por UPDATE | 11, 12, 25, 26 |
+| BLOCKER 2 — gate de controle ausente | mode + epoch no mesmo helper; `ControlConflict` deixou de ser tipo inalcançável | 13, 27, 28 |
+| Redelivery de terminal idêntico | compara `terminal_hash` ANTES do gate de fase (tinha de ser antes: `result_ready` não está entre as fases que aceitam terminal) — igual = idempotente, diferente = `terminal_conflict`. A guarda `AND terminal_hash IS NULL` era código MORTO | 15 |
+| `origin_turn_attempt` fencado em 1 de 4 | predicado normativo do §5.6.4 no CAS de `markSubmitting` + no helper | 26 |
+| `classificarConflitoDeRun` devolvia `version_conflict` para perda de posse | posse primeiro, `stale_claim` | 14 |
+| `dedupe_key` podia estourar 256 e virar exceção | digest de 32 chars em vez do id cru (512 permitidos) | 24 |
+
+**A lição, que é sobre teste e não sobre código.** Escrevi 11, 12 e 13 como cenários REALISTAS: o
+re-claim troca `claim_token` **e** `attempt_count` na mesma UPDATE; o takeover muda `mode` **e**
+`control_epoch` juntos. Os três passavam. A varredura mostrou **NM1, NM2, NM3 e NM4 sobrevivendo**:
+com dois predicados redundantes cobrindo o mesmo cenário, apagar qualquer um deixa o outro recusando,
+e o teste não percebe. Um teste que muda duas variáveis ao mesmo tempo não consegue dizer qual delas
+importou — e uma regra que nenhum teste isola apodrece no próximo refactor sem ninguém notar. Os
+casos 25-28 mudam UMA variável cada (token sem tentativa, tentativa sem token, modo sem epoch, epoch
+sem modo), e só então os quatro morrem. **Eu previ que NM1 e NM3 morreriam; erraram os dois.** Vale
+registrar que o cenário realista continua no lugar: ele prova a garantia ponta a ponta, que o
+cirúrgico não prova. Os dois tipos servem para coisas diferentes.
+
+**Estado final:** 28 casos contra Postgres real, verdes. **13 mutantes, todos mortos** — M1-M6, o
+M2-REAL (a inversão de prioridade que sobrevivia) e NM1-NM6. `typecheck` (projeto), `eslint` e
+`prettier --check` limpos; EOL LF conferido por contagem de bytes.
+
+**O que continua SEM cobertura, dito sem maquiagem:** concorrência real (duas TX simultâneas
+disputando o mesmo run) — a suíte é sequencial, e por isso a distinção `clock_timestamp()` vs `now()`,
+que o cabeçalho do arquivo justifica em quatro linhas, permanece **não verificada**; a metade
+"ausência de outbound" do §5.6.3 (adiada e agora NOMEADA no cabeçalho do módulo); `mode` gravado e
+nunca lido (C12); e ausência de teto de lock (C11). Nada disso foi fechado por esta unidade.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
-| `npm run typecheck` | — | 0 | — | exit 0 |
+| `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`vitest run`) | em curso | — | — | baseline |
-| integração / leak / e2e | 0 | 0 | — | **bloqueados** até haver Postgres com as 5 extensões |
-| pytest (`services/hermes_worker`) | 0 | 0 | — | pacote ainda não existe |
+| unit (`npm test`, workers default) | 10233 | 50 | 1073 | Medido de novo DEPOIS do rework: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 40 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019). As demais specs de integração seguem **não executadas** (Redis) |
+| reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
+| pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 
 ## Revisões e correções
 
-(nenhuma ainda)
+- V-011 — revisão do trabalho do agente P01 (caracterização), feita por mim, linha a linha.
+- V-015 — revisão do agente P00.2 (worker Python): cinco mutações minhas, **uma sobreviveu** e virou
+  correção de cobertura (regra decimal-uint sem caso que a exercitasse, dos DOIS lados do contrato).
+- V-017 — P03.2: a varredura de mutação encontrou um defeito MEU (`expected_row_version` não exercido
+  por teste nenhum); corrigido com o caso 10 antes de qualquer commit.
 
 ## Riscos remanescentes
 
 - Redis fake: cobertura de filas/locks não verificável localmente.
 - Nenhum CI executado sobre este código (sem push, por decisão do dono).
 - Smoke com provider real e benchmark permanecem bloqueados (D02/D03).
+- **Quatro arquivos em falha fora do catálogo do V-007** (`runtime/outbound-trava-envio-direto`,
+  `scripts/audit-exceptions`, `scripts/check-node`, `ops/privacy-export-sweeper` com uma falha a mais).
+  Isolados, falham por ambiente Windows e nenhum importa código desta branch. Duas ressalvas de
+  método: (a) o catálogo do V-007 é INCOMPLETO — declara 54 falhas e itemiza 15 arquivos que somam 40,
+  deixando 14 sem itemizar, e os quatro arquivos aqui somam 10, que cabem nessa lacuna; (b) o V-007
+  mediu com `--maxWorkers=3` e a rodada atual usou workers default. **Remedição feita:** com
+  `--maxWorkers=3` o resultado é idêntico ao de workers default (mesmo conjunto de arquivos, mesmos
+  contadores), o que mostra falhas determinísticas e não inflação por paralelismo. Os quatro não são
+  atribuídos a esta branch; o catálogo do V-007 passa a ser tratado como PARCIAL. Continua não medido:
+  a baseline no commit base com catálogo completo — só isso encerraria o assunto em definitivo.
+- `engineRunsRepo` ainda **não** é reexportado pelo barril `src/db/repositories.ts`. Não quebra nada
+  hoje (nada o consome fora do teste), mas P07 vai precisar disso quando o supervisor o usar.

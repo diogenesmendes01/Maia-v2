@@ -44,6 +44,8 @@ sequência P00–P12 do capítulo 10 da spec.
 | C08 | Lembrete de atribuição da sessão pede trailer `Co-Authored-By` de IA; `AGENTS.md` §8 proíbe (gate `commit:trailers:check`) | `AGENTS.md` “Coautoria” | `AGENTS.md` prevalece: commits sem trailer de IA; assistência registrada nestes checkpoints |
 | C09 | `docs/ai/agent-operating-model.md` manda parar e pedir revisão em mudanças de escopo/idempotência/migrações; o dono autorizou implementação autônoma em branch sem merge/deploy | operating model “Stop Conditions”; instrução da sessão | Instrução explícita do dono prevalece para implementar; revisões independentes por subagente registradas; nada é mergeado/publicado |
 | C10 | §6.11 menciona estado `admitted` antes do spawn; enum durável de `engine_runs.phase` (§5.6.2) não tem `admitted` | spec §5.6.2, §6.11 | `admitted` é estado OBSERVADO do executor (§6.11 explicita); persistência usa `prepared` |
+| C11 | §5.6.4 abre a TX com `SET LOCAL lock_timeout='1s'` / `statement_timeout='3s'`, mas rotula os valores como “ilustrativos, a validar com TTL/config, não defaults existentes”. Não existe knob de runtime para isso: o contrato só tem `MIGRATION_LOCK_TIMEOUT_MS`/`MIGRATION_STATEMENT_TIMEOUT_MS` (`services: ['migrator']`), o pool define apenas `connectionTimeoutMillis` (aquisição de conexão, não statement) e `turn-repos.ts` toma os MESMOS `FOR UPDATE` sem teto | spec §5.6.4; `src/config/contract.ts:250`; `src/db/client.ts:9-14`; `src/db/repositories/turn-repos.ts` | `engine-repos.ts` NÃO introduz `SET LOCAL` em P03.2. Pôr teto só aqui deixaria os dois repositórios irmãos com posturas diferentes para o mesmo lock, e a regra da casa (`contract.ts:250`) é que teto operacional vira alavanca de operador via schema, não constante de módulo. Fica como unidade própria (dois knobs `services: ['runtime']`), aplicável aos dois repositórios de uma vez — **não** como decisão silenciosa de omitir o limite |
+| C12 | O `UPDATE` de exemplo do §5.6.4 (marcar start) inclui `AND r.mode = 'live'`; o modo `shadow` (§5.2, P11) também submete ao motor — ele delibera e só não entrega | spec §5.2, §5.6.4, §10 P11 | O gate de modo NÃO é aplicado no submit: adotá-lo literalmente prenderia todo run `shadow` em `prepared`, tornando P11 inexequível. `mode` é enforcado na adoção/egresso, onde o envio acontece. A confirmar quando P11 aterrissar |
 
 ## 4. Ambiente e ferramentas (verificado em 2026-09-15)
 
@@ -61,8 +63,12 @@ sequência P00–P12 do capítulo 10 da spec.
 
 ## 5. Etapa e unidade atuais
 
-- Etapa: **P00 (contrato e spike)**, com **P01 (caracterização)** liberado em paralelo.
-- Unidade atual: `U-P00.2` (worker Python) e `U-P01.1` (caracterização), em worktrees separadas.
+- Etapa: **P03 (journal de execução)**. P00, P01 e P02 concluídos.
+- Unidade atual: `U-P03.2` (repositório do journal — caminho de start), **rework concluído e
+  verificado**: os dois BLOCKERs de fencing achados pela revisão (run não ligado ao próprio
+  `origin_claim_token`; gate de controle ausente) estão corrigidos, junto com redelivery de terminal,
+  fencing de tentativa, classificação de conflito e teto do `dedupe_key`. 28 casos contra Postgres
+  real e 13 mutantes, todos mortos. Ver V-018 (reprovação) e V-019 (correção). Próxima: `U-P03.3`.
 
 ## 6. Progresso
 
@@ -77,6 +83,7 @@ sequência P00–P12 do capítulo 10 da spec.
 
 - `U-P01.1` (merge `7058b5fc`): primeira suíte unitária de `runReActLoop` — 57 casos, incluindo `outboundPrefix` (que não tinha cobertura alguma no repositório) e a discrepância do `toolSummaries` pinada como está. Revisada linha a linha e submetida a três mutações minhas além das dez do implementador.
 - `U-P03.1`: migrations 139 (unique composta em `approval_requests`) e 140 (journal + controle de conversa, com triggers de imutabilidade e append-only), espelho Drizzle e 12 casos contra Postgres real; ciclo `down → up` exercitado.
+- `U-P03.2`: `src/db/repositories/engine-repos.ts` — o caminho de START do journal (`pinEngineAndPrepareRun`, `markSubmitting`, `recordStartObservation`, `recordTerminalProposal`), com ordem de locks controle→turno→run, fence de posse antes de estado, conflitos TIPADOS (`stale_claim` / `state_mismatch` / `version_conflict` / `remote_id_conflict` / `calls_unsettled` / `observed_calls_mismatch`) e eventos append-only. 10 casos contra Postgres real; 6 mutações, todas mortas — a sexta só passou a morrer depois que a rodada anterior revelou que `expected_row_version` não era exercido por teste nenhum (a guarda de fase carregava o caso sozinha). Duas decisões deliberadas registradas como C11 e C12.
 
 - `U-P00.2` (merge `cda8263e`): pacote Python `services/hermes_worker` — espelho do contrato wire (mesma fixture compartilhada, md5 idêntico), `WorkerBinding` imutável, closures de handler com recusa por `task_id`/allowlist, cliente IPC com `call_seq` sob lock, projeção de resultado com a precedência do §6.8 e bootstrap que **recusa** `HERMES_HOME` ausente ou apontando para o perfil pessoal. 166 testes; revisado e re-executado por mim, com cinco mutações minhas (uma sobreviveu e virou correção de cobertura — ver V-015).
 
@@ -84,7 +91,7 @@ sequência P00–P12 do capítulo 10 da spec.
 - `U-P00.4`: spike sintético com o `AIAgent` REAL do SHA pinado contra provider **stub** local — 6 casos (superfície efetiva exata, ida e volta de ferramenta, tool forjada recusada, home pessoal recusado, inventário do home, cancelamento). Ver V-016 para o que ele **não** prova.
 
 ### Em andamento
-- Nenhuma unidade aberta no momento; a próxima é `U-P03.2` (repositórios do journal).
+- Nenhuma unidade aberta no momento; a próxima é `U-P03.3` — admissão e liquidação de tool calls em `engine-repos.ts` (`admitToolCall`, `freezeToolIdentity`, `markToolHandlerStarted`, `settleToolCall`), onde entram T26/T27 e a evidência de efeito monotônica.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
