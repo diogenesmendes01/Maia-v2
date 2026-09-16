@@ -1129,13 +1129,73 @@ mexiam em código de produção com escopo de tenant; aqui o diff é um spec nov
 **nenhuma linha de produção mudou**. Rodá-lo produziria uma marca de verificação sem significado — e
 `npm test` já cobre a lane unitária.
 
+### V-031 · P03.8b — a varredura achou um defeito de DESENHO, não de teste
+
+`src/runtime/engines/recovery.ts` é o terceiro entregável que o capítulo 10 nomeia para o P03, e com
+ele a etapa entrega os três. É a tabela de dezessete linhas do §5.8.2 como função TOTAL num módulo
+PURO — sem acesso a dados, contexto de execução, configuração de processo ou métricas —, no mesmo
+gênero de `poison-policy.ts`. Isso é o que torna a pergunta "o que é seguro fazer com este run depois
+de uma queda?" respondível sem Postgres, sem Redis e sem boot.
+
+Nove disposições, cada uma citando a linha do §5.8.2/§5.8.4 que a origina: vocabulário sem procedência
+é vocabulário inventado, que é o erro que o C18 e o C20 já me obrigaram a registrar. Duas garantias
+são estruturais e não dependem de disciplina de quem chama: a EVIDÊNCIA DE EFEITO domina a fase (mesma
+régua com que `unsafe_to_retry` domina o código de erro em `poison-policy`), de modo que um
+`result_ready` íntegro não autoriza adoção por cima de efeito não conciliado; e o vocabulário fechado
+**não consegue expressar** "retomar a sequência de ferramentas" — a ausência é o mecanismo do INV-09,
+exatamente como a ausência de `resend_blind` em `RECONCILIATION_DISPOSITIONS`.
+
+**Sete casos escritos ANTES da varredura, por previsão.** Ao mapear as mutações percebi que seis ramos
+sobreviveriam sem caso próprio (o `dead_letter`, o `cancelling`, o ramo `adopted` do `result_ready`, os
+três ramos de `running` e a metade "turno terminal" do helper). Um caso de TOTALIDADE prova que a
+função responde; não prova QUAL ramo respondeu. Também apertei o caso 11: ele aceitava uma lista de
+três disposições, e nessa forma desligar a regra do `inconclusive` devolveria `query_same_request_key`
+— que estava na lista — e o caso seguiria verde. Um teste que aceita três respostas não distingue a
+regra certa da ausência dela.
+
+**E ainda assim a primeira rodada teve um sobrevivente, que era defeito MEU de desenho.** RM2 (a regra
+`blocked → block`) sobreviveu com 22/22 verdes. Causa: o fundo do poço devolvia `block`, então
+desligar a regra 2 fazia um `blocked` cair até lá e produzir a MESMA resposta. O caso 9 não conseguia
+distinguir a regra da ausência dela — mascaramento por par redundante, o mesmo padrão de GM5/GM6.
+
+A saída não foi remendar o teste. Um instantâneo que a tabela não previu **não é um estado seguro
+conhecido**: é defeito de programação, e devolver uma disposição ali faz uma OMISSÃO parecer uma
+DECISÃO. Troquei o fundo por um guard de exaustividade com `never` — idioma que a própria casa já usa
+em `deriveProviderIdempotencyKey`. Agora o COMPILADOR prova que a linha é inalcançável (o `typecheck`
+só passa porque as onze regras cobrem os nove membros de `EngineRunPhaseV1`), um membro novo na união
+quebra a build exatamente ali, e a regra 2 voltou a ser observável.
+
+**Segunda rodada: 13 de 14 mortos**, zero erros de harness, arquivo restaurado idêntico. RM2, que
+sobrevivera, agora morre com 2 falhas — a prova de que a correção foi de desenho. O único sobrevivente
+é RM14, a mutação do próprio guard, e sua sobrevivência é **provada pelo compilador**, não afirmada
+por mim: mutar uma linha que o `never` demonstra inalcançável não pode ser observado. É uma posição
+melhor que a dos dois mutantes "não-matáveis por construção" do P03.4, que tive de aceitar na palavra.
+
+**Defeito de harness, registrado:** a âncora do fundo montava o cedilha com os BYTES UTF-8 (195,167)
+em vez da code unit (231), produzindo `poÃ§o` e `n=0`. O guard de `n !== 1` pegou — é a quarta falha
+da mesma família de escapes nesta sessão, e a razão de o harness abortar em vez de reportar.
+
+**Estado final:** 22 casos unitários, verdes. `typecheck`, `lint` (481 warnings, idêntico à baseline),
+`check:node`, `docs:ai:check`, `config:check:drift` e `audit:exceptions:check` em **exit 0**;
+`prettier --check` limpo nos dois arquivos.
+
+**Regressão — e desta vez a aritmética é DIFERENTE de todas as anteriores.** Como o módulo é puro, os
+testes rodam na lane UNITÁRIA: `50 failed | 10255 passed | 1200 skipped (11505)` contra
+`50 | 10233 | 1200 (11483)` do V-030. O `passed` sobe exatamente +22 e o `skipped` fica INALTERADO —
+o oposto do padrão de toda unidade anterior, cujos testes só engrossavam os pulados. Previsto antes de
+medir, e o spec aparece verde na saída (`✓ engine-recovery-policy.spec.ts (22 tests)`).
+
+**Fora de escopo, e NOMEADO:** a fiação de `routeExistingEngineRun` em `core.ts:750-753` é estrutura
+PROPOSTA (`grep` no código = 0) e altera o pipeline vivo de turno. Fica para unidade própria — o §3
+pede unidades pequenas, e essa tem o maior raio de explosão de tudo que esta épica tocou até aqui.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1200 | Medido de novo em P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| unit (`npm test`, workers default) | 10255 | 50 | 1200 | Medido de novo em P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
 | integração real-db (procedimento local de 2 passos) | 167 | 0 | — | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
 | `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a e P03.7b, com perfil IDÊNTICO nas três vezes** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |

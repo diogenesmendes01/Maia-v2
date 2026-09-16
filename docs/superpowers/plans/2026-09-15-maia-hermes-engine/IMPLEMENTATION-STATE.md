@@ -228,7 +228,7 @@ sequência P00–P12 do capítulo 10 da spec.
   append-only de `engine_run_events`; a certa distingue journal (imutável) de agendamento (não), e o
   `afterAll` passou a APOSENTAR o que cria. Provado com duas rodadas consecutivas e contagem estável.
   Ver V-029.
-- `U-P03.8a` — **concluída e verificada**: caracterização de `engine_projections`, uma LACUNA que só
+- `U-P03.8a` (commit `277f14e9`) — **concluída e verificada**: caracterização de `engine_projections`, uma LACUNA que só
   apareceu quando li o capítulo 10 na FONTE em vez de derivar unidades do §5.6.3. A tabela nasceu na
   140 junto das três irmãs do journal, as três ganharam caracterização no P03.1, e ela ficou com
   `grep` em `tests/` = ZERO. Ninguém teria notado: não há consumidor de produção, então nada quebraria
@@ -242,6 +242,19 @@ sequência P00–P12 do capítulo 10 da spec.
   Poluição de fixture **pre-emptada** desta vez, não remediada depois: escopos vencidos 4 antes e 4
   depois, varredura ainda 30/30. `test:leak` deliberadamente NÃO executado — nenhuma linha de produção
   mudou. Ver V-030.
+- `U-P03.8b` — **concluída e verificada**: `src/runtime/engines/recovery.ts`, o terceiro entregável do
+  capítulo 10 — **com ele o P03 entrega os três**. A tabela do §5.8.2 como função TOTAL num módulo
+  PURO (sem dados, contexto, config ou métricas), no gênero de `poison-policy.ts`. Nove disposições,
+  cada uma citando a linha que a origina. Efeito não conciliado DOMINA a fase; e o vocabulário fechado
+  não consegue expressar "retomar a sequência de ferramentas" — a ausência é o mecanismo do INV-09.
+  22 casos unitários; 14 mutantes. **A varredura achou um defeito de DESENHO meu**: RM2 sobreviveu
+  porque o fundo do poço devolvia `block` e mascarava a regra `blocked → block`. Corrigi o desenho, e
+  não o teste — o fundo virou guard de exaustividade com `never` (idioma de
+  `deriveProviderIdempotencyKey`), porque instantâneo não previsto é DEFEITO, não estado seguro.
+  Segunda rodada: 13/14 mortos, e RM2 morre. O único sobrevivente é o próprio guard, **inalcançável
+  por prova do compilador** — melhor que os dois "não-matáveis por construção" do P03.4.
+  Regressão com aritmética inédita: `passed` +22 e `skipped` INALTERADO, por ser lane unitária.
+  Ver V-031.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
@@ -264,7 +277,20 @@ sequência P00–P12 do capítulo 10 da spec.
 > eu desenhasse o recovery DENTRO do repositório: ele é módulo de RUNTIME. O capítulo lista ainda
 > "projeções" e "testes DB/crash" como escopo do P03.
 
-1. `U-P03.8b` — **`src/runtime/engines/recovery.ts`**, o TERCEIRO entregável que o capítulo 10 nomeia
+> **P03 CONCLUÍDO.** Os três entregáveis que o capítulo 10 nomeia estão entregues e verificados:
+> `engine-repos.ts`, schema + migrations reservadas, e `recovery.ts`. A etapa somou 167 casos de
+> integração contra Postgres real, 22 unitários puros, e varreduras de mutação em cada unidade.
+
+1. `P04` — **controle humano da conversa e fencing de egresso**. O capítulo 10 dá o escopo:
+   "pause/pausing/human/resume e fence real em TODO egresso; hold de inbound", tocando
+   `conversation-controls-repo.ts`, `conversation-control.ts`, admissão de turno, o dispatcher de
+   tools e as rotas de egresso/inline/recovery. Depende do P03 (feito) e **vale também no engine
+   local** — não é fatia só-Hermes. A spec manda testar ABA e backlog, e o §5.6.2 já deixou o
+   `control_epoch` no journal justamente para derrotar ABA.
+2. **Fiação de `routeExistingEngineRun`** (`core.ts:750-753`), em unidade própria: altera o pipeline
+   vivo de turno, que é o maior raio de explosão desta épica até agora.
+
+   Descrição da etapa 8b, mantida como contexto histórico: **`src/runtime/engines/recovery.ts`**, o TERCEIRO entregável que o capítulo 10 nomeia
    para o P03 e o único que falta. A tabela de política do §5.8.2 como módulo PURO de decisão (estado
    do journal → ação segura), sem tocar no fluxo de turno. A spec nomeia o arquivo mas **não
    especifica API nenhuma** — o desenho é meu e será registrado como decisão, não como leitura.
