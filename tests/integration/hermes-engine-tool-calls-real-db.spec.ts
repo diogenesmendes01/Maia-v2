@@ -818,4 +818,326 @@ d("engine-repos — admissão de tool call contra Postgres real", () => {
     );
     expect(row.rows[0]?.idempotency_key).toBeNull();
   });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 21-28 (P03.3c): `markToolHandlerStarted` — o UPDATE do §5.6.4 linha
+  // 1190. É o marcador que separa "não começou" de "pode ter começado", e por
+  // isso a 140 exige `handler_started_at`, `dispatch_token` e
+  // `reservation_token` juntos.
+  //
+  // Os casos 27 e 28 são cirúrgicos DE PROPÓSITO, escritos antes da varredura:
+  // "não pode começar duas vezes" aciona a guarda de estado E a de versão ao
+  // mesmo tempo, que é exatamente como BM3/BM4 sobreviveram em P03.3b. Repetir
+  // o mesmo erro uma terceira vez seria não ter aprendido nada.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** Call em `dispatching` com identidade já congelada — pronta para o marcador. */
+  async function callPronta(
+    effect_class: "abort_safe" | "non_interruptible" = "non_interruptible",
+  ): Promise<{
+    run_id: string;
+    turno: { turn_id: string; claim_token: string; attempt: number };
+    call_id: string;
+    dispatch_token: string;
+    row_version: number;
+  }> {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+    const disp = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: { ...classificacao, effect_class },
+      }),
+    );
+    if (!disp.ok) throw new Error("setup: markToolDispatching falhou");
+    await noEscopo(() =>
+      engineRunsRepo.freezeToolIdentity({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        idempotency_key: "k-" + randomUUID(),
+        idempotency_payload_hash: "v2:" + "a".repeat(64),
+        normalized_args: { texto: "oi" },
+      }),
+    );
+    const row = await pool.query<{ row_version: string }>(
+      "SELECT row_version FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    return {
+      run_id,
+      turno,
+      call_id,
+      dispatch_token: disp.dispatch_token,
+      row_version: Number(row.rows[0]?.row_version),
+    };
+  }
+
+  it("21. marca `handler_started` com os tokens, e eleva `effect_evidence` a `possible`", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callPronta("non_interruptible");
+    const reservation_token = randomUUID();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        reservation_token,
+        approval_claim_token: null,
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{
+      state: string;
+      handler_started_at: string | null;
+      reservation_token: string | null;
+      effect_evidence: string;
+    }>(
+      "SELECT state, handler_started_at, reservation_token, effect_evidence FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("handler_started");
+    expect(row.rows[0]?.handler_started_at).not.toBeNull();
+    expect(row.rows[0]?.reservation_token).toBe(reservation_token);
+    // Classe com efeito: a partir daqui um cancelamento tardio é
+    // `effect_unknown`, então a evidência sobe ANTES de o handler rodar.
+    expect(row.rows[0]?.effect_evidence).toBe("possible");
+  });
+
+  it("22. `abort_safe` NÃO eleva a evidência de efeito", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callPronta("abort_safe");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        reservation_token: randomUUID(),
+        approval_claim_token: null,
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{ state: string; effect_evidence: string }>(
+      "SELECT state, effect_evidence FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("handler_started");
+    // Abortar uma leitura não deixa nada para reconciliar.
+    expect(row.rows[0]?.effect_evidence).toBe("none");
+  });
+
+  it("23. uma call não pode COMEÇAR duas vezes", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callPronta();
+    const args = {
+      run_id,
+      turn_id: turno.turn_id,
+      origin_claim_token: turno.claim_token,
+      call_id,
+      expected_row_version: row_version,
+      dispatch_token,
+      reservation_token: randomUUID(),
+      approval_claim_token: null,
+    };
+    const primeiro = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted(args),
+    );
+    expect(primeiro.ok).toBe(true);
+
+    const segundo = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted(args),
+    );
+    expect(segundo.ok).toBe(false);
+  });
+
+  it("24. `dispatch_token` divergente é recusado, e nada é marcado", async () => {
+    const { run_id, turno, call_id, row_version } = await callPronta();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token: randomUUID(),
+        reservation_token: randomUUID(),
+        approval_claim_token: null,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("dispatch_token_mismatch");
+
+    const row = await pool.query<{ state: string }>(
+      "SELECT state FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("dispatching");
+  });
+
+  it("25. sem identidade congelada o marcador é recusado", async () => {
+    const { run_id, turno, call_id } = await runComCallAdmitida();
+    const disp = await noEscopo(() =>
+      engineRunsRepo.markToolDispatching({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 0,
+        classification: classificacao,
+      }),
+    );
+    if (!disp.ok) throw new Error("setup falhou");
+
+    // Sem `freezeToolIdentity`: o §5.6.4 exige chave/hash presentes.
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: 1,
+        dispatch_token: disp.dispatch_token,
+        reservation_token: randomUUID(),
+        approval_claim_token: null,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("identity_not_frozen");
+
+    const row = await pool.query<{ state: string }>(
+      "SELECT state FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("dispatching");
+  });
+
+  it("26. capacidades revogadas impedem o marcador", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callPronta();
+    await pool.query(
+      "UPDATE engine_runs SET capabilities_revoked_at = now() WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        reservation_token: randomUUID(),
+        approval_claim_token: null,
+      }),
+    );
+    expect(r.ok).toBe(false);
+
+    const row = await pool.query<{ state: string }>(
+      "SELECT state FROM engine_tool_calls WHERE call_id = $1",
+      [call_id],
+    );
+    expect(row.rows[0]?.state).toBe("dispatching");
+  });
+
+  it("27. estado errado com a versão CERTA: só a guarda de ESTADO recusa", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callPronta();
+
+    // Volta para `received` sem mexer em `row_version`.
+    await pool.query(
+      "UPDATE engine_tool_calls SET state = 'received' WHERE call_id = $1",
+      [call_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        reservation_token: randomUUID(),
+        approval_claim_token: null,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("state_conflict");
+  });
+
+  it("28. versão errada com o estado CERTO: só a guarda de VERSÃO recusa", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callPronta();
+
+    await pool.query(
+      "UPDATE engine_tool_calls SET row_version = row_version + 1 WHERE call_id = $1",
+      [call_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        reservation_token: randomUUID(),
+        approval_claim_token: null,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "version_conflict") {
+      expect(r.current_row_version).toBe(row_version + 1);
+    } else if (!r.ok) {
+      throw new Error(`esperado version_conflict, veio ${r.reason}`);
+    }
+  });
+
+  it("29. marcador JÁ carimbado: não recomeça, e o motivo diz exatamente isso", async () => {
+    const { run_id, turno, call_id, dispatch_token, row_version } =
+      await callPronta();
+
+    // Estado e versão INTACTOS; só o carimbo existe. A 140 permite: o
+    // `handler_chk` só exige o trio (carimbo + dispatch + reservation) quando o
+    // estado é `handler_started`. É o único input que isola a guarda
+    // `handler_started_at IS NULL` — o caso 23 move estado, versão e carimbo de
+    // uma vez, então qualquer uma das três recusa sozinha.
+    await pool.query(
+      "UPDATE engine_tool_calls SET handler_started_at = now() WHERE call_id = $1",
+      [call_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.markToolHandlerStarted({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        call_id,
+        expected_row_version: row_version,
+        dispatch_token,
+        reservation_token: randomUUID(),
+        approval_claim_token: null,
+      }),
+    );
+    expect(r.ok).toBe(false);
+    // NÃO pode ser `version_conflict`: a versão pedida é a versão corrente.
+    if (!r.ok) expect(r.reason).toBe("already_started");
+  });
 });

@@ -106,7 +106,7 @@ sequência P00–P12 do capítulo 10 da spec.
   fence de origem só morreu depois do caso 10 (rotação do token SEM avançar a tentativa), porque o
   caso realista de re-claim muda as duas coisas juntas e não isola predicado nenhum. `args_hash` é
   derivado aqui, não transportado: ver C13.
-- `U-P03.3b` — **concluída e verificada**: `markToolDispatching` + `freezeToolIdentity`. A transição
+- `U-P03.3b` (commit `faef2f66`) — **concluída e verificada**: `markToolDispatching` + `freezeToolIdentity`. A transição
   `received → dispatching` ganhou operação própria por C14; ela atribui `dispatch_token`, persiste a
   classificação do registry e RECUSA duas coisas que o §5.6.4 manda recusar antes do UPDATE de
   handler: `effect_class` nulo e prazo restante abaixo de `minimumBudgetMs(effect_class)` (250ms para
@@ -115,11 +115,14 @@ sequência P00–P12 do capítulo 10 da spec.
   (`normalized_args_mismatch`) se redigerir o objeto não reproduzir o `args_hash`. 20 casos no spec de
   tool calls; 7 mutantes, todos mortos — quatro só morreram depois dos casos cirúrgicos 17-20, porque
   o cenário do caso 14 aciona as guardas de estado e de versão ao mesmo tempo e não isola nenhuma.
-- `U-P03.3c` (depois): `markToolHandlerStarted` — o UPDATE do §5.6.4 linha 1190 (CAS por
-  `dispatch_token`, `handler_started_at IS NULL`, identidade presente, `row_version` esperada), que
-  persiste `reservation_token`/`approval_claim_token` e eleva `effect_evidence` para `possible` nas
-  classes cujo veredito de `classifyToolCancellation` é `effect_unknown` — derivado do contrato, não
-  de um `!== 'abort_safe'` escrito à mão.
+- `U-P03.3c` — **concluída e verificada**: `markToolHandlerStarted`, o UPDATE do §5.6.4 linha 1190
+  (CAS por `dispatch_token`, `handler_started_at IS NULL`, identidade presente, `row_version`
+  esperada), que persiste `reservation_token`/`approval_claim_token` e eleva `effect_evidence` para
+  `possible` nas classes cujo veredito de `classifyToolCancellation` é `effect_unknown` — derivado do
+  contrato, não de um `!== 'abort_safe'` escrito à mão. 29 casos no spec de tool calls; 7 mutantes,
+  todos mortos. A varredura achou um defeito REAL: uma call com o marcador já carimbado caía em
+  `version_conflict` com a versão IGUAL à pedida — motivo que sugere "releia e tente de novo" onde a
+  resposta certa é "não recomece". Virou razão própria, `already_started`, com o caso 29 a prendendo.
 - `U-P03.3d` (depois): `settleToolCall` — CAS por `dispatch_token` **mais** fence do turno ATUAL
   (§5.7.4 item 8), ligando o completion de idempotência ao receipt pelo
   `idempotencyOutboxRepo.markCompletedWithEffect` que já existe.

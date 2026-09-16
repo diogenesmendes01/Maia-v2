@@ -608,6 +608,28 @@ export type FreezeIdentityResult =
       expected_args_hash: string;
     };
 
+export type HandlerStartedResult =
+  | { ok: true; effect_evidence: "none" | "possible"; row_version: number }
+  | TurnFenceConflict
+  | ControlConflict
+  | NotFound
+  | { ok: false; reason: "run_not_authorized"; current_phase: EngineRunPhaseV1 }
+  | { ok: false; reason: "capabilities_revoked" }
+  | { ok: false; reason: "deadline_exceeded" }
+  | { ok: false; reason: "state_conflict"; current_state: string }
+  /** O token da call não é o que foi atribuído no `dispatching`. */
+  | { ok: false; reason: "dispatch_token_mismatch" }
+  /** §5.6.4 exige `idempotency_key`/`payload_hash` presentes ANTES do marcador. */
+  | { ok: false; reason: "identity_not_frozen" }
+  /**
+   * A call JÁ tem carimbo de início. Distinto de `version_conflict`: ali o
+   * chamador está com snapshot velho e reler resolve; aqui o handler pode já ter
+   * rodado, e "começar de novo" é justamente o que não se pode fazer. Devolver
+   * `version_conflict` para este caso convidaria à reação errada.
+   */
+  | { ok: false; reason: "already_started" }
+  | { ok: false; reason: "version_conflict"; current_row_version: number };
+
 export const engineRunsRepo = {
   /**
    * TX A do §5.7.3: fixa o motor no turno e cria o run `prepared`.
@@ -1769,6 +1791,214 @@ export const engineRunsRepo = {
 
       conta("freeze_identity", "ok");
       return { ok: true, frozen: true };
+    });
+  },
+
+  /**
+   * O MARCADOR do §5.6.4 (linha 1190): o que separa "não começou" de "pode ter
+   * começado". Depois desta TX commitar, nenhuma recuperação tem direito de
+   * afirmar ausência de efeito para uma classe que carrega efeito.
+   *
+   * `effect_evidence` sobe para `possible` ANTES de o handler rodar, e a decisão
+   * vem do contrato de classes (`classifyToolCancellation`), não de um
+   * `!== 'abort_safe'` escrito à mão: se amanhã uma classe nova entrar no
+   * vocabulário, ela herda o comportamento conservador sozinha, e um valor fora
+   * do vocabulário já é tratado como efeito desconhecido.
+   *
+   * O limite que este protocolo NÃO resolve, e que o §5.6.4 manda não fingir que
+   * resolve: entre o COMMIT deste marcador e a chamada física pode-se perder a
+   * lease. Segurar TX durante o handler não é a solução — a evidência marcada
+   * aqui é.
+   */
+  async markToolHandlerStarted(input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    call_id: string;
+    expected_row_version: number;
+    dispatch_token: string;
+    reservation_token: string;
+    approval_claim_token?: string | null;
+  }): Promise<HandlerStartedResult> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<HandlerStartedResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("handler_started", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const fence = await lockTurnAndCheckFence(tx, {
+        turn_id: input.turn_id,
+        origin_claim_token: input.origin_claim_token,
+      });
+      if (!fence.ok) {
+        conta("handler_started", fence.reason);
+        return fence;
+      }
+
+      const rows = linhas<
+        RunSnapshotRow &
+          RunFenceRow & { revogado: boolean; deadline_vencido: boolean }
+      >(
+        await tx.execute(sql`
+          SELECT ${SNAPSHOT_COLS}, ${FENCE_COLS},
+                 (capabilities_revoked_at IS NOT NULL) AS revogado,
+                 (deadline_at <= clock_timestamp()) AS deadline_vencido
+            FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           FOR UPDATE`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("handler_started", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const recusa = checarFenceDoRun({
+        run,
+        turno: fence.turno,
+        origin_claim_token: input.origin_claim_token,
+        controle,
+      });
+      if (recusa) {
+        conta("handler_started", recusa.reason);
+        return recusa;
+      }
+      const fase = run.phase as EngineRunPhaseV1;
+      if (fase !== "running") {
+        conta("handler_started", "run_not_authorized");
+        return { ok: false, reason: "run_not_authorized", current_phase: fase };
+      }
+      if (run.revogado) {
+        conta("handler_started", "capabilities_revoked");
+        return { ok: false, reason: "capabilities_revoked" };
+      }
+      if (run.deadline_vencido) {
+        conta("handler_started", "deadline_exceeded");
+        return { ok: false, reason: "deadline_exceeded" };
+      }
+
+      const calls = linhas<{ effect_class: string | null }>(
+        await tx.execute(sql`
+          SELECT effect_class FROM ${engine_tool_calls}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+           FOR UPDATE`),
+      );
+      const call = calls[0];
+      if (!call) {
+        conta("handler_started", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      // Classe fora do vocabulário cai no ramo conservador do contrato.
+      const evidencia =
+        classifyToolCancellation(call.effect_class as ToolEffectClass)
+          .outcome === "effect_unknown"
+          ? "possible"
+          : "none";
+
+      const atualizado = linhas<{ row_version: string | number }>(
+        await tx.execute(sql`
+          UPDATE ${engine_tool_calls}
+             SET state = 'handler_started',
+                 handler_started_at = clock_timestamp(),
+                 reservation_token = ${input.reservation_token},
+                 approval_claim_token = ${input.approval_claim_token ?? null},
+                 effect_evidence = ${evidencia},
+                 row_version = row_version + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+             AND state = 'dispatching'
+             AND dispatch_token = ${input.dispatch_token}::uuid
+             AND handler_started_at IS NULL
+             AND idempotency_key IS NOT NULL
+             AND idempotency_payload_hash IS NOT NULL
+             AND row_version = ${input.expected_row_version}
+           RETURNING row_version`),
+      );
+      const marcado = atualizado[0];
+      if (!marcado) {
+        const atual = linhas<{
+          state: string;
+          row_version: string | number;
+          dispatch_token: string | null;
+          idempotency_key: string | null;
+          handler_started_at: string | null;
+        }>(
+          await tx.execute(sql`
+            SELECT state, row_version, dispatch_token::text AS dispatch_token,
+                   idempotency_key, handler_started_at
+              FROM ${engine_tool_calls}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+               AND run_id = ${input.run_id} AND call_id = ${input.call_id}`),
+        );
+        const linha = atual[0];
+        if (!linha) {
+          conta("handler_started", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        if (linha.state !== "dispatching") {
+          conta("handler_started", "state_conflict");
+          return {
+            ok: false,
+            reason: "state_conflict",
+            current_state: linha.state,
+          };
+        }
+        if (linha.dispatch_token !== input.dispatch_token) {
+          conta("handler_started", "dispatch_token_mismatch");
+          return { ok: false, reason: "dispatch_token_mismatch" };
+        }
+        if (linha.idempotency_key === null) {
+          conta("handler_started", "identity_not_frozen");
+          return { ok: false, reason: "identity_not_frozen" };
+        }
+        if (linha.handler_started_at !== null) {
+          // Estado, token e identidade batem: o que sobra é que o marcador JÁ
+          // existe. Sem esta checagem o caso cairia em `version_conflict` com a
+          // versão IGUAL à pedida — um motivo que não explica nada e sugere
+          // "releia e tente de novo" onde a resposta é "não recomece".
+          conta("handler_started", "already_started");
+          return { ok: false, reason: "already_started" };
+        }
+        conta("handler_started", "version_conflict");
+        return {
+          ok: false,
+          reason: "version_conflict",
+          current_row_version: Number(linha.row_version),
+        };
+      }
+
+      const seq = linhas<{ last_event_sequence: string | number }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           RETURNING last_event_sequence`),
+      );
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(seq[0]?.last_event_sequence ?? 1),
+        dedupe_key: `tool_state:${input.call_id}:handler_started`,
+        event_type: "tool_state",
+        actor_kind: "turn_owner",
+        actor_turn_attempt: Number(fence.turno.attempt_count),
+        metadata: {
+          call_id: input.call_id,
+          state: "handler_started",
+          effect_class: call.effect_class,
+          effect_evidence: evidencia,
+          approval_claimed: input.approval_claim_token != null,
+        },
+      });
+
+      conta("handler_started", "ok");
+      return {
+        ok: true,
+        effect_evidence: evidencia,
+        row_version: Number(marcado.row_version),
+      };
     });
   },
 };

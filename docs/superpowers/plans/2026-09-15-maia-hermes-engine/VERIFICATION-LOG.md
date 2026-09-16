@@ -617,14 +617,65 @@ com o hash, freeze antes de `dispatching`. Com eles, **os sete morrem**.
 `reservation_token` e `approval_claim_token` ainda não são persistidos por ninguém, e `effect_evidence`
 continua `none` em toda call. Também segue sem teste de concorrência real.
 
+### V-022 · P03.3c — `markToolHandlerStarted`, o marcador de início
+
+O UPDATE do §5.6.4 linha 1190, implementado como está escrito: CAS por `dispatch_token` com
+`state='dispatching'`, `handler_started_at IS NULL`, identidade congelada e `row_version` esperada,
+sob run `running`/não-revogado/prazo vivo e fence do turno atual. É o que separa "não começou" de
+"pode ter começado" — depois deste COMMIT, nenhuma recuperação tem direito de afirmar ausência de
+efeito para uma classe que carrega efeito.
+
+`effect_evidence` sobe para `possible` **antes** de o handler rodar, e a decisão vem do contrato
+(`classifyToolCancellation(...).outcome === 'effect_unknown'`), não de um `!== 'abort_safe'` escrito à
+mão: classe nova no vocabulário herda o comportamento conservador sozinha, e valor fora do vocabulário
+já cai no ramo conservador do próprio contrato. O caso 22 prende o outro lado — `abort_safe` **não**
+eleva evidência, porque abortar uma leitura não deixa nada para reconciliar.
+
+**Um defeito REAL achado pela varredura.** Com o marcador já carimbado, a operação caía em
+`version_conflict` — com `current_row_version` IGUAL à versão pedida. Um motivo que não explica nada e
+que sugere a reação errada: `version_conflict` convida a reler e tentar de novo, e "tentar de novo" é
+exatamente o que não se pode fazer com um handler que já pode ter rodado. Virou razão própria,
+`already_started`, com o caso 29 a prendendo (carimbo posto por fora, estado e versão intactos — o
+único input que isola aquela guarda, já que o caso 23 move as três coisas de uma vez).
+
+**Mutação: 7 mutantes, previsão 6/7.** Previ CM1-CM6 mortos e CM7 sobrevivente. CM7 sobreviveu como
+esperado (redundância tripla no caso 23). O erro foi CM3: eu previ morte e ele sobreviveu — mas a
+causa **não** era falta de teste, e sim do harness. Eu mutei só `idempotency_key IS NOT NULL`, e o
+`identity_chk` da 140 garante que as duas colunas de identidade andam juntas, então
+`idempotency_payload_hash IS NOT NULL` continuava recusando sozinho. Reancorado para mutar **as duas**,
+CM3 morre pelo caso 25. Lição: mutar metade de um predicado PAREADO mede o harness, não o teste.
+
+**Terceira vez que uma sequência de escape não sobrevive à camada de shell** — antes foram o `$'\r'`
+do grep (que reportava CR invertido) e o caminho POSIX entregue ao Node (que virou `C:\c\Users\...`).
+Desta vez o `\n` de um patch virou newline literal dentro de string JS e quebrou o harness na carga.
+O arquivo foi **reescrito sem nenhum escape**: partes em aspas simples (que mantêm `${...}` literal)
+unidas por `String.fromCharCode(10)`. Vale como regra para as próximas unidades. Confirmei também que
+o script quebrado morreu na CARGA, sem tocar em `engine-repos.ts` — os quatro predicados reais seguiam
+presentes uma vez cada e zero mutantes vazados.
+
+**Estado final:** 29 casos no spec de tool calls, verdes; 7 mutantes, todos mortos.
+`prettier --check`, `typecheck` (projeto) e `eslint` em 0. **Regressão:** `50 failed | 10233 passed |
+1102 skipped (11385)`, os MESMOS 20 arquivos, nenhuma falha citando `engine-repos` ou `tool-calls`, e
+os pulados subindo exatamente os 9 casos novos.
+
+**O que NÃO está feito, e por que `settleToolCall` (P03.3d) virou decisão e não fiação:** o §5.6.3 pede
+que o settle "ligue atomicamente o completion de idempotência ao receipt", mas (a)
+`markCompletedWithEffect` abre a PRÓPRIA `withTx`, e como o `withTx` desta casa faz `pool.connect()` +
+`BEGIN`, chamá-la de dentro da minha TX pegaria **outra conexão e outra transação** — "atômico" seria
+afirmação falsa; o próprio §5.6.3 antecipa isso e manda "extrair helper SQL que aceite executor TX";
+(b) varredura confirma que **nenhuma** fachada de `idempotency-repos.ts` aceita executor hoje, então
+esse helper não existe e criá-lo mexe em módulo compartilhado; e (c) `PlannedEffect` é união de efeitos
+de MENSAGEM (WhatsApp e afins), não de efeito arbitrário de ferramenta — ou seja, a variante com outbox
+pode estar errada em ESPÉCIE, não só em forma de transação. Nada disso foi decidido ainda.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1093 | Medido de novo em P03.3b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 60 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019) + `hermes-engine-tool-calls-real-db` (20: 10 de P03.3a + 10 de P03.3b). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1102 | Medido de novo em P03.3c: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 69 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019) + `hermes-engine-tool-calls-real-db` (29: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c). As demais specs de integração seguem **não executadas** (Redis) |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 
