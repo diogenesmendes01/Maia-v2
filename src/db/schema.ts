@@ -4263,6 +4263,83 @@ export const conversation_controls = pgTable(
   }),
 );
 
+/**
+ * O COMANDO de pause/resume como linha durável (spec §8.2.3 passo 2, §8.2.4).
+ *
+ * `conversation_controls` guarda o ESTADO; esta tabela guarda o PEDIDO e o seu
+ * resultado. Os dois têm tempos de vida diferentes — um estado, muitos comandos
+ * —, e sem o resultado persistido a regra do §8.2.1 ("retry da mesma chave
+ * devolve o mesmo comando, sem novo incremento de epoch") seria impossível de
+ * cumprir: o código não saberia que já viu aquela chave.
+ *
+ * Também é OUTBOX da intenção de cancelamento/reconciliação, com claim/lease
+ * próprios — o pause commita uma barreira local, mas levar o cancel ao motor
+ * remoto é I/O que pode falhar, e sem linha durável a intenção morreria com o
+ * processo.
+ */
+export const conversation_control_commands = pgTable(
+  'conversation_control_commands',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    control_id: uuid('control_id').notNull(),
+    /** `pause` | `resume`. Só comandos de OPERADOR: `pausing → human` é do reconciliador. */
+    kind: text('kind').notNull(),
+    idempotency_key: uuid('idempotency_key').notNull(),
+    /** sha256 do payload canônico + principal: separa REDELIVERY de CONFLITO. */
+    request_hash: text('request_hash').notNull(),
+    /** O CAS do §8.2.3 passo 3. `bigint` pela mesma razão de `control_epoch`. */
+    expected_epoch: bigint('expected_epoch', { mode: 'bigint' }).notNull(),
+    result_epoch: bigint('result_epoch', { mode: 'bigint' }),
+    /** `app_users.id` é text, e a referência é SOFT — como em `conversation_controls`. */
+    requested_by_app_user_id: text('requested_by_app_user_id').notNull(),
+    /** `pending` | `accepted` | `conflict` | `failed`. */
+    status: text('status').notNull().default('pending'),
+    outcome_code: text('outcome_code'),
+    /**
+     * §8.2.3: `barrier_committed = true` NÃO significa `drain_status = 'complete'`.
+     * São dois fatos, e colapsá-los num campo prometeria que nenhuma mensagem
+     * chega depois do clique — o que a spec proíbe afirmar.
+     */
+    barrier_committed: boolean('barrier_committed').notNull().default(false),
+    drain_status: text('drain_status'),
+    inflight_effects: integer('inflight_effects').notNull().default(0),
+    unknown_deliveries: integer('unknown_deliveries').notNull().default(0),
+    /** "resumo sem conteúdo": só ids, códigos e contagens. */
+    summary_json: jsonb('summary_json').notNull().default({}),
+    claimed_by: text('claimed_by'),
+    claim_token: uuid('claim_token'),
+    lease_expires_at: timestamp('lease_expires_at', { withTimezone: true }),
+    attempt: integer('attempt').notNull().default(0),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdUq: unique('conversation_control_commands_scope_id_uq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.id,
+    ),
+    /** A idempotência do §8.2.3 passo 2, no BANCO — e escopada, nunca global. */
+    idemUq: unique('conversation_control_commands_idem_uq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.idempotency_key,
+    ),
+    scopeIdx: index('conversation_control_commands_scope_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.created_at,
+      t.id,
+    ),
+    // `conversation_control_commands_outbox_idx` é PARCIAL (status accepted e
+    // drenagem não concluída) e CROSS-TENANT; o predicado vive na migration
+    // 141, que é quem cria índice. Aqui ficaria só uma cópia sem o `WHERE`,
+    // e uma cópia incompleta é pior que a ausência: sugere paridade que não há.
+  }),
+);
+
 /** UM motor por turno oficial. O pin não muda em retry (spec §5.6.2). */
 export const engine_turn_bindings = pgTable(
   'engine_turn_bindings',

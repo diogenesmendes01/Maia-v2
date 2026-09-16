@@ -57,6 +57,9 @@ sequência P00–P12 do capítulo 10 da spec.
 
 | C20 | O §5.8.4 exige uma operação de **manutenção de metadata** que grave "somente reconciliação de metadata/prova do run", mas o vocabulário FECHADO de `engine_run_events.event_type` não tem termo para ela: os dez valores (`prepared`, `submit_started`, `submit_observed`, `tool_state`, `terminal_observed`, `capabilities_revoked`, `reconcile_decision`, `output_handoff`, `closed`, `projection`) param aí, e nenhuma migration posterior à 140 os estende — conferido no banco, não só no arquivo | spec §5.8.4 itens 2 e 4, §5.6.3 linha 1138; `migrations/140:414-416`; CHECK vigente lido de `pg_constraint` | **Reusar `reconcile_decision`**, que é o termo mais próximo ("o que fazer com uma linha incerta") e já é usado por `markRunBlocked` com `dedupe_key = reconcile_decision:blocked:<row_version>`; a manutenção usa `reconcile_decision:maintenance:<row_version>`, sem colisão porque o dedupe é único por `(run, chave)`. **Isto é decisão minha, não leitura da spec** — a alternativa seria uma migration para acrescentar `maintenance_observed` ao CHECK, o que é mudança de schema e não cabe numa unidade de repositório. Registrado para que P08/P09, que também vão querer emitir eventos novos, decidam de uma vez se o vocabulário cresce |
 
+| C21 | O capítulo 10 nomeia o repositório do controle humano como `conversation-controls-repo.ts` (plural) e o §8.2.3 o nomeia `conversation-control-repo.ts` (singular). Nenhum dos dois existe no código (`find` por `*conversation-control*` em `src/` = vazio) | spec cap. 10 linha 2626; §8.2.3; verificado no código | **Adotar o singular do §8.2.3**, porque é a seção NORMATIVA que descreve a operação (`pauseConversationTx`) e o capítulo 10 é índice de entregáveis. O par `control-service.ts` do mesmo parágrafo também é singular, então o singular mantém os dois nomes coerentes. Registrado para que a divergência não vire descoberta no meio da implementação |
+| C22 | O §8.2.3 passo 4 exige gravar "comando e auditoria durável na MESMA transação" via `auditTx`, mas **não existe ação de auditoria para tomada/retomada humana**: varri os 303 membros de `AUDIT_ACTIONS` com 14 termos (`pause`, `resume`, `takeover`, `human`, `control`, `handoff`, `operator`, `bot`, `mode`, `conversa`, `stream`, `block`, `lock`, …) e nenhuma serve | `src/governance/audit-actions.ts` (303 ações); `src/governance/audit.ts:114` (`auditTx`); spec §8.2.1, §8.2.3 passo 4 | **P04 precisa ACRESCENTAR ações ao vocabulário**, e isso é mudança em módulo de governança COMPARTILHADO — registrada aqui em vez de embutida. O que NÃO serve, e por quê: `owner_handoff_requested` é o PEDIDO ("precisa de humano"), e o §8.2.1 diz em letras que `handoff_requested` não é um modo de autorização — usá-la para "humano assumiu" afirmaria o que ela não diz; `turn_stream_blocked`/`stream_poisoned`/`stream_unblocked` são bloqueio por poison/FIFO, conceito distinto de tomada humana. Fato adjacente, também verificado e não presumido: `conversation_controls` **não tem FK** para `app_users` (`pg_constraint` contype='f' = vazio), então `owner_app_user_id` é referência SOFT — a tabela de comandos segue a mesma decisão da casa, sem inventar integridade que a 140 não criou |
+
 ## 4. Ambiente e ferramentas (verificado em 2026-09-15)
 
 | Item | Estado |
@@ -242,7 +245,7 @@ sequência P00–P12 do capítulo 10 da spec.
   Poluição de fixture **pre-emptada** desta vez, não remediada depois: escopos vencidos 4 antes e 4
   depois, varredura ainda 30/30. `test:leak` deliberadamente NÃO executado — nenhuma linha de produção
   mudou. Ver V-030.
-- `U-P03.8b` — **concluída e verificada**: `src/runtime/engines/recovery.ts`, o terceiro entregável do
+- `U-P03.8b` (commit `f2f4b4f9`) — **concluída e verificada**: `src/runtime/engines/recovery.ts`, o terceiro entregável do
   capítulo 10 — **com ele o P03 entrega os três**. A tabela do §5.8.2 como função TOTAL num módulo
   PURO (sem dados, contexto, config ou métricas), no gênero de `poison-policy.ts`. Nove disposições,
   cada uma citando a linha que a origina. Efeito não conciliado DOMINA a fase; e o vocabulário fechado
@@ -255,6 +258,19 @@ sequência P00–P12 do capítulo 10 da spec.
   por prova do compilador** — melhor que os dois "não-matáveis por construção" do P03.4.
   Regressão com aritmética inédita: `passed` +22 e `skipped` INALTERADO, por ser lane unitária.
   Ver V-031.
+- `U-P04.1` — **concluída e verificada**: migration **141** `conversation_control_commands` + `_down` +
+  espelho drizzle + 17 casos de caracterização. É a linha do COMANDO (o estado já estava na 140):
+  `request_hash` separa redelivery de conflito, a unique de idempotência é ESCOPADA (com caso
+  complementar provando que a mesma chave em outro escopo convive), e `barrier_committed`/`drain_status`
+  são colunas separadas porque o §8.2.3 nega que uma implique a outra.
+  **Duas falhas de ferramenta, minhas:** `migrate:reserve` slugificou um propósito de 600 caracteres
+  como nome de arquivo, e na segunda tentativa o npm não repassou `--filename` por falta do separador
+  `--`. Corrigido pelo caminho que o próprio ledger documenta (linha à mão); as duas linhas ruins
+  estavam NÃO COMMITADAS, e a regra append-only protege entradas commitadas, não erro próprio antes de
+  virar histórico. Guard final: 148 reservas para 148 migrations.
+  **`_down` verificado nos DOIS caminhos**: a recusa real (221 conversas fora de `bot` — investigadas,
+  são fixtures dos meus casos de fence do P03) e o DROP, provado em transação revertida com efeito
+  permanente zero. Ver V-032.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
@@ -362,6 +378,23 @@ D01 launcher/isolamento real · D02 provider/modelo/conta · D03 volume/latênci
   apenas as alterações da tarefa (§2). Por isso a caracterização de `engine_projections` foi para
   arquivo próprio. Normalizar `tests/` de uma vez é decisão do dono — é diff grande e sem relação com
   esta épica, e eu não vou embutí-lo aqui.
+- **O espelho drizzle de `src/db/schema.ts` é CONVENÇÃO, não gate.** Verificado ao criar a 141: as seis
+  tabelas da 140 têm espelho, mas **nenhum teste cobra a paridade** entre `schema.ts` e as migrations —
+  não há spec de paridade, e `probe:drizzle-kit`/`config:check:drift` são outra coisa (o segundo checa
+  artefatos de configuração). Ou seja, esquecer o espelho de uma tabela nova não quebraria nada e
+  passaria despercebido até alguém precisar importá-la num repositório. Registrado porque eu quase
+  fechei o P04.1 sem ele, e só notei ao conferir com o padrão de grep certo — o primeiro grep (de uma
+  linha só) deu falso negativo dizendo que NENHUMA tabela estava espelhada. Um gate de paridade seria
+  barato e é decisão do dono; não o acrescento aqui para não expandir escopo.
+- **A lacuna do prettier NÃO é só de `tests/` — `src/` também está fora de norma.** Medido ao fechar o
+  P04.1: `prettier --check` na versão do HEAD de `src/db/schema.ts` REPROVA. Rodar
+  `prettier --write` nele para acompanhar um acréscimo de ~80 linhas produziu um diff de
+  **3100 adicionadas / 2117 removidas** — ~5 mil linhas de reformatação alheia enterrando o conteúdo
+  da tarefa, o que violaria o §2 ("commits de apenas as alterações desta tarefa"). Restaurei o arquivo
+  e reapliquei só o bloco, no estilo vigente do arquivo. **O detalhe que torna isso uma decisão do
+  dono, e não um bug meu:** o gate da casa é `npm run format` = `prettier --write src`, então rodar o
+  PRÓPRIO gate hoje produziria esse churn em massa. Normalizar o repositório de uma vez é um commit
+  separado e grande; embuti-lo numa fatia desta épica seria esconder a decisão dentro de outra coisa.
 
 ## 9. Comandos de retomada
 

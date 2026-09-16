@@ -1189,14 +1189,73 @@ medir, e o spec aparece verde na saída (`✓ engine-recovery-policy.spec.ts (22
 PROPOSTA (`grep` no código = 0) e altera o pipeline vivo de turno. Fica para unidade própria — o §3
 pede unidades pequenas, e essa tem o maior raio de explosão de tudo que esta épica tocou até aqui.
 
+### V-032 · P04.1 — a tabela de comandos, e duas ferramentas que me morderam
+
+Primeira unidade do P04. `conversation_controls` (140) guarda o ESTADO; faltava onde guardar o
+COMANDO e o seu resultado. Sem isso, a regra do §8.2.1 — "retry da mesma chave devolve o mesmo
+comando, sem novo incremento de epoch" — seria promessa que o código não consegue cumprir, porque ele
+não saberia que já viu aquela chave. `request_hash` é o que separa REDELIVERY de CONFLITO: guardar só
+a chave transformaria "mesma chave, payload diferente" em última-escrita-vence, que o §8.2.4 proíbe.
+
+`barrier_committed` e `drain_status` são colunas SEPARADAS, e o caso 14 existe só para prender isso: o
+§8.2.3 diz em letras que `barrierCommitted=true` não significa `drainStatus='complete'`. Colapsá-las
+num campo faria a UI afirmar que nenhuma mensagem chega depois do clique — exatamente o que a spec
+proíbe prometer.
+
+**Duas falhas de ferramenta, ambas minhas, registradas porque custaram tempo real:**
+
+1. `npm run migrate:reserve "<propósito longo>"` slugificou um parágrafo de ~600 caracteres INTEIRO
+   como nome de arquivo. O script documenta `--filename`, e eu não usei.
+2. Na segunda tentativa usei `--filename` — e o npm **não repassou a flag**, porque falta o separador
+   `--`. O script tratou tudo como propósito e slugificou de novo, agora com o nome colado no fim.
+
+Resolvido pelo caminho que o próprio ledger documenta ("**or** add the line by hand at the bottom").
+Restaurei as duas linhas — ambas NÃO COMMITADAS, só na minha worktree — e anexei a correta à mão.
+Registro o raciocínio porque a regra do ledger é "append-only, nunca edite": ela protege entradas
+COMMITADAS, para que reservas concorrentes colidam no git. Desfazer erro próprio antes de virar
+histórico não é o que ela proíbe, e deixar a linha ruim quebraria o guard, que exige que toda reserva
+aponte para arquivo existente. Guard final: **148 reservas cobrem 148 migrations**, e os dois specs de
+unicidade/reserva verdes (31 casos).
+
+**O `_down` foi verificado nos DOIS caminhos, e o primeiro resultado foi enganoso.** Rodado de
+verdade, ele RECUSOU: "221 conversa(s) fora de bot". Investigado em vez de assumido — as 221 são todas
+de `hermes-repos-tenant`, isto é, fixtures dos meus próprios casos de fence do P03 (`control_not_bot`),
+que viram `mode` para `human` e não limpam. Ou seja, o guard estava certo e minha verificação estava
+pela METADE: eu provara a recusa, não a remoção. Fechei provando o caminho de DROP dentro de uma
+transação que normaliza os modos, executa o down inline e faz `ROLLBACK` — `DROP INDEX`, `DROP TABLE`,
+tabela em 0 lá dentro, e depois tudo de volta (tabela presente, 221 modos intactos). Efeito permanente
+zero.
+
+**Achado de repositório:** o espelho drizzle de `schema.ts` é CONVENÇÃO, não gate — não há spec de
+paridade entre `schema.ts` e as migrations. Quase fechei a unidade sem o espelho, e o que me salvou foi
+refazer o grep: o primeiro padrão (de uma linha só) deu FALSO NEGATIVO dizendo que nenhuma das seis
+tabelas da 140 estava espelhada, quando todas estão — o arquivo põe o nome na linha seguinte ao
+`pgTable(`. Espelho acrescentado; o índice PARCIAL fica declarado só na migration, com o motivo no
+código: uma cópia sem o `WHERE` sugeriria paridade que não existe.
+
+**Estado final:** 17 casos de caracterização contra Postgres real, verdes, afirmando por SQLSTATE, com
+quatro pares complementares (idempotência escopada ↔ mesma chave em outro escopo; `accepted` sem/com
+`result_epoch`; recusa sem motivo ↔ aceite com motivo; claim parcial ↔ claim completo). `typecheck`,
+`lint` (481 warnings, idêntico à baseline), `check:node`, `docs:ai:check`, `config:check:drift` e
+`audit:exceptions:check` em **exit 0**. Migration aplicada no banco local (checksum `2d4ded232851`,
+`transaction_mode: self`) e registrada em `schema_migrations`.
+
+**Regressão:** `50 failed | 10255 passed | 1217 skipped (11522)` contra `50 | 10255 | 1200 (11505)` do
+V-031. Passados e falhos INALTERADOS, os mesmos 20 arquivos; pulados e total sobem exatamente +17.
+
+**O que esta unidade NÃO faz, e é o resto do P04:** `pauseConversationTx`, o serviço puro de
+transporte, as ações de auditoria que o §8.2.3 passo 4 exige e que ainda não existem no vocabulário
+(C22), e os fences nas dez fronteiras de egresso do §8.2.4. Aqui só o schema — nenhum caminho vivo foi
+tocado.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10255 | 50 | 1200 | Medido de novo em P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 167 | 0 | — | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10255 | 50 | 1217 | Medido de novo em P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 184 | 0 | — | Agora com `hermes-control-commands-real-db` (17 de P04.1). Detalhe anterior: | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
 | `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a e P03.7b, com perfil IDÊNTICO nas três vezes** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
