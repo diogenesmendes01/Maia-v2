@@ -1069,14 +1069,74 @@ nome exato; pulados e total sobem exatamente +15, que são os casos novos.
 23 skipped (151)`, os mesmos 6 arquivos, `outbound-leak` verde. Classificação inalterada em relação ao
 V-027, incluindo `turn-context-batch-repos` como item aberto sem controle em HEAD.
 
+### V-030 · P03.8a — a lacuna que só apareceu quando li o capítulo 10 na FONTE
+
+Eu vinha derivando as unidades do P03 da tabela de operações do §5.6.3. Ao abrir o capítulo 10 — que é
+onde o §3 manda buscar rastreabilidade — a etapa P03 declara **três** entregáveis: `engine-repos.ts`,
+schema + migrations reservadas, e `src/runtime/engines/recovery.ts`. O terceiro nem começou, e o
+capítulo lista ainda "projeções" como escopo. Foi isso que me fez conferir `engine_projections`, e o
+`grep` em `tests/` devolveu **ZERO**: a tabela nasceu na 140 junto das três irmãs do journal, as três
+ganharam caracterização no P03.1, e ela ficou sem uma única asserção. Ninguém teria notado — não há
+consumidor de produção, então nada quebraria até alguém depender de um CHECK que talvez não existisse
+como se imaginava.
+
+**Não confundir com o adiamento do P03.6b, que continua de pé.** Aquele é sobre PROCESSAR projeções
+(criá-las no fechamento, executá-las), que é a costura de P08/P09. O que faltava aqui eram os
+INVARIANTES DE SCHEMA, que já existem hoje.
+
+**São testes de CARACTERIZAÇÃO**, e por isso passaram de primeira — o §4 é explícito em que
+caracterização registra a linha de base sem falha artificial, e forçar um vermelho teatral aqui seria
+encenação. A proteção contra caso vazio é dupla: `expectPgError` LANÇA se a operação passar, e cada
+caso afirma um **SQLSTATE** específico em vez de "deu erro" — um typo no INSERT também dá erro, e
+passaria num teste frouxo.
+
+**Três pares complementares**, pela lição que me custou dois ciclos hoje (provar a garantia sem provar
+qual predicado a sustenta): o caso 5 (`started` SEM `finished_at` é válido) é o que impede os casos 3/4
+de passarem sob um CHECK que exigisse `finished_at` SEMPRE; o caso 7 faz o mesmo pelo 6; o caso 9 faz
+o mesmo pela PK do caso 8. Sem os complementos, os três predicados seriam indistinguíveis de versões
+mais grosseiras deles.
+
+**A assimetria registrada como decisão:** `engine_projections` é a única das quatro tabelas do journal
+**sem trigger** — as outras têm `engine_runs_immutable_trg`,
+`engine_tool_calls_immutable_trg` e `engine_run_events_append_only_trg`. A ausência é correta, porque
+uma projeção CAMINHA (`pending → started → completed`), e o caso 13 a fixa: quem "consertar" a
+assimetria acrescentando um trigger quebra no teste, não em produção. O mesmo caso registra que
+`row_version` NÃO é incrementado pelo banco — quem versiona é a aplicação.
+
+**Achado de repositório, registrado e não contornado em silêncio:** não existe configuração de prettier
+(sem `.prettierrc*`, sem chave em `package.json`, sem `.prettierignore`) e o gate da casa é
+`npm run format` = `prettier --write **src**`, que não cobre `tests/`. Medido: o próprio
+`hermes-runs-real-db.spec.ts` REPROVA em `prettier --check`. Acrescentar casos lá e formatar
+reescreveria 461 linhas preexistentes e o commit deixaria de conter apenas as alterações desta tarefa
+(§2), então a caracterização foi para arquivo próprio. Normalizar `tests/` é decisão do dono e está na
+seção de riscos.
+
+**Poluição PRE-EMPTADA, não remediada depois.** `mkRun` insere em `phase='running'` sem tocar
+`next_poll_at`, que assume o default `now()` — ou seja, toda linha nasce VENCIDA e alimentaria o mesmo
+envenenamento cross-tenant que quebrou o baseline da varredura em P03.7b. Desta vez o `afterAll`
+aposenta os runs ANTES de o estrago existir. Provado: escopos vencidos **4 antes e 4 depois**, e o spec
+de varredura segue **30/30** — sem contaminação cruzada.
+
+**Estado final:** 13 casos, verdes. `typecheck`, `lint` (481 warnings, idêntico à baseline),
+`check:node`, `docs:ai:check`, `config:check:drift` e `audit:exceptions:check` todos em **exit 0**;
+`prettier --check` limpo no arquivo tocado.
+
+**Regressão:** `50 failed | 10233 passed | 1200 skipped (11483)` contra `50 | 10233 | 1187 (11470)` do
+V-029. Passados, falhos e os 20 arquivos INALTERADOS; pulados e total sobem exatamente +13.
+
+**`test:leak` NÃO foi executado nesta unidade, deliberadamente.** Rodei nas três anteriores porque
+mexiam em código de produção com escopo de tenant; aqui o diff é um spec novo mais documentação, e
+**nenhuma linha de produção mudou**. Rodá-lo produziria uma marca de verificação sem significado — e
+`npm test` já cobre a lane unitária.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1187 | Medido de novo em P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 154 | 0 | — | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1200 | Medido de novo em P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 167 | 0 | — | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
 | `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a e P03.7b, com perfil IDÊNTICO nas três vezes** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |

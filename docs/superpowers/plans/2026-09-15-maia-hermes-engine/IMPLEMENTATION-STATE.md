@@ -212,7 +212,7 @@ sequência P00–P12 do capítulo 10 da spec.
   Corrigido de quebra um defeito meu do P03.6b: eu havia duplicado à mão o helper `statusList` da casa
   (`turn-fence-sql.ts:61`); substituído, com P03.6b revalidado em 74/74. `test:leak` reexecutado com
   perfil IDÊNTICO (mesmos 6 arquivos, `outbound-leak` verde). Ver V-028 e C19.
-- `U-P03.7b` — **concluída e verificada**: `reserveMaintenanceObservation` + `recordMaintenanceObservation`.
+- `U-P03.7b` (commit `60682783`) — **concluída e verificada**: `reserveMaintenanceObservation` + `recordMaintenanceObservation`.
   Nenhuma das duas passa por `lockTurnAndCheckFence`, e não podem: o §5.8.4 existe para quando o turno
   já NÃO é reivindicável. O fence é a `row_version` devolvida ("não é claim token de turno"), e a
   reserva dispensa coluna nova porque empurrar `next_poll_at` É a exclusão. `owner_alive` tem duas
@@ -228,6 +228,20 @@ sequência P00–P12 do capítulo 10 da spec.
   append-only de `engine_run_events`; a certa distingue journal (imutável) de agendamento (não), e o
   `afterAll` passou a APOSENTAR o que cria. Provado com duas rodadas consecutivas e contagem estável.
   Ver V-029.
+- `U-P03.8a` — **concluída e verificada**: caracterização de `engine_projections`, uma LACUNA que só
+  apareceu quando li o capítulo 10 na FONTE em vez de derivar unidades do §5.6.3. A tabela nasceu na
+  140 junto das três irmãs do journal, as três ganharam caracterização no P03.1, e ela ficou com
+  `grep` em `tests/` = ZERO. Ninguém teria notado: não há consumidor de produção, então nada quebraria
+  até alguém depender de um CHECK que talvez não existisse como se imaginava.
+  13 casos afirmando por **SQLSTATE**, com TRÊS pares complementares (5↔3/4, 7↔6, 9↔8) para que cada
+  predicado seja distinguível de uma versão mais grosseira dele. O caso 13 fixa como DECISÃO a
+  ausência de trigger — assimetria real frente às irmãs — e registra que `row_version` não é
+  incrementado pelo banco.
+  Caracterização passa de primeira por definição (§4: sem falha artificial); a proteção contra caso
+  vazio é `expectPgError` lançar quando a operação passa, somada à asserção por SQLSTATE.
+  Poluição de fixture **pre-emptada** desta vez, não remediada depois: escopos vencidos 4 antes e 4
+  depois, varredura ainda 30/30. `test:leak` deliberadamente NÃO executado — nenhuma linha de produção
+  mudou. Ver V-030.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
@@ -244,7 +258,41 @@ sequência P00–P12 do capítulo 10 da spec.
 > retomada da seção 9 apontavam para binário, data dir e nome de banco errados e consumiram um desvio
 > inteiro de diagnóstico nesta sessão. Manter esta lista viva é parte do trabalho, não enfeite.
 
-1. `U-P03.8` — **recovery do journal**, a última unidade do P03. Compõe o que já existe em vez de
+> **Escopo do P03 relido na FONTE (capítulo 10, linha 2625), e não nos nomes que derivei do §5.6.3.**
+> A etapa tem TRÊS entregáveis: `engine-repos.ts` (feito), schema + migrations reservadas (feito) e
+> **`src/runtime/engines/recovery.ts` (nem começado)**. Ler o capítulo 10 antes de continuar evitou que
+> eu desenhasse o recovery DENTRO do repositório: ele é módulo de RUNTIME. O capítulo lista ainda
+> "projeções" e "testes DB/crash" como escopo do P03.
+
+1. `U-P03.8b` — **`src/runtime/engines/recovery.ts`**, o TERCEIRO entregável que o capítulo 10 nomeia
+   para o P03 e o único que falta. A tabela de política do §5.8.2 como módulo PURO de decisão (estado
+   do journal → ação segura), sem tocar no fluxo de turno. A spec nomeia o arquivo mas **não
+   especifica API nenhuma** — o desenho é meu e será registrado como decisão, não como leitura.
+   `routeExistingEngineRun` é estrutura PROPOSTA (`grep` no código = 0) e sua costura tem lugar exato
+   (linha 495: depois do claim/ALS, ANTES de reexecutar `runAgentTurnPipeline`, em `core.ts:750-753` —
+   as duas chamadas sob `comEscopoDeSaida`). **A fiação fica para unidade própria**: alterar o pipeline
+   vivo de turno tem raio de explosão maior que tudo feito até aqui.
+2. `P04` — controle humano da conversa e fencing de egresso.
+
+   Descrição da etapa 8a, mantida como contexto histórico: caracterização de `engine_projections`,
+   lacuna encontrada ao reler o
+   capítulo 10, não um item do plano original: a tabela existe desde a 140, mas `grep` em `tests/`
+   devolve ZERO — nenhum caso a exercita, enquanto as três irmãs do journal ganharam caracterização no
+   P03.1. São 6 CHECKs (vocabulário de `projection` e de `state`, terminal exige `finished_at`,
+   `anchor_message_id` só em `event_history`), FK e PK compostas, e **nenhum trigger** — assimetria que
+   merece teste próprio, porque a ausência é correta (o estado avança `pending→started→completed`) e
+   alguém pode "consertá-la" por engano. Não confundir com o adiamento do P03.6b, que é sobre
+   PROCESSAR projeções (P08/P09) e continua de pé.
+2. `U-P03.8b` — **`src/runtime/engines/recovery.ts`**: a tabela de política do §5.8.2 como módulo PURO
+   de decisão (estado do journal → ação segura), sem tocar no fluxo de turno. A spec nomeia o arquivo
+   mas **não especifica API nenhuma** — o desenho é meu e será registrado. `routeExistingEngineRun` é
+   estrutura PROPOSTA (não existe no código: `grep` = 0) e sua costura tem lugar exato (§5.8.2 linha
+   495: depois do claim/ALS, ANTES de reexecutar `runAgentTurnPipeline`, em `core.ts:750-753` — as duas
+   chamadas sob `comEscopoDeSaida`). **A fiação fica para unidade própria**: alterar o pipeline vivo de
+   turno tem raio de explosão maior que tudo feito até aqui, e o §3 pede unidades pequenas.
+3. `P04` — controle humano da conversa e fencing de egresso.
+
+   Descrição anterior desta etapa, mantida como contexto: compõe o que já existe em vez de
    reimplementar: a varredura (7a) descobre o trabalho, a manutenção (7b) reserva a janela,
    `revokeRunCapabilities` (P03.4) revoga de forma monotônica e `closeRunAfterHandoff` (P03.6b) fecha
    com prova. O que falta é a POLÍTICA que encadeia os quatro — §5.8.4 item 5 ("com prova de outbound,
@@ -279,6 +327,15 @@ D01 launcher/isolamento real · D02 provider/modelo/conta · D03 volume/latênci
 - Ambiente local sem Redis real: gates que dependem de BullMQ/Redis ficam como não verificados localmente.
 - Postgres local é 16.2 com pgvector 0.6.2 (CI usa imagem `pgvector/pgvector:pg16`, versão mais nova); diferença registrada.
 - Sem push: nenhum CI roda sobre o código novo (INV-13: CI da baseline não homologa nada).
+- **O gate de formatação da casa não cobre `tests/`.** Não existe configuração de prettier no
+  repositório (sem `.prettierrc*`, sem chave em `package.json`, sem `.prettierignore`), então ele roda
+  no default — e `npm run format` é `prettier --write **src**`. Consequência medida, não suposta:
+  `tests/integration/hermes-runs-real-db.spec.ts` REPROVA em `prettier --check`, enquanto os specs que
+  escrevi hoje passam. Isso não é defeito de ninguém, mas tem efeito prático: acrescentar casos a um
+  spec antigo e formatá-lo reescreveria centenas de linhas preexistentes e o commit deixaria de conter
+  apenas as alterações da tarefa (§2). Por isso a caracterização de `engine_projections` foi para
+  arquivo próprio. Normalizar `tests/` de uma vez é decisão do dono — é diff grande e sem relação com
+  esta épica, e eu não vou embutí-lo aqui.
 
 ## 9. Comandos de retomada
 
