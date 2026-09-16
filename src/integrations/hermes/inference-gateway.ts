@@ -533,3 +533,141 @@ export function validateInferenceGrant(
 
   return { kind: 'ok' };
 }
+
+// ─── schema da resposta ─────────────────────────────────────────────────────
+
+/**
+ * O que o gateway devolve ao filho.
+ *
+ * O §9.1 item 8 manda "filtrar/validar nomes de tools retornados ANTES de expor
+ * ao filho", e o item 9 manda "registrar usage observado". As duas coisas são
+ * deste schema: o que não passa por aqui não chega ao processo filho.
+ *
+ * O modo inicial é NÃO-STREAMING ("o modo inicial pode usar resposta
+ * não-streaming para reduzir superfície, se o cliente pinado aceitar"), porque
+ * o próprio item 8 avisa que resultado em stream "exige buffering de metadados
+ * suficiente para não liberar tool inválida". Validar uma tool que já foi
+ * emitida em pedaços é tarde demais.
+ */
+const responseMessageSchema = z
+  .object({
+    role: z.literal('assistant'),
+    content: z.string().nullable(),
+    tool_calls: z.array(toolCallSchema).max(INFERENCE_LIMITS.max_tools).optional(),
+  })
+  .strict();
+
+const responseChoiceSchema = z
+  .object({
+    index: z.number().int().min(0),
+    message: responseMessageSchema,
+    finish_reason: z.enum(['stop', 'length', 'tool_calls', 'content_filter']).nullable(),
+  })
+  .strict();
+
+const usageObservedSchema = z
+  .object({
+    prompt_tokens: z.number().int().min(0),
+    completion_tokens: z.number().int().min(0),
+    total_tokens: z.number().int().min(0),
+  })
+  .strict();
+
+const inferenceResponseSchema = z
+  .object({
+    id: z.string().min(1).max(256),
+    object: z.literal('chat.completion'),
+    created: z.number().int().min(0),
+    model: z.string().min(1).max(256),
+    choices: z.array(responseChoiceSchema).min(1).max(8),
+    /** OPCIONAL de propósito — ver `InferenceResponseV1.usage`. */
+    usage: usageObservedSchema.optional(),
+  })
+  .strict();
+
+export interface InferenceUsageObservedV1 {
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+}
+
+export interface InferenceResponseV1 {
+  id: string;
+  object: 'chat.completion';
+  created: number;
+  model: string;
+  choices: z.infer<typeof responseChoiceSchema>[];
+  /**
+   * `null` quando o provider NÃO reportou uso.
+   *
+   * Não é um objeto de zeros, e a diferença é a do T59: zeros virariam um
+   * evento `reported` de custo zero na contabilidade, apagando uma chamada que
+   * pode ter sido cobrada. `null` é o que faz `cost-accounting` marcar
+   * `unknown` em vez de liquidar — "erros após envio não equivalem a custo
+   * zero" (§9.1 item 9).
+   */
+  usage: InferenceUsageObservedV1 | null;
+}
+
+export type ParsedInferenceResponse =
+  | { kind: 'ok'; response: InferenceResponseV1 }
+  | {
+      kind: 'invalid';
+      code: Extract<InferenceErrorCode, 'provider_unavailable' | 'tool_surface_mismatch'>;
+      field: string;
+    };
+
+/**
+ * Valida a resposta do provider antes de expô-la ao filho. Função TOTAL.
+ *
+ * `allowed_tool_names` é a superfície NORMALIZADA do manifest — a mesma régua
+ * do §9.1 validação 4, agora no sentido de volta. Um provider que devolve uma
+ * tool fora do manifest não recebe o benefício da dúvida: a call seria admitida
+ * pelo broker com um nome que o agente nunca ofereceu.
+ *
+ * Resposta malformada vira `provider_unavailable` (503) e não `invalid_request`:
+ * o pedido do filho estava correto, quem falhou foi o upstream, e devolver 400
+ * ensinaria o cliente a corrigir um pedido que não tem defeito.
+ */
+export function parseInferenceResponse(
+  raw: unknown,
+  allowed_tool_names: readonly string[],
+): ParsedInferenceResponse {
+  const parsed = inferenceResponseSchema.safeParse(raw);
+  if (!parsed.success) {
+    const issue = parsed.error.issues[0];
+    return {
+      kind: 'invalid',
+      code: 'provider_unavailable',
+      field: issue?.path.join('.') || 'body',
+    };
+  }
+
+  const permitidas = new Set<string>(allowed_tool_names);
+  for (const choice of parsed.data.choices) {
+    for (const call of choice.message.tool_calls ?? []) {
+      if (!permitidas.has(call.function.name)) {
+        // Sem o NOME da tool no diagnóstico: ele volta ao cliente e é
+        // superfície do agente.
+        return {
+          kind: 'invalid',
+          code: 'tool_surface_mismatch',
+          field: `choices.${choice.index}.message.tool_calls`,
+        };
+      }
+    }
+  }
+
+  return {
+    kind: 'ok',
+    response: {
+      id: parsed.data.id,
+      object: parsed.data.object,
+      created: parsed.data.created,
+      model: parsed.data.model,
+      choices: parsed.data.choices,
+      // Ausência é preservada como ausência. Ver o comentário do campo.
+      usage: parsed.data.usage ?? null,
+    },
+  };
+}

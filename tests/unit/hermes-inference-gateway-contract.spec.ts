@@ -41,6 +41,7 @@ import {
   INFERENCE_ERROR_STATUS,
   INFERENCE_LIMITS,
   parseInferenceRequest,
+  parseInferenceResponse,
   toWireError,
   validateInferenceGrant,
   type InferenceGrantV1,
@@ -495,6 +496,114 @@ describe('T18 — revogação, estado do run, modelo e superfície', () => {
     expect(
       validateInferenceGrant(null, ctx({ model_requested: 'modelo-errado', run_phase: 'closed' })),
     ).toMatchObject({ kind: 'refused', code: 'invalid_inference_grant' });
+  });
+});
+
+describe('P06 — schema da RESPOSTA (§9.1 itens 8 e 9)', () => {
+  function resp(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      id: 'chatcmpl-1',
+      object: 'chat.completion',
+      created: 1_789_000_000,
+      model: 'gpt-4o-mini-pinned',
+      choices: [
+        { index: 0, message: { role: 'assistant', content: 'oi' }, finish_reason: 'stop' },
+      ],
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+      ...over,
+    };
+  }
+
+  it('45. resposta válida passa', () => {
+    expect(parseInferenceResponse(resp(), []).kind).toBe('ok');
+  });
+
+  it('46. campo desconhecido na resposta é recusado (nada extra chega ao filho)', () => {
+    expect(parseInferenceResponse(resp({ system_fingerprint_extra: 'x' }), []).kind).toBe(
+      'invalid',
+    );
+  });
+
+  it('47. tool devolvida FORA da superfície é `tool_surface_mismatch` (§9.1 item 8)', () => {
+    const r = parseInferenceResponse(
+      resp({
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: [
+                {
+                  id: 'call_1',
+                  type: 'function',
+                  function: { name: 'terminal_exec', arguments: '{}' },
+                },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      }),
+      ['consultar_saldo'],
+    );
+    expect(r).toMatchObject({ kind: 'invalid', code: 'tool_surface_mismatch' });
+  });
+
+  it('48. tool devolvida DENTRO da superfície passa', () => {
+    const r = parseInferenceResponse(
+      resp({
+        choices: [
+          {
+            index: 0,
+            message: {
+              role: 'assistant',
+              content: null,
+              tool_calls: [
+                {
+                  id: 'call_1',
+                  type: 'function',
+                  function: { name: 'consultar_saldo', arguments: '{}' },
+                },
+              ],
+            },
+            finish_reason: 'tool_calls',
+          },
+        ],
+      }),
+      ['consultar_saldo'],
+    );
+    expect(r.kind).toBe('ok');
+  });
+
+  it('49. usage AUSENTE vira `null` VISÍVEL, nunca zeros fabricados (T59)', () => {
+    const { usage: _omitido, ...semUsage } = resp();
+    const r = parseInferenceResponse(semUsage, []);
+    if (r.kind !== 'ok') throw new Error('esperava resposta válida');
+    // O §9.1 item 9 manda registrar o usage OBSERVADO. Um objeto de zeros aqui
+    // viraria um evento `reported` de custo zero lá na frente — exatamente o
+    // "custo zero fabricado" que o T59 proíbe.
+    expect(r.response.usage).toBeNull();
+  });
+
+  it('50. content em blocos na resposta é recusado (piloto textual)', () => {
+    const r = parseInferenceResponse(
+      resp({
+        choices: [
+          {
+            index: 0,
+            message: { role: 'assistant', content: [{ type: 'text', text: 'oi' }] },
+            finish_reason: 'stop',
+          },
+        ],
+      }),
+      [],
+    );
+    expect(r.kind).toBe('invalid');
+  });
+
+  it('51. `choices` vazio é recusado', () => {
+    expect(parseInferenceResponse(resp({ choices: [] }), []).kind).toBe('invalid');
   });
 });
 
