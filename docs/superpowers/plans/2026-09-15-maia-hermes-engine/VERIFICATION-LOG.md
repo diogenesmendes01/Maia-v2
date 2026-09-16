@@ -256,6 +256,71 @@ O caso que mais importa é o segundo: um adapter local que devolvesse
 supervisor a recomeçar um turno que pode ter executado ferramentas. Por isso o registro em memória
 é explicitamente honesto — “não tenho registro” nunca é prova de não-execução (§5.3.1).
 
+### V-014 · P02.2 — separação entre deliberar e entregar em `react-loop.ts`
+
+A iteração deixou de despachar: ela registra o candidato (texto cru + texto com prefixo de role) e o
+envio acontece depois do laço, numa fachada de saída. A ordem observável foi preservada de
+propósito — `outboundText` continua atribuído antes de qualquer tentativa de envio, `not_sent`
+continua encerrando sem marcar entrega, `sent_no_persist` continua marcando incerteza **e** entrega,
+e a reflexão de lacuna continua acontecendo só quando algo chegou ao usuário.
+
+| Gate | Resultado |
+|---|---|
+| `tests/unit/react-loop-characterization.spec.ts` (a rede da refatoração) | 57/57 |
+| `maia-engine` + `hermes-wire-contract` + `hermes-history-normalizer` + `agent-engine-contract` | 131/131 |
+| `npm run typecheck` | 0 erros (depois de corrigir o estreitamento de `candidato` para `never`) |
+| `npx eslint src/agent/react-loop.ts` | 0 achados |
+
+Dois percalços registrados porque distorceriam a leitura do diff:
+
+1. o compilador estreitava `candidato` para `never` — ele não acompanha atribuições feitas dentro da
+   closure da iteração. Resolvido com container mutável + captura numa `const` local;
+2. **as ferramentas de edição desta máquina gravam CRLF, e o repositório é LF.** O diff apareceu como
+   723+/695− (arquivo inteiro) quando a mudança real era 100+/68−. Pior: minha primeira "correção"
+   converteu o arquivo para CRLF, e um script de normalização meu pegou a lista errada e alterou o
+   fim de linha de **146 arquivos alheios** antes de abortar. Todos foram restaurados com
+   `git checkout --` (a mudança neles era exclusivamente de EOL, confirmado com
+   `--ignore-cr-at-eol`), e o `schema.ts` — que já tinha entrado com esse ruído no commit `6517579d`
+   — foi devolvido a LF no commit `f0bb928a`. **Regra para o resto da sessão: conferir EOL de todo
+   arquivo existente antes de commitar.**
+
+### V-015 · Revisão do trabalho do agente P00.2 (worker Python) — feita por mim
+
+O agente entregou `services/hermes_worker` (20 arquivos, 4869 linhas) e relatou 166 testes verdes.
+O que eu fiz, além de ler o relatório:
+
+1. Li `protocol.py` e `main.py`. Pontos que sustentam a integração: o comprimento de string é medido
+   em unidade UTF-16 (é assim que o Zod mede, então um nome com emoji conta igual dos dois lados); a
+   regex de instante ISO foi recomposta a partir do próprio Zod, em vez de "melhorada"; a ordem das
+   checagens é tratada como parte do contrato, porque a fixture afirma o CÓDIGO de recusa; e o
+   bootstrap **recusa** `HERMES_HOME` ausente, relativo ou apontando para o perfil pessoal do Hermes
+   Desktop — que é exatamente o risco de isolamento que registrei em V-002.
+2. Reexecutei a suíte em venv limpo, sem `HERMES_HOME` nem credenciais: **166 passed**.
+3. Conferi que a fixture compartilhada é byte a byte a mesma dos dois lados (md5 `8931cc97…`).
+4. Apliquei **cinco mutações minhas** em `protocol.py`: teto de frame, teto de payload de tool,
+   profundidade de JSON, regra de inteiro decimal e regex de instante ISO.
+
+**Quatro foram detectadas. A quinta sobreviveu** — afrouxar a regra de inteiro decimal
+(`cost_microusd`) não derrubou nenhum teste. Investigando: o validador Python estava CORRETO; o que
+faltava era caso de teste, e o mesmo buraco existia no meu lado, porque a fixture compartilhada não
+tinha nenhum custo malformado. Acrescentei três casos (`25.5` recusado, `'0'` aceito como medição,
+`'007'` recusado por dupla representação) e reapliquei a mutação:
+
+| Lado | Antes dos casos novos | Depois |
+|---|---|---|
+| Python (`test_protocol_fixtures.py`) | mutação SOBREVIVE | 2 casos vermelhos |
+| TypeScript (`hermes-wire-contract.spec.ts`) | mutação sobrevive | 2 casos vermelhos |
+
+Ambos voltam verdes com o arquivo restaurado (Python 39, TS 65). É a demonstração de que a fixture
+compartilhada funciona como guarda de divergência: um caso acrescentado fecha o buraco nas DUAS
+implementações de uma vez.
+
+UNKNOWNs que o autor deixou explícitos e que viram trabalho do supervisor (registrados, não
+resolvidos): `tool_schema_digest` precisa ser calculado igual dos dois lados ou a readiness trava sem
+erro óbvio; a janela de contexto está fixa em 64.000 porque o frame `start` não a carrega; e a
+estratégia de descritores (duplicar o FD 1 e mandar stdout para stderr) **não foi validada contra um
+spawn real do Node no Windows** — isso é parte do P00.4.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |

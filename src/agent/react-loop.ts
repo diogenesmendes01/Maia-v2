@@ -235,6 +235,22 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   const sensitiveTools: string[] = [];
   let latestReportPdf: LatestReportPdf | null = null;
   let outboundText = '';
+  /**
+   * P02.2 (spec §5.2, §5.3.3) — SEPARAÇÃO ENTRE DELIBERAR E ENTREGAR.
+   *
+   * Até aqui o laço despachava a resposta DENTRO da iteração e devolvia um
+   * veredito de entrega junto com o de raciocínio. Quem chamava não conseguia
+   * distinguir "o modelo não produziu texto" de "o envio falhou antes de sair"
+   * sem ler `exitReason`, e um motor em outro processo não teria como produzir
+   * esse veredito — ele não entrega nada.
+   *
+   * Agora a iteração só REGISTRA o candidato (texto cru e texto final com o
+   * prefixo de role); o despacho acontece depois do laço, na fachada de saída
+   * abaixo. O comportamento observável é o mesmo — é o que os 57 casos de
+   * `tests/unit/react-loop-characterization.spec.ts` verificam —, mas a
+   * fronteira passa a existir.
+   */
+  const candidato: { atual: { rawText: string; text: string } | null } = { atual: null };
   const toolsCalled: Array<{ name: string; result: unknown }> = [];
   // Issue #73 — accumulator of structured per-tool summaries used both for
   // anti-anchoring (next-turn events block) and as the audit trail. Persisted
@@ -371,74 +387,9 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
           ? `${prefix}\n\n${rawText}`
           : rawText;
       outboundText = text;
-      if (text) {
-        // Centralised, never-throwing dispatch (Codex #216 HIGH-1). We are the
-        // terminal ReAct turn, so there's no further fallback: on a not_sent
-        // (pre-send / disconnected) outcome NOTHING reached the user — record an
-        // outbound_failure exit (tool summaries still flush below) instead of
-        // silently marking the turn delivered.
-        const outcome = await safeDispatchOutput({
-          pessoa,
-          conversa: c,
-          inbound,
-          jid,
-          text,
-          latestPending,
-          latestReportPdf,
-          turnHasSensitive,
-          sensitiveTools,
-        });
-        if (outcome.status === 'not_sent') {
-          logger.warn(
-            { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error },
-            'react_loop.outbound_not_delivered',
-          );
-          exitReason = 'outbound_failure';
-          return 'stop';
-        }
-        if (outcome.status === 'sent_no_persist') {
-          // Sent but persist failed (or ambiguous) — user has it; do NOT re-send.
-          logger.error(
-            { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error, ops_alert: true },
-            'react_loop.dispatch_inconsistency',
-          );
-          persistUnknown = true;
-        }
-        outboundDispatched = true;
-
-        // P1 reflection trigger: INTERNAL_GAP. Inspects the final outbound
-        // text for self-recognized gaps ("não sei", "preciso verificar",
-        // "sem acesso a..."). Fire-and-forget — reflection MUST never
-        // block the user-facing reply or the ReAct return.
-        // [P88-C4] Use rawText (without role announcement prefix) so the
-        // announcement string can't trigger spurious gap detection.
-        const gap = detectGap(rawText);
-        if (gap.detected) {
-          const responseText = rawText;
-          const signal = gap.signal ?? '';
-          void (async () => {
-            try {
-              const event = {
-                type: CognitiveEventType.INTERNAL_GAP,
-                conversa_id: c.id,
-                inbound_mensagem_id: inbound.id,
-                gap_description: signal,
-                attempted_response: responseText,
-              } as const;
-              const reflected = await reflect(event, { pessoa_id: pessoa.id });
-              if (!reflected || !reflected.insight) return;
-              const classified = await classify(reflected.insight);
-              if (!classified) return;
-              await persistCandidate(classified, event);
-            } catch (err) {
-              logger.warn(
-                { err: (err as Error).message, mensagem_id: inbound.id },
-                'gap.reflection.failed',
-              );
-            }
-          })();
-        }
-      }
+      // P02.2: a deliberação termina AQUI. O candidato fica registrado e a
+      // entrega acontece depois do laço — ver `candidato` lá em cima.
+      candidato.atual = { rawText, text };
       return 'stop';
     }
 
@@ -671,6 +622,87 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
     const step = await instrumentReactIteration(i + 1, () => runIteration(i));
     if (step === 'stop') break;
+  }
+
+  // ─── FACHADA DE SAÍDA (P02.2) ─────────────────────────────────────────────
+  //
+  // O que era o miolo do `if (text)` da iteração, agora DEPOIS da deliberação.
+  // A ordem preservada é deliberada: `outboundText` já foi atribuído no laço
+  // (antes de qualquer tentativa de envio), o `not_sent` continua encerrando
+  // sem marcar entrega, o `sent_no_persist` continua marcando incerteza E
+  // entrega, e a reflexão de lacuna continua acontecendo SÓ quando algo chegou
+  // ao usuário — nunca depois de uma falha pre-send.
+  // Capturado numa const: o acumulador é um container mutável porque a
+  // atribuição acontece dentro da closure da iteração, e o compilador não
+  // acompanha atribuições através dessa fronteira.
+  const proposta = candidato.atual;
+  if (proposta && proposta.text) {
+    // Centralised, never-throwing dispatch (Codex #216 HIGH-1). We are the
+    // terminal ReAct turn, so there's no further fallback: on a not_sent
+    // (pre-send / disconnected) outcome NOTHING reached the user — record an
+    // outbound_failure exit (tool summaries still flush below) instead of
+    // silently marking the turn delivered.
+    const outcome = await safeDispatchOutput({
+      pessoa,
+      conversa: c,
+      inbound,
+      jid,
+      text: proposta.text,
+      latestPending,
+      latestReportPdf,
+      turnHasSensitive,
+      sensitiveTools,
+    });
+    if (outcome.status === 'not_sent') {
+      logger.warn(
+        { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error },
+        'react_loop.outbound_not_delivered',
+      );
+      exitReason = 'outbound_failure';
+    } else {
+      if (outcome.status === 'sent_no_persist') {
+        // Sent but persist failed (or ambiguous) — user has it; do NOT re-send.
+        logger.error(
+          { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error, ops_alert: true },
+          'react_loop.dispatch_inconsistency',
+        );
+        persistUnknown = true;
+      }
+      outboundDispatched = true;
+
+      // P1 reflection trigger: INTERNAL_GAP. Inspects the final outbound
+      // text for self-recognized gaps ("não sei", "preciso verificar",
+      // "sem acesso a..."). Fire-and-forget — reflection MUST never
+      // block the user-facing reply or the ReAct return.
+      // [P88-C4] Use rawText (without role announcement prefix) so the
+      // announcement string can't trigger spurious gap detection.
+      const gap = detectGap(proposta.rawText);
+      if (gap.detected) {
+        const responseText = proposta.rawText;
+        const signal = gap.signal ?? '';
+        void (async () => {
+          try {
+            const event = {
+              type: CognitiveEventType.INTERNAL_GAP,
+              conversa_id: c.id,
+              inbound_mensagem_id: inbound.id,
+              gap_description: signal,
+              attempted_response: responseText,
+            } as const;
+            const reflected = await reflect(event, { pessoa_id: pessoa.id });
+            if (!reflected || !reflected.insight) return;
+            const classified = await classify(reflected.insight);
+            if (!classified) return;
+            await persistCandidate(classified, event);
+          } catch (err) {
+            logger.warn(
+              { err: (err as Error).message, mensagem_id: inbound.id },
+              'gap.reflection.failed',
+            );
+          }
+        })();
+      }
+    }
   }
 
   // Codex C1 (PR #74): when no outbound was dispatched but tools ran, persist

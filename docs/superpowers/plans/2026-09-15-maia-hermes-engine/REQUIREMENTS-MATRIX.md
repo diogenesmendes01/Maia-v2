@@ -53,7 +53,7 @@
 
 | PR | Entrega verificável | Estado |
 |---|---|---|
-| P00 | Wire/JSON Schema TS+Python, normalização de histórico, execução sintética real com AIAgent, superfície após compressão e cleanup | **em andamento**: P00.1 (contrato wire TS + canônico + fixtures compartilhadas) concluído e verificado; P00.2 (worker Python), P00.3 (normalizador de histórico) e P00.4 (spike real com `AIAgent`) pendentes |
+| P00 | Wire/JSON Schema TS+Python, normalização de histórico, execução sintética real com AIAgent, superfície após compressão e cleanup | **em andamento**: P00.1 (contrato wire TS + canônico + fixtures), P00.2 (pacote Python `services/hermes_worker`, 166 testes, mesma fixture compartilhada) e P00.3 (normalizador de histórico) concluídos e verificados. Falta **P00.4** — a execução sintética com `AIAgent` real, superfície após compressão e cleanup do home efêmero |
 | P01 | Caracterização do comportamento local (matriz de delivery, role/pending/report/sensitive, pós-turno) | **concluído e verificado** — `tests/unit/react-loop-characterization.spec.ts` (57 casos), primeira suíte unitária de `runReActLoop`; 10 mutações do implementador + 3 minhas, independentes, todas detectadas |
 | P02 | `AgentEnginePortV1`, `MaiaEngine`, assembler, output coordinator; default local | **em andamento**: P02.0 (contratos + schemas) e P02.1 (`MaiaEngine` com raciocínio injetado) concluídos e verificados; falta ligar o laço real (P02.2), o assembler e o coordenador de saída |
 | P03 | Binding/run/tool journal/eventos/projeções, CAS/constraints/imutabilidade, recovery sem rerun | **em andamento**: P03.1 (migrations 139/140 + espelho Drizzle + 12 casos contra Postgres real, incluindo triggers de imutabilidade e append-only) concluído; `engine-repos` e recovery pendentes |
