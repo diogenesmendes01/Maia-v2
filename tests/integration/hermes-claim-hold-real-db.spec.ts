@@ -525,4 +525,92 @@ d('P04.6 — hold de admissão/claim sob controle humano (DB real)', () => {
     expect(r.ok).toBe(false);
     expect(r.ok === false && r.reason).toBe('not_eligible');
   });
+
+  // ─── O QUINTO E SEXTO CONSUMIDORES: o fechador de DEBOUNCE ──────────────
+  //
+  // Achado por revisão adversarial do desenho da fatia seguinte, e confirmado
+  // por leitura minha do código: `closeDueDebounceBatchTx` põe `status='queued'`
+  // no head, carimba `promoted_at = now()`, zera `next_attempt_at` e empurra
+  // `last_ingress_seq` com `GREATEST(...)` — tudo sem consultar o controle. O
+  // worker que o dirige é um relógio cross-tenant, e `listDueDebounceStreams`
+  // também não consulta.
+  //
+  // O hold do claim impedia a EXECUÇÃO, então a conversa não era respondida.
+  // Mas a linha era MUTADA, e o deslocamento de `last_ingress_seq` furava o
+  // filtro do descarte de backlog (`<= watermark`): um head que absorvesse
+  // mensagem depois do watermark escapava do cancelamento e voltava a ser
+  // reivindicável no instante em que o modo virasse `bot` — quebrando
+  // `future_only` justamente no caminho que o §8.2.5 existe para fechar.
+
+  /** Turno com JANELA DE DEBOUNCE vencida — o que o fechador vem buscar. */
+  async function mkTurnoComJanelaVencida(key: string): Promise<string> {
+    const turno = await mkTurno({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      status: 'received',
+    });
+    await pool.query(
+      `UPDATE agent_turns
+          SET debounce_window_opened_at = now() - interval '2 minutes',
+              debounce_deadline_at      = now() - interval '1 minute',
+              debounce_closed_at        = NULL
+        WHERE id = $1`,
+      [turno],
+    );
+    return turno;
+  }
+
+  it('17. o fechador de debounce NÃO fecha janela de conversa retida', async () => {
+    const key = streamKey();
+    const turno = await mkTurnoComJanelaVencida(key);
+    await mkControle({ tenant: T_A, agent: A_A, stream_key: key, mode: 'human' });
+
+    const r = await inA(() => repos().agentTurnsRepo.closeDueDebounceBatch({ stream_key: key }));
+    expect(r.closed).toBe(false);
+    // Motivo PRÓPRIO, e não `lost_race`: o CAS falhar por causa do predicado
+    // contaria a história errada — mandaria o operador procurar corrida onde há
+    // decisão humana. Mesma régua que separou `stream_poisoned` de
+    // `stream_blocked`.
+    expect(r.closed === false && r.reason).toBe('conversation_human_control');
+
+    // E a LINHA não foi tocada: é isto que fura o descarte, não o fechamento.
+    const depois = await lerTurno(turno);
+    expect(depois['status']).toBe('received');
+    expect(depois['debounce_closed_at']).toBeNull();
+    expect(depois['promoted_at']).toBeNull();
+    expect(Number(depois['last_ingress_seq'])).toBe(1);
+  });
+
+  it('18. a MESMA janela fecha quando a conversa é do bot', async () => {
+    // Sem esta ponta, o caso 17 passaria num sistema que nunca fecha janela.
+    const key = streamKey();
+    const turno = await mkTurnoComJanelaVencida(key);
+    await mkControle({ tenant: T_A, agent: A_A, stream_key: key, mode: 'bot' });
+
+    const r = await inA(() => repos().agentTurnsRepo.closeDueDebounceBatch({ stream_key: key }));
+    expect(r.closed).toBe(true);
+    const depois = await lerTurno(turno);
+    expect(depois['status']).toBe('queued');
+    expect(depois['debounce_closed_at']).not.toBeNull();
+  });
+
+  it('19. o varredor cross-tenant não ENUMERA a stream retida', async () => {
+    // A enumeração é advisória — o CAS é a barreira —, mas sem ela o worker
+    // gasta o `limit` da rodada em conversas que não pode fechar, e uma stream
+    // retida de longa duração empurraria streams legítimas para fora do lote
+    // (a starvation que a própria ordenação por prazo existe para evitar).
+    const retida = streamKey();
+    const livre = streamKey();
+    await mkTurnoComJanelaVencida(retida);
+    await mkTurnoComJanelaVencida(livre);
+    await mkControle({ tenant: T_A, agent: A_A, stream_key: retida, mode: 'human' });
+    await mkControle({ tenant: T_A, agent: A_A, stream_key: livre, mode: 'bot' });
+
+    const streams = await repos().agentTurnsRepo.listDueDebounceStreams(200);
+    const chaves = streams.map((s) => s.stream_key);
+    expect(chaves).not.toContain(retida);
+    expect(chaves).toContain(livre);
+  });
 });

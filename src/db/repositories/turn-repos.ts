@@ -211,7 +211,23 @@ export type DebounceCloseResult =
     }
   | {
       closed: false;
-      reason: 'stream_locked' | 'no_window' | 'not_due' | 'lost_race';
+      reason:
+        | 'stream_locked'
+        | 'no_window'
+        | 'not_due'
+        | 'lost_race'
+        /**
+         * P04.6b (spec maia-hermes §8.2.5) — a CONVERSA está sob controle
+         * humano, e o fechamento é recusado.
+         *
+         * Motivo PRÓPRIO, e não `lost_race`, pela mesma régua que separou
+         * `stream_poisoned` de `stream_blocked`: as remediações são opostas.
+         * `lost_race` diz "outra transação mexeu no turno; o próximo tick
+         * fecha" — e mandaria o operador esperar por um fechamento que não vem
+         * enquanto um humano estiver atendendo. Este diz "há decisão humana em
+         * curso; o fechamento volta com o `resume`".
+         */
+        | 'conversation_human_control';
     };
 
 /**
@@ -978,6 +994,18 @@ export const agentTurnsRepo = {
          AND t.debounce_deadline_at IS NOT NULL
          AND t.debounce_closed_at IS NULL
          AND t.debounce_deadline_at <= now()
+         -- P04.6b -- conversa sob CONTROLE HUMANO nao entra no lote. A
+         -- enumeracao e ADVISORIA (o CAS do fechamento e a barreira), mas sem
+         -- ela o varredor gasta o limit da rodada em streams que nao pode
+         -- fechar, e uma conversa retida de longa duracao empurraria streams
+         -- legitimas para fora do lote -- a starvation que a propria ordenacao
+         -- por prazo existe para evitar. CROSS-TENANT: o escopo sai das
+         -- COLUNAS da linha, como em listTenantAgentPairsWithRecoverableTurns.
+         AND ${streamNotHumanControlled({
+           tenant: sql`t.tenant_id`,
+           agent: sql`t.agent_id`,
+           alvo: sql`t`,
+         })}
        GROUP BY t.tenant_id, t.agent_id, t.stream_key
        ORDER BY MIN(t.debounce_deadline_at)
        LIMIT ${limit}
@@ -2826,6 +2854,34 @@ async function closeDueDebounceBatchTx(
   const head = membrosDoBatch[0];
   if (!head) return { closed: false, reason: 'no_window' };
 
+  // P04.6b — A CONVERSA ESTÁ SOB CONTROLE HUMANO?
+  //
+  // Encontrado por revisão adversarial do desenho do descarte de backlog e
+  // confirmado por teste contra banco real: sem esta recusa, o fechador põe
+  // `status='queued'` no head, carimba `promoted_at` (dívida de wake-up), zera
+  // `next_attempt_at` e empurra `last_ingress_seq` — tudo numa conversa que um
+  // humano assumiu. O hold do claim impedia a EXECUÇÃO, então nada era
+  // respondido; mas a LINHA era mutada, e o deslocamento de `last_ingress_seq`
+  // furava o filtro `<= watermark` do descarte administrativo (§8.2.5): um head
+  // que absorvesse mensagem depois do watermark escapava do cancelamento e
+  // voltava a ser reivindicável assim que o modo virasse `bot`.
+  //
+  // A sonda dá o MOTIVO; o predicado no CAS abaixo dá a ATOMICIDADE. Os dois,
+  // porque esta transação segura o mutex da STREAM e não o lock do CONTROLE:
+  // uma pausa pode commitar entre esta leitura e o `UPDATE`, e aí quem recusa é
+  // o `WHERE`. É o mesmo par que o claim usa (`explainClaimRejection` explica,
+  // o `WHERE` barra).
+  const retido = await tx.execute<{ control_id: string; mode: string }>(
+    humanControlProbe({
+      tenant: sql`${tenant_id}`,
+      agent: sql`${agent_id}`,
+      turn_id: head.id,
+    }),
+  );
+  if (Array.from(retido.rows as unknown as unknown[]).length > 0) {
+    return { closed: false, reason: 'conversation_human_control' };
+  }
+
   // 4. O RELÓGIO PERSISTENTE. `due` foi avaliado no banco; basta UM membro
   // vencido — o prazo é o mesmo em todos, e exigir que fosse o head tornaria o
   // fechamento refém de uma linha que pode ter perdido o carimbo.
@@ -2863,6 +2919,15 @@ async function closeDueDebounceBatchTx(
        AND u.state_version = ${Number(head.state_version)}
        AND u.debounce_closed_at IS NULL
        AND u.status IN (${statusList(CLAIMABLE_STATUSES)})
+       -- P04.6b -- a barreira ATOMICA do hold. A sonda acima da o motivo
+       -- legivel; esta linha e o que impede a corrida: o fechador segura o
+       -- mutex da STREAM, nao o lock do CONTROLE, entao uma pausa pode commitar
+       -- entre a sonda e este UPDATE. Sem ela, a recusa seria apenas provavel.
+       AND ${streamNotHumanControlled({
+         tenant: sql`${tenant_id}`,
+         agent: sql`${agent_id}`,
+         alvo: sql`u`,
+       })}
     RETURNING u.id, u.representative_message_id, u.conversa_id, u.status
   `);
   const headFechado = Array.from(

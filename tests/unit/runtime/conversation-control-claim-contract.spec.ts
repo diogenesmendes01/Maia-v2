@@ -215,8 +215,28 @@ describe('P04.6 — o predicado do hold, e a ausência de uma segunda cópia', (
     // agent) com trabalho recuperável. Sem o predicado, um par cujos únicos
     // candidatos estão todos retidos seria enumerado a cada varredura para o
     // inner devolver lista vazia.
+    // ⚠️ **ERAM QUATRO, E FALTAVAM DOIS.** A revisão adversarial do desenho do
+    // P04.5b.2 encontrou um caminho que eu não tinha visto, e a verificação
+    // pessoal confirmou: o FECHADOR DE DEBOUNCE avança turnos de uma conversa
+    // retida. `closeDueDebounceBatchTx` põe `status='queued'`, carimba
+    // `promoted_at = now()` (dívida de wake-up), zera `next_attempt_at` e
+    // empurra `last_ingress_seq` com `GREATEST(...)` — e o `WHERE` dele só
+    // confere `state_version`, `debounce_closed_at` e estados reivindicáveis.
+    // `listDueDebounceStreams` tampouco consulta controle.
+    //
+    // O hold do claim impedia a EXECUÇÃO, então nada era respondido — mas a
+    // linha era mutada, e o deslocamento de `last_ingress_seq` furava o filtro
+    // `last_ingress_seq <= watermark` do descarte de backlog: um head que
+    // absorvesse mensagem depois do watermark escapava do cancelamento e
+    // voltava a ser reivindicável assim que o modo virasse `bot`.
+    //
+    // Por que os DOIS, e não só o CAS: a enumeração é sempre ADVISÓRIA — uma
+    // pausa pode commitar entre listar e fechar —, então o CAS é a barreira de
+    // verdade e a enumeração evita trabalho desperdiçado. É exatamente como
+    // `streamNotPoisoned` é usada (filtro do recovery + dispatcher + claim +
+    // promoção).
     const chamadas = semDoc(repoFonte).match(/streamNotHumanControlled\(/g) ?? [];
-    expect(chamadas.length).toBe(4);
+    expect(chamadas.length).toBe(6);
   });
 
   it('o repositório NÃO tem uma segunda cópia do predicado escrita à mão', () => {
