@@ -297,7 +297,13 @@ describe('P06 — limites são recusa determinística, nunca truncamento', () =>
       type: 'function',
       function: { name: `t${i}`, parameters: { type: 'object' } },
     }));
-    expect(parseInferenceRequest(req({ tools })).kind).toBe('invalid');
+    // O CÓDIGO importa: sem ele, apagar o teto de tools passaria despercebido,
+    // porque o `.max()` do Zod recusaria com `invalid_request` e o caso ainda
+    // veria "invalid".
+    expect(parseInferenceRequest(req({ tools }))).toMatchObject({
+      kind: 'invalid',
+      code: 'payload_too_large',
+    });
   });
 });
 

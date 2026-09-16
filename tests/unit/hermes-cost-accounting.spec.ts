@@ -275,6 +275,17 @@ describe('T56 — falha de provider não zera custo', () => {
     expect(() =>
       foldUsageEvents([ev({ event_id: 'e1', kind: 'reported', delta_microusd: '-10' })]),
     ).toThrow();
+
+    // ISOLA a guarda POR EVENTO. No caso acima o total também ficaria negativo,
+    // então a guarda de total cobriria a ausência desta — duas guardas, um só
+    // teste, e a mutação provou que apagar a do evento não matava nada. Aqui o
+    // total fica em 90, positivo: só a guarda do evento pode recusar.
+    expect(() =>
+      foldUsageEvents([
+        ev({ event_id: 'e1', kind: 'reported', delta_microusd: '100' }),
+        ev({ event_id: 'e2', kind: 'reported', delta_microusd: '-10' }),
+      ]),
+    ).toThrow(/adjustment/);
   });
 
   it('20. ajuste que levaria o total a NEGATIVO é defeito, não saldo a favor', () => {
