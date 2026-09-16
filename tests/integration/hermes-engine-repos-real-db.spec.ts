@@ -28,6 +28,12 @@ import pg from "pg";
 import { randomUUID } from "node:crypto";
 import { runWithTenantContext } from "@/db/tenant-context.js";
 import { engineRunsRepo } from "@/db/repositories/engine-repos.js";
+import {
+  computePayloadHash,
+  deriveLogicalDedupeKey,
+  deriveProviderIdempotencyKey,
+  OUTBOUND_PAYLOAD_VERSION,
+} from "@/runtime/outbound/contract.js";
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL &&
@@ -2045,6 +2051,768 @@ d("engine-repos — journal de execução contra Postgres real", () => {
       expect(r.current_row_version).toBe(Number(v.rows[0]?.row_version) + 1);
     } else if (!r.ok) {
       throw new Error(`esperado version_conflict, veio ${r.reason}`);
+    }
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Casos 53-72: `closeRunAfterHandoff` (P03.6b) — §5.6.3, §5.7.2, §5.7.3.
+  //
+  // Fechar é a ÚNICA operação do módulo que exige prova EXTERNA ao journal. O
+  // §5.7.2 admite `handed_to_outbox` só com "commit outbound comprovado", e o
+  // invariante 7 admite `safe_to_retry` só com "ausência de outbound e de
+  // efeitos não reconciliados". O C18 decidiu o que conta como prova, e a
+  // decisão tem DOIS níveis que os casos 58/59/61 separam:
+  //
+  //   RESOLVIDO = `OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES`. `delivered` está
+  //   deliberadamente FORA: libera a próxima parte, mas não fechou histórico,
+  //   então não prova convergência.
+  //   SUCESSO   = `completed`. Um artefato `cancelled` está resolvido e NÃO é
+  //   entrega — fechar `handed_to_outbox` sobre ele afirmaria uma saída que
+  //   não houve.
+  //
+  // Os casos 54 e 55 são cirúrgicos, escritos ANTES da varredura: isolam a
+  // guarda de FASE da guarda de VERSÃO, que um cenário realista move junto (a
+  // lição recorrente de M2/NM1/AM7/BM3-BM4/CM7/EM3).
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /** Run em `result_ready`, com terminal aceito E adotado — de onde se fecha. */
+  async function runAdotado(): Promise<{
+    run_id: string;
+    turno: { turn_id: string; claim_token: string; attempt: number };
+  }> {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = randomUUID();
+    const p = pedido(run_id, turno, control_id);
+    await noEscopo(() => engineRunsRepo.pinEngineAndPrepareRun(p));
+    await noEscopo(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        expected_row_version: 0,
+      }),
+    );
+    await noEscopo(() =>
+      engineRunsRepo.recordStartObservation({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        observation: { kind: "accepted", remote_run_id: `w-${randomUUID()}` },
+      }),
+    );
+    const t = await noEscopo(() =>
+      engineRunsRepo.recordTerminalProposal({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        proposal: {
+          version: 1,
+          run_id,
+          request_key: p.request_key,
+          stop: { kind: "reply", raw_text: "resposta" },
+          iterations: 1,
+          observed_tool_call_ids: [],
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_microusd: null,
+            source: "engine_reported",
+          },
+        },
+      }),
+    );
+    if (!t.ok) throw new Error("setup: recordTerminalProposal falhou");
+    const a = await noEscopo(() =>
+      engineRunsRepo.adoptTerminalResult({
+        run_id,
+        turn_id: turno.turn_id,
+        claim_token: turno.claim_token,
+        output_preparation: { texto: "resposta" },
+      }),
+    );
+    if (!a.ok) throw new Error("setup: adoptTerminalResult falhou");
+    return { run_id, turno };
+  }
+
+  /**
+   * Saída durável do MESMO turno.
+   *
+   * O `outbound_messages_durable_row_complete_check` exige o tuplo INTEIRO
+   * assim que `turn_id` existe. As duas chaves são DERIVADAS pelo contrato, não
+   * literais: não há CHECK de formato nelas, então um literal passaria no banco
+   * e mentiria sobre a identidade — exatamente o tipo de fixture que faz um
+   * teste verde afirmar o que o código não garante.
+   */
+  async function mkOutbound(
+    turn_id: string,
+    status: string,
+    sequence_in_turn = 0,
+  ): Promise<void> {
+    const payload = { type: "text" as const, text: "resposta" };
+    const payload_hash = computePayloadHash(payload);
+    const identidade = {
+      tenant_id: TENANT,
+      agent_id: AGENT,
+      turn_id,
+      sequence_in_turn,
+      payload_hash,
+    };
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO outbound_messages
+         (id, tenant_id, agent_id, idempotency_key, conversa_id, in_reply_to, channel,
+          status, turn_id, sequence_in_turn, payload_version, payload_type, payload_json,
+          payload_hash, logical_dedupe_key, provider_idempotency_key, next_attempt_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'text',$7,$8,$9,$10,'text',$11::jsonb,$12,$13,$14, now())`,
+      [
+        id,
+        TENANT,
+        AGENT,
+        `idem-${id}`,
+        randomUUID(),
+        randomUUID(),
+        status,
+        turn_id,
+        sequence_in_turn,
+        OUTBOUND_PAYLOAD_VERSION,
+        JSON.stringify(payload),
+        payload_hash,
+        deriveLogicalDedupeKey(identidade),
+        deriveProviderIdempotencyKey(identidade, "whatsapp"),
+      ],
+    );
+  }
+
+  /**
+   * Call por SQL CRU, deliberadamente.
+   *
+   * O caminho normal IMPEDE este estado: `recordTerminalProposal` recusa
+   * terminal com chamada pendente. Construí-lo à mão é o que prova que o
+   * fechamento tem guarda PRÓPRIA, em vez de herdar a do terminal — se um dia
+   * alguém relaxar aquela guarda, esta continua de pé.
+   */
+  async function mkCallCrua(
+    run_id: string,
+    turn_id: string,
+    state: string,
+    effect_evidence: string,
+    ordinal = 0,
+  ): Promise<void> {
+    const conciliada = [
+      "completed",
+      "denied",
+      "approval_required",
+      "effect_unknown",
+      "cancelled",
+    ].includes(state);
+    // `engine_tool_calls_handler_chk`: o marcador de handler só é válido com os
+    // TRÊS campos juntos. Sem eles o INSERT violaria o CHECK e o caso falharia
+    // por erro de fixture — um vermelho que não mede o que o teste afirma medir.
+    const precisaMarcador = state === "handler_started";
+    await pool.query(
+      `INSERT INTO engine_tool_calls (tenant_id, agent_id, turn_id, run_id, call_id, ordinal,
+          tool_name, args_json, args_hash, request_id, state, effect_evidence, finished_at, result_json,
+          handler_started_at, dispatch_token, reservation_token)
+       VALUES ($1,$2,$3,$4,$5,$6,'maia_fixture_echo','{}'::jsonb,$7,$8,$9,$10,
+               ${conciliada ? "now()" : "NULL"}, ${conciliada ? "'{}'::jsonb" : "NULL"},
+               ${precisaMarcador ? "now()" : "NULL"},
+               ${precisaMarcador ? "gen_random_uuid()" : "NULL"},
+               ${precisaMarcador ? "'res-fixture'" : "NULL"})`,
+      [
+        TENANT,
+        AGENT,
+        turn_id,
+        run_id,
+        `${run_id}:${ordinal}`,
+        ordinal,
+        SHA,
+        randomUUID(),
+        state,
+        effect_evidence,
+      ],
+    );
+  }
+
+  const donoDe = (turno: { claim_token: string }) =>
+    ({ kind: "turn_owner", origin_claim_token: turno.claim_token }) as const;
+
+  async function contaEventosClosed(run_id: string): Promise<number> {
+    const r = await pool.query<{ n: number }>(
+      "SELECT count(*)::int AS n FROM engine_run_events WHERE run_id = $1 AND event_type = 'closed'",
+      [run_id],
+    );
+    return r.rows[0]?.n ?? 0;
+  }
+
+  it("53. `handed_to_outbox` com artefato `completed`: fecha e registra o evento", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(true);
+    if (r.ok) expect(r.already_closed).toBe(false);
+
+    const row = await pool.query<{
+      phase: string;
+      closed_reason: string | null;
+      closed_at: string | null;
+      capabilities_revoked_at: string | null;
+    }>(
+      `SELECT phase, closed_reason, closed_at::text AS closed_at,
+              capabilities_revoked_at::text AS capabilities_revoked_at
+         FROM engine_runs WHERE id = $1`,
+      [run_id],
+    );
+    expect(row.rows[0]?.phase).toBe("closed");
+    expect(row.rows[0]?.closed_reason).toBe("handed_to_outbox");
+    // A 140 exige os três juntos em toda linha `closed`.
+    expect(row.rows[0]?.closed_at).not.toBeNull();
+    expect(row.rows[0]?.capabilities_revoked_at).not.toBeNull();
+    expect(await contaEventosClosed(run_id)).toBe(1);
+  });
+
+  it("54. fase errada com tudo o mais certo: só a guarda de FASE recusa", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+    // Volta a fase sem tocar em mais nada: prova externa intacta, adoção
+    // intacta, versão intacta. Só a fase diverge.
+    await pool.query("UPDATE engine_runs SET phase = 'running' WHERE id = $1", [
+      run_id,
+    ]);
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "phase_conflict") {
+      expect(r.current_phase).toBe("running");
+    } else if (!r.ok) {
+      throw new Error(`esperado phase_conflict, veio ${r.reason}`);
+    }
+  });
+
+  it("55. versão errada com a fase CERTA: só a guarda de VERSÃO recusa", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+    const v = await pool.query<{ row_version: string }>(
+      "SELECT row_version FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    await pool.query(
+      "UPDATE engine_runs SET row_version = row_version + 1 WHERE id = $1",
+      [run_id],
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+        expected_row_version: Number(v.rows[0]?.row_version),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "version_conflict") {
+      expect(r.current_row_version).toBe(Number(v.rows[0]?.row_version) + 1);
+    } else if (!r.ok) {
+      throw new Error(`esperado version_conflict, veio ${r.reason}`);
+    }
+  });
+
+  it("56. re-fechar com a MESMA razão após crash: ok, sem segundo evento", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+    const entrada = {
+      run_id,
+      turn_id: turno.turn_id,
+      decision: "handed_to_outbox" as const,
+      actor: donoDe(turno),
+    };
+    const primeiro = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff(entrada),
+    );
+    expect(primeiro.ok).toBe(true);
+
+    // "pode ser repetido após crash" (§5.6.3). Repetir é SUCESSO, não conflito.
+    const segundo = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff(entrada),
+    );
+    expect(segundo.ok).toBe(true);
+    if (segundo.ok) expect(segundo.already_closed).toBe(true);
+    // O evento é o que não pode duplicar: o journal é append-only e um segundo
+    // `closed` contaria a mesma decisão duas vezes.
+    expect(await contaEventosClosed(run_id)).toBe(1);
+  });
+
+  it("57. re-fechar com razão DIFERENTE é conflito, não idempotência", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+    await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "completed_no_reply",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "close_reason_conflict") {
+      expect(r.current_closed_reason).toBe("handed_to_outbox");
+    } else if (!r.ok) {
+      throw new Error(`esperado close_reason_conflict, veio ${r.reason}`);
+    }
+  });
+
+  it("58. outbound só `pending` NÃO é prova: artefato não resolvido", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "pending");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("artifacts_unresolved");
+  });
+
+  it("59. `delivered` NÃO é convergência: artefato não resolvido (C18)", async () => {
+    const { run_id, turno } = await runAdotado();
+    // O caso que a CORREÇÃO do C18 produziu: `delivered` é intermediário que um
+    // CAS promove, e está deliberadamente fora de
+    // OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES. Fechar aqui declararia handoff
+    // sobre linha que a casa ainda considera em voo.
+    await mkOutbound(turno.turn_id, "delivered");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("artifacts_unresolved");
+  });
+
+  it("60. `handed_to_outbox` sem outbound nenhum: prova ausente", async () => {
+    const { run_id, turno } = await runAdotado();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("outbound_proof_missing");
+  });
+
+  it("61. artefato RESOLVIDO mas `cancelled` não é entrega: prova ausente", async () => {
+    const { run_id, turno } = await runAdotado();
+    // `cancelled` está em OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES — resolvido.
+    // Mas resolvido é a pergunta "convergiu?", e SUCESSO é outra pergunta.
+    // Este caso separa as duas: sem ele, um único predicado de "resolvido"
+    // passaria por prova de handoff.
+    await mkOutbound(turno.turn_id, "cancelled");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("outbound_proof_missing");
+  });
+
+  it("62. `completed_no_reply` sem outbound: fecha", async () => {
+    const { run_id, turno } = await runAdotado();
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "completed_no_reply",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{ closed_reason: string | null }>(
+      "SELECT closed_reason FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.closed_reason).toBe("completed_no_reply");
+  });
+
+  it("63. `completed_no_reply` COM outbound é contradição: recusa", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "completed_no_reply",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("outbound_present");
+  });
+
+  it("64. `safe_to_retry` com outbound: recusa (invariante 7, condição A)", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "safe_to_retry",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("outbound_present");
+  });
+
+  it("65. `safe_to_retry` com call NÃO conciliada: recusa (condição B)", async () => {
+    const { run_id, turno } = await runAdotado();
+    // Sem outbound: a condição A está satisfeita.
+    //
+    // `effect_evidence` é `none` DE PROPÓSITO, e esta linha é a correção de um
+    // defeito que a varredura expôs: a primeira versão usava `possible`, o que
+    // movia DUAS variáveis de uma vez. Com evidência `possible`, desligar o
+    // predicado de ESTADO deixava o de evidência recusar sozinho, o teste
+    // continuava verde e o mutante EM9 sobrevivia — o caso provava a garantia
+    // sem provar QUAL predicado a sustenta. Com `none`, só a não-conciliação do
+    // estado pode recusar. É legal na 140: `engine_tool_calls_unknown_chk` só
+    // amarra evidência a `effect_unknown`, e uma tool `abort_safe` fica mesmo
+    // `handler_started` sem evidência nenhuma.
+    await mkCallCrua(run_id, turno.turn_id, "handler_started", "none");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "safe_to_retry",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("effect_unreconciled");
+  });
+
+  it("66. `safe_to_retry` com call conciliada mas efeito `committed`: recusa", async () => {
+    const { run_id, turno } = await runAdotado();
+    // A call ESTÁ conciliada (`completed`, com `finished_at`), então o predicado
+    // de estado sozinho a aprovaria. O que impede o retry é a EVIDÊNCIA: um
+    // efeito comprometido significa que repetir o turno repetiria o efeito.
+    // Isolado do 65 de propósito — dois predicados, dois casos.
+    await mkCallCrua(run_id, turno.turn_id, "completed", "committed");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "safe_to_retry",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("effect_unreconciled");
+  });
+
+  it("67. `safe_to_retry` sem outbound e sem efeito: fecha", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkCallCrua(run_id, turno.turn_id, "completed", "none");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "safe_to_retry",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{ closed_reason: string | null }>(
+      "SELECT closed_reason FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    expect(row.rows[0]?.closed_reason).toBe("safe_to_retry");
+  });
+
+  it("68. fechar sem adoção recusa TIPADO, antes de o CHECK da 140 estourar", async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = randomUUID();
+    const p = pedido(run_id, turno, control_id);
+    await noEscopo(() => engineRunsRepo.pinEngineAndPrepareRun(p));
+    await noEscopo(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        expected_row_version: 0,
+      }),
+    );
+    await noEscopo(() =>
+      engineRunsRepo.recordStartObservation({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        observation: { kind: "accepted", remote_run_id: `w-${randomUUID()}` },
+      }),
+    );
+    await noEscopo(() =>
+      engineRunsRepo.recordTerminalProposal({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        proposal: {
+          version: 1,
+          run_id,
+          request_key: p.request_key,
+          stop: { kind: "reply", raw_text: "resposta" },
+          iterations: 1,
+          observed_tool_call_ids: [],
+          usage: {
+            input_tokens: 1,
+            output_tokens: 1,
+            cost_microusd: null,
+            source: "engine_reported",
+          },
+        },
+      }),
+    );
+    // Terminal SIM, adoção NÃO. O `engine_runs_adopted_chk` recusaria no banco;
+    // o ponto é que a recusa tem de ser TIPADA (§5.6.4), não uma exceção de
+    // constraint escapando da transação.
+    await mkOutbound(turno.turn_id, "completed");
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("adoption_required");
+  });
+
+  it("69. run `blocked` não fecha por esta porta (só `resolveBlockedRun`)", async () => {
+    const { run_id, turno } = await runAdotado();
+    await noEscopo(() =>
+      engineRunsRepo.markRunBlocked({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: donoDe(turno),
+        error_code: "efeito_incerto",
+        evidence: { nota: "fixture" },
+      }),
+    );
+    await mkOutbound(turno.turn_id, "completed");
+
+    // Fechar um `blocked` por aqui burlaria a exigência de operador + evidência
+    // do §5.6.3 ("nenhuma liberação automática por TTL").
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "phase_conflict") {
+      expect(r.current_phase).toBe("blocked");
+    } else if (!r.ok) {
+      throw new Error(`esperado phase_conflict, veio ${r.reason}`);
+    }
+  });
+
+  it("70. fechar PRESERVA o carimbo de revogação de P03.4", async () => {
+    const { run_id, turno } = await runAdotado();
+    await noEscopo(() =>
+      engineRunsRepo.revokeRunCapabilities({
+        run_id,
+        turn_id: turno.turn_id,
+        actor: donoDe(turno),
+        reason_code: "lease_perdida",
+      }),
+    );
+    const antes = await pool.query<{ t: string }>(
+      "SELECT capabilities_revoked_at::text AS t FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    await mkOutbound(turno.turn_id, "completed");
+
+    await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+
+    const depois = await pool.query<{ t: string }>(
+      "SELECT capabilities_revoked_at::text AS t FROM engine_runs WHERE id = $1",
+      [run_id],
+    );
+    // COALESCE, não sobrescrita: a monotonicidade de P03.4 vale também aqui.
+    expect(depois.rows[0]?.t).toBe(antes.rows[0]?.t);
+  });
+
+  it("71. dono ATUAL que não é a origem do run: `not_run_origin`", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+    // CIRÚRGICO: um token aleatório pararia em `stale_claim` no fence do turno e
+    // nunca exercitaria esta guarda. Re-reivindicar dá um dono com posse VIVA e
+    // turno `running` — ele ATRAVESSA o fence e só então esbarra em não ser a
+    // origem deste run. É o único jeito de isolar o predicado.
+    const novoToken = await reivindicarDeNovo(turno.turn_id);
+
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: { kind: "turn_owner", origin_claim_token: novoToken },
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "not_run_origin") {
+      expect(r.run_origin_claim_token).toBe(turno.claim_token);
+    } else if (!r.ok) {
+      throw new Error(`esperado not_run_origin, veio ${r.reason}`);
+    }
+  });
+
+  it("72. `recovery` fecha SEM token de origem (§5.7.3 item 5)", async () => {
+    const { run_id, turno } = await runAdotado();
+    await mkOutbound(turno.turn_id, "completed");
+
+    // A assimetria de P03.4 repetida: o cenário que mais precisa de fechamento
+    // é justamente aquele em que o dono sumiu. Exigir o token dele deixaria
+    // órfãos para sempre — que é o caso que o §5.7.3 manda o scanner resolver.
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const ev = await pool.query<{ actor_kind: string }>(
+      "SELECT actor_kind FROM engine_run_events WHERE run_id = $1 AND event_type = 'closed'",
+      [run_id],
+    );
+    expect(ev.rows[0]?.actor_kind).toBe("recovery");
+  });
+
+  /** Run parado em `submitting`: pin + intenção de start, sem aceite. */
+  async function runSubmetendo(): Promise<{
+    run_id: string;
+    turno: { turn_id: string; claim_token: string; attempt: number };
+  }> {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = randomUUID();
+    const p = pedido(run_id, turno, control_id);
+    await noEscopo(() => engineRunsRepo.pinEngineAndPrepareRun(p));
+    const s = await noEscopo(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: turno.turn_id,
+        origin_claim_token: turno.claim_token,
+        expected_row_version: 0,
+      }),
+    );
+    if (!s.ok) throw new Error("setup: markSubmitting falhou");
+    return { run_id, turno };
+  }
+
+  it("73. `safe_to_retry` fecha a partir de `submitting` (§5.7.2)", async () => {
+    const { run_id, turno } = await runSubmetendo();
+    // Sem terminal e sem adoção — `safe_to_retry` não os exige. É a linha
+    // "rejeição comprovadamente anterior a aceite" do §5.7.2, e o
+    // `engine_runs_adopted_chk` só constrange as DUAS razões de desfecho.
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "safe_to_retry",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(true);
+
+    const row = await pool.query<{
+      phase: string;
+      closed_reason: string | null;
+    }>("SELECT phase, closed_reason FROM engine_runs WHERE id = $1", [run_id]);
+    expect(row.rows[0]?.phase).toBe("closed");
+    expect(row.rows[0]?.closed_reason).toBe("safe_to_retry");
+  });
+
+  it("74. `handed_to_outbox` NÃO fecha a partir de `submitting`", async () => {
+    const { run_id, turno } = await runSubmetendo();
+    // O PAR do 73: mesma fase, decisão diferente, resultado oposto. É isto que
+    // prende que cada decisão consulta o SEU conjunto de fases — um conjunto
+    // único passaria nos dois casos isolados e só falharia aqui.
+    const r = await noEscopo(() =>
+      engineRunsRepo.closeRunAfterHandoff({
+        run_id,
+        turn_id: turno.turn_id,
+        decision: "handed_to_outbox",
+        actor: donoDe(turno),
+      }),
+    );
+    expect(r.ok).toBe(false);
+    if (!r.ok && r.reason === "phase_conflict") {
+      expect(r.current_phase).toBe("submitting");
+    } else if (!r.ok) {
+      throw new Error(`esperado phase_conflict, veio ${r.reason}`);
     }
   });
 });

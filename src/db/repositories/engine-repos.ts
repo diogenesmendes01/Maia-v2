@@ -33,17 +33,27 @@
  * audita é a camada de runtime (§5.6.3), único chamador de produção.
  *
  * ESCOPO DESTE ARQUIVO HOJE: o caminho de START (preparar, submeter, observar
- * o aceite) e a admissão do terminal. As demais operações da tabela §5.6.3
- * (`admitToolCall`, `freezeToolIdentity`, `markToolHandlerStarted`,
- * `settleToolCall`, `revokeRunCapabilities`, `adoptTerminalResult`,
- * `closeRunAfterHandoff`, varredura e manutenção, `markRunBlocked`/
- * `resolveBlockedRun`) entram nas unidades seguintes.
+ * o aceite), a admissão do terminal, o journal por chamada, revogação, a porta
+ * operacional de `blocked`, a adoção e o FECHAMENTO. Falta da tabela §5.6.3 a
+ * varredura/manutenção (`enumerateDueScopes`, `listDueRuns`,
+ * `reserveMaintenanceObservation`/`recordMaintenanceObservation`) e o recovery.
  *
- * ADIADO E NOMEADO (senão vira omissão silenciosa): `pinEngineAndPrepareRun`
- * confere ausência de outro run ABERTO, mas ainda não confere ausência de
- * OUTBOUND do mesmo turno, que o §5.6.3 pede na mesma frase. A metade outbound
- * depende de `closeRunAfterHandoff` e da regra de `safe_to_retry` (§5.6.2,
- * invariante 7), que chegam com as operações de fechamento.
+ * ADIADO E NOMEADO (senão vira omissão silenciosa):
+ *
+ *  1. `pinEngineAndPrepareRun` confere ausência de outro run ABERTO, mas ainda
+ *     não confere ausência de OUTBOUND do mesmo turno, que o §5.6.3 pede na
+ *     mesma frase. Agora que `closeRunAfterHandoff` existe, a consulta de prova
+ *     já está escrita e reusável — o que falta é decidir se a ausência de
+ *     outbound BLOQUEIA preparar (e com que razão tipada), que é mudança de
+ *     comportamento do START e merece unidade própria.
+ *  2. `closeRunAfterHandoff` NÃO cria `engine_projections`, embora a tabela de
+ *     operações do §5.6.3 diga "fecha run com motivo, evento, projeções". As
+ *     projeções (`event_history`, `postturn_graph`, `gap_reflection`) são a
+ *     costura do aprendizado governado, cujos portões G1-G4 são P08/P09.
+ *     Criá-las aqui produziria linhas `pending` que nenhum consumidor processa
+ *     — trabalho invisível parado numa tabela, que é pior que a ausência
+ *     declarada.
+ *  3. `discarded` não é fechável por esta porta: ver `CloseDecisionV1`.
  */
 import { sql } from "drizzle-orm";
 import { canonicalDigest } from "@/integrations/hermes/canonical-json.js";
@@ -56,6 +66,7 @@ import type {
   Json,
 } from "@/runtime/engines/contracts.js";
 import { engineTerminalProposalV1Schema } from "@/runtime/engines/schemas.js";
+import { OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES } from "@/runtime/outbound/recovery-contract.js";
 import {
   classifyToolCancellation,
   minimumBudgetMs,
@@ -69,6 +80,7 @@ import {
   engine_runs,
   engine_tool_calls,
   engine_turn_bindings,
+  outbound_messages,
 } from "../schema.js";
 import { getCurrentAgent, getCurrentTenant } from "../tenant-context.js";
 
@@ -750,6 +762,91 @@ export type AdoptTerminalResultResult =
   | { ok: false; reason: "phase_conflict"; current_phase: EngineRunPhaseV1 }
   | { ok: false; reason: "version_conflict"; current_row_version: number }
   | { ok: false; reason: "preparation_too_large"; max_bytes: number };
+
+/**
+ * As razões de fechamento que ESTA porta implementa.
+ *
+ * `discarded` e `manual_resolved` estão fora, e não por esquecimento:
+ * `manual_resolved` pertence a `resolveBlockedRun` (exige operador e evidência),
+ * e `discarded` aparece no §5.7.2 apenas como "closed/discarded/safe_to_retry
+ * **conforme política**" — e a política é justamente o que a spec não define.
+ * Implementá-lo aqui seria inventar a política, não a implementar.
+ */
+export type CloseDecisionV1 =
+  | "handed_to_outbox"
+  | "completed_no_reply"
+  | "safe_to_retry";
+
+/**
+ * Quem fecha. Mesma assimetria de `RevokeActor`, pela mesma razão: o §5.7.3
+ * item 5 manda o scanner fechar órfãos com `actor_kind=recovery`, e o órfão é
+ * exatamente o run cujo dono sumiu. Exigir o token de origem do recovery
+ * deixaria esses runs abertos para sempre — travando a unique parcial e, com
+ * ela, toda nova geração do turno.
+ */
+export type CloseActor =
+  | { kind: "turn_owner"; origin_claim_token: string }
+  | { kind: "recovery" | "operator"; actor_ref: string };
+
+export type CloseRunResult =
+  /** `already_closed: true` = repetição após crash; nenhum evento novo. */
+  | { ok: true; row_version: number; already_closed: boolean }
+  | TurnFenceConflict
+  | NotFound
+  | { ok: false; reason: "not_run_origin"; run_origin_claim_token: string }
+  | { ok: false; reason: "phase_conflict"; current_phase: EngineRunPhaseV1 }
+  | { ok: false; reason: "version_conflict"; current_row_version: number }
+  /** Já fechado por OUTRA razão. Repetir não pode reescrever o desfecho. */
+  | {
+      ok: false;
+      reason: "close_reason_conflict";
+      current_closed_reason: string;
+    }
+  /** `engine_runs_adopted_chk`: entregar/concluir exige terminal E dono que adotou. */
+  | { ok: false; reason: "adoption_required" }
+  /** Há saída do turno que ainda não convergiu (C18). */
+  | { ok: false; reason: "artifacts_unresolved"; unresolved: number }
+  /** Nenhum artefato `completed`: resolvido não é sinônimo de entregue. */
+  | { ok: false; reason: "outbound_proof_missing" }
+  /** `completed_no_reply`/`safe_to_retry` com saída existente é contradição. */
+  | { ok: false; reason: "outbound_present"; outbound_count: number }
+  /** Invariante 7: retry seguro exige efeito reconciliado E ausente. */
+  | { ok: false; reason: "effect_unreconciled"; calls: number };
+
+/**
+ * `handed_to_outbox` e `completed_no_reply` só saem de `result_ready`: ambos
+ * afirmam um desfecho, e o `engine_runs_ready_chk` garante que só ali o
+ * terminal existe.
+ */
+const FASES_QUE_ACEITAM_ENTREGA = new Set<EngineRunPhaseV1>(["result_ready"]);
+
+/**
+ * `safe_to_retry` tem origem mais larga porque o §5.7.2 lhe dá três linhas
+ * próprias: `submitting` (rejeição anterior ao aceite), `cancelling`/
+ * `reconciling` ("conforme política") e `result_ready` (falha recuperável sem
+ * risco e sem outbound). `submission_unknown` entra pela mesma porta de
+ * reconciliação. `prepared`, `running` e `blocked` ficam FORA: as duas
+ * primeiras têm execução viva, e `blocked` só sai por `resolveBlockedRun`.
+ */
+const FASES_QUE_ACEITAM_RETRY_SEGURO = new Set<EngineRunPhaseV1>([
+  "submitting",
+  "submission_unknown",
+  "cancelling",
+  "reconciling",
+  "result_ready",
+]);
+
+/** Espelha a constante EXPORTADA do contrato de saída (C18), sem redigitar. */
+const LISTA_STATUS_FINAIS = sql.join(
+  OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES.map((s) => sql`${s}`),
+  sql`, `,
+);
+
+/** Derivada do Set acima — uma fonte só para "chamada conciliada". */
+const LISTA_ESTADOS_CONCILIADOS = sql.join(
+  Array.from(ESTADOS_CONCILIADOS).map((s) => sql`${s}`),
+  sql`, `,
+);
 
 export const engineRunsRepo = {
   /**
@@ -2846,6 +2943,282 @@ export const engineRunsRepo = {
         ok: true,
         adopted_by_turn_attempt: attempt,
         row_version: Number(linha.row_version),
+      };
+    });
+  },
+
+  /**
+   * Fecha o run depois do handoff (§5.6.3, §5.7.2, §5.7.3 item 5).
+   *
+   * **A operação que exige prova EXTERNA ao journal.** Todas as anteriores
+   * decidem olhando só para `engine_runs`/`engine_tool_calls`. Esta não pode:
+   * o §5.7.2 admite `handed_to_outbox` apenas com "commit outbound comprovado",
+   * e o invariante 7 admite `safe_to_retry` apenas com "ausência de outbound e
+   * de efeitos não reconciliados". Fechar sem olhar a saída seria declarar
+   * entrega por decreto.
+   *
+   * O C18 decidiu o que conta como prova, em DOIS níveis que não se confundem:
+   *
+   *   * RESOLVIDO é `OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES`. `delivered` está
+   *     deliberadamente fora — libera a próxima parte, mas não fechou histórico
+   *     e por isso "não prova convergência".
+   *   * SUCESSO é `completed`. Um artefato `cancelled` está RESOLVIDO e não é
+   *     entrega: fechar `handed_to_outbox` sobre ele afirmaria uma saída que
+   *     não houve. Esta metade é decisão MINHA registrada no C18, não leitura
+   *     da spec — `finalizeResolvedTurnTx` usa `completed` open-coded e eu
+   *     segui a casa em vez de inventar critério.
+   *
+   * `outbound_messages` é lido **sem `FOR UPDATE`**, e de propósito: aquelas
+   * linhas são do delivery worker, e travá-las criaria uma aresta de lock nova
+   * entre o journal e o egresso — fora da ordem do §5.6.3, que termina em
+   * `engine_tool_calls`. Ler sem travar é seguro porque o erro possível é
+   * FECHADO: uma linha que ainda não convergiu faz o fechamento ser RECUSADO
+   * agora e aceito depois, nunca o contrário.
+   *
+   * Como `revokeRunCapabilities`, **não** há porteira de modo/epoch do
+   * controle: fechar o journal é precisamente o que se quer quando um humano
+   * assumiu a conversa.
+   */
+  async closeRunAfterHandoff(input: {
+    run_id: string;
+    turn_id: string;
+    decision: CloseDecisionV1;
+    actor: CloseActor;
+    expected_row_version?: number;
+  }): Promise<CloseRunResult> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<CloseRunResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("close", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      let actor_turn_attempt: number | null = null;
+      if (input.actor.kind === "turn_owner") {
+        const fence = await lockTurnAndCheckFence(tx, {
+          turn_id: input.turn_id,
+          origin_claim_token: input.actor.origin_claim_token,
+        });
+        if (!fence.ok) {
+          conta("close", fence.reason);
+          return fence;
+        }
+        actor_turn_attempt = Number(fence.turno.attempt_count);
+      }
+
+      const rows = linhas<{
+        phase: string;
+        row_version: string | number;
+        origin_claim_token: string;
+        closed_reason: string | null;
+        tem_terminal: boolean;
+        adotado: number | null;
+      }>(
+        await tx.execute(sql`
+          SELECT phase, row_version, origin_claim_token::text AS origin_claim_token,
+                 closed_reason,
+                 (terminal_json IS NOT NULL) AS tem_terminal,
+                 adopted_by_turn_attempt AS adotado
+            FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           FOR UPDATE`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("close", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      // Ser dono do TURNO não basta: tem de ser a ORIGEM deste run (§5.7.1,
+      // "não pode adotar o run em voo como nova autoridade").
+      if (
+        input.actor.kind === "turn_owner" &&
+        run.origin_claim_token !== input.actor.origin_claim_token
+      ) {
+        conta("close", "not_run_origin");
+        return {
+          ok: false,
+          reason: "not_run_origin",
+          run_origin_claim_token: run.origin_claim_token,
+        };
+      }
+
+      // IDEMPOTÊNCIA ANTES DA PORTEIRA DE FASE. "Pode ser repetido após crash"
+      // (§5.6.3): quem repete não está numa fase errada, está refazendo algo
+      // já feito. Deixar a porteira de fase responder primeiro devolveria
+      // `phase_conflict` para o caminho FELIZ da retomada — o mesmo defeito que
+      // a redelivery do terminal expôs em P03.2.
+      if (run.phase === "closed") {
+        if (run.closed_reason === input.decision) {
+          conta("close", "already_closed");
+          return {
+            ok: true,
+            row_version: Number(run.row_version),
+            already_closed: true,
+          };
+        }
+        conta("close", "close_reason_conflict");
+        return {
+          ok: false,
+          reason: "close_reason_conflict",
+          current_closed_reason: run.closed_reason ?? "",
+        };
+      }
+
+      const permitidas =
+        input.decision === "safe_to_retry"
+          ? FASES_QUE_ACEITAM_RETRY_SEGURO
+          : FASES_QUE_ACEITAM_ENTREGA;
+      if (!permitidas.has(run.phase as EngineRunPhaseV1)) {
+        conta("close", "phase_conflict");
+        return {
+          ok: false,
+          reason: "phase_conflict",
+          current_phase: run.phase as EngineRunPhaseV1,
+        };
+      }
+
+      // A linha está travada desde o `FOR UPDATE`, então isto não é CAS
+      // otimista: é a conferência do fence que o chamador trouxe. Separada da
+      // porteira de fase de propósito — um cenário realista move as duas juntas
+      // e não diria qual delas segura a garantia.
+      if (
+        input.expected_row_version !== undefined &&
+        Number(run.row_version) !== input.expected_row_version
+      ) {
+        conta("close", "version_conflict");
+        return {
+          ok: false,
+          reason: "version_conflict",
+          current_row_version: Number(run.row_version),
+        };
+      }
+
+      // `engine_runs_adopted_chk` recusaria no banco; recusar aqui mantém a
+      // resposta TIPADA em vez de trocar recusa por violação de constraint
+      // escapando da transação (§5.6.4).
+      if (
+        input.decision !== "safe_to_retry" &&
+        (!run.tem_terminal || run.adotado === null)
+      ) {
+        conta("close", "adoption_required");
+        return { ok: false, reason: "adoption_required" };
+      }
+
+      const provas = linhas<{
+        total: number;
+        nao_resolvidos: number;
+        entregues: number;
+      }>(
+        await tx.execute(sql`
+          SELECT count(*)::int AS total,
+                 (count(*) FILTER (WHERE status NOT IN (${LISTA_STATUS_FINAIS})))::int
+                   AS nao_resolvidos,
+                 (count(*) FILTER (WHERE status = 'completed'))::int AS entregues
+            FROM ${outbound_messages}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND turn_id = ${input.turn_id}`),
+      );
+      const prova = provas[0] ?? {
+        total: 0,
+        nao_resolvidos: 0,
+        entregues: 0,
+      };
+
+      if (input.decision === "handed_to_outbox") {
+        if (prova.nao_resolvidos > 0) {
+          conta("close", "artifacts_unresolved");
+          return {
+            ok: false,
+            reason: "artifacts_unresolved",
+            unresolved: prova.nao_resolvidos,
+          };
+        }
+        if (prova.entregues === 0) {
+          conta("close", "outbound_proof_missing");
+          return { ok: false, reason: "outbound_proof_missing" };
+        }
+      } else if (prova.total > 0) {
+        // `completed_no_reply` e `safe_to_retry` afirmam, cada um à sua
+        // maneira, que NÃO houve saída. Qualquer linha desmente os dois.
+        conta("close", "outbound_present");
+        return {
+          ok: false,
+          reason: "outbound_present",
+          outbound_count: prova.total,
+        };
+      }
+
+      if (input.decision === "safe_to_retry") {
+        // Invariante 7 tem DUAS condições e esta é a segunda. `state` fora dos
+        // conciliados é "não sei se terminou"; `effect_evidence <> 'none'` é
+        // "pode ter havido efeito" — e repetir o turno repetiria esse efeito.
+        // Uma call `completed` com evidência `committed` é reconciliada E
+        // insegura, então o predicado de estado sozinho não serve.
+        const pendentes = linhas<{ n: number }>(
+          await tx.execute(sql`
+            SELECT count(*)::int AS n
+              FROM ${engine_tool_calls}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+               AND run_id = ${input.run_id}
+               AND (state NOT IN (${LISTA_ESTADOS_CONCILIADOS})
+                    OR effect_evidence <> 'none')`),
+        );
+        const n = pendentes[0]?.n ?? 0;
+        if (n > 0) {
+          conta("close", "effect_unreconciled");
+          return { ok: false, reason: "effect_unreconciled", calls: n };
+        }
+      }
+
+      const fechado = linhas<{
+        row_version: string | number;
+        last_event_sequence: string | number;
+      }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET phase = 'closed',
+                 closed_at = clock_timestamp(),
+                 closed_reason = ${input.decision},
+                 capabilities_revoked_at = COALESCE(capabilities_revoked_at, clock_timestamp()),
+                 row_version = row_version + 1,
+                 last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND id = ${input.run_id}
+             AND phase = ${run.phase}
+           RETURNING row_version, last_event_sequence`),
+      );
+      const linha = fechado[0];
+      if (!linha) {
+        conta("close", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(linha.last_event_sequence),
+        // Um run fecha UMA vez; o unique de dedupe é por (run, chave), então
+        // isto também é a rede que impede segundo evento numa corrida.
+        dedupe_key: `closed:${input.decision}`,
+        event_type: "closed",
+        actor_kind: input.actor.kind,
+        actor_turn_attempt,
+        metadata: {
+          decision: input.decision,
+          actor_ref:
+            input.actor.kind === "turn_owner" ? null : input.actor.actor_ref,
+          outbound_total: prova.total,
+          outbound_completed: prova.entregues,
+        },
+      });
+
+      conta("close", "ok");
+      return {
+        ok: true,
+        row_version: Number(linha.row_version),
+        already_closed: false,
       };
     });
   },

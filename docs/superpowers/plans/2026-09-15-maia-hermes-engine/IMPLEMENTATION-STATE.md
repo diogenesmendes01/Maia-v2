@@ -164,7 +164,7 @@ sequência P00–P12 do capítulo 10 da spec.
   COALESCE preserva o carimbo monotônico de P03.4. Contrato normativo mínimo registrado em C17.
   45 casos no spec de runs; 8 mutantes, **todos mortos** — três só morreram depois dos casos 43-45, e
   os três eram caminho SEM TESTE (run já fechado, teto de evidência, bump de versão), não redundância.
-- `U-P03.6a` — **concluída e verificada**: `adoptTerminalResult`. A operação tem uma **assimetria
+- `U-P03.6a` (commit `001a0098`) — **concluída e verificada**: `adoptTerminalResult`. A operação tem uma **assimetria
   deliberada** contra todo o resto do módulo: o fence é do turno ATUAL, não da origem do run. O motivo
   é que adotar não autoriza efeito nenhum — pega um terminal já persistido e diz quem assume a saída —
   e o §5.8.2 manda explicitamente que o NOVO owner adote em vez de pagar outra deliberação por um
@@ -174,11 +174,24 @@ sequência P00–P12 do capítulo 10 da spec.
   52 casos no spec de runs; 5 mutantes, todos mortos. Registrado sem maquiagem: o caso 50 **não tem
   mutante** porque o código simplesmente não toca naquela coluna — ele guarda uma regressão futura, e
   contá-lo como "coberto pela varredura" seria inflar o placar.
-- `U-P03.6b` (próxima): `closeRunAfterHandoff`. Depende de prova de outbound — ver C18, que precisou
-  ser CORRIGIDO: o marcador de convergência da casa é `status='completed'`, não o `sent`/`unknown` do
-  vocabulário legado, e `delivered` é intermediário que um CAS promove. Reusar
-  `OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES` (exportado) para "resolvido"; `safe_to_retry` exige ausência
-  de outbound **e** de efeito não reconciliado (invariante 7), então também consulta `effect_evidence`.
+- `U-P03.6b` — **concluída e verificada**: `closeRunAfterHandoff`, a ÚNICA operação do módulo que exige
+  prova EXTERNA ao journal. O C18 tem dois níveis que a implementação separa: RESOLVIDO é
+  `OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES` (reusada por `sql.join`, não redigitada) e SUCESSO é
+  `completed` — um artefato `cancelled` está resolvido e NÃO é entrega (caso 61). `safe_to_retry` exige
+  as DUAS condições do invariante 7 em casos separados: estado não conciliado (65) e evidência de
+  efeito (66). Fence exigido do dono, não do `recovery` (§5.7.3 item 5, caso 72); `outbound_messages`
+  lido SEM `FOR UPDATE` para não criar aresta de lock com o delivery; idempotência ANTES da porteira de
+  fase, senão a retomada após crash levaria `phase_conflict` no caminho feliz.
+  **Adiado e nomeado:** projeções (`engine_projections`) ficam para P08/P09 — criá-las agora seria
+  trabalho `pending` que nenhum consumidor processa; `discarded` não fecha por esta porta porque o
+  §5.7.2 só o cita "conforme política" e a política não está definida.
+  74 casos no spec de runs; 13 mutantes. **Um sobreviveu na primeira rodada (EM9)** e a causa era
+  defeito meu de teste — o caso 65 movia duas variáveis de uma vez, provando a garantia sem provar qual
+  predicado a sustenta. Corrigido; segunda rodada 13/13 mortos, zero erros de harness.
+  `npm run test:leak` foi **executado e não está verde** (8/151): a spec vizinha `outbound-leak` passa,
+  cinco morrem em `loadConfig` por o config local pular o `globalSetup` (controle sob o config do
+  projeto: 51/51 verdes) e uma (`turn-context-batch-repos`) fica como **item aberto sem controle em
+  HEAD**, não atribuível a esta branch por construção. Ver V-027.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado
@@ -208,8 +221,12 @@ D01 launcher/isolamento real · D02 provider/modelo/conta · D03 volume/latênci
 ```bash
 # Node do projeto
 export PATH="<scratchpad>/tools/node22:$PATH"
-# Postgres descartável
-/c/Users/Mendes/AppData/Local/Temp/mhx/pgsql/bin/pg_ctl.exe -D /c/Users/Mendes/AppData/Local/Temp/mhx/data -o "-p 55432 -c listen_addresses=127.0.0.1 -c max_connections=300" -l /c/Users/Mendes/AppData/Local/Temp/mhx/server.log -w start
+# Postgres descartável — binário `pgs`, data dir `data2`.
+# ATENÇÃO: o par `pgsql`/`data` é o PRIMEIRO initdb e está ABANDONADO — `vector.dll`
+# não carrega nele (`unknown error 127`) e a 001 exige `CREATE EXTENSION vector`.
+# Refeito em `pgs`/`data2` em 15/09 19:59. Esta linha já apontou para o par errado
+# e custou um desvio inteiro de diagnóstico; não "corrija" de volta.
+/c/Users/Mendes/AppData/Local/Temp/mhx/pgs/bin/pg_ctl.exe -D /c/Users/Mendes/AppData/Local/Temp/mhx/data2 -o "-p 55432 -c listen_addresses=127.0.0.1 -c max_connections=300" -l /c/Users/Mendes/AppData/Local/Temp/mhx/server2.log -w start
 # Redis FAKE
 <scratchpad>/venvs/pg/Scripts/python.exe -c "from fakeredis import TcpFakeServer; TcpFakeServer(('127.0.0.1',56379), server_type='redis').serve_forever()"
 # Integração contra o banco local

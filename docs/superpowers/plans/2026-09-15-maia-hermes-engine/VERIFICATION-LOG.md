@@ -858,14 +858,96 @@ os pulados subindo exatamente os 7 casos novos (`↓ 52 tests | 52 skipped`).
 literais. E `safe_to_retry` exige ausência de outbound **e** de efeito não reconciliado (invariante 7),
 então também consulta `effect_evidence`/estados não conciliados de `engine_tool_calls`.
 
+### V-027 · P03.6b — `closeRunAfterHandoff`, a única operação com prova EXTERNA
+
+Todas as operações anteriores do módulo decidem olhando só para `engine_runs`/`engine_tool_calls`.
+Esta não pode: o §5.7.2 admite `handed_to_outbox` apenas com "commit outbound comprovado" e o
+invariante 7 admite `safe_to_retry` apenas com "ausência de outbound e de efeitos não reconciliados".
+
+**O C18 tem DOIS níveis, e separá-los foi o trabalho conceitual da unidade.** RESOLVIDO é
+`OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES` (reusada, não redigitada — `sql.join` sobre a constante
+exportada); SUCESSO é `completed`. Os dois não coincidem: um artefato `cancelled` está RESOLVIDO e não
+é entrega. O caso 61 existe só para prender essa diferença — sem ele, um predicado único de "resolvido"
+passaria por prova de handoff e o run fecharia `handed_to_outbox` sobre uma saída que nunca houve.
+
+**Adiado e NOMEADO, não omitido:** (a) `closeRunAfterHandoff` não cria `engine_projections`, embora a
+tabela de operações do §5.6.3 diga "motivo, evento, projeções" — projeções são a costura do aprendizado
+governado (G1–G4, P08/P09), e criá-las agora produziria linhas `pending` que nenhum consumidor
+processa, trabalho invisível parado numa tabela; (b) `discarded` não é fechável por esta porta, porque
+o §5.7.2 só o cita como "conforme política" e a política é justamente o que a spec não define —
+implementá-lo seria inventá-la; (c) a metade outbound do `pinEngineAndPrepareRun` continua pendente,
+agora com a consulta de prova já escrita e reusável.
+
+**Decisões de desenho registradas:** o fence do turno é exigido do `turn_owner` e NÃO do `recovery` —
+mesma assimetria de P03.4 e pela mesma razão, já que o §5.7.3 item 5 manda o scanner fechar órfãos com
+`actor_kind=recovery` e o órfão é exatamente o run cujo dono sumiu (caso 72). `outbound_messages` é
+lido **sem `FOR UPDATE`**: travar linha do delivery criaria aresta de lock fora da ordem do §5.6.3, e
+ler sem travar é seguro porque o erro possível é FECHADO (linha ainda não convergida faz o fechamento
+ser recusado agora e aceito depois, nunca o contrário). A idempotência vem ANTES da porteira de fase,
+porque quem repete após crash não está numa fase errada — a ordem inversa devolveria `phase_conflict`
+para o caminho FELIZ da retomada, o mesmo defeito que a redelivery do terminal expôs em P03.2.
+
+**Varredura de mutação: 13 mutantes, e um SOBREVIVEU na primeira rodada.** EM9 desliga o predicado de
+ESTADO do invariante 7 e sobreviveu com 74/74 verdes. A causa era defeito MEU de teste: o caso 65 movia
+duas variáveis de uma vez (`handler_started` **e** `effect_evidence='possible'`), então com o estado
+desligado a evidência recusava sozinha e o caso continuava verde — provava a garantia sem provar QUAL
+predicado a sustenta. É a mesma lição de M2/NM1/AM7/BM3-BM4/CM7/EM3, desta vez cometida por mim depois
+de eu ter escrito que estava isolando. Corrigido usando `effect_evidence='none'` (legal: o
+`engine_tool_calls_unknown_chk` só amarra evidência a `effect_unknown`, verificado no banco, e uma tool
+`abort_safe` fica mesmo `handler_started` sem evidência). Segunda rodada: **13/13 mortos, zero
+sobreviventes, zero erros de harness, arquivo restaurado idêntico**.
+
+O harness desta unidade passou a **ABORTAR** em âncora com `ocorrências != 1`, em vez de só reportar.
+Quatro âncoras de uma linha eram AMBÍGUAS (`COALESCE(capabilities_revoked_at, …)` e
+`run.origin_claim_token !== …` com n=2, `effect_evidence <> 'none'` com n=2, `actor_kind:
+input.actor.kind` com n=3) e teriam mutado `resolveBlockedRun`/`revokeRunCapabilities` junto; todas
+viraram blocos multi-linha. Também corrigi um defeito do próprio harness antes de rodá-lo: EM9 trocava
+a lista por um identificador inexistente, o que mataria o mutante por `ReferenceError` de carga em vez
+de por detecção — o artefato CM3 de P03.3b repetido.
+
+**Dois casos escritos ANTES da varredura, prevendo o mutante:** 73/74 fecham e recusam a partir de
+`submitting` com a mesma fase e decisões diferentes, prendendo que cada decisão consulta o SEU conjunto
+de fases. Sem eles, EM13 sobreviveria.
+
+**Estado final:** 74 casos no spec de runs, verdes. `typecheck`, `lint` (481 warnings, idêntico à
+baseline), `check:node`, `docs:ai:check`, `config:check:drift` e `audit:exceptions:check` todos em
+**exit 0**. `prettier --check` nos dois arquivos tocados: limpo.
+
+**Regressão:** `50 failed | 10233 passed | 1157 skipped (11440)` contra `50 | 10233 | 1135 (11418)` do
+V-026. Passados e falhos INALTERADOS, os mesmos 20 arquivos, nenhuma falha citando `engine-repos`,
+`hermes-engine` ou `tool-calls`; pulados e total sobem exatamente +22, que é o spec crescendo de 52
+para 74 casos. Aritmética fechada.
+
+**`npm run test:leak` — executado, e NÃO verde.** O AGENTS.md o marca "critical, run before any
+tenant-related change", e esta unidade adiciona consulta escopada por tenant/agent numa tabela que o
+módulo nunca tocava, então pulá-lo seria escolher a opção fácil. Resultado pelo procedimento local:
+`8 failed | 120 passed | 23 skipped (151)`, 6 arquivos em falha. Classificação honesta:
+
+* **`tests/integration/outbound-leak.spec.ts` — a spec mais próxima desta mudança — PASSOU** (10 casos).
+* **Cinco** (`constitutional`, `cross-entity`, `turn-context-statement-count`,
+  `tool-request-aggregation-real-db`, `tool-request-triagem-console-real-db`) morrem em
+  `loadConfig` (`src/config/env.ts:112`, "Invalid configuration … profile development") na CARGA do
+  módulo — as duas últimas nem chegam a rodar caso algum (9 e 14 pulados). É o custo do config local de
+  duas etapas, que pula o `globalSetup` de propósito. **Controle executado:** as três unitárias rodadas
+  sob o config do PROJETO, no MEU código, passam — `51 passed (51)`, exit 0. Mesmo código, resultado
+  oposto ⇒ configuração, não mudança.
+* **Uma** (`turn-context-batch-repos.spec.ts`, teste `resolveScope no longer resolves a foreign profile
+  into a grant`) é falha de asserção real, determinística, e falha também SOZINHA (`1 failed | 13
+  passed`), logo não é interação com o meu spec no lote. **Não é atribuível a esta branch por
+  construção:** nada em `src/`/`tests/`/`scripts/` importa `engine-repos` além dos meus dois specs, ele
+  não está no barril, e o teste opera só sobre `profiles`/`pessoas`/`permissoes`/`entidades`, que as
+  minhas fixtures nunca escrevem — o vitest sequer carrega o módulo alterado nessa rodada. **Mas não
+  afirmo que seja preexistente: não há controle em HEAD para ela.** Fica como item aberto.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1135 | Medido de novo em P03.6a: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 102 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (52: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1157 | Medido de novo em P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 124 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d). As demais specs de integração seguem **não executadas** (Redis) |
+| `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Executado em P03.6b e NÃO verde** — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 
