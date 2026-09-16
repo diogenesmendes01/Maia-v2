@@ -526,14 +526,61 @@ que o cabeçalho do arquivo justifica em quatro linhas, permanece **não verific
 "ausência de outbound" do §5.6.3 (adiada e agora NOMEADA no cabeçalho do módulo); `mode` gravado e
 nunca lido (C12); e ausência de teto de lock (C11). Nada disso foi fechado por esta unidade.
 
+### V-020 · P03.3a — admissão de tool call
+
+Unidade: `admitToolCall` em `engine-repos.ts` + `tests/integration/hermes-engine-tool-calls-real-db.spec.ts`
+(novo, 10 casos). Arquivo de teste separado do journal de start porque a pergunta é outra: lá era "de
+quem é este run", aqui é "esta chamada pode entrar, e o que se responde a quem já perguntou antes".
+
+| Caso | O que prende |
+|---|---|
+| 1 | primeira chamada entra como `received`, ordinal 0 |
+| 2 | **T26** — redelivery do mesmo `call_id`/`args_hash` com o vencedor em voo devolve `in_progress`, e **não** cria segunda linha |
+| 3 | **T26** — redelivery de chamada já conciliada devolve o resultado PERSISTIDO (repetir o handler repetiria o efeito) |
+| 4 | **T27** — mesmo id com args diferentes é `payload_conflict`, e o `args_hash` gravado não muda |
+| 5 | `ordinal` fora de ordem é recusado — o UNIQUE da 140 impede duplicata, não desordem |
+| 6 | piloto sequencial: com uma call pendente, outra NOVA é recusada |
+| 7 | **callback adiantado**: em `submitting` a call entra como `received` e a resposta é `in_progress`, nunca execução |
+| 8 | `result_ready` não libera chamada nova |
+| 9 | re-claim: o novo dono não admite call no run do dono antigo, e nada é inserido |
+| 10 | token rotacionado SEM avançar a tentativa (ver a lição abaixo) |
+
+**`args_hash` é derivado, não transportado.** O wire não tem campo de hash (`grep -c hash` em
+`protocol.ts` = 0), e nem a spec nem a DDL dizem como derivá-lo. Como o valor nunca atravessa a
+fronteira, não há acordo entre linguagens a manter: Maia deriva com `canonicalDigest(args)`, que sai
+em 64 hex puros e satisfaz o CHECK — enquanto o hash da casa (`computePayloadHash`) sai com prefixo
+`v2:` e seria REPROVADO nessa coluna. Registrado como C13.
+
+**A lição, de novo — e desta vez eu a previ.** Sete mutantes. Seis morreram de primeira; o do fence de
+origem (AM7) **sobreviveu**, exatamente como eu tinha escrito antes de rodar. Causa idêntica à do
+V-019: o caso 9 é o re-claim REALISTA, que troca token e tentativa na mesma UPDATE, então apagar o
+predicado de token deixa o de tentativa recusando. Uma ressalva honesta sobre o que esse "sobreviveu"
+significa: o literal é o mesmo do fence compartilhado, e ele **já morre** no spec do journal (caso 25).
+A sobrevivência era, portanto, do escopo da varredura — que roda um arquivo só —, não uma regra
+desprotegida. Mesmo assim o caso 10 entrou: a admissão não pode depender de um teste que mora em
+outro arquivo, porque basta alguém lhe dar um fence próprio para a garantia sumir sem ninguém
+reclamar. Com ele, os sete morrem.
+
+**Gates:** `prettier --check`, `typecheck` (projeto) e `eslint` em 0. **Regressão:** `50 failed |
+10233 passed | 1083 skipped (11366)`, os MESMOS 20 arquivos em falha de antes, e nenhuma falha citando
+`engine-repos` ou `tool-calls`. Pulados sobem 1073 → 1083 e arquivos 924 → 925: exatamente o spec novo
+(`↓ 10 tests | 10 skipped`). Aritmética fechada de novo.
+
+**O que esta unidade NÃO faz:** não executa nada (a admissão só decide se a chamada entra e o que se
+responde); não cobre `freezeToolIdentity`, `markToolHandlerStarted` nem `settleToolCall` (P03.3b/c);
+não traduz nada para `EngineToolReplyV1` — isso é gateway, P05; e não há teste de concorrência real.
+Uma consequência registrada: seguir o item 3 à risca faz um redelivery com `iteration` diferente virar
+`payload_conflict`. É mais estrito que tratar `iteration` como telemetria, e é o que o texto normativo
+manda; está comentado no código para quem reavaliar.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10233 | 50 | 1073 | Medido de novo DEPOIS do rework: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 40 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10233 | 50 | 1083 | Medido de novo em P03.3a: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes. Pulados sobem 1055 → 1073 e o total 11338 → 11356: +18 é exatamente o meu spec crescendo de 10 para 28 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 50 | 0 | — | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (28, após o rework do V-019) + `hermes-engine-tool-calls-real-db` (10, P03.3a). As demais specs de integração seguem **não executadas** (Redis) |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
 

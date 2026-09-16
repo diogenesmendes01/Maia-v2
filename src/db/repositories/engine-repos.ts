@@ -52,6 +52,7 @@ import type {
   EngineKind,
   EngineRunPhaseV1,
   EngineTerminalProposalV1,
+  EngineToolCallStateV1,
   Json,
 } from "@/runtime/engines/contracts.js";
 import { engineTerminalProposalV1Schema } from "@/runtime/engines/schemas.js";
@@ -500,6 +501,64 @@ const FASES_QUE_ACEITAM_TERMINAL = new Set<EngineRunPhaseV1>([
   "reconciling",
   "submission_unknown",
 ]);
+
+// ---------------------------------------------------------------------------
+// Admissão de tool call (§5.7.4 itens 3-5)
+// ---------------------------------------------------------------------------
+
+/**
+ * Fases em que uma call pode ser ADMITIDA no journal.
+ *
+ * `running` é a única que libera o dispatcher. `submitting` e
+ * `submission_unknown` entram por causa do **callback adiantado** (§5.7.4 item
+ * 5): o engine pode pedir tool antes de o aceite do start estar persistido, e a
+ * resposta certa é journalar `received` e devolver `in_progress` — não executar
+ * e não pedir deliberação nova. `result_ready`, `cancelling`, `reconciling`,
+ * `blocked` e `closed` nunca liberam chamada nova.
+ */
+const FASES_QUE_ADMITEM_CALL = new Set<EngineRunPhaseV1>([
+  "running",
+  "submitting",
+  "submission_unknown",
+]);
+
+/**
+ * Estados que OCUPAM a vaga sequencial do piloto (§5.7.4 item 4: no máximo uma
+ * chamada pendente por run). É exatamente o conjunto do índice parcial
+ * `engine_tool_calls_unsettled_idx` da 140 — `effect_unknown` entra porque uma
+ * call com efeito incerto continua bloqueadora (§5.7.4 item 9).
+ */
+const ESTADOS_QUE_OCUPAM_A_VAGA = new Set([
+  "received",
+  "dispatching",
+  "handler_started",
+  "effect_unknown",
+]);
+
+export type ToolCallAdmission =
+  /** Chamada nova journalada em `received`, com o run já em `running`. */
+  | { ok: true; kind: "admitted"; call_id: string; ordinal: number }
+  /** Vencedor ainda em voo, ou callback adiantado: journalado, não liberado. */
+  | { ok: true; kind: "in_progress"; call_id: string }
+  /** Já conciliada: devolve o que está persistido, sem repetir handler. */
+  | {
+      ok: true;
+      kind: "receipt";
+      call_id: string;
+      state: EngineToolCallStateV1;
+      result: Json;
+    }
+  | TurnFenceConflict
+  | ControlConflict
+  | NotFound
+  | { ok: false; reason: "payload_conflict"; current_args_hash: string }
+  | { ok: false; reason: "ordinal_out_of_order"; expected_ordinal: number }
+  | { ok: false; reason: "call_pending"; pending_call_id: string }
+  | {
+      ok: false;
+      reason: "run_not_authorized";
+      current_phase: EngineRunPhaseV1;
+    };
 
 export const engineRunsRepo = {
   /**
@@ -1138,6 +1197,231 @@ export const engineRunsRepo = {
 
       conta("terminal", "ok");
       return { ok: true, run: snapshot(run) };
+    });
+  },
+
+  /**
+   * Admite — ou RECONHECE — uma chamada de ferramenta (§5.7.4 itens 3-5).
+   *
+   * Nada aqui executa coisa alguma: a operação decide se a chamada entra no
+   * journal e o que se responde a quem já perguntou antes. As três respostas
+   * positivas são diferentes de propósito:
+   *
+   *   * `admitted`   — chamada nova, run em `running`: o dispatcher pode agir;
+   *   * `in_progress`— vencedor ainda em voo OU callback adiantado: journalada,
+   *                    NÃO liberada. Repetir a MESMA `call_id` é o protocolo;
+   *   * `receipt`    — já conciliada: devolve o resultado persistido. Repetir o
+   *                    handler aqui repetiria o EFEITO, que é o que o item 3
+   *                    proíbe.
+   *
+   * `args_hash` é derivado aqui (`canonicalDigest`), não transportado: o wire
+   * não tem campo de hash, então não há acordo entre linguagens a manter. Ver
+   * C13 nos checkpoints.
+   */
+  async admitToolCall(input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    request_id: string;
+    call: {
+      call_id: string;
+      ordinal: number;
+      iteration: number | null;
+      name: string;
+      args: Json;
+    };
+  }): Promise<ToolCallAdmission> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<ToolCallAdmission> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("admit_call", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+
+      const fence = await lockTurnAndCheckFence(tx, {
+        turn_id: input.turn_id,
+        origin_claim_token: input.origin_claim_token,
+      });
+      if (!fence.ok) {
+        conta("admit_call", fence.reason);
+        return fence;
+      }
+
+      const rows = linhas<
+        RunSnapshotRow & RunFenceRow & { last_event_sequence: string | number }
+      >(
+        await tx.execute(sql`
+          SELECT ${SNAPSHOT_COLS}, ${FENCE_COLS}, last_event_sequence FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           FOR UPDATE`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("admit_call", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const recusa = checarFenceDoRun({
+        run,
+        turno: fence.turno,
+        origin_claim_token: input.origin_claim_token,
+        controle,
+      });
+      if (recusa) {
+        conta("admit_call", recusa.reason);
+        return recusa;
+      }
+      const fase = run.phase as EngineRunPhaseV1;
+      if (!FASES_QUE_ADMITEM_CALL.has(fase)) {
+        conta("admit_call", "run_not_authorized");
+        return { ok: false, reason: "run_not_authorized", current_phase: fase };
+      }
+
+      const args_hash = canonicalDigest(input.call.args);
+
+      // REDELIVERY primeiro: a identidade é `(tenant, agent, run_id, call_id)`.
+      const existentes = linhas<{
+        call_id: string;
+        ordinal: number | string;
+        iteration: number | string | null;
+        tool_name: string;
+        args_hash: string;
+        state: string;
+        result_json: Json | null;
+      }>(
+        await tx.execute(sql`
+          SELECT call_id, ordinal, iteration, tool_name, args_hash, state, result_json
+            FROM ${engine_tool_calls}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id} AND call_id = ${input.call.call_id}
+           FOR UPDATE`),
+      );
+      const existente = existentes[0];
+      if (existente) {
+        // O §5.7.4 item 3 manda comparar hash, nome, ordinal E iteration.
+        // Seguir isso à risca significa que um redelivery com `iteration`
+        // diferente vira conflito — é mais estrito do que tratar `iteration`
+        // como telemetria, e é o que o texto normativo pede.
+        const mesmo =
+          existente.args_hash === args_hash &&
+          existente.tool_name === input.call.name &&
+          Number(existente.ordinal) === input.call.ordinal &&
+          (existente.iteration === null
+            ? input.call.iteration === null
+            : Number(existente.iteration) === input.call.iteration);
+        if (!mesmo) {
+          conta("admit_call", "payload_conflict");
+          return {
+            ok: false,
+            reason: "payload_conflict",
+            current_args_hash: existente.args_hash,
+          };
+        }
+        if (
+          ESTADOS_CONCILIADOS.has(existente.state) &&
+          existente.result_json !== null
+        ) {
+          conta("admit_call", "receipt");
+          return {
+            ok: true,
+            kind: "receipt",
+            call_id: existente.call_id,
+            state: existente.state as EngineToolCallStateV1,
+            result: existente.result_json,
+          };
+        }
+        conta("admit_call", "in_progress");
+        return { ok: true, kind: "in_progress", call_id: existente.call_id };
+      }
+
+      // Chamada NOVA: vaga sequencial antes da ordem, porque uma call pendente
+      // torna qualquer ordinal irrelevante.
+      const pendentes = linhas<{ call_id: string; state: string }>(
+        await tx.execute(sql`
+          SELECT call_id, state FROM ${engine_tool_calls}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id}
+             AND state IN ('received', 'dispatching', 'handler_started', 'effect_unknown')
+           ORDER BY ordinal
+           FOR UPDATE`),
+      );
+      const ocupando = pendentes.find((c) =>
+        ESTADOS_QUE_OCUPAM_A_VAGA.has(c.state),
+      );
+      if (ocupando) {
+        conta("admit_call", "call_pending");
+        return {
+          ok: false,
+          reason: "call_pending",
+          pending_call_id: ocupando.call_id,
+        };
+      }
+
+      const proximo = linhas<{ esperado: number | string }>(
+        await tx.execute(sql`
+          SELECT COALESCE(MAX(ordinal) + 1, 0) AS esperado FROM ${engine_tool_calls}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id}`),
+      );
+      const esperado = Number(proximo[0]?.esperado ?? 0);
+      if (input.call.ordinal !== esperado) {
+        // O UNIQUE de `ordinal` da 140 impede DUPLICATA, não desordem: dois
+        // ordinais distintos passam por ele sem reclamar (§5.7.4 item 4).
+        conta("admit_call", "ordinal_out_of_order");
+        return {
+          ok: false,
+          reason: "ordinal_out_of_order",
+          expected_ordinal: esperado,
+        };
+      }
+
+      await tx.execute(sql`
+        INSERT INTO ${engine_tool_calls}
+          (tenant_id, agent_id, turn_id, run_id, call_id, ordinal, iteration,
+           tool_name, args_json, args_hash, request_id, state)
+        VALUES (${tenant_id}, ${agent_id}, ${input.turn_id}, ${input.run_id},
+                ${input.call.call_id}, ${input.call.ordinal}, ${input.call.iteration},
+                ${input.call.name}, ${JSON.stringify(input.call.args)}::jsonb,
+                ${args_hash}, ${input.request_id}::uuid, 'received')`);
+
+      // `last_event_sequence` anda; `row_version` NÃO — ele é o token de CAS
+      // das transições do RUN, e admitir uma call não é transição de run.
+      const seq = linhas<{ last_event_sequence: string | number }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           RETURNING last_event_sequence`),
+      );
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(seq[0]?.last_event_sequence ?? 1),
+        dedupe_key: `tool_state:${input.call.call_id}:received`,
+        event_type: "tool_state",
+        actor_kind: "turn_owner",
+        actor_turn_attempt: Number(fence.turno.attempt_count),
+        metadata: {
+          call_id: input.call.call_id,
+          ordinal: input.call.ordinal,
+          tool_name: input.call.name,
+          state: "received",
+          admitted_under_phase: fase,
+        },
+      });
+
+      // Callback adiantado: journalado, mas não liberado.
+      if (fase !== "running") {
+        conta("admit_call", "early_callback");
+        return { ok: true, kind: "in_progress", call_id: input.call.call_id };
+      }
+      conta("admit_call", "admitted");
+      return {
+        ok: true,
+        kind: "admitted",
+        call_id: input.call.call_id,
+        ordinal: input.call.ordinal,
+      };
     });
   },
 };
