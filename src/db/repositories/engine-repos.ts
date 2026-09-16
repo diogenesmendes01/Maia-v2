@@ -76,6 +76,11 @@ import {
 import { db, withTx } from "../client.js";
 import { statusList } from "./turn-fence-sql.js";
 import {
+  lockControlByIdSql,
+  lockControlByRunSql,
+  type ConversationControlLockRow,
+} from "./conversation-control-sql.js";
+import {
   agent_turns,
   conversation_controls,
   engine_run_events,
@@ -200,32 +205,40 @@ type EventoTipo =
 // Helpers de lock e fence
 // ---------------------------------------------------------------------------
 
-type ControleRow = { id: string; mode: string; control_epoch: string };
+/**
+ * A linha do controle, definida em `conversation-control-sql.ts` junto do SQL
+ * que a produz. O alias local preserva os 16 call sites que já falam
+ * `ControleRow` — renomeá-los seria churn sem ganho no mesmo commit da extração.
+ */
+type ControleRow = ConversationControlLockRow;
 
 /**
  * PRIMEIRO na ordem de locks. Duas formas: por `control_id` (quando o run
  * ainda não existe) e pelo run (quando existe), como no SQL do §5.6.4.
+ *
+ * O SQL **não mora mais aqui** (P04.3a): ele foi extraído para
+ * `conversation-control-sql.ts`, um módulo PURO, porque o `pauseConversationTx`
+ * do §8.2.3 precisa trancar a MESMA linha e o §8.2.3 passo 3 proíbe "dois
+ * ordenamentos incompatíveis". Copiar o SELECT para o repositório de controle
+ * criaria a segunda cópia; importá-lo DE CÁ inverteria a dependência, já que
+ * controle é o degrau anterior ao journal. Mesmo desenho de `turn-fence-sql.ts`
+ * (#504) e `stream-head-sql.ts` (#626), e pelo mesmo motivo: este arquivo
+ * importa `../client.js`, que constrói o `pg.Pool` no import, então enquanto o
+ * SQL morasse aqui a única prova possível do lock era um teste de integração.
+ *
+ * O que esta função guarda é o que NÃO é puro: a leitura do escopo no ALS e a
+ * execução no `tx`.
  */
 async function lockControl(
   tx: Executor,
   alvo: { control_id: string } | { run_id: string },
 ): Promise<ControleRow | null> {
   const { tenant_id, agent_id } = scope();
-  const res =
+  const res = await tx.execute(
     "control_id" in alvo
-      ? await tx.execute(sql`
-          SELECT c.id, c.mode, c.control_epoch::text AS control_epoch
-            FROM ${conversation_controls} c
-           WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
-             AND c.id = ${alvo.control_id}
-           FOR UPDATE`)
-      : await tx.execute(sql`
-          SELECT c.id, c.mode, c.control_epoch::text AS control_epoch
-            FROM ${conversation_controls} c
-            JOIN ${engine_runs} r
-              ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id AND r.control_id = c.id
-           WHERE r.tenant_id = ${tenant_id} AND r.agent_id = ${agent_id} AND r.id = ${alvo.run_id}
-           FOR UPDATE OF c`);
+      ? lockControlByIdSql({ tenant_id, agent_id, control_id: alvo.control_id })
+      : lockControlByRunSql({ tenant_id, agent_id, run_id: alvo.run_id }),
+  );
   return linhas<ControleRow>(res)[0] ?? null;
 }
 

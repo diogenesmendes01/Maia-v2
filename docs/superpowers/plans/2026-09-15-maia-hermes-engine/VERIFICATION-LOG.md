@@ -1468,13 +1468,112 @@ auxiliares, mais teste com provider real — D02, sem orçamento; nada disso exi
 banco, crash é processo). Nenhum dos oito módulos das três frentes tem call site de produção: compilam,
 são testados e estão inertes.
 
+### V-036 · P04.3a — o trancamento do controle extraído, e uma asserção MINHA que não mordia
+
+**A unidade.** `src/db/repositories/conversation-control-sql.ts`: os dois construtores do SQL que tranca
+`conversation_controls` (`lockControlByIdSql`, `lockControlByRunSql`), extraídos de uma função privada
+de `engine-repos.ts` com 16 call sites.
+
+**Por que é pré-requisito e não refatoração cosmética.** O `pauseConversationTx` do §8.2.3 precisa
+trancar a MESMA linha, e o passo 3 daquela seção proíbe em letras "introduzir dois ordenamentos
+incompatíveis". As alternativas eram copiar o SELECT — duas cópias divergem, e divergência de ordem de
+lock só aparece sob concorrência, em produção, como deadlock — ou o repositório de controle importar do
+journal, o que inverteria a dependência, já que controle é o degrau ANTERIOR. A terceira saída é a que
+a casa já usou duas vezes pelo mesmo motivo (`turn-fence-sql.ts` #504, `stream-head-sql.ts` #626):
+`engine-repos.ts` importa `../client.js`, que constrói o `pg.Pool` no import, então enquanto o SQL
+morasse lá a única prova possível do lock era um teste de integração — e teste de integração que não
+roda não prova nada.
+
+**A garantia substantiva do arquivo é o `FOR UPDATE OF c`.** Num join, um `FOR UPDATE` pelado tranca
+TODAS as tabelas da consulta: o controle *e* `engine_runs`. Isso poria uma aresta de lock sobre o run
+ANTES do controle, invertendo a ordem que o §5.6.3 fixou. O caso 5 prende exatamente isso.
+
+**Vermelho legítimo, e FRACO — registrado como tal.** `Cannot find package
+'@/db/repositories/conversation-control-sql.js'`, exit 1, `Tests no tests`: zero casos executados. Não
+é asserção falhando, é módulo inexistente, e a distinção importa.
+
+**Defeito MEU, achado pela varredura.** Primeira rodada: 5 mortos, **2 sobreviventes** — e os dois eram
+de isolamento de tenant, justamente o que eu vinha cobrando dos agentes. Meu caso 4 fazia
+`toMatch(/tenant_id[\s\S]*agent_id/)`, uma checagem de PRESENÇA e não de estrutura: sobrevivia tanto a
+tirar `agent_id` do `WHERE` quanto a reduzir o join a `ON r.control_id = c.id`, porque nos dois casos as
+palavras continuavam no SQL noutro ponto. É o mesmo defeito do caso vacuoso que o U-P04.2 me obrigou a
+corrigir, cometido de novo **uma unidade depois**. Corrigi o TESTE: passou a afirmar sobre PARÂMETRO
+(só o que é interpolado vira parâmetro, então tirar o escopo do `WHERE` some com o valor) e sobre
+CONTAGEM de ocorrências por eixo (o escopo tem de aparecer duas vezes — no `ON` e no `WHERE`).
+Segunda rodada: **7 de 7 mortos, zero sobreviventes.**
+
+**Preservação de comportamento: 184/184 contra Postgres REAL**, os seis specs real-db, pelo
+procedimento local de dois passos do V-005. Numa extração, isto é a evidência que vale — `tsc` prova
+que compila, não que a semântica é a mesma. **O alvo do banco foi PROVADO, não presumido:** a primeira
+tentativa (via `npm run test:integration`) morreu na guarda da #571 com `executados=0`, porque o
+fakeredis não sustenta o `FLUSHDB` do db lógico; refeita pelo passo 2 (sem `globalSetup`), e depois
+confirmei por consulta direta que o banco genérico `maia_test` tem **zero** das tabelas do journal
+enquanto o escopado por worktree tem **167 runs criados nos últimos 10 minutos**.
+
+**Gates:** `tsc` 0, `eslint` 0, `lint` 0 (483 warnings, idêntico ao V-033 — a mudança não acrescentou
+nenhum), `check:node` 0, `docs:ai:check` 0, `config:check:drift` 0, `audit:exceptions:check` 0,
+`migrate:reservations:check` 0. Diff de `engine-repos.ts`: **28/15**, proporcional à mudança, sem
+import órfão.
+
+**Regressão:** `50 failed | 10268 passed | 1217 skipped (11535)` contra `50 | 10261 | 1217 (11528)` do
+V-033. Falhos, pulados e os mesmos 20 arquivos INALTERADOS; passados e total sobem **exatamente +7**,
+que são os sete casos desta unidade, puros e portanto na lane unitária.
+
+**O que esta unidade NÃO faz:** o `pauseConversationTx` em si (P04.3b). Aqui só o degrau de lock ficou
+com um dono único — nenhum caminho novo foi aberto.
+
+### V-037 · P05 — o fail-open de profundidade, corrigido e reverificado por mim
+
+**O defeito** está no V-035 e no C39. **A correção** veio nos commits `989355eb` (código e testes) e
+`8a309b3d` (relatório), na branch `claude/mh-p05-broker`.
+
+**A raiz, melhor formulada pelo agente do que por mim:** `encontraChaveReservada` devolvia
+`string | null`, e `null` significava ao mesmo tempo "varri tudo e está limpo" e "desisti por
+profundidade". O chamador lia os dois como "conferido". A correção é de POSTURA e de TIPO — três
+estados (`clean | found | too_deep`), de modo que o tipo não consegue mais confundir os dois fatos e
+quem consome é obrigado a decidir. O teto continua 16: subi-lo teria o mesmo defeito mais fundo.
+
+Duas decisões de desenho que valem registro: `collectResourceRefs` passou a devolver
+`{refs, truncated}` e a autorização recusa `scan_truncated` ANTES de qualquer pertencimento — a
+varredura e a decisão viajam juntas de propósito, senão o fail-closed dependeria de cada call site
+lembrar de conferir o truncamento, e um que esquecesse reproduziria o defeito. E a guarda de
+profundidade ficou DEPOIS da checagem de tipo: um escalar fundo não esconde nada abaixo de si, então o
+que dispara a recusa é estrutura **não varrida**.
+
+**Um achado dele que eu não tinha visto:** o teto do broker (16) é mais estrito que o `max_json_depth`
+do wire (32), então entre **17 e 32** o frame passava no P00 e a varredura desistia calada. A faixa
+explorável era maior do que a que eu reportei.
+
+**Reverificado por MIM, com a mesma sonda de antes:** profundidades 2 e 15 → `reserved_argument`;
+**16, 17, 20, 32 e 40 → `too_deep`**. O fail-open fechou em toda a faixa, inclusive na que ele
+identificou. Gates por mim: `tsc` 0, **94/94 com zero pulados**. Nenhum arquivo proibido — confirmei
+especificamente que **a fixture compartilhada do P00 não foi tocada** —, zero trailers, árvore limpa.
+
+**Ele corrigiu dois vereditos próprios sem eu pedir:** T20 e T24 estavam marcados COBERTO
+prematuramente, e "morre em qualquer profundidade" era literalmente falso acima do teto. Também
+registrou que a varredura por operador não é dele. Rodei a minha na correção: **61 mortos, 8
+sobreviventes**, e classifiquei os oito lendo os sítios em vez de supor por semelhança — que é o que
+me fez achar o bypass da vez anterior:
+
+| Sítio | Mutação | Classificação |
+|---|---|---|
+| `run-binding.ts:116`, `run-binding.ts:233` | `\|\|` → `&&` | **Rótulo, não garantia.** `issue?.path.join('.') \|\| 'binding'` e `caminho \|\| '$'` são o nome do campo no erro e o caminho na raiz. Mutar rótulo não prova nada — mesma família de `\|\| 'body'`, já absolvida por mutação combinada |
+| `tool-broker.ts:309` (×2) | `&&` → `\|\|` | **Guarda positivo de três termos**, redundante: é o mesmo sítio que eu já havia absolvido ANTES da correção, deslocado pelas linhas novas |
+| `tool-broker.ts:433` (×2) | `\|\|` → `&&` | **Checagem defensiva de forma** sobre `input_schema.properties`, redundante com a validação do manifest que já rodou |
+| `tool-broker.ts:264`, `run-binding.ts:228` | `\|\|` → `&&` | **Guarda de tipo** (`valor === null \|\| typeof valor !== 'object'`). Muda o comportamento só para escalar em profundidade, e escalar não esconde nada abaixo de si — que é, aliás, exatamente por que o agente moveu a guarda de profundidade para DEPOIS desta. Ramo não exercitado, sem consequência de segurança |
+
+**O que importa nessa lista é o que NÃO está nela:** as guardas de profundidade. As mutações `>` → `>=`
+nos dois tetos **morrem**, então o fail-closed novo está preso por teste, não apenas escrito. Nenhum
+dos oito sobreviventes toca uma garantia — e essa conclusão veio de ler os sete sítios um a um, não de
+presumir que se pareciam com os já absolvidos.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10261 | 50 | 1217 | Medido de novo em P04.2: passados 10255 → **10261** e total 11522 → **11528**, **+6 = exatamente os seis casos** do spec de vocabulário, que rodam na lane unitária por ser puro; falhos (50), pulados (1217) e os **mesmos 20 arquivos** INALTERADOS, e nenhuma falha cita `audit-actions` nem `conversation-control`. Histórico de P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| unit (`npm test`, workers default) | 10268 | 50 | 1217 | Medido de novo em P04.3a: passados 10261 → **10268** e total 11528 → **11535**, **+7 = exatamente os sete casos** do spec do módulo de SQL puro; falhos (50), pulados (1217) e os mesmos 20 arquivos INALTERADOS. Histórico de P04.2: passados 10255 → **10261** e total 11522 → **11528**, **+6 = exatamente os seis casos** do spec de vocabulário, que rodam na lane unitária por ser puro; falhos (50), pulados (1217) e os **mesmos 20 arquivos** INALTERADOS, e nenhuma falha cita `audit-actions` nem `conversation-control`. Histórico de P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
 | integração real-db (procedimento local de 2 passos) | 184 | 0 | — | Agora com `hermes-control-commands-real-db` (17 de P04.1). Detalhe anterior: | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
 | `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a e P03.7b, com perfil IDÊNTICO nas três vezes** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
