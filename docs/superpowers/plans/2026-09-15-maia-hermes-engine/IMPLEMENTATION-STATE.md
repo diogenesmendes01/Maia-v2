@@ -443,6 +443,26 @@ sequência P00–P12 do capítulo 10 da spec.
   fechou em 74, corrigi na raiz e os 8 voltaram a 103/103. Ver C51.
   Regressão final `51 | 10279 | 1272 (11602)`: total +28, pulados +16, e o resíduo de +1 falha
   atribuído ao flake de `check-commit-trailers` por medição NOVA (isolado 13/13 duas vezes). Ver V-041.
+- `U-P04.5b.1` — **concluída e verificada**: as duas arestas manuais que o descarte administrativo de
+  backlog (§8.2.5) exige — `queued → ignored` e `retryable → ignored` em `MANUAL_TRANSITIONS`. Fatia
+  SEPARADA do cancelamento em si pelo mesmo critério de P04.3a/P04.3b: contrato compartilhado que
+  governa todo turno do sistema não deve mudar dentro de um commit de repositório. Só duas arestas
+  faltavam (`received → ignored` e `running → ignored` já eram automáticas desde o #503), e elas entram
+  pela porta MANUAL porque a spec é literal: "sem liberar `queued → ignored` para callers automáticos".
+  **Sem migration** — o CHECK de `agent_turns` já aceita `ignored` + `operator_cancelled` (097/115),
+  conferido antes de escrever.
+  ⚠️ **O vermelho pegou um defeito MEU antes do código:** eu afirmara que `queued → superseded` seria
+  recusado na porta manual, mas `superseded` é aresta AUTOMÁTICA de `queued` (o debounce absorvendo um
+  irmão). "Consertar" o contrato para satisfazer o teste teria removido uma transição viva.
+  **Mutação 6/6 mortas, zero sobreviventes, zero puladas** — a decisiva é a M5, que ACRESCENTA a aresta
+  ao caminho automático em vez de remover algo: se sobrevivesse, os testes afirmariam a aresta sem
+  afirmar a PORTA, que é do que a cláusula trata. Raio medido: **212/212 em 13 specs de turno**;
+  `tsc` 0, `eslint` 0; regressão `50 | 10284 | 1272 (11606)` fechando exata (+4 casos puros; o −1 de
+  falha é o flake de `check-commit-trailers` passando desta vez, com o mesmo código). Ver V-042.
+  **Pendente: U-P04.5b.2**, o cancelamento em si, com o terreno já levantado (encaixe na transação do
+  resume, precedente de lote em `recoverExpiredStreamClaims`, transição pelo contrato via
+  `completeRecoveredOutboundTurnInTx`, referência ao comando na trilha em vez de coluna nova, e a prova
+  de drenagem precisando de variante por TURNO).
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado

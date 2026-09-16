@@ -172,6 +172,96 @@ describe('turn state machine — tabela COMPLETA de transições inválidas', ()
       expect(checkTurnTransition(terminal, 'queued', null, { manual: true }).allowed).toBe(false);
     }
   });
+
+  // ─── P04.5b.1 — o descarte administrativo de backlog (spec maia-hermes §8.2.5)
+  //
+  // A spec manda: "turnos `received/queued/retryable` retidos pelo controle, sem
+  // execução/efeito pendente e anteriores ou iguais ao watermark, terminam em
+  // `ignored` + `operator_cancelled`" e "acrescentar as arestas estritamente
+  // manuais necessárias em `MANUAL_TRANSITIONS`, **sem liberar `queued →
+  // ignored` para callers automáticos**".
+  //
+  // `received → ignored` e `running → ignored` JÁ existem na tabela automática,
+  // então só duas arestas faltam. Elas entram pela porta MANUAL porque o
+  // caminho automático de um turno `queued` é avançar, não ser descartado: um
+  // `ignored` alcançável automaticamente daria a qualquer caller a capacidade de
+  // sumir com trabalho enfileirado sem operação auditada.
+
+  it('`queued → ignored` e `retryable → ignored` existem SÓ na porta manual', () => {
+    for (const from of ['queued', 'retryable'] as const) {
+      // Fechado para o caminho automático — a cláusula literal da spec.
+      expect(checkTurnTransition(from, 'ignored', 'operator_cancelled')).toMatchObject({
+        allowed: false,
+        reason: 'not_in_transition_table',
+      });
+      // Aberto para a operação explícita e auditada.
+      expect(checkTurnTransition(from, 'ignored', 'operator_cancelled', { manual: true })).toEqual({
+        allowed: true,
+      });
+      expect(MANUAL_TRANSITIONS[from]).toEqual(['ignored']);
+    }
+  });
+
+  it('a porta manual NÃO vira um curinga: só `ignored` se abre para esses dois', () => {
+    // Sem esta guarda, acrescentar uma aresta manual seria acrescentar um
+    // caminho livre a partir do mesmo estado. `completed` é o caso que mais
+    // importa: descartar backlog é diferente de declarar que ele foi executado.
+    //
+    // ⚠️ A primeira versão deste caso também exigia que `queued → superseded`
+    // fosse recusado na porta manual, e a asserção era FALSA: `superseded` é
+    // aresta AUTOMÁTICA de `queued` desde o #503 (é como o debounce absorve um
+    // irmão). O vermelho a pegou. Registro em vez de apagar porque o conserto
+    // tentador era o perigoso — "ajustar" o contrato para satisfazer o teste
+    // teria removido uma transição legítima e viva.
+    //
+    // A invariante correta não é "nada mais se abre a partir daqui", é "a PORTA
+    // MANUAL não acrescenta nada além de `ignored`". O conjunto manual é
+    // afirmado por extenso; o que já era automático continua sendo, e isso é
+    // verificado pelo caso da tabela de transições, não aqui.
+    for (const from of ['queued', 'retryable'] as const) {
+      expect(
+        checkTurnTransition(from, 'completed', 'reply_delivered', { manual: true }).allowed,
+      ).toBe(false);
+      expect(MANUAL_TRANSITIONS[from]).toHaveLength(1);
+    }
+    // E o replay de dead letter continua sendo o que era, sem ganhar destinos.
+    expect(MANUAL_TRANSITIONS['dead_letter']).toEqual(['queued']);
+    expect(checkTurnTransition('dead_letter', 'ignored', 'operator_cancelled', { manual: true }).allowed).toBe(
+      false,
+    );
+  });
+
+  it('a compatibilidade estado/outcome continua valendo DENTRO da porta manual', () => {
+    // A porta manual admite a ARESTA; ela não relaxa o par estado/outcome. Um
+    // `retry_exhausted` pertence a `dead_letter`, e atravessar por aqui seria
+    // gravar um outcome que o CHECK da migration 097 recusaria no banco — erro
+    // que apareceria como exceção de escrita, não como recusa tipada.
+    expect(
+      checkTurnTransition('queued', 'ignored', 'retry_exhausted', { manual: true }),
+    ).toMatchObject({ allowed: false, reason: 'incompatible_outcome' });
+    // E terminal sem outcome continua recusado.
+    expect(checkTurnTransition('queued', 'ignored', null, { manual: true })).toMatchObject({
+      allowed: false,
+      reason: 'missing_outcome',
+    });
+  });
+
+  it('`sourceStatusesFor` revela que a porta manual inclui `running` — e por isso o caller TEM de interseccionar', () => {
+    // Esta é a asserção que a fatia do cancelamento depende, e ela existe para
+    // um erro específico: `running → ignored` é AUTOMÁTICO (um turno em
+    // execução pode se descartar por política), então pedir as origens de
+    // `ignored` em modo manual devolve `running` JUNTO. Um caller que passasse
+    // esse conjunto direto ao `UPDATE` cancelaria administrativamente um turno
+    // que está EXECUTANDO — o oposto do "sem execução/efeito pendente" que a
+    // spec exige.
+    //
+    // Comparação por conjunto ordenado, e não por ordem de array: a ordem aqui é
+    // a de `TURN_STATUSES`, um detalhe interno que não deve prender o teste.
+    expect([...sourceStatusesFor('ignored')].sort()).toEqual(['received', 'running']);
+    expect([...sourceStatusesFor('ignored', { manual: true })].sort()).toEqual(
+      ['queued', 'received', 'retryable', 'running'].sort(),
+    );
+  });
 });
 
 describe('turn state machine — estado terminal exige outcome compatível', () => {
