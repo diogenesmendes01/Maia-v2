@@ -89,6 +89,10 @@ sequência P00–P12 do capítulo 10 da spec.
 | C38 | (P05 C-P05-7) **`authorization_target` é validado e NÃO é enforçado por ninguém.** O §7.10.1 cria `entity\|current_subject\|current_turn`, mas o dispatcher continua exigindo entidade para toda tool | spec §7.10.1 linha 2244; **verificado por mim**: `src/tools/_dispatcher.ts:389` é `if (!entity_id) return { error: 'no_entity_in_scope' };`, e `grep` por `authorization_target\|current_subject\|current_turn` em `src/tools/` e `src/runtime/` = **vazio** | Uma tool `current_subject`/`current_turn` no manifest é hoje **indespachável**, e a fase "memória privada" do §4.2 não sai do papel sem esse branch. Exige mudança em `_dispatcher.ts`, arquivo que o agente não podia tocar — fica nomeado, não meio-feito |
 | C39 | **O teto de profundidade dos varredores do broker é fail-OPEN** — achado MEU, por varredura de mutação por operador seguida de sonda contra a função real, não por leitura. `screenToolArgs` devolve `{kind:'ok'}` para `tenant_id` aninhado a ≥16 níveis (pega em 15) e `collectResourceRefs` devolve `[]` a partir de 16 | `tool-broker.ts:226` (`MAX_ARG_DEPTH`), `run-binding.ts:212` (`MAX_REF_DEPTH`), branch `claude/mh-p05-broker`; sonda executada contra as funções reais | Atinge **T20/INV-02** e **T24/INV-01**: estourar o teto devolve "nada encontrado" em vez de "fundo demais para afirmar", e como `screenToolArgs` só compara chaves de TOPO contra as declaradas, uma chave declarada carregando o reservado no fundo atravessa as duas peneiras. **Devolvido ao agente para correção fail-closed**, com a exigência explícita de **não subir o teto** — 1000 níveis teria o mesmo defeito mais fundo; o que muda é a postura no limite. Não corrigido por mim: o arquivo é dele e está em branch própria |
 
+| C40 | **A spec nomeia uma tabela de auditoria que não existe.** O §8.6.1 exige "vínculo entre `audit_logs` e `admin_audit_log` por correlation/command ID" — e `audit_logs` (plural) **não existe no banco**. A tabela real é **`audit_log`** (singular) | consulta ao catálogo do banco local: existem `audit_log` e `admin_audit_log`, e nenhuma `audit_logs`; `src/db/schema.ts:1167` (`pgTable('audit_log', …)`); `src/governance/audit.ts:114` (`auditTx` → `auditRepo.writeTx`) | Erro de nome na spec, não divergência de desenho — adoto **`audit_log`**, que é o que o código e o banco têm. Registrado porque quem implementasse pelo texto referenciaria tabela inexistente, e porque é o mesmo gênero do C21 (nome de arquivo divergente entre capítulo 10 e §8.2.3). **Decisão adjacente, tomada com evidência e não por conveniência:** as duas trilhas têm papéis distintos e a fatia do repositório escreve só uma. `audit_log` recebe `acao: AuditAction` — onde vivem as cinco ações do U-P04.2 —, carrega `tenant_id`/`agent_id` do ALS, tem `conversa_id` e `metadata`, e o `auditTx` é deliberadamente **sem try/catch**, para que a falha da trilha desfaça a escrita que a originou; é essa propriedade que cumpre o §8.2.3 passo 4. `admin_audit_log` é a trilha do ATOR administrativo (`actor_id`, `actor_role`, `change_summary`) e **não tem coluna de agente**, como o próprio §8.6.1 observa — ela pertence à camada que tem o principal autenticado, isto é, ao serviço/console, não ao repositório. O vínculo que o §8.6.1 pede fica pelo `command_id`, presente no `metadata` de um lado e no `change_summary` do outro |
+
+| C41 | **Padrão de defeito NO MEU PRÓPRIO TRABALHO: asserção de isolamento que não morde um dos dois eixos.** Três vezes na mesma sessão, em três unidades consecutivas, escrevi um teste que parecia provar isolamento e não provava — e nas três quem apontou foi a varredura por mutação, nunca a leitura: **(1) U-P04.2**, caso 5 iterava os literais escritos no próprio spec contra um regex, então nenhuma mudança de código conseguia derrubá-lo; **(2) U-P04.3a**, caso 4 usava `toMatch(/tenant_id[\s\S]*agent_id/)` — presença, não estrutura —, e sobrevivia tanto a tirar `agent_id` do `WHERE` quanto a reduzir o join a `ON r.control_id = c.id`; **(3) U-P04.3b**, caso 10 varia o TENANT e o helper `noEscopo` usava o MESMO agente nos dois, então remover `agent_id` da busca de idempotência passou ileso | V-033 (mutação M5/M7), V-036 (M4/M6), V-038 (M5); os três specs correspondentes | **A causa é comum às três:** o escopo desta casa tem DOIS eixos (`tenant_id`, `agent_id`) e eu escrevia fixtures que variavam um só, ou asserções que verificavam a PRESENÇA das palavras em vez da ESTRUTURA do predicado. Um teste assim passa, parece cobrir e não cobre — e é indistinguível de cobertura real até alguém mutar o código. **Regra que adoto daqui em diante, e que vale para as unidades seguintes do P04 e para o P05/P06/P07 quando forem integrados:** toda garantia de isolamento precisa de fixture que varie **cada eixo separadamente** (dois tenants com o mesmo agente **e** dois agentes no mesmo tenant), e toda asserção sobre SQL precisa afirmar sobre PARÂMETRO ou CONTAGEM, nunca sobre a aparição de um nome de coluna no texto. Registrado como contradição porque é contradição entre o que meus registros anteriores AFIRMAVAM ter verificado e o que os testes de fato prendiam |
+
 ## 4. Ambiente e ferramentas (verificado em 2026-09-15)
 
 | Item | Estado |
@@ -337,6 +341,28 @@ sequência P00–P12 do capítulo 10 da spec.
   **Preservação provada: 184/184 contra Postgres real** nos seis specs real-db, com o banco-alvo
   confirmado por consulta direta (o genérico `maia_test` não tem as tabelas; o escopado tinha 167 runs
   recém-criados). Regressão +7 exatos, falhos e pulados inalterados. Ver V-036.
+- `U-P04.3b` — **concluída e verificada**: `src/db/repositories/conversation-control-repo.ts`
+  (singular, por C21) com `pauseConversationTx` — a transação de pausa do §8.2.3, e o **primeiro
+  escritor de `conversation_controls` em código de produção**. Levantei antes de escrever: não havia
+  nenhum INSERT/UPDATE sobre a tabela em `src/`, e os únicos incrementos de `control_epoch`
+  existentes viviam em fixtures dos meus próprios specs — o mecanismo estava declarado na 140 e
+  nunca tinha andado fora de teste.
+  Tudo sob o MESMO lock: idempotência escopada ANTES de tocar no controle, lock pelo construtor único
+  do P04.3a, **epoch conferido antes do modo** (ordem do passo 3; o epoch é o marcador de autoridade,
+  e "você está desatualizado" é fato diferente de "a transição não se aplica aqui"), transição
+  completa com dono/carimbo/motivo, comando `accepted` com `result_epoch`, e `auditTx` na mesma
+  transação — decisão apoiada em evidência, não em conveniência: o veto a auditar em repositório é do
+  cabeçalho do `engine-repos.ts`, não da casa, e `ops-repos`/`outbound-delivery`/`outbound-outbox` já
+  chamam `auditTx` de dentro da TX exatamente quando a garantia exige atomicidade (ver C40).
+  **12 casos contra Postgres real; 13 mutações, 12 mortas.** O sobrevivente é o `FOR UPDATE` da busca
+  de idempotência, declarado por escrito ANTES de rodar — sem concorrência real na suíte, ele não tem
+  como morrer. **Duas correções minhas:** um ramo que respondia `payload_conflict` com o payload
+  batendo (o certo é devolver o desfecho PERSISTIDO, e agora há caso para ele), e o caso de
+  isolamento que variava só o tenant — a mutação "idempotência sem `agent_id`" sobreviveu à primeira
+  varredura porque nenhuma fixture tinha dois agentes. Ver **C41**.
+  Poluição PRE-EMPTADA: o índice de outbox dos comandos é parcial e cross-tenant, então o `afterAll`
+  **aposenta** (`drain_status='complete'`) em vez de deletar — a FK é `ON DELETE RESTRICT` — e a fila
+  ficou em 8, igual à baseline, em todas as rodadas. Ver V-038.
 - Harness do spike: `tests/helpers/hermes-stub-provider.ts` (provider **stub** compatível com Chat Completions, com gravação das requisições — é também o instrumento que responde a decisão D09) — escrito, ainda não commitado porque só faz sentido junto do teste do spike.
 
 ### Bloqueado

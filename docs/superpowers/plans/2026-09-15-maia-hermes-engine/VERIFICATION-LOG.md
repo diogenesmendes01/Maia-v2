@@ -1567,14 +1567,77 @@ nos dois tetos **morrem**, então o fail-closed novo está preso por teste, não
 dos oito sobreviventes toca uma garantia — e essa conclusão veio de ler os sete sítios um a um, não de
 presumir que se pareciam com os já absolvidos.
 
+### V-038 · P04.3b — `pauseConversationTx`, e o eixo que os meus testes não olhavam
+
+**A unidade.** `src/db/repositories/conversation-control-repo.ts` (singular, por C21) com
+`pauseConversationTx`: a transação de pausa do §8.2.3, e o **primeiro escritor de
+`conversation_controls` em código de produção**. Levantei antes de escrever — não havia nenhum
+INSERT/UPDATE sobre a tabela em `src/`, e os únicos incrementos de `control_epoch` viviam em fixtures
+dos meus próprios specs. O mecanismo estava declarado na 140 desde o P03.1 e nunca tinha andado fora
+de teste.
+
+**Decisões apoiadas em evidência, não em conveniência.** (a) **Auditoria dentro do repositório**: o
+cabeçalho do `engine-repos.ts` diz que auditoria não acontece ali, e eu quase li isso como regra da
+casa — mas `ops-repos.ts`, `outbound-delivery-repo.ts` e `outbound-outbox-repo.ts` chamam `auditTx` de
+dentro da TX exatamente quando a garantia exige atomicidade, que é o caso do §8.2.3 passo 4. O
+`auditTx` é deliberadamente SEM try/catch, para a falha da trilha desfazer a escrita que a originou.
+(b) **Epoch conferido ANTES do modo**, na ordem do passo 3: o epoch é o marcador de autoridade, e
+"você está desatualizado" é fato diferente de "a transição não se aplica aqui". (c) `conversa_id`
+NULO na trilha, porque a coluna tem FK para `conversas` e o §8.2.1 admite controle sem conversa
+resolvida; os ids viajam no `metadata`, que é o vínculo do §8.6.1.
+
+**Vermelho legítimo e FRACO**, registrado como tal: módulo inexistente, exit 1, `Tests no tests`.
+
+**Mutação: 13 aplicadas, 12 MORTAS.** Os alvos são as cláusulas, não o texto — epoch que não
+incrementa, gate de epoch e de modo desligados, `request_hash` ignorado, idempotência sem `agent_id`,
+barreira mentindo sobre drenagem, transição pulando `pausing`, `UPDATE` sem dono (que o
+`_owner_chk` da 140 recusa), comando criado sem controle, fallback errado do desfecho persistido.
+
+**O único sobrevivente é o M13 — e foi DECLARADO POR ESCRITO ANTES DE RODAR:** remover o `FOR UPDATE`
+da busca de idempotência não tem como morrer, porque esta suíte não tem concorrência real. É a mesma
+lacuna que carrego desde o P03 ("nenhum teste de concorrência real no módulo"), agora com um mutante
+que a demonstra em vez de uma frase que a alega.
+
+**DOIS DEFEITOS MEUS, achados aqui.**
+1. Um ramo devolvia `payload_conflict` quando o payload BATIA — o que havia era um comando guardado
+   não aceito. Tipo satisfeito, semântica errada, zero testes. Corrigido para devolver o desfecho
+   PERSISTIDO (que o `_outcome_chk` da 141 garante existir), com caso próprio. "Inalcançável hoje" não
+   justifica resposta errada — é a régua que recusei no C39.
+2. **A mutação "idempotência sem `agent_id`" SOBREVIVEU à primeira varredura.** O caso de isolamento
+   variava o TENANT, e o helper usava o MESMO agente nos dois — o eixo do agente nunca era exercitado.
+   Acrescentei o caso com dois agentes no mesmo tenant e M5 passou a morrer. **É a terceira vez na
+   mesma sessão que escrevo uma asserção de isolamento que não morde um dos dois eixos**, e por isso
+   virou o registro **C41**, com a regra que adoto daqui em diante.
+
+**Poluição PRE-EMPTADA, não remediada.** `conversation_control_commands_outbox_idx` é PARCIAL e
+CROSS-TENANT (coluna líder `lease_expires_at`, mesma forma dos varredores das migrations 114/131/140),
+e cada rodada deste spec deixaria ~9 comandos aceitos e não drenados. O `afterAll` **aposenta**
+(`drain_status='complete'`) em vez de deletar — a FK é `ON DELETE RESTRICT` — e a fila ficou em **8**,
+idêntica à baseline, em todas as rodadas, inclusive nas 13 da varredura.
+
+**Gates:** `tsc` 0, `eslint` 0, `lint` 0 (483 warnings, inalterado), `check:node` 0, `docs:ai:check` 0,
+`config:check:drift` 0, `audit:exceptions:check` 0, `migrate:reservations:check` 0.
+
+**Regressão, com aritmética INVERSA à da unidade anterior e prevista antes de medir:**
+`50 failed | 10268 passed | 1229 skipped (11547)` contra `50 | 10268 | 1217 (11535)` do V-036.
+Passados INALTERADOS e pulados +12 — o spec é de INTEGRAÇÃO e pula na lane unitária, ao contrário do
+módulo puro do P04.3a, que somava aos passados. **Real-db: 196/196** em 7 arquivos (184 da baseline
+mais os 12 novos), provando que o repositório novo não perturbou nenhum spec do journal.
+
+**O que esta unidade NÃO faz:** a reconciliação `pausing → human`, o `resume`, o serviço puro de
+transporte e o router tRPC (C23), os fences das dez fronteiras de egresso do §8.2.4 e a tabela
+`conversation_handoff_requests`. A barreira é local: `barrier_committed=true` com
+`drain_status='pending'` é o retorno honesto do §8.2.3 — "barreira estabelecida, drenagem pendente",
+que a spec proíbe confundir com drenagem concluída.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |
 |---|---|---|---|---|
 | `npm run typecheck` | — | 0 | — | exit 0, projeto inteiro |
 | `npm run lint` | — | 0 (481 warnings) | — | exit 0 |
-| unit (`npm test`, workers default) | 10268 | 50 | 1217 | Medido de novo em P04.3a: passados 10261 → **10268** e total 11528 → **11535**, **+7 = exatamente os sete casos** do spec do módulo de SQL puro; falhos (50), pulados (1217) e os mesmos 20 arquivos INALTERADOS. Histórico de P04.2: passados 10255 → **10261** e total 11522 → **11528**, **+6 = exatamente os seis casos** do spec de vocabulário, que rodam na lane unitária por ser puro; falhos (50), pulados (1217) e os **mesmos 20 arquivos** INALTERADOS, e nenhuma falha cita `audit-actions` nem `conversation-control`. Histórico de P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
-| integração real-db (procedimento local de 2 passos) | 184 | 0 | — | Agora com `hermes-control-commands-real-db` (17 de P04.1). Detalhe anterior: | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
+| unit (`npm test`, workers default) | 10268 | 50 | 1229 | Medido de novo em P04.3b: passados **INALTERADOS** em 10268, pulados 1217 → **1229** e total 11535 → **11547**, **+12 = exatamente os doze casos** do spec de pausa, que pula na lane unitária por ser de INTEGRAÇÃO — aritmética inversa à do P04.3a, e prevista antes de medir. Falhos (50) e os mesmos 20 arquivos INALTERADOS. Histórico de P04.3a: passados 10261 → **10268** e total 11528 → **11535**, **+7 = exatamente os sete casos** do spec do módulo de SQL puro; falhos (50), pulados (1217) e os mesmos 20 arquivos INALTERADOS. Histórico de P04.2: passados 10255 → **10261** e total 11522 → **11528**, **+6 = exatamente os seis casos** do spec de vocabulário, que rodam na lane unitária por ser puro; falhos (50), pulados (1217) e os **mesmos 20 arquivos** INALTERADOS, e nenhuma falha cita `audit-actions` nem `conversation-control`. Histórico de P04.1: pulados 1200 → 1217 e total 11505 → 11522, +17 = a caracterização de `conversation_control_commands`, que pula na lane unitária por ser de integração; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.8b, e a aritmética é DIFERENTE das anteriores: `recovery.ts` é módulo PURO, então seus 22 casos rodam na lane unitária — `passed` sobe 10233 → 10255 e o total 11483 → 11505, com `skipped` INALTERADO em 1200. Todas as unidades anteriores só engrossavam os pulados. Histórico de P03.8a: pulados 1187 → 1200 e total 11470 → 11483, +13 = os casos de caracterização de `engine_projections`; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7b: pulados 1172 → 1187 e total 11455 → 11470, +15 = os casos de manutenção; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.7a: pulados 1157 → 1172 e total 11440 → 11455, +15 = os 15 casos do spec de varredura; passados, falhos e os 20 arquivos INALTERADOS. Histórico de P03.6b: 20 arquivos em falha, **o mesmo conjunto e a mesma contagem (50)** de antes, e passados inalterados em 10233. Pulados sobem 1135 → 1157 e o total 11418 → 11440: +22 é exatamente o meu spec crescendo de 52 para 74 casos, que pulam na lane unitária por falta de `TEST_DB_URL`. Aritmética fechada é a evidência de que nada mais se moveu. 16 dos 20 batem com o catálogo do V-007 — que é **parcial**: declara 54 falhas e itemiza 40. Os outros 4 não vêm desta branch: com `--maxWorkers=3` o resultado é idêntico (falhas determinísticas) e suas 10 falhas cabem nas 14 que o V-007 não itemizou |
+| integração real-db (procedimento local de 2 passos) | 196 | 0 | — | Agora com `hermes-pause-conversation-real-db` (12 de P04.3b), em 7 arquivos; os 184 anteriores seguem verdes, o que prova que o primeiro escritor de `conversation_controls` não perturbou o journal. Detalhe anterior: | Agora com `hermes-control-commands-real-db` (17 de P04.1). Detalhe anterior: | Agora com `hermes-projections-real-db` (13 de P03.8a), em arquivo próprio pelo motivo registrado no V-030. Detalhe anterior: | Agora com `hermes-engine-sweep-real-db` em **30** casos (15 de P03.7a + 15 de P03.7b). Detalhe anterior: | `hermes-runs-real-db` (12) + `hermes-engine-repos-real-db` (74: 28 do caminho de start + 7 de P03.4 + 10 de P03.5 + 7 de P03.6a + 22 de P03.6b) + `hermes-engine-tool-calls-real-db` (38: 10 de P03.3a + 10 de P03.3b + 9 de P03.3c + 9 de P03.3d) + `hermes-engine-sweep-real-db` (15 de P03.7a). As demais specs de integração seguem **não executadas** (Redis) |
 | `npm run test:leak` (procedimento local de 2 passos) | 151 | 8 | 23 | **Reexecutado em P03.7a e P03.7b, com perfil IDÊNTICO nas três vezes** (mesmos contadores, mesmos 6 arquivos, `outbound-leak` verde) — a leitura cross-tenant nova não moveu nada. Da primeira execução, em P03.6b, e ainda NÃO verde — 6 arquivos em falha de 20. `outbound-leak` (a mais próxima desta mudança) PASSOU com 10 casos. Cinco falham em `loadConfig` na carga, por o config local pular o `globalSetup`; controle: as três unitárias sob o config do projeto passam (51/51, exit 0). A sexta (`turn-context-batch-repos`) é asserção real, determinística, falha sozinha, e não é atribuível a esta branch por construção (nada importa `engine-repos`; tabelas disjuntas) — **sem controle em HEAD, fica como item aberto**. Ver V-027 |
 | reliability (`hermes-worker-spike`) | 6 | 0 | — | `AIAgent` real do SHA pinado contra provider **stub** (V-016) |
 | pytest (`services/hermes_worker`) | 166 | 0 | — | V-015 |
