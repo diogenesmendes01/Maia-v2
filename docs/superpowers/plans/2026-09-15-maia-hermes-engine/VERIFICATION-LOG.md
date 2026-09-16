@@ -237,6 +237,25 @@ teria virado uma conclusão errada sobre o schema:
    `(tenant, agent, remote_instance_id, remote_run_id)` — passou na primeira rodada e colidiu na
    segunda. Corrigido com ids únicos por rodada, e a spec agora roda duas vezes seguidas verde.
 
+### V-013 · P02.1 — `MaiaEngine` (motor local atrás da porta)
+
+| Gate | Resultado |
+|---|---|
+| `vitest run tests/unit/maia-engine.spec.ts` | primeiro vermelho (módulo inexistente), depois `15 passed` |
+| `npm run typecheck` | 0 erros |
+| `npx eslint src/runtime/engines tests/unit/maia-engine.spec.ts` | 0 achados |
+| Verificação por mutação (5 mutações) | todas detectadas |
+
+Mutações e efeito: conflito de `request_key` deixando de ser detectado (`accepted` no lugar de
+`rejected`) · `not_found` passando a alegar `definitely_not_accepted` (2 casos) · perda de posse
+virando desfecho em vez de propagar (2 casos) · sinal entregue ao raciocínio deixando de ser o
+derivado, o que torna `cancel` decorativo · `already_terminal` suprimido.
+
+O caso que mais importa é o segundo: um adapter local que devolvesse
+`definitely_not_accepted` para um run que ele simplesmente não tem em memória autorizaria o
+supervisor a recomeçar um turno que pode ter executado ferramentas. Por isso o registro em memória
+é explicitamente honesto — “não tenho registro” nunca é prova de não-execução (§5.3.1).
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |

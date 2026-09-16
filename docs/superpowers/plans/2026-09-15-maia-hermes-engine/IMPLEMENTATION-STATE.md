@@ -87,10 +87,12 @@ sequência P00–P12 do capítulo 10 da spec.
 - `U-P00.4` com provider real pago — D02/orçamento. O spike com stub NÃO é bloqueado.
 - `U-P02.1` (extração do reasoner) — esperando a caracterização do P01 aterrissar, para não mexer em `react-loop.ts` antes de existir a linha de base.
 
+- `U-P02.1`: `MaiaEngine` — o motor local implementando `AgentEnginePortV1`, com raciocínio injetado (`runReasoning`), registro de execução em memória deliberadamente honesto (`not_found/inconclusive`, nunca prova de não-aceite), conflito de `request_key` como recusa terminal e `cancel` que pede sem afirmar ausência de efeito. 15 casos, 5 mutações detectadas.
+
 ### Próximo trabalho
-1. `U-P03.1` — migrations do journal de execução (§5.6.2) + `engine-repos`. **Desbloqueado**: o Postgres local aplica as 145 migrations. Atenção à contradição C11 abaixo: o DDL de `engine_runs` tem FK para `conversation_controls`, que o capítulo 8 (P04) introduz — as duas tabelas precisam nascer na mesma fatia de schema, mesmo com o comportamento de pausa/retomada ficando no P04.
-2. `U-P00.4` — spike sintético: `AIAgent` do checkout pinado contra o provider stub, verificando superfície efetiva de tools, rotação de sessão por compressão, cancelamento e limpeza do home efêmero.
-3. `U-P02.1` — `MaiaEngine` atrás do seam de `core.ts:2146-2162`, depois do P01.
+1. `U-P02.2` — ligar `runReasoning` ao laço REAL: extrair de `runReActLoop` a parte deliberativa (sem despacho), mantendo `runReActLoop` como fachada com o comportamento de hoje. A rede que protege essa troca é a caracterização do P01 (57 casos) — qualquer divergência aparece lá.
+2. `U-P03.2` — `engine-repos` (CAS de fase, admissão de call, journal) sobre as tabelas da 140, com testes contra o Postgres real.
+3. `U-P00.4` — spike sintético: `AIAgent` do checkout pinado contra o provider stub, verificando superfície efetiva de tools, rotação de sessão por compressão, cancelamento e limpeza do home efêmero (depende do worker Python do agente paralelo).
 
 ## 7. Decisões pendentes (spec §12.5) — nenhuma preenchida por suposição
 
