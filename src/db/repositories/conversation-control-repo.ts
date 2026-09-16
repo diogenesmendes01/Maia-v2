@@ -557,6 +557,250 @@ async function reconcileInTx(
   };
 }
 
+/** Motivos de RETOMADA do §8.3.2 — disjuntos dos de pausa, e o CHECK separa. */
+export const RESUME_REASON_CODES = [
+  'human_resolved',
+  'operator_release',
+  'supervised_recovery',
+] as const;
+
+export type ResumeReasonCode = (typeof RESUME_REASON_CODES)[number];
+
+export type ResumeConversationInput = {
+  control_id: string;
+  expected_epoch: string;
+  idempotency_key: string;
+  requested_by_app_user_id: string;
+  reason_code: ResumeReasonCode;
+  /** V1 admite um valor só (§8.2.5); o campo existe para a recusa ser tipada. */
+  resume_policy: 'future_only';
+  request_payload: unknown;
+};
+
+export type ResumeConversationResult =
+  | {
+      ok: true;
+      idempotent: boolean;
+      command_id: string;
+      control_id: string;
+      mode: string;
+      epoch: string;
+      /** Decimal em string: a coluna é bigint (§8.3.2). */
+      resume_after_ingress_seq: string;
+      updated_at: Date;
+    }
+  | {
+      ok: false;
+      reason: PauseConversationRefusal;
+      command_id?: string;
+      current_epoch?: string;
+      current_mode?: string;
+    };
+
+type WatermarkRow = { watermark: string };
+type ControleResumido = {
+  mode: string;
+  control_epoch: string;
+  updated_at: Date;
+  resume_after_ingress_seq: string;
+};
+
+async function resumeInTx(
+  tx: Executor,
+  input: ResumeConversationInput,
+): Promise<ResumeConversationResult> {
+  const { tenant_id, agent_id } = scope();
+  const request_hash = canonicalDigest(input.request_payload ?? null);
+
+  const existente = linhas<ComandoRow>(
+    await tx.execute(sql`
+      SELECT id, request_hash, status, outcome_code,
+             result_epoch::text AS result_epoch,
+             barrier_committed, drain_status, inflight_effects,
+             unknown_deliveries, updated_at
+        FROM conversation_control_commands
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+         AND idempotency_key = ${input.idempotency_key}
+       FOR UPDATE`),
+  )[0];
+
+  if (existente) {
+    if (existente.request_hash !== request_hash) {
+      await auditTx(tx, {
+        acao: 'conversation_control_conflict',
+        metadata: {
+          command_id: existente.id,
+          control_id: input.control_id,
+          outcome_code: 'payload_conflict',
+        },
+      });
+      return { ok: false, reason: 'payload_conflict', command_id: existente.id };
+    }
+    if (existente.status !== 'accepted') {
+      return {
+        ok: false,
+        reason: (existente.outcome_code ??
+          'forbidden') as PauseConversationRefusal,
+        command_id: existente.id,
+      };
+    }
+    // Replay: devolve o desfecho guardado e NÃO reaudita.
+    const atual = linhas<ControleResumido>(
+      await tx.execute(sql`
+        SELECT mode, control_epoch::text AS control_epoch, updated_at,
+               coalesce(resume_after_ingress_seq, 0)::text AS resume_after_ingress_seq
+          FROM conversation_controls
+         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+           AND id = ${input.control_id}`),
+    )[0];
+    return {
+      ok: true,
+      idempotent: true,
+      command_id: existente.id,
+      control_id: input.control_id,
+      mode: atual?.mode ?? 'bot',
+      epoch: existente.result_epoch ?? '0',
+      resume_after_ingress_seq: atual?.resume_after_ingress_seq ?? '0',
+      updated_at: existente.updated_at,
+    };
+  }
+
+  const controle = linhas<{ id: string; mode: string; control_epoch: string }>(
+    await tx.execute(
+      lockControlByIdSql({ tenant_id, agent_id, control_id: input.control_id }),
+    ),
+  )[0];
+
+  if (!controle) return { ok: false, reason: 'control_not_found' };
+
+  // Epoch antes de modo, como nas outras duas operações e pela mesma razão.
+  if (controle.control_epoch !== input.expected_epoch) {
+    return {
+      ok: false,
+      reason: 'epoch_mismatch',
+      current_epoch: controle.control_epoch,
+      current_mode: controle.mode,
+    };
+  }
+
+  // Só `human` retoma. `pausing` é recusa por PENDÊNCIA — o §8.2.1 exige
+  // "pendências conciliadas", e `pausing` é justamente o estado em que elas
+  // ainda não foram; `bot` é recusa porque não há automação a devolver.
+  if (controle.mode !== 'human') {
+    return {
+      ok: false,
+      reason: 'mode_not_allowed',
+      current_epoch: controle.control_epoch,
+      current_mode: controle.mode,
+    };
+  }
+
+  // WATERMARK, capturado SOB O MESMO LOCK (§8.2.5).
+  //
+  // É o MAIOR entre o contador da stream e o maior ingresso já retido em
+  // turnos dela. O contador sozinho não basta: ele pode estar à frente do que
+  // chegou a virar turno. O maior turno sozinho também não: uma stream sem
+  // turno retido ainda tem ingressos contados, e devolver 0 ali faria
+  // `future_only` reabrir tudo. `max()` ignora NULL, que é o caso dos turnos
+  // criados pelo caminho de compatibilidade, que não alocam sequência (C50) —
+  // eles ficam fora da ordenação por construção, e a captura não falha por isso.
+  const wm = linhas<WatermarkRow>(
+    await tx.execute(sql`
+      SELECT GREATEST(
+               coalesce((SELECT s.last_ingress_seq
+                           FROM agent_stream_sequences s
+                           JOIN conversation_controls c
+                             ON c.tenant_id = s.tenant_id AND c.agent_id = s.agent_id
+                            AND c.stream_key = s.stream_key
+                          WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+                            AND c.id = ${input.control_id}), 0),
+               coalesce((SELECT max(t.last_ingress_seq)
+                           FROM agent_turns t
+                           JOIN conversation_controls c
+                             ON c.tenant_id = t.tenant_id AND c.agent_id = t.agent_id
+                            AND c.stream_key = t.stream_key
+                          WHERE t.tenant_id = ${tenant_id} AND t.agent_id = ${agent_id}
+                            AND c.id = ${input.control_id}), 0)
+             )::text AS watermark`),
+  )[0]!;
+
+  const command_id = crypto.randomUUID();
+  const atualizado = linhas<ControleResumido>(
+    await tx.execute(sql`
+      UPDATE conversation_controls
+         SET mode = 'bot',
+             control_epoch = control_epoch + 1,
+             resumed_at = now(),
+             reason_code = ${input.reason_code},
+             resume_after_ingress_seq = ${wm.watermark}::bigint,
+             last_command_id = ${command_id},
+             updated_at = now()
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+         AND id = ${input.control_id} AND mode = 'human'
+   RETURNING mode, control_epoch::text AS control_epoch, updated_at,
+             resume_after_ingress_seq::text AS resume_after_ingress_seq`),
+  )[0];
+
+  if (!atualizado) return { ok: false, reason: 'control_not_found' };
+
+  const comando = linhas<ComandoRow>(
+    await tx.execute(sql`
+      INSERT INTO conversation_control_commands
+        (id, tenant_id, agent_id, control_id, kind, idempotency_key, request_hash,
+         expected_epoch, result_epoch, requested_by_app_user_id, status,
+         barrier_committed, drain_status, summary_json)
+      VALUES
+        (${command_id}, ${tenant_id}, ${agent_id}, ${input.control_id}, 'resume',
+         ${input.idempotency_key}, ${request_hash},
+         ${input.expected_epoch}::bigint, ${atualizado.control_epoch}::bigint,
+         ${input.requested_by_app_user_id}, 'accepted',
+         true, 'complete',
+         ${JSON.stringify({ reason_code: input.reason_code, resume_policy: input.resume_policy })}::jsonb)
+   RETURNING id, request_hash, status, outcome_code,
+             result_epoch::text AS result_epoch,
+             barrier_committed, drain_status, inflight_effects,
+             unknown_deliveries, updated_at`),
+  )[0]!;
+
+  // O PAR do §8.6.1: pedido e efeito são fatos distintos. O §8.3.2 manda o
+  // resume recusar enquanto houver pendência, logo existe um estado real em que
+  // o operador pediu e a automação não voltou — colapsar as duas ações apagaria
+  // essa distância, que é o erro registrado em C24.
+  await auditTx(tx, {
+    acao: 'conversation_resume_requested',
+    metadata: {
+      command_id: comando.id,
+      control_id: input.control_id,
+      expected_epoch: input.expected_epoch,
+      reason_code: input.reason_code,
+      resume_policy: input.resume_policy,
+      requested_by: input.requested_by_app_user_id,
+    },
+  });
+  await auditTx(tx, {
+    acao: 'conversation_automation_resumed',
+    metadata: {
+      command_id: comando.id,
+      control_id: input.control_id,
+      epoch_before: input.expected_epoch,
+      epoch_after: atualizado.control_epoch,
+      resume_policy: input.resume_policy,
+      resume_after_ingress_seq: atualizado.resume_after_ingress_seq,
+    },
+  });
+
+  return {
+    ok: true,
+    idempotent: false,
+    command_id: comando.id,
+    control_id: input.control_id,
+    mode: atualizado.mode,
+    epoch: atualizado.control_epoch,
+    resume_after_ingress_seq: atualizado.resume_after_ingress_seq,
+    updated_at: atualizado.updated_at,
+  };
+}
+
 export const conversationControlRepo = {
   /**
    * A pausa numa transação própria — o atalho para quem não tem transação em
@@ -607,5 +851,26 @@ export const conversationControlRepo = {
     input: ReconcilePauseInput,
   ): Promise<ReconcilePauseResult> {
     return reconcileInTx(tx, input);
+  },
+
+  /**
+   * A retomada `human → bot` do §8.2.1, em transação própria.
+   *
+   * Diferente da reconciliação, esta **incrementa** o epoch: é o outro extremo
+   * do ABA que o §8.2.2 manda fechar, para que um run iniciado no epoch antigo
+   * não recupere autoridade só porque o modo voltou a `bot`.
+   */
+  async resumeConversationTx(
+    input: ResumeConversationInput,
+  ): Promise<ResumeConversationResult> {
+    return withTx((tx) => resumeInTx(tx, input));
+  },
+
+  /** A MESMA retomada, na transação de quem chama. */
+  async resumeConversationInTx(
+    tx: Executor,
+    input: ResumeConversationInput,
+  ): Promise<ResumeConversationResult> {
+    return resumeInTx(tx, input);
   },
 };
