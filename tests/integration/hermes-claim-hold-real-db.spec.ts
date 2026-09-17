@@ -613,4 +613,135 @@ d('P04.6 — hold de admissão/claim sob controle humano (DB real)', () => {
     expect(chaves).not.toContain(retida);
     expect(chaves).toContain(livre);
   });
+
+  // ─── O SÉTIMO CONSUMIDOR: a recuperação de claim EXPIRADO ───────────────
+  //
+  // Achado de revisão da PR #766. O claim de M2 recupera, na mesma transação,
+  // o head M1 cuja lease venceu — e isso acontecia ANTES de alguém consultar o
+  // controle. O claim de M2 era recusado com `conversation_human_control`, mas a
+  // transação comitava a recuperação: M1 virava `retryable` com `promoted_at`,
+  // e `acquireTurnLease` o re-enfileirava e auditava. Não executava nada (o
+  // claim do job novo é recusado pelo hold), mas mutava a linha retida, apagava
+  // a evidência de que havia um dono em voo e tornava um zumbi `running`
+  // descartável pelo resume.
+  //
+  // Pela porta de produção `acquireTurnLease`, que é quem sinaliza.
+
+  const lease = moduloDeProducao(() => import('@/runtime/turns/lease.js'));
+
+  /** M1 reivindicado SEM controle, levado ao status pedido, com a lease vencida. */
+  async function headComLeaseVencida(
+    key: string,
+    status: 'claimed' | 'running',
+  ): Promise<{ m1: string; m2: string; antes: Record<string, unknown> }> {
+    const m1 = await mkTurno({ tenant: T_A, agent: A_A, stream_key: key, seq: 1 });
+    const m2 = await mkTurno({ tenant: T_A, agent: A_A, stream_key: key, seq: 2 });
+    const r = await claim(m1);
+    expect(r.ok).toBe(true);
+    // `running` direto na linha: o que importa é o estado que ocupa a stream,
+    // não o caminho até ele — e `beginTurnExecution` puxaria o motor junto.
+    await pool.query(
+      `UPDATE agent_turns
+          SET status = $2, lease_expires_at = now() - interval '1 second'
+        WHERE id = $1`,
+      [m1, status],
+    );
+    return { m1, m2, antes: await lerTurno(m1) };
+  }
+
+  async function auditoriasDoSinal(): Promise<number> {
+    const r = await pool.query(
+      `SELECT count(*)::int AS n FROM audit_log
+        WHERE tenant_id = $1 AND acao IN ('turn_stream_claim_recovered', 'turn_promoted')`,
+      [T_A],
+    );
+    return r.rows[0].n;
+  }
+
+  async function esperaIntocado(
+    m1: string,
+    antes: Record<string, unknown>,
+    tentativa: Awaited<ReturnType<ReturnType<typeof lease>['acquireTurnLease']>>,
+  ): Promise<void> {
+    expect(tentativa.lease).toBeNull();
+    expect(tentativa.result.ok === false && tentativa.result.reason).toBe(
+      'conversation_human_control',
+    );
+    expect(tentativa.result.recovered_stream_claims ?? []).toEqual([]);
+    const depois = await lerTurno(m1);
+    for (const coluna of [
+      'status',
+      'state_version',
+      'attempt_count',
+      'claim_token',
+      'claimed_by',
+      'lease_expires_at',
+      'next_attempt_at',
+    ]) {
+      expect(depois[coluna], coluna).toEqual(antes[coluna]);
+    }
+    expect(depois['promoted_at']).toBeNull();
+    expect(depois['last_error_code']).toBeNull();
+    expect(enqueueAgentMock).not.toHaveBeenCalled();
+    expect(await auditoriasDoSinal()).toBe(0);
+    expect(await vezesContado('maia_turn_stream_claim_recovered_total', `from="${antes['status']}"`)).toBe(0);
+    expect(await vezesContado('maia_stream_promotion_total', 'result="promoted"')).toBe(0);
+  }
+
+  it('20. conversa em `human`: o claim de M2 NÃO recupera nem re-arma o head `claimed` vencido', async () => {
+    const key = streamKey();
+    const { m1, m2, antes } = await headComLeaseVencida(key, 'claimed');
+    await mkControle({ tenant: T_A, agent: A_A, stream_key: key, mode: 'human' });
+
+    await esperaIntocado(m1, antes, await inA(() => lease().acquireTurnLease(m2)));
+  });
+
+  it('21. conversa em `pausing`: o head `running` vencido fica como está — é I/O em voo', async () => {
+    // §8.2.3: "um lease vencido sozinho não prova que um processo remoto deixou
+    // de enviar". Reescrever `running` como `stream_lease_expired` durante a
+    // drenagem apagaria justamente a pendência que a reconciliação precisa ver.
+    const key = streamKey();
+    const { m1, m2, antes } = await headComLeaseVencida(key, 'running');
+    await mkControle({ tenant: T_A, agent: A_A, stream_key: key, mode: 'pausing' });
+
+    await esperaIntocado(m1, antes, await inA(() => lease().acquireTurnLease(m2)));
+  });
+
+  it('22. A OUTRA PONTA — conversa em `bot`: recupera, re-arma e sinaliza o head', async () => {
+    const key = streamKey();
+    const { m1, m2, antes } = await headComLeaseVencida(key, 'claimed');
+    await mkControle({ tenant: T_A, agent: A_A, stream_key: key, mode: 'bot' });
+
+    const tentativa = await inA(() => lease().acquireTurnLease(m2));
+    expect(tentativa.result.ok === false && tentativa.result.reason).toBe('not_head');
+    expect(tentativa.result.recovered_stream_claims?.map((r) => r.turn_id)).toEqual([m1]);
+    const depois = await lerTurno(m1);
+    expect(depois['status']).toBe('retryable');
+    expect(depois['last_error_code']).toBe('stream_lease_expired');
+    expect(depois['promoted_at']).not.toBeNull();
+    expect(depois['attempt_count']).toEqual(antes['attempt_count']);
+    expect(enqueueAgentMock).toHaveBeenCalledTimes(1);
+    expect((enqueueAgentMock.mock.calls[0] as unknown as [{ turn_id: string }])[0].turn_id).toBe(m1);
+    expect(await auditoriasDoSinal()).toBe(2);
+  });
+
+  it('23. SEM controle nenhum: recupera como antes do P04', async () => {
+    const key = streamKey();
+    const { m1, m2 } = await headComLeaseVencida(key, 'running');
+
+    const tentativa = await inA(() => lease().acquireTurnLease(m2));
+    expect(tentativa.result.recovered_stream_claims?.map((r) => r.turn_id)).toEqual([m1]);
+    expect((await lerTurno(m1))['status']).toBe('retryable');
+  });
+
+  it('24. controle `human` da MESMA `stream_key` noutro tenant e noutro agente não retém a recuperação', async () => {
+    const key = streamKey();
+    const { m1, m2 } = await headComLeaseVencida(key, 'claimed');
+    await mkControle({ tenant: T_B, agent: A_B, stream_key: key, mode: 'human' });
+    await mkControle({ tenant: T_A, agent: A_A2, stream_key: key, mode: 'human' });
+
+    const tentativa = await inA(() => lease().acquireTurnLease(m2));
+    expect(tentativa.result.recovered_stream_claims?.map((r) => r.turn_id)).toEqual([m1]);
+    expect((await lerTurno(m1))['status']).toBe('retryable');
+  });
 });

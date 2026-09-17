@@ -48,7 +48,8 @@
  * ─── P04.6: o módulo passou a ter uma SEGUNDA responsabilidade ─────────────
  *
  * Além do LOCK (escrita), ele agora hospeda o predicado de ELEGIBILIDADE que o
- * caminho do turno consulta em quatro lugares (`streamNotHumanControlled`) e a
+ * caminho do turno consulta em sete lugares — a contagem é afirmada em
+ * `conversation-control-claim-contract.spec.ts` (`streamNotHumanControlled`) — e a
  * sonda que explica a recusa (`humanControlProbe`). As duas moram aqui pela
  * razão nº 1 acima, aplicada de novo: elas nomeiam `conversation_controls`, e
  * uma segunda cópia do predicado divergiria em silêncio.
@@ -219,9 +220,10 @@ export function lockControlByRunSql(input: {
  *
  * A subconsulta é um lookup no índice único `conversation_controls_stream_uq`
  * `(tenant_id, agent_id, stream_key)` (migration 140). O escopo entra como
- * FRAGMENTO, e não como string, porque os quatro consumidores escopam de formas
- * diferentes: o claim, o recovery e a promoção têm o par do ALS como parâmetro;
- * o dispatcher cross-tenant correlaciona com as colunas da própria linha. Um
+ * FRAGMENTO, e não como string, porque os consumidores escopam de formas
+ * diferentes: o claim, os recoveries e a promoção têm o par do ALS como
+ * parâmetro; o dispatcher e o varredor de debounce, cross-tenant, correlacionam
+ * com as colunas da própria linha. Um
  * `string` obrigaria o dispatcher a montar o predicado à mão — a segunda cópia
  * que este módulo existe para impedir.
  */

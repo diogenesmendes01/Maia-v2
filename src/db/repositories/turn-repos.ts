@@ -2348,6 +2348,23 @@ async function recoverExpiredStreamClaims(
        AND u.id       <> ${args.turn_id}
        AND ativos.lease_expires_at IS NOT NULL
        AND ativos.lease_expires_at <= now()
+       -- Achado de revisao da PR #766 -- conversa sob CONTROLE HUMANO nao
+       -- recupera. Esta funcao roda ANTES do WHERE do claim que consulta o
+       -- controle, e a transacao comita mesmo com o claim recusado: sem isto o
+       -- head vencido virava retryable, ganhava promoted_at e era
+       -- re-enfileirado -- o wake-up fabricado que o 8.2.4 proibe ("recovery/
+       -- promotion nao podem fabricar tentativa nova que ignore a pausa"). O
+       -- varredor ja excluia holds pelo caminho dele; esta era a copia que
+       -- divergia. Sob hold a linha fica como esta: a lease vencida nao devolve
+       -- posse a ninguem (toda escrita fenced exige lease viva), e um running
+       -- sob pausing e I/O em voo que a reconciliacao precisa enxergar.
+       -- No WHERE do UPDATE e nao nas CTEs, pelo motivo do conjunto de locks
+       -- descrito acima. SEM CRASE neste bloco (template literal, ver C45).
+       AND ${streamNotHumanControlled({
+         tenant: sql`${args.tenant_id}`,
+         agent: sql`${args.agent_id}`,
+         alvo: sql`u`,
+       })}
     RETURNING u.id, u.representative_message_id, u.conversa_id,
               ativos.status AS previous_status
   `);

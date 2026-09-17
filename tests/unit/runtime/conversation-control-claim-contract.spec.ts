@@ -235,8 +235,30 @@ describe('P04.6 — o predicado do hold, e a ausência de uma segunda cópia', (
     // verdade e a enumeração evita trabalho desperdiçado. É exatamente como
     // `streamNotPoisoned` é usada (filtro do recovery + dispatcher + claim +
     // promoção).
+    //
+    // ⚠️ **SETE: faltava a RECUPERAÇÃO DE CLAIM EXPIRADO** — achado de revisão da
+    // PR #766. `recoverExpiredStreamClaims` roda na transação do claim ANTES do
+    // `WHERE` que consulta o controle, e comitava mesmo com o claim recusado: o
+    // head vencido virava `retryable`, ganhava `promoted_at`, e o caller o
+    // re-enfileirava com duas auditorias — o wake-up fabricado que o §8.2.4
+    // proíbe, e que a promoção por conclusão já não fazia desde o P04.6. O
+    // varredor, que tem caminho próprio para o mesmo estado, já excluía holds.
     const chamadas = semDoc(repoFonte).match(/streamNotHumanControlled\(/g) ?? [];
-    expect(chamadas.length).toBe(6);
+    expect(chamadas.length).toBe(7);
+  });
+
+  it('a recuperação de claim expirado consulta o controle NO `WHERE` do UPDATE', () => {
+    // No WHERE, e não nas CTEs: `ativos` tranca todas as linhas ativas da
+    // stream para que o conjunto de locks seja o MESMO em toda transação que a
+    // toque (ver o comentário da função). Filtrar ali mudaria o conjunto
+    // conforme o modo do controle.
+    const codigo = semDoc(repoFonte);
+    const inicio = codigo.indexOf('async function recoverExpiredStreamClaims');
+    const fim = codigo.indexOf('async function', inicio + 1);
+    expect(inicio).toBeGreaterThan(-1);
+    const corpo = codigo.slice(inicio, fim);
+    expect(corpo.match(/streamNotHumanControlled\(/g) ?? []).toHaveLength(1);
+    expect(corpo.indexOf('streamNotHumanControlled(')).toBeGreaterThan(corpo.indexOf('FROM ativos'));
   });
 
   it('o repositório NÃO tem uma segunda cópia do predicado escrita à mão', () => {
