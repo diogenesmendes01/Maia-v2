@@ -1,0 +1,1084 @@
+/**
+ * P04.3b (spec §8.2.1, §8.2.3) — a transação de PAUSA do controle humano.
+ *
+ * Nome no SINGULAR por C21: o capítulo 10 grafa `conversation-controls-repo.ts`
+ * e o §8.2.3 grafa `conversation-control-repo.ts`; adoto o do §8.2.3, que é a
+ * seção NORMATIVA que descreve a operação, e que mantém o par coerente com o
+ * `control-service.ts` do mesmo parágrafo.
+ *
+ * ─── O que esta transação garante ──────────────────────────────────────────
+ *
+ * O §8.2.3 diz que "não confundir SELECT com fence atômico": um
+ * `if (epochMatches) await handler()` tem janela de corrida. Por isso tudo aqui
+ * acontece sob o MESMO lock e na MESMA transação — o controle é trancado com
+ * `lockControlByIdSql` (P04.3a, dono único do SQL de lock, para não existirem
+ * dois ordenamentos) e só então o epoch é conferido e incrementado.
+ *
+ * A ordem das recusas é a do §8.2.3 passo 3 — "conferir `expectedEpoch`,
+ * conversa vigente e modo permitido" —, e ela não é arbitrária: o epoch é o
+ * marcador de AUTORIDADE. Uma conversa já pausada por outro operador recusa por
+ * `epoch_mismatch` quando quem chega traz epoch velho, e por `mode_not_allowed`
+ * quando o epoch está em dia mas o modo não admite a transição. Colapsar os
+ * dois faria "você está desatualizado" e "isto não se aplica aqui" contarem a
+ * mesma história.
+ *
+ * ─── Auditoria AQUI, e por quê ─────────────────────────────────────────────
+ *
+ * O cabeçalho de `engine-repos.ts` diz que auditoria não acontece em
+ * repositório — mas aquela é uma regra DAQUELE arquivo, não da casa:
+ * `ops-repos.ts`, `outbound-delivery-repo.ts` e `outbound-outbox-repo.ts`
+ * chamam `auditTx` de dentro da transação, exatamente quando a garantia exige
+ * atomicidade. É o caso aqui: o §8.2.3 passo 4 manda gravar "comando e
+ * auditoria durável na MESMA transação", e o `auditTx` é deliberadamente SEM
+ * try/catch para que a falha da trilha desfaça a escrita que a originou.
+ *
+ * O destino é `audit_log` (SINGULAR). O §8.6.1 escreve `audit_logs`, tabela que
+ * não existe — ver C40. `conversa_id` fica NULO: a coluna tem FK para
+ * `conversas`, e um controle pode existir antes de a conversa ser resolvida
+ * (§8.2.1: "`conversa_id` pode ser nulo no inbound"). Os identificadores viajam
+ * no `metadata`, que é também o vínculo com `admin_audit_log` que o §8.6.1 pede.
+ *
+ * ─── O que esta fatia NÃO faz ──────────────────────────────────────────────
+ *
+ * Não drena. `barrier_committed=true` com `drain_status='pending'` é o retorno
+ * honesto do §8.2.3: "barreira estabelecida, drenagem pendente" — e o §8.2.3 é
+ * explícito em que `barrierCommitted=true` NÃO significa `drainStatus`
+ * completo. A reconciliação (`pausing → human`), os fences das dez fronteiras
+ * de egresso do §8.2.4 e o `resume` são unidades próprias.
+ */
+import { sql } from 'drizzle-orm';
+import { db, withTx } from '../client.js';
+import { getCurrentAgent, getCurrentTenant } from '../tenant-context.js';
+import {
+  heldBacklogForCancellationSql,
+  lockControlByIdSql,
+} from './conversation-control-sql.js';
+// P04.5b.2c — a fiação do descarte do §8.2.5. A primitiva mora em
+// `turn-repos.ts` porque quem é dono da transição de turno é ele: este
+// repositório não escreve `status` direto, pela mesma regra que vale para todo
+// caller. Não há ciclo — `turn-repos.ts` importa o módulo SQL do controle, não
+// este arquivo.
+import {
+  cancelHeldBacklogTurnInTx,
+  recordBacklogCancellationCommitted,
+} from './turn-repos.js';
+import { statusList } from './turn-fence-sql.js';
+import { OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES } from '@/runtime/outbound/recovery-contract.js';
+import { auditTx } from '@/governance/audit.js';
+import { canonicalDigest } from '@/integrations/hermes/canonical-json.js';
+
+type Executor = typeof db;
+
+function scope(): { tenant_id: string; agent_id: string } {
+  return { tenant_id: getCurrentTenant(), agent_id: getCurrentAgent() };
+}
+
+function linhas<T>(res: { rows: unknown }): T[] {
+  return Array.from(res.rows as unknown as T[]);
+}
+
+/** Motivos de PAUSA do §8.3.2 — os de resume são outros, e o CHECK separa. */
+export const PAUSE_REASON_CODES = [
+  'operator_takeover',
+  'customer_requested',
+  'safety_review',
+  'handoff_accepted',
+] as const;
+
+export type PauseReasonCode = (typeof PAUSE_REASON_CODES)[number];
+
+export type PauseConversationInput = {
+  control_id: string;
+  /** Decimal canônico, nunca `number`: a coluna é bigint (§8.3.2). */
+  expected_epoch: string;
+  idempotency_key: string;
+  requested_by_app_user_id: string;
+  reason_code: PauseReasonCode;
+  /** Payload validado do comando; entra no `request_hash` canônico. */
+  request_payload: unknown;
+};
+
+/** O modelo de retorno do §8.2.3, com `epoch` como string decimal. */
+export type PauseConversationResult =
+  | {
+      ok: true;
+      idempotent: boolean;
+      command_id: string;
+      control_id: string;
+      mode: string;
+      epoch: string;
+      barrier_committed: boolean;
+      drain_status: string | null;
+      inflight_effects: number;
+      unknown_deliveries: number;
+      updated_at: Date;
+    }
+  | {
+      ok: false;
+      reason:
+        | 'payload_conflict'
+        | 'epoch_mismatch'
+        | 'mode_not_allowed'
+        | 'control_not_found'
+        | 'forbidden'
+        | 'reconciliation_required';
+      command_id?: string;
+      current_epoch?: string;
+      current_mode?: string;
+    };
+
+/** Os motivos de recusa, extraídos para o ramo do desfecho persistido usá-los. */
+export type PauseConversationRefusal =
+  | 'payload_conflict'
+  | 'epoch_mismatch'
+  | 'mode_not_allowed'
+  | 'control_not_found'
+  | 'forbidden'
+  | 'reconciliation_required';
+
+type ComandoRow = {
+  id: string;
+  control_id: string;
+  request_hash: string;
+  status: string;
+  outcome_code: string | null;
+  result_epoch: string | null;
+  barrier_committed: boolean;
+  drain_status: string | null;
+  inflight_effects: number;
+  unknown_deliveries: number;
+  updated_at: Date;
+};
+
+/**
+ * Versão do contrato da identidade de comando. Entra no digest: mudar o que a
+ * identidade cobre muda o valor, e um retry que atravesse essa mudança vira
+ * conflito em vez de casar por acaso.
+ */
+export const CONVERSATION_CONTROL_COMMAND_CONTRACT =
+  'maia.conversation_control_command/v1' as const;
+
+/** Tudo o que distingue um comando de outro que reuse a mesma chave. */
+export type ConversationControlCommandIdentity = {
+  kind: 'pause' | 'resume';
+  control_id: string;
+  expected_epoch: string;
+  requested_by_app_user_id: string;
+  reason_code: string;
+  resume_policy: string | null;
+  request_payload: unknown;
+};
+
+/**
+ * O `request_hash` do comando (§8.3.2): "versão do contrato, principal
+ * autenticado, tipo de comando, controle/conversa, epoch esperado e payload
+ * validado".
+ *
+ * A primeira versão cobria só `request_payload` — achado de revisão da PR #766.
+ * A mesma chave com o mesmo payload, noutra conversa, por outro operador, com
+ * outro epoch ou noutra operação, voltava como replay ACEITO do comando
+ * anterior: sucesso sem pausar nada. O §8.3.2 manda o contrário: "reuso
+ * divergente, inclusive em outra conversa ou tipo de comando, dá conflito".
+ *
+ * Tenant e agente não entram: a busca e a unique da 141 já são escopadas pelos
+ * dois, então nunca comparam hashes de escopos diferentes.
+ */
+export function conversationControlCommandDigest(
+  identity: ConversationControlCommandIdentity,
+): string {
+  return canonicalDigest({
+    contract: CONVERSATION_CONTROL_COMMAND_CONTRACT,
+    kind: identity.kind,
+    control_id: identity.control_id,
+    expected_epoch: identity.expected_epoch,
+    requested_by_app_user_id: identity.requested_by_app_user_id,
+    reason_code: identity.reason_code,
+    resume_policy: identity.resume_policy,
+    request_payload: identity.request_payload ?? null,
+  });
+}
+
+/**
+ * O comando já gravado com esta chave, no escopo corrente.
+ *
+ * `trancar` só na leitura que ABRE a operação, antes do lock do controle — a de
+ * sempre. A releitura que acontece DEPOIS do lock do controle é um SELECT
+ * simples: trancar o comando ali criaria a aresta controle → comando na ordem de
+ * locks, e nada precisa dela.
+ */
+async function lerComandoPorChave(
+  tx: Executor,
+  escopo: { tenant_id: string; agent_id: string },
+  idempotency_key: string,
+  trancar: boolean,
+): Promise<ComandoRow | undefined> {
+  return linhas<ComandoRow>(
+    await tx.execute(sql`
+      SELECT id, control_id, request_hash, status, outcome_code,
+             result_epoch::text AS result_epoch,
+             barrier_committed, drain_status, inflight_effects,
+             unknown_deliveries, updated_at
+        FROM conversation_control_commands
+       WHERE tenant_id = ${escopo.tenant_id} AND agent_id = ${escopo.agent_id}
+         AND idempotency_key = ${idempotency_key}
+       ${trancar ? sql`FOR UPDATE` : sql``}`),
+  )[0];
+}
+
+/**
+ * A recusa devida a um comando já gravado com a mesma chave, ou `null` quando
+ * ele é o MESMO comando, aceito — e aí quem chama responde o replay.
+ */
+async function recusaDoComandoGravado(
+  tx: Executor,
+  existente: ComandoRow,
+  request_hash: string,
+  control_id_pedido: string,
+): Promise<{ ok: false; reason: PauseConversationRefusal; command_id?: string } | null> {
+  // Mesma chave com identidade divergente é CONFLITO, nunca última-escrita-vence
+  // (§8.2.4). Guardar só a chave tornaria os dois indistinguíveis.
+  if (existente.request_hash !== request_hash) {
+    await auditTx(tx, {
+      acao: 'conversation_control_conflict',
+      metadata: {
+        command_id: existente.id,
+        control_id: control_id_pedido,
+        outcome_code: 'payload_conflict',
+      },
+    });
+    // Sem `command_id`: o comando gravado é de OUTRA identidade, e o §8.2.4
+    // manda "não devolver resultados de outra identidade que reutilize uma
+    // chave". O vínculo fica na trilha, não na resposta.
+    return { ok: false, reason: 'payload_conflict' };
+  }
+  if (existente.status !== 'accepted') {
+    // A identidade BATEU — o que há é um comando guardado que não foi aceito.
+    // Devolver `payload_conflict` aqui seria mentir sobre a causa, e era o que a
+    // primeira versão da pausa fazia: um ramo sem teste, com o tipo satisfeito e
+    // a semântica errada. O desfecho correto é o que está PERSISTIDO, e o
+    // `_outcome_chk` da 141 garante que ele existe — status `conflict`/`failed`
+    // exige `outcome_code` não nulo.
+    //
+    // Pausa e retomada só escrevem `accepted`, então hoje o ramo é alcançável
+    // apenas por linha escrita por outra fatia (ou à mão). "Inalcançável hoje"
+    // não é razão para devolver resposta errada: é a mesma régua do C39.
+    return {
+      ok: false,
+      reason: (existente.outcome_code ?? 'forbidden') as PauseConversationRefusal,
+      command_id: existente.id,
+    };
+  }
+  return null;
+}
+
+type ControleAtualizado = {
+  mode: string;
+  control_epoch: string;
+  updated_at: Date;
+};
+
+/** A resposta da pausa diante de um comando já gravado com a mesma chave. */
+async function responderPausaGravada(
+  tx: Executor,
+  existente: ComandoRow,
+  request_hash: string,
+  control_id_pedido: string,
+): Promise<PauseConversationResult> {
+  const recusa = await recusaDoComandoGravado(tx, existente, request_hash, control_id_pedido);
+  if (recusa) return recusa;
+  // Replay: devolve o MESMO desfecho e NÃO audita de novo — a operação não
+  // aconteceu de novo (mesma régua de `requestCommandWithAuditInTx`). O
+  // `control_id` é o GRAVADO: com a identidade conferida ele é igual ao pedido,
+  // mas a resposta descreve o comando, não ecoa a requisição.
+  return {
+    ok: true,
+    idempotent: true,
+    command_id: existente.id,
+    control_id: existente.control_id,
+    mode: 'pausing',
+    epoch: existente.result_epoch ?? '0',
+    barrier_committed: existente.barrier_committed,
+    drain_status: existente.drain_status,
+    inflight_effects: Number(existente.inflight_effects),
+    unknown_deliveries: Number(existente.unknown_deliveries),
+    updated_at: existente.updated_at,
+  };
+}
+
+async function pauseInTx(
+  tx: Executor,
+  input: PauseConversationInput,
+): Promise<PauseConversationResult> {
+  const { tenant_id, agent_id } = scope();
+  const request_hash = conversationControlCommandDigest({
+    kind: 'pause',
+    control_id: input.control_id,
+    expected_epoch: input.expected_epoch,
+    requested_by_app_user_id: input.requested_by_app_user_id,
+    reason_code: input.reason_code,
+    resume_policy: null,
+    request_payload: input.request_payload,
+  });
+
+  // PASSO 2 do §8.2.3 — idempotência ANTES de tocar no controle. Um retry não
+  // pode chegar sequer a trancar a row: o §8.2.1 manda devolver "o resultado do
+  // mesmo comando, sem novo incremento".
+  const existente = await lerComandoPorChave(
+    tx,
+    { tenant_id, agent_id },
+    input.idempotency_key,
+    true,
+  );
+  if (existente) return responderPausaGravada(tx, existente, request_hash, input.control_id);
+
+  // PASSO 3 — o controle é o PRIMEIRO degrau da ordem de locks (§5.6.3,
+  // §8.2.3). O SQL vem de `conversation-control-sql.ts`, dono único.
+  const controle = linhas<{ id: string; mode: string; control_epoch: string }>(
+    await tx.execute(
+      lockControlByIdSql({ tenant_id, agent_id, control_id: input.control_id }),
+    ),
+  )[0];
+
+  if (!controle) {
+    // Nenhuma linha de comando é criada: o comando não tem a que se referir, e
+    // a FK composta o recusaria de qualquer forma.
+    return { ok: false, reason: 'control_not_found' };
+  }
+
+  // A MESMA chave, relida sob o lock do controle — achado de revisão da PR
+  // #766. A leitura do passo 2 não enxerga o INSERT ainda não comitado de uma
+  // entrega concorrente, e o FOR UPDATE não tranca linha que não existe. As duas
+  // entregas passavam por ela vazias; a que esperou o lock via o epoch já
+  // incrementado pela outra e respondia `epoch_mismatch` — com auditoria de
+  // conflito — a um comando ACEITO. Todo comando desta chave neste controle é
+  // gravado segurando este lock, e o commit o libera: sob READ COMMITTED, esta
+  // leitura já enxerga a linha comitada.
+  const gravadoNaEspera = await lerComandoPorChave(
+    tx,
+    { tenant_id, agent_id },
+    input.idempotency_key,
+    false,
+  );
+  if (gravadoNaEspera) {
+    return responderPausaGravada(tx, gravadoNaEspera, request_hash, input.control_id);
+  }
+
+  // Epoch ANTES de modo: o epoch é o marcador de autoridade, e quem chega com
+  // epoch velho está desatualizado — fato diferente de "a transição não se
+  // aplica a este modo".
+  if (controle.control_epoch !== input.expected_epoch) {
+    await auditTx(tx, {
+      acao: 'conversation_control_conflict',
+      metadata: {
+        control_id: controle.id,
+        outcome_code: 'epoch_mismatch',
+        expected_epoch: input.expected_epoch,
+        current_epoch: controle.control_epoch,
+      },
+    });
+    return {
+      ok: false,
+      reason: 'epoch_mismatch',
+      current_epoch: controle.control_epoch,
+      current_mode: controle.mode,
+    };
+  }
+
+  if (controle.mode !== 'bot') {
+    await auditTx(tx, {
+      acao: 'conversation_control_conflict',
+      metadata: {
+        control_id: controle.id,
+        outcome_code: 'mode_not_allowed',
+        current_mode: controle.mode,
+      },
+    });
+    return {
+      ok: false,
+      reason: 'mode_not_allowed',
+      current_epoch: controle.control_epoch,
+      current_mode: controle.mode,
+    };
+  }
+
+  // PASSO 4 — a transição COMPLETA. Os CHECKs `_owner_chk` e `_paused_chk` da
+  // 140 tornam impossível sair de `bot` sem dono e sem carimbo: uma
+  // implementação que esquecesse qualquer um dos dois não passaria com campo
+  // nulo, quebraria.
+  const command_id = crypto.randomUUID();
+  const atualizado = linhas<ControleAtualizado>(
+    await tx.execute(sql`
+      UPDATE conversation_controls
+         SET mode = 'pausing',
+             control_epoch = control_epoch + 1,
+             owner_app_user_id = ${input.requested_by_app_user_id},
+             paused_at = now(),
+             reason_code = ${input.reason_code},
+             last_command_id = ${command_id},
+             updated_at = now()
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+         AND id = ${input.control_id}
+   RETURNING mode, control_epoch::text AS control_epoch, updated_at`),
+  )[0];
+
+  if (!atualizado) return { ok: false, reason: 'control_not_found' };
+
+  const comando = linhas<ComandoRow>(
+    await tx.execute(sql`
+      INSERT INTO conversation_control_commands
+        (id, tenant_id, agent_id, control_id, kind, idempotency_key, request_hash,
+         expected_epoch, result_epoch, requested_by_app_user_id, status,
+         barrier_committed, drain_status, summary_json)
+      VALUES
+        (${command_id}, ${tenant_id}, ${agent_id}, ${input.control_id}, 'pause',
+         ${input.idempotency_key}, ${request_hash},
+         ${input.expected_epoch}::bigint, ${atualizado.control_epoch}::bigint,
+         ${input.requested_by_app_user_id}, 'accepted',
+         true, 'pending', ${JSON.stringify({ reason_code: input.reason_code })}::jsonb)
+   RETURNING id, control_id, request_hash, status, outcome_code,
+             result_epoch::text AS result_epoch,
+             barrier_committed, drain_status, inflight_effects,
+             unknown_deliveries, updated_at`),
+  )[0]!;
+
+  // PASSO 4, segunda metade: a trilha durável, na MESMA transação.
+  await auditTx(tx, {
+    acao: 'conversation_pause_requested',
+    metadata: {
+      command_id: comando.id,
+      control_id: input.control_id,
+      epoch_before: input.expected_epoch,
+      epoch_after: atualizado.control_epoch,
+      reason_code: input.reason_code,
+      requested_by: input.requested_by_app_user_id,
+    },
+  });
+
+  return {
+    ok: true,
+    idempotent: false,
+    command_id: comando.id,
+    control_id: input.control_id,
+    mode: atualizado.mode,
+    epoch: atualizado.control_epoch,
+    barrier_committed: comando.barrier_committed,
+    drain_status: comando.drain_status,
+    inflight_effects: Number(comando.inflight_effects),
+    unknown_deliveries: Number(comando.unknown_deliveries),
+    updated_at: atualizado.updated_at,
+  };
+}
+
+/** O que a reconciliação devolve, com o limite da contagem DECLARADO. */
+export type ReconcilePauseResult =
+  | {
+      ok: true;
+      idempotent: boolean;
+      control_id: string;
+      mode: string;
+      epoch: string;
+      drain_status: 'complete' | 'reconciliation_required';
+      inflight_effects: number;
+      unknown_deliveries: number;
+      /**
+       * A contagem cobre APENAS egresso de origem engine. `outbound_messages`
+       * alcança o TURNO, não o controle, e nem ela nem `agent_turns` têm
+       * `control_id` — medido no catálogo, registrado em C43. Declarar o escopo
+       * é o que impede o consumidor de ler "0" como "não há efeito em aberto".
+       */
+      drain_scope: 'engine_originated_only';
+      updated_at: Date;
+    }
+  | {
+      ok: false;
+      reason: 'control_not_found' | 'mode_not_allowed' | 'epoch_mismatch';
+      current_mode?: string;
+      current_epoch?: string;
+    };
+
+export type ReconcilePauseInput = {
+  control_id: string;
+  expected_epoch: string;
+  idempotency_key: string;
+  requested_by_app_user_id: string;
+};
+
+/**
+ * Os quatro estados que o índice parcial `engine_tool_calls_unsettled_idx`
+ * define como NÃO liquidada — a mesma definição que `ESTADOS_CONCILIADOS` usa
+ * do outro lado, em `engine-repos.ts`. Reusada, não reinventada: uma terceira
+ * definição de "em aberto" é o defeito que o C18 e o C20 me custaram.
+ *
+ * `approval_required` fica DE FORA deliberadamente (C44): a pergunta do §8.2.1
+ * é "há I/O AUTORIZADO em aberto?", e uma chamada parada esperando humano não
+ * tem autorização. Contá-la prenderia em `pausing` toda conversa com aprovação
+ * pendente.
+ */
+const ESTADOS_EM_VOO = [
+  'received',
+  'dispatching',
+  'handler_started',
+  'effect_unknown',
+] as const;
+
+type DrenagemRow = {
+  runs_abertos: string;
+  calls_em_voo: string;
+  entregas_desconhecidas: string;
+};
+
+async function reconcileInTx(
+  tx: Executor,
+  input: ReconcilePauseInput,
+): Promise<ReconcilePauseResult> {
+  const { tenant_id, agent_id } = scope();
+
+  const controle = linhas<{ id: string; mode: string; control_epoch: string }>(
+    await tx.execute(
+      lockControlByIdSql({ tenant_id, agent_id, control_id: input.control_id }),
+    ),
+  )[0];
+
+  if (!controle) return { ok: false, reason: 'control_not_found' };
+
+  // Epoch ANTES de modo, como na pausa e pela mesma razão: o epoch é o marcador
+  // de AUTORIDADE, e quem chega com epoch velho está agindo sobre uma visão
+  // obsoleta do controle — fato diferente de "a transição não se aplica a este
+  // modo". O §8.2.3 passo 3 lista o epoch entre o que se confere.
+  //
+  // Esta conferência foi ACRESCENTADA depois: a primeira versão declarava
+  // `epoch_mismatch` no tipo de retorno e nunca o produzia — vocabulário sem
+  // emissor, o mesmo defeito que este repositório já registra em C24 e que o
+  // arquivo de ações de auditoria descreve em `llm_circuit_opened/closed`.
+  if (controle.control_epoch !== input.expected_epoch) {
+    return {
+      ok: false,
+      reason: 'epoch_mismatch',
+      current_epoch: controle.control_epoch,
+      current_mode: controle.mode,
+    };
+  }
+
+  // Já em `human`: a tomada foi confirmada antes. Devolve idempotente e NÃO
+  // audita de novo — a operação não aconteceu de novo.
+  if (controle.mode === 'human') {
+    return {
+      ok: true,
+      idempotent: true,
+      control_id: controle.id,
+      mode: 'human',
+      epoch: controle.control_epoch,
+      drain_status: 'complete',
+      inflight_effects: 0,
+      unknown_deliveries: 0,
+      drain_scope: 'engine_originated_only',
+      updated_at: new Date(),
+    };
+  }
+
+  // `bot` não se reconcilia: não há tomada a confirmar.
+  if (controle.mode !== 'pausing') {
+    return {
+      ok: false,
+      reason: 'mode_not_allowed',
+      current_mode: controle.mode,
+      current_epoch: controle.control_epoch,
+    };
+  }
+
+  // A PROVA DE DRENAGEM — composta, e declarada como composição (C42). O
+  // "journal de efeitos/admissão" que o §8.2.3 pressupõe não existe; estes três
+  // predicados são o que dá para provar hoje sem inventar estrutura.
+  //
+  // O `count(DISTINCT o.id)` da terceira subconsulta NÃO é zelo supérfluo:
+  // `outbound_messages` junta a `engine_runs` por `(tenant, agent, turn_id)`, e
+  // um turno pode ter VÁRIAS gerações de run — `engine_runs_one_open_turn_uq`
+  // só restringe as ABERTAS, então as fechadas se acumulam. Sem o `DISTINCT`,
+  // um mesmo artefato seria contado uma vez por geração e a drenagem
+  // reportaria mais entregas desconhecidas do que existem. As contagens de tool
+  // call não correm esse risco: o join delas usa a chave composta inteira
+  // (`tenant, agent, turn_id, run_id`), então casa exatamente um run.
+  //
+  // Esta explicação mora AQUI, e não dentro do template, porque comentário SQL
+  // com crase dentro de um `sql` do drizzle ENCERRA o template literal — foi
+  // exatamente o que quebrou a compilação deste arquivo numa versão anterior,
+  // com seis `TS1005` em cascata e um sintoma que não apontava para a causa.
+  const d = linhas<DrenagemRow>(
+    await tx.execute(sql`
+      SELECT
+        (SELECT count(*) FROM engine_runs r
+          WHERE r.tenant_id = ${tenant_id} AND r.agent_id = ${agent_id}
+            AND r.control_id = ${input.control_id}
+            AND r.phase <> 'closed')::text AS runs_abertos,
+        (SELECT count(*) FROM engine_tool_calls c
+           JOIN engine_runs r
+             ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id
+            AND r.turn_id = c.turn_id AND r.id = c.run_id
+          WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+            AND r.control_id = ${input.control_id}
+            AND c.state IN (${statusList(ESTADOS_EM_VOO)}))::text AS calls_em_voo,
+        (
+          (SELECT count(*) FROM engine_tool_calls c
+             JOIN engine_runs r
+               ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id
+              AND r.turn_id = c.turn_id AND r.id = c.run_id
+            WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+              AND r.control_id = ${input.control_id}
+              AND c.effect_evidence = 'unknown')
+        + (SELECT count(DISTINCT o.id) FROM outbound_messages o
+             JOIN engine_runs r
+               ON r.tenant_id = o.tenant_id AND r.agent_id = o.agent_id
+              AND r.turn_id = o.turn_id
+            WHERE o.tenant_id = ${tenant_id} AND o.agent_id = ${agent_id}
+              AND r.control_id = ${input.control_id}
+              AND o.status NOT IN (${statusList(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES)}))
+        )::text AS entregas_desconhecidas`),
+  )[0]!;
+
+  const inflight = Number(d.runs_abertos) + Number(d.calls_em_voo);
+  const desconhecidas = Number(d.entregas_desconhecidas);
+
+  if (inflight > 0 || desconhecidas > 0) {
+    // NÃO finge drenagem concluída — a frase é da spec. O modo fica em
+    // `pausing`, que é estado REAL: barreira posta, drenagem pendente.
+    return {
+      ok: true,
+      idempotent: false,
+      control_id: controle.id,
+      mode: 'pausing',
+      epoch: controle.control_epoch,
+      drain_status: 'reconciliation_required',
+      inflight_effects: inflight,
+      unknown_deliveries: desconhecidas,
+      drain_scope: 'engine_originated_only',
+      updated_at: new Date(),
+    };
+  }
+
+  // Drenado. O epoch NÃO incrementa: confirmar a mesma tomada não é tomada
+  // nova, e incrementar aqui invalidaria claims que a própria pausa já fenceou.
+  const atualizado = linhas<ControleAtualizado>(
+    await tx.execute(sql`
+      UPDATE conversation_controls
+         SET mode = 'human', updated_at = now()
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+         AND id = ${input.control_id} AND mode = 'pausing'
+   RETURNING mode, control_epoch::text AS control_epoch, updated_at`),
+  )[0];
+
+  if (!atualizado) return { ok: false, reason: 'control_not_found' };
+
+  await auditTx(tx, {
+    acao: 'conversation_control_acquired',
+    metadata: {
+      control_id: input.control_id,
+      epoch: atualizado.control_epoch,
+      drain_scope: 'engine_originated_only',
+      requested_by: input.requested_by_app_user_id,
+    },
+  });
+
+  return {
+    ok: true,
+    idempotent: false,
+    control_id: controle.id,
+    mode: atualizado.mode,
+    epoch: atualizado.control_epoch,
+    drain_status: 'complete',
+    inflight_effects: 0,
+    unknown_deliveries: 0,
+    drain_scope: 'engine_originated_only',
+    updated_at: atualizado.updated_at,
+  };
+}
+
+/** Motivos de RETOMADA do §8.3.2 — disjuntos dos de pausa, e o CHECK separa. */
+export const RESUME_REASON_CODES = [
+  'human_resolved',
+  'operator_release',
+  'supervised_recovery',
+] as const;
+
+export type ResumeReasonCode = (typeof RESUME_REASON_CODES)[number];
+
+export type ResumeConversationInput = {
+  control_id: string;
+  expected_epoch: string;
+  idempotency_key: string;
+  requested_by_app_user_id: string;
+  reason_code: ResumeReasonCode;
+  /** V1 admite um valor só (§8.2.5); o campo existe para a recusa ser tipada. */
+  resume_policy: 'future_only';
+  request_payload: unknown;
+};
+
+export type ResumeConversationResult =
+  | {
+      ok: true;
+      idempotent: boolean;
+      command_id: string;
+      control_id: string;
+      mode: string;
+      epoch: string;
+      /** Decimal em string: a coluna é bigint (§8.3.2). */
+      resume_after_ingress_seq: string;
+      /**
+       * Quantos turnos retidos o §8.2.5 descartou nesta retomada. É `number` e
+       * não `string` porque é contagem de linhas desta transação, não valor de
+       * coluna bigint. Num replay idempotente vale 0: o descarte já aconteceu
+       * no comando original e repeti-lo apagaria turnos novos.
+       */
+      backlog_cancelled: number;
+      updated_at: Date;
+    }
+  | {
+      ok: false;
+      reason: PauseConversationRefusal;
+      command_id?: string;
+      current_epoch?: string;
+      current_mode?: string;
+    };
+
+type WatermarkRow = { watermark: string };
+type ControleResumido = {
+  mode: string;
+  control_epoch: string;
+  updated_at: Date;
+  resume_after_ingress_seq: string;
+};
+
+/** A resposta da retomada diante de um comando já gravado com a mesma chave. */
+async function responderRetomadaGravada(
+  tx: Executor,
+  existente: ComandoRow,
+  request_hash: string,
+  control_id_pedido: string,
+): Promise<ResumeConversationResult> {
+  const recusa = await recusaDoComandoGravado(tx, existente, request_hash, control_id_pedido);
+  if (recusa) return recusa;
+  const { tenant_id, agent_id } = scope();
+  // Replay: devolve o desfecho guardado e NÃO reaudita. O estado lido é o do
+  // controle DO COMANDO — com a identidade conferida, o mesmo do pedido.
+  const atual = linhas<ControleResumido>(
+    await tx.execute(sql`
+      SELECT mode, control_epoch::text AS control_epoch, updated_at,
+             coalesce(resume_after_ingress_seq, 0)::text AS resume_after_ingress_seq
+        FROM conversation_controls
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+         AND id = ${existente.control_id}`),
+  )[0];
+  return {
+    ok: true,
+    idempotent: true,
+    command_id: existente.id,
+    control_id: existente.control_id,
+    mode: atual?.mode ?? 'bot',
+    epoch: existente.result_epoch ?? '0',
+    resume_after_ingress_seq: atual?.resume_after_ingress_seq ?? '0',
+    // Replay NÃO redescarta. O backlog do comando original já foi fechado, e
+    // turnos que chegaram depois são justamente o "future" que a política
+    // preserva — descartá-los aqui transformaria um retry de rede em perda
+    // de mensagem.
+    backlog_cancelled: 0,
+    updated_at: existente.updated_at,
+  };
+}
+
+async function resumeInTx(
+  tx: Executor,
+  input: ResumeConversationInput,
+): Promise<ResumeConversationResult> {
+  const { tenant_id, agent_id } = scope();
+  const request_hash = conversationControlCommandDigest({
+    kind: 'resume',
+    control_id: input.control_id,
+    expected_epoch: input.expected_epoch,
+    requested_by_app_user_id: input.requested_by_app_user_id,
+    reason_code: input.reason_code,
+    resume_policy: input.resume_policy,
+    request_payload: input.request_payload,
+  });
+
+  const existente = await lerComandoPorChave(
+    tx,
+    { tenant_id, agent_id },
+    input.idempotency_key,
+    true,
+  );
+  if (existente) {
+    return responderRetomadaGravada(tx, existente, request_hash, input.control_id);
+  }
+
+  const controle = linhas<{ id: string; mode: string; control_epoch: string }>(
+    await tx.execute(
+      lockControlByIdSql({ tenant_id, agent_id, control_id: input.control_id }),
+    ),
+  )[0];
+
+  if (!controle) return { ok: false, reason: 'control_not_found' };
+
+  // A chave relida sob o lock do controle, pela mesma razão da pausa: uma
+  // entrega concorrente do MESMO comando que ganhou o lock já incrementou o
+  // epoch, e sem esta leitura a que esperou responderia `epoch_mismatch` a um
+  // comando aceito.
+  const gravadoNaEspera = await lerComandoPorChave(
+    tx,
+    { tenant_id, agent_id },
+    input.idempotency_key,
+    false,
+  );
+  if (gravadoNaEspera) {
+    return responderRetomadaGravada(tx, gravadoNaEspera, request_hash, input.control_id);
+  }
+
+  // Epoch antes de modo, como nas outras duas operações e pela mesma razão.
+  if (controle.control_epoch !== input.expected_epoch) {
+    return {
+      ok: false,
+      reason: 'epoch_mismatch',
+      current_epoch: controle.control_epoch,
+      current_mode: controle.mode,
+    };
+  }
+
+  // Só `human` retoma. `pausing` é recusa por PENDÊNCIA — o §8.2.1 exige
+  // "pendências conciliadas", e `pausing` é justamente o estado em que elas
+  // ainda não foram; `bot` é recusa porque não há automação a devolver.
+  if (controle.mode !== 'human') {
+    return {
+      ok: false,
+      reason: 'mode_not_allowed',
+      current_epoch: controle.control_epoch,
+      current_mode: controle.mode,
+    };
+  }
+
+  // WATERMARK, capturado SOB O MESMO LOCK (§8.2.5).
+  //
+  // É o MAIOR entre o contador da stream e o maior ingresso já retido em
+  // turnos dela. O contador sozinho não basta: ele pode estar à frente do que
+  // chegou a virar turno. O maior turno sozinho também não: uma stream sem
+  // turno retido ainda tem ingressos contados, e devolver 0 ali faria
+  // `future_only` reabrir tudo. `max()` ignora NULL, que é o caso dos turnos
+  // criados pelo caminho de compatibilidade, que não alocam sequência (C50) —
+  // eles ficam fora da ordenação por construção, e a captura não falha por isso.
+  const wm = linhas<WatermarkRow>(
+    await tx.execute(sql`
+      SELECT GREATEST(
+               coalesce((SELECT s.last_ingress_seq
+                           FROM agent_stream_sequences s
+                           JOIN conversation_controls c
+                             ON c.tenant_id = s.tenant_id AND c.agent_id = s.agent_id
+                            AND c.stream_key = s.stream_key
+                          WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+                            AND c.id = ${input.control_id}), 0),
+               coalesce((SELECT max(t.last_ingress_seq)
+                           FROM agent_turns t
+                           JOIN conversation_controls c
+                             ON c.tenant_id = t.tenant_id AND c.agent_id = t.agent_id
+                            AND c.stream_key = t.stream_key
+                          WHERE t.tenant_id = ${tenant_id} AND t.agent_id = ${agent_id}
+                            AND c.id = ${input.control_id}), 0)
+             )::text AS watermark`),
+  )[0]!;
+
+  const command_id = crypto.randomUUID();
+  const atualizado = linhas<ControleResumido>(
+    await tx.execute(sql`
+      UPDATE conversation_controls
+         SET mode = 'bot',
+             control_epoch = control_epoch + 1,
+             resumed_at = now(),
+             reason_code = ${input.reason_code},
+             resume_after_ingress_seq = ${wm.watermark}::bigint,
+             last_command_id = ${command_id},
+             updated_at = now()
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+         AND id = ${input.control_id} AND mode = 'human'
+   RETURNING mode, control_epoch::text AS control_epoch, updated_at,
+             resume_after_ingress_seq::text AS resume_after_ingress_seq`),
+  )[0];
+
+  if (!atualizado) return { ok: false, reason: 'control_not_found' };
+
+  // ─── §8.2.5: fechar a obrigação de automação do backlog retido ───────────
+  //
+  // Vem DEPOIS do `UPDATE` de propósito. Se o controle não transicionou — epoch
+  // obsoleto, modo errado, linha alheia — a função já retornou acima e nenhum
+  // turno foi tocado: o descarte é atômico com a retomada e não acontece sem
+  // ela. A ordem de lock é a do §8.2.3 passo 3: o controle já está trancado
+  // desde `lockControlByIdSql`, e só agora se tranca `agent_turns`, em
+  // `ORDER BY t.id` dentro do próprio construtor.
+  //
+  // O laço é sequencial por ESCOLHA: cada turno passa pelo CONTRATO de
+  // transição, não por um `UPDATE ... WHERE id = ANY(...)`. Um update em massa
+  // pularia `assertTurnTransition` e o CAS por linha — as duas guardas que
+  // impedem descartar um turno que andou entre a seleção e a escrita. O
+  // conjunto é o backlog de UMA conversa, não uma varredura global.
+  const retidos = linhas<{ id: string; state_version: number }>(
+    await tx.execute(
+      heldBacklogForCancellationSql({
+        tenant_id,
+        agent_id,
+        control_id: input.control_id,
+        watermark: wm.watermark,
+      }),
+    ),
+  );
+  for (const turno of retidos) {
+    await cancelHeldBacklogTurnInTx(tx, {
+      turn_id: turno.id,
+      expected_version: Number(turno.state_version),
+    });
+  }
+  const backlog_cancelled = retidos.length;
+
+  const comando = linhas<ComandoRow>(
+    await tx.execute(sql`
+      INSERT INTO conversation_control_commands
+        (id, tenant_id, agent_id, control_id, kind, idempotency_key, request_hash,
+         expected_epoch, result_epoch, requested_by_app_user_id, status,
+         barrier_committed, drain_status, summary_json)
+      VALUES
+        (${command_id}, ${tenant_id}, ${agent_id}, ${input.control_id}, 'resume',
+         ${input.idempotency_key}, ${request_hash},
+         ${input.expected_epoch}::bigint, ${atualizado.control_epoch}::bigint,
+         ${input.requested_by_app_user_id}, 'accepted',
+         true, 'complete',
+         ${JSON.stringify({ reason_code: input.reason_code, resume_policy: input.resume_policy })}::jsonb)
+   RETURNING id, control_id, request_hash, status, outcome_code,
+             result_epoch::text AS result_epoch,
+             barrier_committed, drain_status, inflight_effects,
+             unknown_deliveries, updated_at`),
+  )[0]!;
+
+  // O PAR do §8.6.1: pedido e efeito são fatos distintos. O §8.3.2 manda o
+  // resume recusar enquanto houver pendência, logo existe um estado real em que
+  // o operador pediu e a automação não voltou — colapsar as duas ações apagaria
+  // essa distância, que é o erro registrado em C24.
+  await auditTx(tx, {
+    acao: 'conversation_resume_requested',
+    metadata: {
+      command_id: comando.id,
+      control_id: input.control_id,
+      expected_epoch: input.expected_epoch,
+      reason_code: input.reason_code,
+      resume_policy: input.resume_policy,
+      requested_by: input.requested_by_app_user_id,
+    },
+  });
+  await auditTx(tx, {
+    acao: 'conversation_automation_resumed',
+    metadata: {
+      command_id: comando.id,
+      control_id: input.control_id,
+      epoch_before: input.expected_epoch,
+      epoch_after: atualizado.control_epoch,
+      resume_policy: input.resume_policy,
+      resume_after_ingress_seq: atualizado.resume_after_ingress_seq,
+      // Quantos turnos a política fechou. Sem isto a trilha diria que a
+      // automação voltou sem dizer que mensagens do cliente foram descartadas
+      // por decisão do operador — o fato mais consequente da operação.
+      backlog_cancelled,
+    },
+  });
+
+  return {
+    ok: true,
+    idempotent: false,
+    command_id: comando.id,
+    control_id: input.control_id,
+    mode: atualizado.mode,
+    epoch: atualizado.control_epoch,
+    resume_after_ingress_seq: atualizado.resume_after_ingress_seq,
+    backlog_cancelled,
+    updated_at: atualizado.updated_at,
+  };
+}
+
+export const conversationControlRepo = {
+  /**
+   * A pausa numa transação própria — o atalho para quem não tem transação em
+   * mãos.
+   */
+  async pauseConversationTx(
+    input: PauseConversationInput,
+  ): Promise<PauseConversationResult> {
+    return withTx((tx) => pauseInTx(tx, input));
+  },
+
+  /**
+   * A MESMA pausa, na transação de QUEM CHAMA. Existe pelo motivo que
+   * `requestCommandWithAuditInTx` documenta: um caller que já está numa
+   * transação precisa que a barreira entre no MESMO commit da decisão que a
+   * autorizou — pausar por fora, em transação própria, faria o efeito preceder
+   * a decisão. Os dois compartilham este corpo, então não há como divergirem.
+   */
+  async pauseConversationInTx(
+    tx: Executor,
+    input: PauseConversationInput,
+  ): Promise<PauseConversationResult> {
+    return pauseInTx(tx, input);
+  },
+
+  /**
+   * A reconciliação `pausing → human` do §8.2.1, em transação própria.
+   *
+   * NÃO é comando de operador: quem decide é o reconciliador Maia, e por isso
+   * ela não cria linha em `conversation_control_commands` — o `kind` daquela
+   * tabela só admite `pause` e `resume`. A idempotência vem do ESTADO: um
+   * controle já em `human` devolve `idempotent: true` sem reauditar.
+   */
+  async reconcilePauseTx(
+    input: ReconcilePauseInput,
+  ): Promise<ReconcilePauseResult> {
+    return withTx((tx) => reconcileInTx(tx, input));
+  },
+
+  /**
+   * A MESMA reconciliação, na transação de quem chama — mesmo motivo do par da
+   * pausa: um caller que já está numa transação precisa que a confirmação da
+   * tomada entre no mesmo commit da decisão que a autorizou. Os dois
+   * compartilham este corpo, então não há como um divergir do outro.
+   */
+  async reconcilePauseInTx(
+    tx: Executor,
+    input: ReconcilePauseInput,
+  ): Promise<ReconcilePauseResult> {
+    return reconcileInTx(tx, input);
+  },
+
+  /**
+   * A retomada `human → bot` do §8.2.1, em transação própria.
+   *
+   * Diferente da reconciliação, esta **incrementa** o epoch: é o outro extremo
+   * do ABA que o §8.2.2 manda fechar, para que um run iniciado no epoch antigo
+   * não recupere autoridade só porque o modo voltou a `bot`.
+   */
+  async resumeConversationTx(
+    input: ResumeConversationInput,
+  ): Promise<ResumeConversationResult> {
+    const r = await withTx((tx) => resumeInTx(tx, input));
+    // DEPOIS do commit, nunca dentro. É a mesma regra de
+    // `recordRecoveredOutboundTurnCommitted`: um contador emitido na transação
+    // registraria descartes que o rollback desfez, e mentiria exatamente no
+    // incidente em que alguém o consultaria.
+    if (r.ok) recordBacklogCancellationCommitted({ cancelados: r.backlog_cancelled });
+    return r;
+  },
+
+  /**
+   * A MESMA retomada, na transação de quem chama.
+   *
+   * NÃO emite a métrica, e a assimetria com a variante acima é deliberada: aqui
+   * o commit é de quem chamou, e só ele sabe se aconteceu. O caller que usar
+   * esta porta é responsável por chamar `recordBacklogCancellationCommitted`
+   * com `backlog_cancelled` depois de comitar.
+   */
+  async resumeConversationInTx(
+    tx: Executor,
+    input: ResumeConversationInput,
+  ): Promise<ResumeConversationResult> {
+    return resumeInTx(tx, input);
+  },
+};

@@ -92,6 +92,19 @@ import {
   streamPoisonProbe,
   streamSuccessorCandidate,
 } from './stream-head-sql.js';
+// P04.6/P04.6b (spec maia-hermes §8.2.4, §8.2.5) — o HOLD de CONTROLE HUMANO,
+// no módulo que é dono de `conversation_controls`. Os SEIS consumidores neste
+// arquivo — o `WHERE` do claim, o filtro do recovery, o dispatcher cross-tenant,
+// a eleição da promoção e, desde o P04.6b, o enumerador de janelas de debounce
+// vencidas e o CAS que as fecha — chamam esta função; nenhum monta predicado
+// próprio, pela mesma razão que vale para a regra FIFO e para o poison.
+// `tests/unit/runtime/conversation-control-claim-contract.spec.ts` conta as
+// chamadas e proíbe que `conversation_controls` seja nomeada aqui dentro.
+import {
+  ESTADOS_DESCARTAVEIS_DO_BACKLOG,
+  humanControlProbe,
+  streamNotHumanControlled,
+} from './conversation-control-sql.js';
 // #628 — a FRONTEIRA do batch de debounce, no mesmo formato e pela mesma razão
 // do módulo acima: SQL puro, compilável sem banco, com a borda escrita num
 // lugar só. `armDebounceWindowTx` e `closeDueDebounceBatchTx` são os únicos
@@ -200,7 +213,23 @@ export type DebounceCloseResult =
     }
   | {
       closed: false;
-      reason: 'stream_locked' | 'no_window' | 'not_due' | 'lost_race';
+      reason:
+        | 'stream_locked'
+        | 'no_window'
+        | 'not_due'
+        | 'lost_race'
+        /**
+         * P04.6b (spec maia-hermes §8.2.5) — a CONVERSA está sob controle
+         * humano, e o fechamento é recusado.
+         *
+         * Motivo PRÓPRIO, e não `lost_race`, pela mesma régua que separou
+         * `stream_poisoned` de `stream_blocked`: as remediações são opostas.
+         * `lost_race` diz "outra transação mexeu no turno; o próximo tick
+         * fecha" — e mandaria o operador esperar por um fechamento que não vem
+         * enquanto um humano estiver atendendo. Este diz "há decisão humana em
+         * curso; o fechamento volta com o `resume`".
+         */
+        | 'conversation_human_control';
     };
 
 /**
@@ -967,6 +996,18 @@ export const agentTurnsRepo = {
          AND t.debounce_deadline_at IS NOT NULL
          AND t.debounce_closed_at IS NULL
          AND t.debounce_deadline_at <= now()
+         -- P04.6b -- conversa sob CONTROLE HUMANO nao entra no lote. A
+         -- enumeracao e ADVISORIA (o CAS do fechamento e a barreira), mas sem
+         -- ela o varredor gasta o limit da rodada em streams que nao pode
+         -- fechar, e uma conversa retida de longa duracao empurraria streams
+         -- legitimas para fora do lote -- a starvation que a propria ordenacao
+         -- por prazo existe para evitar. CROSS-TENANT: o escopo sai das
+         -- COLUNAS da linha, como em listTenantAgentPairsWithRecoverableTurns.
+         AND ${streamNotHumanControlled({
+           tenant: sql`t.tenant_id`,
+           agent: sql`t.agent_id`,
+           alvo: sql`t`,
+         })}
        GROUP BY t.tenant_id, t.agent_id, t.stream_key
        ORDER BY MIN(t.debounce_deadline_at)
        LIMIT ${limit}
@@ -1685,6 +1726,13 @@ export const agentTurnsRepo = {
           // recuperação, e o `limit` da varredura consumido por conversas que
           // nenhum worker pode destravar.
           streamNotPoisoned(escopoSql(tenant_id, agent_id)),
+          // P04.6 — e a conversa sob CONTROLE HUMANO também não tem trabalho
+          // recuperável. O §8.2.5 é literal: "todos os scans de recovery/claim
+          // devem excluir holds". Sem isto o varredor rearma a cada ciclo um
+          // turno que o claim vai recusar — o "retry storm de jobs bloqueados"
+          // que o §8.2.4 proíbe por escrito, com o `limit` da varredura
+          // consumido por conversas que nenhum worker deve destravar.
+          streamNotHumanControlled(escopoSql(tenant_id, agent_id)),
         ),
       )
       .orderBy(asc(agent_turns.created_at))
@@ -1782,6 +1830,14 @@ export const agentTurnsRepo = {
           // CROSS-TENANT, pela mesma razão do fragmento acima: o escopo sai das
           // COLUNAS da linha. Espelha `findRecoverableTurns` — um par só é
           // enumerado quando o inner de fato teria trabalho.
+          tenant: sql`${agent_turns}.tenant_id`,
+          agent: sql`${agent_turns}.agent_id`,
+          alvo: sql`${agent_turns}`,
+        })}
+        AND ${streamNotHumanControlled({
+          // P04.6 — idem: o par cujo único trabalho está retido por controle
+          // humano não deve ser enumerado, ou o dispatcher acorda o inner a
+          // cada varredura para ele devolver lista vazia.
           tenant: sql`${agent_turns}.tenant_id`,
           agent: sql`${agent_turns}.agent_id`,
           alvo: sql`${agent_turns}`,
@@ -2292,6 +2348,23 @@ async function recoverExpiredStreamClaims(
        AND u.id       <> ${args.turn_id}
        AND ativos.lease_expires_at IS NOT NULL
        AND ativos.lease_expires_at <= now()
+       -- Achado de revisao da PR #766 -- conversa sob CONTROLE HUMANO nao
+       -- recupera. Esta funcao roda ANTES do WHERE do claim que consulta o
+       -- controle, e a transacao comita mesmo com o claim recusado: sem isto o
+       -- head vencido virava retryable, ganhava promoted_at e era
+       -- re-enfileirado -- o wake-up fabricado que o 8.2.4 proibe ("recovery/
+       -- promotion nao podem fabricar tentativa nova que ignore a pausa"). O
+       -- varredor ja excluia holds pelo caminho dele; esta era a copia que
+       -- divergia. Sob hold a linha fica como esta: a lease vencida nao devolve
+       -- posse a ninguem (toda escrita fenced exige lease viva), e um running
+       -- sob pausing e I/O em voo que a reconciliacao precisa enxergar.
+       -- No WHERE do UPDATE e nao nas CTEs, pelo motivo do conjunto de locks
+       -- descrito acima. SEM CRASE neste bloco (template literal, ver C45).
+       AND ${streamNotHumanControlled({
+         tenant: sql`${args.tenant_id}`,
+         agent: sql`${args.agent_id}`,
+         alvo: sql`u`,
+       })}
     RETURNING u.id, u.representative_message_id, u.conversa_id,
               ativos.status AS previous_status
   `);
@@ -2462,6 +2535,18 @@ async function promoteStreamSuccessor(
        -- assim acordaria o sucessor -- um wake-up para um turno que o claim vai
        -- recusar, e a metrica promoted deixaria de significar 'a fila andou'.
        AND ${streamNotPoisoned(alvo)}
+       -- P04.6 -- a conversa sob CONTROLE HUMANO tambem NAO promove ninguem.
+       -- E o consumidor menos obvio do predicado, e foi MEDIDO antes de existir:
+       -- o caso 12 de hermes-claim-hold-real-db viu promoted_at carimbado no
+       -- sucessor de uma conversa em modo human. O 8.2.4 e explicito --
+       -- "recovery/promotion nao podem fabricar tentativa nova que ignore a
+       -- pausa" --, e o defeito seria quase invisivel: a promocao acorda o
+       -- sucessor, o claim o recusa com conversation_human_control, e o unico
+       -- sintoma e um promoted que nao corresponde a fila nenhuma.
+       -- SEM CRASE NESTE BLOCO, de proposito: ele vive dentro de um template
+       -- literal, e uma crase aqui encerra o template. Ja custou seis TS1005 em
+       -- cascata uma vez (C45) e custou de novo ao escrever esta fatia.
+       AND ${streamNotHumanControlled(alvo)}
     RETURNING u.id, u.representative_message_id, u.conversa_id,
               sucessor.status AS status_before, u.status AS status_after
   `);
@@ -2788,6 +2873,34 @@ async function closeDueDebounceBatchTx(
   const head = membrosDoBatch[0];
   if (!head) return { closed: false, reason: 'no_window' };
 
+  // P04.6b — A CONVERSA ESTÁ SOB CONTROLE HUMANO?
+  //
+  // Encontrado por revisão adversarial do desenho do descarte de backlog e
+  // confirmado por teste contra banco real: sem esta recusa, o fechador põe
+  // `status='queued'` no head, carimba `promoted_at` (dívida de wake-up), zera
+  // `next_attempt_at` e empurra `last_ingress_seq` — tudo numa conversa que um
+  // humano assumiu. O hold do claim impedia a EXECUÇÃO, então nada era
+  // respondido; mas a LINHA era mutada, e o deslocamento de `last_ingress_seq`
+  // furava o filtro `<= watermark` do descarte administrativo (§8.2.5): um head
+  // que absorvesse mensagem depois do watermark escapava do cancelamento e
+  // voltava a ser reivindicável assim que o modo virasse `bot`.
+  //
+  // A sonda dá o MOTIVO; o predicado no CAS abaixo dá a ATOMICIDADE. Os dois,
+  // porque esta transação segura o mutex da STREAM e não o lock do CONTROLE:
+  // uma pausa pode commitar entre esta leitura e o `UPDATE`, e aí quem recusa é
+  // o `WHERE`. É o mesmo par que o claim usa (`explainClaimRejection` explica,
+  // o `WHERE` barra).
+  const retido = await tx.execute<{ control_id: string; mode: string }>(
+    humanControlProbe({
+      tenant: sql`${tenant_id}`,
+      agent: sql`${agent_id}`,
+      turn_id: head.id,
+    }),
+  );
+  if (Array.from(retido.rows as unknown as unknown[]).length > 0) {
+    return { closed: false, reason: 'conversation_human_control' };
+  }
+
   // 4. O RELÓGIO PERSISTENTE. `due` foi avaliado no banco; basta UM membro
   // vencido — o prazo é o mesmo em todos, e exigir que fosse o head tornaria o
   // fechamento refém de uma linha que pode ter perdido o carimbo.
@@ -2825,6 +2938,15 @@ async function closeDueDebounceBatchTx(
        AND u.state_version = ${Number(head.state_version)}
        AND u.debounce_closed_at IS NULL
        AND u.status IN (${statusList(CLAIMABLE_STATUSES)})
+       -- P04.6b -- a barreira ATOMICA do hold. A sonda acima da o motivo
+       -- legivel; esta linha e o que impede a corrida: o fechador segura o
+       -- mutex da STREAM, nao o lock do CONTROLE, entao uma pausa pode commitar
+       -- entre a sonda e este UPDATE. Sem ela, a recusa seria apenas provavel.
+       AND ${streamNotHumanControlled({
+         tenant: sql`${tenant_id}`,
+         agent: sql`${agent_id}`,
+         alvo: sql`u`,
+       })}
     RETURNING u.id, u.representative_message_id, u.conversa_id, u.status
   `);
   const headFechado = Array.from(
@@ -3032,6 +3154,16 @@ async function claimWithinStreamExclusion(
        -- fatia e TURN_POISON_BLOCK_CATEGORIES= (vazio), que impede NOVOS
        -- bloqueios de nascer -- nunca desrespeita os que existem.
        AND ${streamNotPoisoned(escopo)}
+       -- P04.6 -- A CONVERSA ESTA SOB CONTROLE HUMANO? Predicado INCONDICIONAL,
+       -- sem flag, pela MESMA razao do de poison logo acima: uma linha de
+       -- controle fora do modo bot e uma decisao ja tomada, auditada e visivel
+       -- no console, e uma flag que a ignorasse faria a plataforma voltar a
+       -- responder numa conversa que um humano assumiu. Retem pausing E human:
+       -- pausing e a janela entre a barreira comitada e a drenagem confirmada,
+       -- e deixa-la de fora permitiria INICIAR um turno depois do clique de
+       -- pausa. O kill switch desta fatia e nao criar controles -- nunca
+       -- desrespeitar os que existem.
+       AND ${streamNotHumanControlled(escopo)}
     RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
               claimed_by, claimed_at, lease_expires_at, state_version,
               -- #629 -- a ESPERA deste turno, do relogio do BANCO. E o que
@@ -3130,6 +3262,44 @@ async function explainClaimRejection(
   if (!encontrado) {
     incCounter('maia_turn_claim_total', { result: 'not_found' });
     return { ok: false, reason: 'not_found', ...trail };
+  }
+
+  // P04.6 — A CONVERSA ESTÁ SOB CONTROLE HUMANO? Verificado ANTES do poison, e
+  // a ordem merece justificativa porque as duas param a conversa.
+  //
+  // Esta é a decisão CORRENTE e reversível por comando (`resume`, §8.2.5);
+  // `stream_poisoned` é dívida operacional esperando desbloqueio manual. Com as
+  // duas valendo ao mesmo tempo, responder "um humano está no controle"
+  // descreve o que o operador vê no console; responder `stream_poisoned` o
+  // mandaria desbloquear uma conversa que alguém está atendendo. Nenhuma das
+  // duas esconde a outra: ambas persistem, o claim segue recusado até as duas
+  // saírem, e o operador que resolver esta encontra a outra na tentativa
+  // seguinte.
+  //
+  // Não devolve `head_block`: quem retém não é um TURNO anterior, é uma linha
+  // de `conversation_controls`. Preencher o campo com um turno qualquer faria o
+  // operador procurar um bloqueador que não existe — e o `control_id` não entra
+  // no resultado porque `ClaimResult` é vocabulário de ESCALONAMENTO, não a
+  // tela de atendimento.
+  //
+  // Custa uma consulta, e só no caminho que JÁ falhou — como o resto deste
+  // diagnóstico.
+  const hold = await tx.execute<{ control_id: string; mode: string }>(
+    humanControlProbe({
+      tenant: escopo.tenant,
+      agent: escopo.agent,
+      turn_id: args.turn_id,
+    }),
+  );
+  const controle = (
+    hold.rows as unknown as Array<{ control_id: string; mode: string }>
+  )[0];
+  if (controle) {
+    incCounter('maia_turn_claim_total', {
+      result: 'conversation_human_control',
+    });
+    recordStreamBlocked('conversation_human_control');
+    return { ok: false, reason: 'conversation_human_control', ...trail };
   }
 
   // #629 — A CONVERSA ESTÁ INTERDITADA? Verificado ANTES de tudo o mais, e a
@@ -3512,6 +3682,92 @@ export function recordRecoveredOutboundTurnCommitted(input: {
     to: 'completed',
     outcome: input.outcome,
   });
+}
+
+/**
+ * P04.5b.2b (spec maia-hermes §8.2.5) — descarta administrativamente UM turno
+ * retido, COMPARTILHANDO a transação de quem retoma a conversa.
+ *
+ * É `...InTx` e não operação própria porque o §8.2.5 manda fechar a obrigação
+ * de automação dos turnos retidos como parte do comando de resume, e o
+ * watermark é capturado sob o mesmo lock: se o descarte comitasse sozinho, um
+ * resume que falhasse depois deixaria mensagens descartadas com a conversa
+ * ainda em `human`. Daí também a recusa RUIDOSA — uma primitiva `...InTx` não
+ * pode devolver conflito e deixar o caller comitar o resto, regra que
+ * `completeRecoveredOutboundTurnInTx` já estabelece.
+ *
+ * As origens vêm da constante do módulo de controle, e NÃO de
+ * `sourceStatusesFor('ignored', { manual: true })`: aquela lista devolve também
+ * `running`, porque `running → ignored` é aresta AUTOMÁTICA. Cancelar
+ * administrativamente um turno EM EXECUÇÃO é o oposto do "sem execução/efeito
+ * pendente" que a spec exige, e montar as origens pela função genérica traria
+ * isso junto sem ninguém notar.
+ *
+ * O fence é `none` por ser honesto, não por conveniência: um turno em
+ * `received`/`queued`/`retryable` ainda não tem posse a respeitar. Quem impede
+ * o descarte de um turno já reivindicado é a lista de origens, e o caso 4 do
+ * spec prende exatamente essa ponta.
+ */
+export async function cancelHeldBacklogTurnInTx(
+  tx: TurnTransitionExecutor,
+  input: { turn_id: string; expected_version: number },
+): Promise<Extract<TurnTransitionResult, { ok: true }>> {
+  // Valida o contrato nas TRÊS origens antes de tocar o banco, pela regra do
+  // cabeçalho deste arquivo: nenhum caller escreve `status` direto. Duas delas
+  // só existem pela porta manual (P04.5b.1); `received → ignored` já era
+  // automática, e o modo manual é aditivo.
+  for (const origem of ESTADOS_DESCARTAVEIS_DO_BACKLOG) {
+    assertTurnTransition(origem, 'ignored', 'operator_cancelled', {
+      manual: true,
+    });
+  }
+  const result = await runTransitionOnExecutor(
+    tx,
+    {
+      turn_id: input.turn_id,
+      to: 'ignored',
+      outcome: 'operator_cancelled',
+      sources: [...ESTADOS_DESCARTAVEIS_DO_BACKLOG],
+      expected_version: input.expected_version,
+      // `bumpAttempt` fica de fora DE PROPÓSITO: `attempt_count` conta
+      // EXECUÇÕES, e um descarte administrativo não executou nada. Gastar
+      // tentativa aqui empurraria para a DLQ um turno que a plataforma nunca
+      // chegou a tentar responder.
+      patch: { next_attempt_at: null, clearClaim: true },
+    },
+    { kind: 'none' },
+    scope(),
+  );
+  if (!result.ok) {
+    throw new Error(
+      `held_backlog_cancellation_conflict:${result.conflict}:${input.turn_id}`,
+    );
+  }
+  return result;
+}
+
+/**
+ * Registra os descartes somente DEPOIS que a transação externa comitou.
+ *
+ * Emitir dentro da transação faria `maia_turn_transitions_total` contar
+ * descartes que o rollback desfez — a métrica mentiria exatamente no incidente
+ * em que alguém a consultaria.
+ */
+export function recordBacklogCancellationCommitted(input: {
+  cancelados: number;
+}): void {
+  if (input.cancelados <= 0) return;
+  incCounter(
+    'maia_turn_transitions_total',
+    {
+      // `any` porque um mesmo resume descarta turnos de origens diferentes; é o
+      // mesmo rótulo que `recordCommittedTransition` usa quando há mais de uma.
+      from: 'any',
+      to: 'ignored',
+      outcome: 'operator_cancelled',
+    },
+    input.cancelados,
+  );
 }
 
 async function runTransitionOnExecutor(

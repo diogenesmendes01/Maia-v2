@@ -34,7 +34,7 @@
  * inclusive contra um resumo com a forma exata do "verde vazio" acima.
  */
 import { describe, it, expect } from 'vitest';
-import { readFileSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdtempSync, rmSync, readdirSync, statSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -184,6 +184,82 @@ describe('#510 fatia D — a lane de fault injection roda no CI e é um GATE', (
 
     it('o nome do job diz o que ele guarda', () => {
       expect(job().name).toMatch(/fault injection/i);
+    });
+  });
+
+  describe('nenhum skip da lane depende de variável que o job não define', () => {
+    // PR #766: o spike do Hermes (`hermes-worker-spike.spec.ts`) foi escrito
+    // DENTRO de `tests/reliability` com guarda em `MAIA_HERMES_WORKER_PYTHON` e
+    // `MAIA_HERMES_UPSTREAM`. O job não define nenhuma das duas, então a spec
+    // pulava sempre e o `--max-pulados 0` reprovava o job — corretamente: um
+    // skip que depende de ambiente que o CI nunca terá é verde vazio permanente.
+    // Este caso pega a CLASSE do defeito antes do CI: toda variável usada na
+    // guarda de `describe.skip` de uma spec da lane precisa existir no env do job
+    // ou do passo da lane.
+
+    /** Variáveis de ambiente da guarda `X ? describe : describe.skip` de um fonte. */
+    function variaveisDaGuarda(fonte: string): string[] {
+      const guarda = /const\s+\w+\s*=\s*(\w+)\s*\?\s*describe\s*:\s*describe\.skip/.exec(fonte);
+      if (!guarda) return [];
+      const cond = guarda[1]!;
+      const def = new RegExp(`const\\s+${cond}\\s*=\\s*([\\s\\S]*?);`).exec(fonte);
+      const expr = def ? def[1]! : cond;
+      const vars = new Set<string>();
+      for (const m of expr.matchAll(/process\.env\.([A-Z0-9_]+)/g)) vars.add(m[1]!);
+      // Um nível de indireção: `const PYTHON = process.env.X;` usado na condição.
+      for (const id of expr.matchAll(/\b([A-Z][A-Z0-9_]*)\b/g)) {
+        const alias = new RegExp(`const\\s+${id[1]}\\s*=\\s*process\\.env\\.([A-Z0-9_]+)`).exec(fonte);
+        if (alias) vars.add(alias[1]!);
+      }
+      return [...vars].sort();
+    }
+
+    function specsDaLane(): string[] {
+      const saida: string[] = [];
+      const varrer = (dir: string): void => {
+        for (const nome of readdirSync(dir)) {
+          const caminho = join(dir, nome);
+          if (statSync(caminho).isDirectory()) varrer(caminho);
+          else if (nome.endsWith('.spec.ts')) saida.push(caminho);
+        }
+      };
+      varrer(join(RAIZ, 'tests/reliability'));
+      return saida;
+    }
+
+    function envDoJobELane(): Set<string> {
+      const j = job();
+      const lane = (j.steps ?? []).find((p) => (p.run ?? '').includes('npm run test:reliability'));
+      return new Set([...Object.keys(j.env ?? {}), ...Object.keys(lane?.env ?? {})]);
+    }
+
+    it('o extrator pega a guarda direta e a guarda por alias (controles sintéticos)', () => {
+      expect(
+        variaveisDaGuarda('const SHOULD_RUN = !!process.env.FOO_BAR; const d = SHOULD_RUN ? describe : describe.skip;'),
+      ).toEqual(['FOO_BAR']);
+      expect(
+        variaveisDaGuarda(
+          'const PY = process.env.X_PY;\nconst UP = process.env.X_UP;\nconst OK = !!PY && !!UP;\nconst d = OK ? describe : describe.skip;',
+        ),
+      ).toEqual(['X_PY', 'X_UP']);
+      expect(variaveisDaGuarda('describe("sem guarda", () => {});')).toEqual([]);
+    });
+
+    it('a varredura não é vácua: acha as specs com guarda da lane', () => {
+      const comGuarda = specsDaLane().filter((f) => variaveisDaGuarda(readFileSync(f, 'utf8')).length > 0);
+      // 8 hoje (os 6 cenários e 2 self-tests), todos guardados só por banco.
+      expect(comGuarda.length).toBeGreaterThanOrEqual(8);
+    });
+
+    it('toda variável de guarda de skip da lane existe no env do job ou da lane', () => {
+      const disponiveis = envDoJobELane();
+      const faltando = specsDaLane()
+        .map((f) => ({
+          spec: f.slice(RAIZ.length + 1).split('\\').join('/'),
+          faltam: variaveisDaGuarda(readFileSync(f, 'utf8')).filter((v) => !disponiveis.has(v)),
+        }))
+        .filter((x) => x.faltam.length > 0);
+      expect(faltando).toEqual([]);
     });
   });
 

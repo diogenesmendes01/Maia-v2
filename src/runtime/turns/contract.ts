@@ -133,11 +133,47 @@ export const TURN_TRANSITIONS: Readonly<Record<TurnStatus, readonly TurnStatus[]
 
 /**
  * Transições MANUAIS — só acessíveis por operação explícita e auditada, nunca
- * pelo caminho automático. Hoje só o replay de dead letter, que precisa gerar
- * nova tentativa/token (#504).
+ * pelo caminho automático. Duas famílias, hoje:
+ *
+ *  1. o replay de dead letter (#504), que precisa gerar nova tentativa/token;
+ *  2. o DESCARTE ADMINISTRATIVO DE BACKLOG (spec maia-hermes §8.2.5), quando um
+ *     operador retoma a conversa com `resumePolicy='future_only'` e as mensagens
+ *     retidas durante a pausa não serão respondidas automaticamente.
+ *
+ * ─── Por que `queued` e `retryable`, e SÓ esses dois ──────────────────────
+ *
+ * A spec mapeia o descarte para turnos `received/queued/retryable`. Os outros
+ * dois já existem na tabela AUTOMÁTICA: `received -> ignored` e
+ * `running -> ignored` estão lá desde o #503 (descarte por regra explícita
+ * durante a execução). Faltavam exatamente estes.
+ *
+ * ─── Por que MANUAL, e não uma aresta automática ──────────────────────────
+ *
+ * A spec é literal: "sem liberar `queued -> ignored` para callers automáticos".
+ * O caminho automático de um turno enfileirado é AVANÇAR; um `ignored`
+ * alcançável sem operação auditada daria a qualquer caller a capacidade de
+ * sumir com trabalho já aceito — e o sintoma seria uma mensagem de cliente que
+ * nunca foi respondida e nunca apareceu em lugar nenhum. A porta manual obriga
+ * `{ manual: true }` explícito, que hoje só existe em operações com trilha.
+ *
+ * ─── A armadilha que o caller TEM de conhecer ────────────────────────────
+ *
+ * `sourceStatusesFor('ignored', { manual: true })` devolve `running` JUNTO, por
+ * causa da aresta automática que já existia. Um caller que passe esse conjunto
+ * direto ao `UPDATE` cancelaria administrativamente um turno EM EXECUÇÃO — o
+ * oposto do "sem execução/efeito pendente" que a spec exige. Quem descarta
+ * backlog precisa interseccionar com `expected_statuses`, e
+ * `tests/unit/turn-state-machine.spec.ts` prende isso num caso próprio para que
+ * a pegadinha não seja redescoberta em produção.
+ *
+ * O outcome do descarte é `operator_cancelled`, que já pertence a `ignored` em
+ * `TERMINAL_OUTCOMES` e já é aceito pelo CHECK de `agent_turns` (migrations 097
+ * e 115) — esta mudança de contrato NÃO pede migration.
  */
 export const MANUAL_TRANSITIONS: Readonly<Record<string, readonly TurnStatus[]>> = {
   dead_letter: ['queued'],
+  queued: ['ignored'],
+  retryable: ['ignored'],
 } as const;
 
 /**

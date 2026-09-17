@@ -131,6 +131,29 @@ export const STREAM_SCHEDULING_RESULTS = [
    * espere"; `stream_poisoned` é "nada vai acontecer até um humano desbloquear").
    */
   'stream_poisoned',
+  /**
+   * P04.6 (spec maia-hermes §8.2.4, §8.2.5) — a CONVERSA está sob CONTROLE
+   * HUMANO: existe linha em `conversation_controls` com `mode <> 'bot'`
+   * (`pausing` ou `human`) para a stream do turno.
+   *
+   * SÉTIMO código, e o nome não é escolha da casa: o §8.2.4 o escreve por
+   * extenso ao exigir que "admission/claim deve consultar controle, retornar
+   * motivo fechado `conversation_human_control`". Grafá-lo de outro jeito seria
+   * inventar vocabulário onde a spec já deu um.
+   *
+   * Vale aqui a MESMA justificativa que a #629 deu para acrescentar o sexto: o
+   * valor é ACRESCENTADO, não redefinido — nenhuma série existente muda de
+   * significado, e a nova é semeada em zero como as outras.
+   *
+   * O que não se podia fazer era reusar `stream_poisoned`: as duas param a
+   * conversa e as remediações são opostas. `stream_poisoned` é "nada acontece
+   * até um humano DESBLOQUEAR" — trabalho de operador PENDENTE.
+   * `conversation_human_control` é "nada DEVE acontecer: um humano já está
+   * atendendo" — o caminho feliz do P04, e a automação volta pelo comando
+   * `resume` (§8.2.5), nunca pelo tempo. Colapsá-las mandaria o operador
+   * procurar um bloqueio em `agent_stream_blocks` que não existe.
+   */
+  'conversation_human_control',
 ] as const;
 
 export type StreamSchedulingResult = (typeof STREAM_SCHEDULING_RESULTS)[number];
@@ -156,6 +179,19 @@ export const STREAM_BLOCKED_REASONS = [
    * manual pendente", que nenhuma das outras três dá.
    */
   'stream_poisoned',
+  /**
+   * P04.6 — a conversa está sob controle humano. Entra aqui porque é bloqueio
+   * de verdade: enquanto a linha de controle não voltar a `bot`, nenhum claim
+   * desta stream é concedido.
+   *
+   * A leitura é a MAIS diferente das cinco, e é a única BENIGNA: `not_head`
+   * cresce e volta sozinha; `stream_blocked` espera o outbox; `stream_busy` é
+   * serialização; `stream_poisoned` é dívida operacional acumulando. Esta é o
+   * produto funcionando — cada ponto é uma mensagem que a plataforma NÃO
+   * respondeu automaticamente porque um humano assumiu a conversa. Subir junto
+   * com pausas no console é o esperado; subir SEM elas é controle órfão.
+   */
+  'conversation_human_control',
 ] as const;
 
 export type StreamBlockedReason = (typeof STREAM_BLOCKED_REASONS)[number];
@@ -386,6 +422,31 @@ export const CLAIM_REJECTIONS = [
    * conversa que está interditada, por decisão de política.
    */
   'stream_poisoned',
+  /**
+   * P04.6 (§8.2.4, §8.2.5) — a CONVERSA está sob controle humano: existe
+   * controle com `mode <> 'bot'` para a stream deste turno.
+   *
+   * Distinto de `not_eligible` pela razão que o §8.2.4 torna obrigatória ao
+   * pedir motivo FECHADO: `not_eligible` fala do TURNO ("este aqui não pode ser
+   * reivindicado agora") quando o fato é sobre a CONVERSA ("um operador a
+   * assumiu"). O turno pode estar perfeitamente elegível — `queued`, sem
+   * backoff, sem ninguém o disputando — e ainda assim não pode rodar.
+   *
+   * Distinto de `stream_poisoned` porque a causa é uma DECISÃO CORRENTE e
+   * reversível por comando (`resume`), não um turno morto esperando
+   * desbloqueio manual.
+   *
+   * O predicado que produz esta recusa retém `pausing` E `human`
+   * (`streamNotHumanControlled`, em `src/db/repositories/conversation-control-sql.ts`).
+   * `pausing` é a janela entre a barreira comitada e a drenagem confirmada:
+   * deixá-la de fora permitiria ao bot INICIAR um turno depois do clique de
+   * pausa, que é o defeito que a fatia existe para impedir.
+   *
+   * NÃO gera row de auditoria por tentativa — mesma régua de `stream_poisoned`.
+   * A DECISÃO já foi auditada (`conversation_pause_requested`); uma row por
+   * claim recusado teria volume proporcional ao retry, não ao fato.
+   */
+  'conversation_human_control',
 ] as const;
 
 export type ClaimRejection = (typeof CLAIM_REJECTIONS)[number];

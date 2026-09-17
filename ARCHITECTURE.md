@@ -120,6 +120,7 @@ Every `src/` subdirectory has a one-line role here and a deep-dive module doc.
 | `src/governance/` | Rules, audit, dual-approval, idempotency | [governance.md](docs/architecture/modules/governance.md) |
 | `src/identity/` | Resolver, quarantine, voice modifier, proposal generator, profile renderer | [identity.md](docs/architecture/modules/identity.md) |
 | `src/import/` | OFX / CSV importers, reconciliation flow | [import.md](docs/architecture/modules/import.md) |
+| `src/integrations/` | Pontes para motores externos (hoje: contrato wire do worker Hermes) | [integrations.md](docs/architecture/modules/integrations.md) |
 | `src/lib/` | **LLM Gateway** (`src/lib/llm/` — fronteira única de chat/classificação/visão) + wrappers: Whisper, Redis, alerts, holidays, decimal | [lib.md](docs/architecture/modules/lib.md) |
 | `src/memory/` | 5 layers (working / episodic / semantic / procedural / vector) over Postgres + Redis | [memory.md](docs/architecture/modules/memory.md) |
 | `src/objectives/` | Work loop: registry de kinds (perceptores/executores) de objetivos | [objectives.md](docs/architecture/modules/objectives.md) |

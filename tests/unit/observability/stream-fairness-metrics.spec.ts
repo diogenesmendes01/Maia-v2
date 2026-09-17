@@ -240,7 +240,24 @@ describe('#629 — séries de fairness do escalonamento por stream', () => {
     for (const linha of linhas) {
       const labels = /\{([^}]*)\}/.exec(linha)?.[1] ?? '';
       // Os proibidos por escrito na issue-mãe, mais o `turn_id`.
-      expect(labels).not.toMatch(/stream_key|remote_jid|turn_id|conversa|tenant|agent_id/);
+      //
+      // ANCORADO NA POSIÇÃO DE NOME DE LABEL (`(^|,)nome…=`), e não solto na
+      // string inteira. A lista acima é de NOMES de label, e o que esta suíte
+      // proíbe — diz o item 3 do cabeçalho — é uma série CARREGAR um deles.
+      // Solto, o padrão também lia VALORES, e um valor de vocabulário fechado
+      // podia trombar por coincidência de substring: o P04.6 acrescentou
+      // `maia_stream_blocked_total{reason="conversation_human_control"}`, cinco
+      // valores fixos e cardinalidade ZERO, que casava em "convers-a-tion".
+      // Renomear o valor seria o conserto errado — a #626 centralizou o
+      // vocabulário justamente para não existirem dois nomes para o mesmo fato.
+      //
+      // A troca ENDURECE em vez de afrouxar: além de `conversa=`, passa a pegar
+      // `conversa_id=`, `tenant_id=` e `agent_id=` por causa do `\w*`. Provado
+      // por mutação: injetando um label `stream_key` numa série de stream, este
+      // caso reprova — se algum dia parar de reprovar, a guarda morreu.
+      expect(labels).not.toMatch(
+        /(^|,)(stream_key|remote_jid|turn_id|conversa|tenant|agent_id)\w*=/,
+      );
       // E o código de erro cru — `[a-z0-9_]{1,64}` livre — nunca. A CATEGORIA
       // existe exatamente para ser a projeção de cardinalidade fechada dele.
       expect(labels).not.toMatch(/error_code/);

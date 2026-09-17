@@ -351,6 +351,58 @@ export const AUDIT_ACTIONS = [
   'stream_unblocked',
   'turn_replay_refused',
   'turn_replay_reconciled',
+  // P04.2 — CONTROLE HUMANO da conversa. Os NOMES abaixo não são escolha
+  // minha: são os da spec maia-hermes §8.6.1 ("NOVOS eventos de audit
+  // tipados"), que é o ÚNICO lugar da especificação que nomeia evento de
+  // auditoria. Os estados que eles registram estão no §8.2.1, e o §8.2.3
+  // passo 4 é quem exige gravá-los.
+  // Ficam aqui, junto de `stream_poisoned`/`stream_unblocked`, e não junto de
+  // `owner_handoff_requested`: aquele bloco é de ações emitidas por TOOLS
+  // baseline, a pedido do modelo; estas são emitidas pelo repositório de
+  // controle a mando de um operador ou do reconciliador, e nunca são
+  // alcançáveis a partir de argumento de modelo.
+  // O §8.2.3 passo 4 exige gravar "comando e auditoria durável na MESMA
+  // transação", via `auditTx` — que recebe `acao: AuditAction`, união FECHADA.
+  // Sem estas cinco linhas o passo 4 é inexequível: não há o que escrever.
+  // Por que CADA uma é uma row, e não um `conversation_control_changed`
+  // genérico com o modo no metadata — mesma régua já aplicada ao par de stream
+  // acima e a `audit_mode_activated`/`audit_mode_deactivated`:
+  //   - `conversation_pause_requested`: um OPERADOR retirou a conversa do bot
+  //     (`bot → pausing`). É o COMANDO, e é ele que incrementa o epoch —
+  //     portanto o que invalida claim e snapshot em voo.
+  //   - `conversation_control_acquired`: o RECONCILIADOR confirmou que não há
+  //     I/O autorizado em aberto (`pausing → human`). Autor diferente do de
+  //     cima e efeito diferente: NÃO incrementa epoch de novo. Uma ação só
+  //     para os dois apagaria a distância entre "mandei parar" e "parou", que
+  //     é exatamente onde mora o efeito pela metade — o §8.2.3 chega a dizer
+  //     que `pause` retorna "barreira estabelecida, drenagem pendente", e não
+  //     "nenhuma mensagem jamais chegará depois deste clique".
+  //   - `conversation_resume_requested` e `conversation_automation_resumed`:
+  //     o MESMO par, do outro lado. Pedir a retomada e a automação de fato
+  //     voltar são fatos distintos, porque o resume "recusa enquanto houver
+  //     efeitos/entregas não conciliados" (§8.3.2) — então existe um estado
+  //     real em que o operador pediu e a automação ainda NÃO voltou.
+  //     Colapsá-los tornaria esse estado invisível, que é a mesma falha que a
+  //     separação do lado da pausa evita. A retomada é `future_only`
+  //     (§8.2.5, K-12): nenhuma das duas reabre o passado.
+  //   - `conversation_control_conflict`: a RECUSA. O §8.2.1 exige que "outra
+  //     chave conflitante não ganhe silenciosamente"; sem row própria, um
+  //     operador que acredita ter pausado fica indistinguível de um que
+  //     pausou, que é a forma de falha que a cláusula nomeia.
+  // Nenhuma delas é apelido de `owner_handoff_requested`: o §8.2.1 é explícito
+  // em que o pedido de handoff "não é um quarto modo de autorização". Pedido
+  // de ajuda e posse humana são fatos distintos e a UI precisa dos dois.
+  // Nenhuma das cinco carrega texto, prompt, telefone, JID ou `stream_key`.
+  // As outras cinco ações nomeadas no mesmo §8.6.1 — `engine_cancel_requested`,
+  // `engine_cancel_reconciled`, `engine_result_fenced`, `engine_quota_denied`
+  // e `operator_reply_committed` — NÃO entram aqui: pertencem a P05/P06/P07 e
+  // ao composer do §8.3.4, cujas semânticas ainda não estão fixadas. Ficam
+  // nomeadas como pendentes em vez de acrescentadas sem produtor.
+  'conversation_pause_requested',
+  'conversation_control_acquired',
+  'conversation_resume_requested',
+  'conversation_automation_resumed',
+  'conversation_control_conflict',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused
