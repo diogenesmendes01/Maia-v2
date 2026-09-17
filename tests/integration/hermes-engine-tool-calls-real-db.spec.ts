@@ -186,7 +186,7 @@ d("engine-repos — admissão de tool call contra Postgres real", () => {
         call_id: `${run_id}:${call_seq}`,
         ordinal: call_seq,
         iteration: over.iteration ?? 1,
-        name: over.name ?? "maia_fixture_echo",
+        name: over.name ?? "fixture_echo",
         args: over.args ?? { texto: "oi" },
       },
     };

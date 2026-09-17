@@ -74,7 +74,7 @@ def _tool_request(**over) -> str:
         "type": "tool.request",
         "run_id": RUN_ID,
         "call_seq": 0,
-        "name": "maia_fixture_echo",
+        "name": "fixture_echo",
         "args": {"texto": "oi"},
         "observed_session_id": None,
     }

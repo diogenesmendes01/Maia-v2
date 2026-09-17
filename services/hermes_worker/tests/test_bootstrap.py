@@ -250,9 +250,9 @@ class _AgenteFake:
 
 
 def test_superficie_igual_ao_manifest_passa() -> None:
-    agente = _AgenteFake(["maia_fixture_echo"])
-    assert verify_effective_surface(agente, ("maia_fixture_echo",)) == (
-        "maia_fixture_echo",
+    agente = _AgenteFake(["fixture_echo"])
+    assert verify_effective_surface(agente, ("fixture_echo",)) == (
+        "fixture_echo",
     )
 
 
@@ -260,31 +260,31 @@ def test_bridge_de_tool_search_na_superficie_bloqueia_a_readiness() -> None:
     """O default ``auto`` troca as tools por tool_search/describe/call."""
     agente = _AgenteFake(["tool_search", "tool_describe", "tool_call"])
     with pytest.raises(SurfaceMismatch, match="extra"):
-        verify_effective_surface(agente, ("maia_fixture_echo",))
+        verify_effective_surface(agente, ("fixture_echo",))
 
 
 def test_nome_extra_ou_ausente_bloqueia() -> None:
     with pytest.raises(SurfaceMismatch):
         verify_effective_surface(
-            _AgenteFake(["maia_fixture_echo", "terminal"]), ("maia_fixture_echo",)
+            _AgenteFake(["fixture_echo", "terminal"]), ("fixture_echo",)
         )
     with pytest.raises(SurfaceMismatch):
-        verify_effective_surface(_AgenteFake([]), ("maia_fixture_echo",))
+        verify_effective_surface(_AgenteFake([]), ("fixture_echo",))
 
 
 def test_duplicata_bloqueia() -> None:
     with pytest.raises(SurfaceMismatch, match="duplicado"):
         verify_effective_surface(
-            _AgenteFake(["maia_fixture_echo", "maia_fixture_echo"]),
-            ("maia_fixture_echo",),
+            _AgenteFake(["fixture_echo", "fixture_echo"]),
+            ("fixture_echo",),
         )
 
 
 def test_valid_tool_names_divergente_bloqueia() -> None:
     """Defesa de runtime do Hermes usa ``valid_tool_names``; divergir é drift."""
-    agente = _AgenteFake(["maia_fixture_echo"], valid=["maia_fixture_echo", "terminal"])
+    agente = _AgenteFake(["fixture_echo"], valid=["fixture_echo", "terminal"])
     with pytest.raises(SurfaceMismatch, match="valid_tool_names"):
-        verify_effective_surface(agente, ("maia_fixture_echo",))
+        verify_effective_surface(agente, ("fixture_echo",))
 
 
 # ─── inventário do home ─────────────────────────────────────────────────────

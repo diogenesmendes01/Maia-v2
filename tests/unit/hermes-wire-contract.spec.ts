@@ -52,7 +52,7 @@ function readyFrame(over: Record<string, unknown> = {}): Record<string, unknown>
       hermes_sha: '5d59366010640c1d6b8f170d8a4ee109db2bbdef',
       python_version: '3.12.10',
     },
-    effective_tool_names: ['maia_fixture_echo'],
+    effective_tool_names: ['fixture_echo'],
     tool_schema_digest: 'a'.repeat(64),
     ...over,
   };
@@ -64,7 +64,7 @@ function toolRequestFrame(over: Record<string, unknown> = {}): Record<string, un
     type: 'tool.request',
     run_id: RUN_ID,
     call_seq: 0,
-    name: 'maia_fixture_echo',
+    name: 'fixture_echo',
     args: { texto: 'oi' },
     observed_session_id: null,
     ...over,
@@ -114,7 +114,7 @@ function startFrame(over: Record<string, unknown> = {}): Record<string, unknown>
       schema: 'maia-hermes-runtime-manifest/v1',
       tools: [
         {
-          name: 'maia_fixture_echo',
+          name: 'fixture_echo',
           input_schema: { type: 'object', properties: {}, additionalProperties: false },
           result_limit_chars: 4096,
         },
@@ -246,7 +246,7 @@ describe('T05/T20 — schema estrito: nenhum campo de autoridade atravessa', () 
       seq: 1,
       event: 'tool_start',
       call_seq: 0,
-      tool_name: 'maia_fixture_echo',
+      tool_name: 'fixture_echo',
     };
     expect(parseWorkerFrame(line(base)).kind).toBe('ok');
     expect(parseWorkerFrame(line({ ...base, display_args: { cpf: '000' } })).kind).toBe('invalid');
@@ -254,7 +254,7 @@ describe('T05/T20 — schema estrito: nenhum campo de autoridade atravessa', () 
   });
 
   it('chave __proto__ é recusada em qualquer profundidade', () => {
-    const poluido = `{"protocol":"${HERMES_WORKER_PROTOCOL_VERSION}","type":"tool.request","run_id":"${RUN_ID}","call_seq":0,"name":"maia_fixture_echo","args":{"__proto__":{"admin":true}},"observed_session_id":null}`;
+    const poluido = `{"protocol":"${HERMES_WORKER_PROTOCOL_VERSION}","type":"tool.request","run_id":"${RUN_ID}","call_seq":0,"name":"fixture_echo","args":{"__proto__":{"admin":true}},"observed_session_id":null}`;
     const parsed = parseWorkerFrame(poluido);
     expect(parsed.kind).toBe('invalid');
     if (parsed.kind === 'invalid') expect(parsed.code).toBe('forbidden_key');

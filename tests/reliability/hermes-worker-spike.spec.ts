@@ -43,7 +43,7 @@ const d = SHOULD_RUN ? describe : describe.skip;
 const REPO = resolve(process.cwd());
 const HERMES_SHA = '5d59366010640c1d6b8f170d8a4ee109db2bbdef';
 const PROTOCOL = 'maia.hermes.worker.v1';
-const TOOL = 'maia_fixture_echo';
+const TOOL = 'fixture_echo';
 
 type Frame = Record<string, unknown>;
 

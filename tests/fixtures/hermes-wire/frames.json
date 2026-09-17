@@ -29,7 +29,7 @@
           "hermes_sha": "5d59366010640c1d6b8f170d8a4ee109db2bbdef",
           "python_version": "3.12.10"
         },
-        "effective_tool_names": ["maia_fixture_echo"],
+        "effective_tool_names": ["fixture_echo"],
         "tool_schema_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       }
     },
@@ -43,7 +43,7 @@
         "type": "tool.request",
         "run_id": "3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70",
         "call_seq": 0,
-        "name": "maia_fixture_echo",
+        "name": "fixture_echo",
         "args": { "texto": "oi" },
         "observed_session_id": null
       }
@@ -58,7 +58,7 @@
         "type": "tool.request",
         "run_id": "3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70",
         "call_seq": 0,
-        "name": "maia_fixture_echo",
+        "name": "fixture_echo",
         "args": { "texto": "oi" },
         "observed_session_id": null,
         "tenant_id": "primary"
@@ -75,7 +75,7 @@
         "run_id": "3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70",
         "call_seq": 0,
         "call_id": "3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70:99",
-        "name": "maia_fixture_echo",
+        "name": "fixture_echo",
         "args": {},
         "observed_session_id": null
       }
@@ -90,7 +90,7 @@
         "type": "tool.request",
         "run_id": "3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70",
         "call_seq": -1,
-        "name": "maia_fixture_echo",
+        "name": "fixture_echo",
         "args": {},
         "observed_session_id": null
       }
@@ -243,7 +243,7 @@
           "schema": "maia-hermes-runtime-manifest/v1",
           "tools": [
             {
-              "name": "maia_fixture_echo",
+              "name": "fixture_echo",
               "input_schema": {
                 "type": "object",
                 "properties": { "texto": { "type": "string" } },
@@ -489,7 +489,7 @@
       "direction": "worker_to_maia",
       "expect": "forbidden_key",
       "why": "__proto__ em qualquer profundidade é recusado antes do schema",
-      "line": "{\"protocol\":\"maia.hermes.worker.v1\",\"type\":\"tool.request\",\"run_id\":\"3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70\",\"call_seq\":0,\"name\":\"maia_fixture_echo\",\"args\":{\"__proto__\":{\"admin\":true}},\"observed_session_id\":null}"
+      "line": "{\"protocol\":\"maia.hermes.worker.v1\",\"type\":\"tool.request\",\"run_id\":\"3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70\",\"call_seq\":0,\"name\":\"fixture_echo\",\"args\":{\"__proto__\":{\"admin\":true}},\"observed_session_id\":null}"
     },
     {
       "id": "nao-json",

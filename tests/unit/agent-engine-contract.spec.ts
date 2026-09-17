@@ -48,7 +48,7 @@ const request = (over: Record<string, unknown> = {}) => ({
   context: {
     system: 'instruções aprovadas',
     messages: [{ role: 'user', content: '<user_message>oi</user_message>' }],
-    tools: [{ name: 'maia_fixture_echo', description: 'eco', input_schema: { type: 'object' } }],
+    tools: [{ name: 'fixture_echo', description: 'eco', input_schema: { type: 'object' } }],
   },
   limits: {
     max_iterations: 5,
@@ -95,7 +95,7 @@ const snapshot = (over: Record<string, unknown> = {}) => ({
   active_execution_id: null,
   outbound_prefix: null,
   allowed_entity_ids: [KEY],
-  allowed_tool_names: ['maia_fixture_echo'],
+  allowed_tool_names: ['fixture_echo'],
   policy_digest: SHA,
   source_versions: [{ kind: 'role', id: KEY, version: null }],
   ...over,
@@ -278,7 +278,7 @@ describe('EngineToolCallV1 / EngineToolReplyV1', () => {
     call_id: `${RUN}:0`,
     ordinal: 0,
     iteration: null,
-    name: 'maia_fixture_echo',
+    name: 'fixture_echo',
     args: { texto: 'oi' },
     ...over,
   });

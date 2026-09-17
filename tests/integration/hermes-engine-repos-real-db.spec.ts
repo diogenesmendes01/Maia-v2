@@ -395,7 +395,7 @@ d("engine-repos — journal de execução contra Postgres real", () => {
     await pool.query(
       `INSERT INTO engine_tool_calls (tenant_id, agent_id, turn_id, run_id, call_id, ordinal,
           tool_name, args_json, args_hash, request_id, state)
-       VALUES ($1,$2,$3,$4,$5,0,'maia_fixture_echo','{}'::jsonb,$6,$7,'dispatching')`,
+       VALUES ($1,$2,$3,$4,$5,0,'fixture_echo','{}'::jsonb,$6,$7,'dispatching')`,
       [TENANT, AGENT, turno.turn_id, run_id, `${run_id}:0`, SHA, randomUUID()],
     );
 
@@ -810,7 +810,7 @@ d("engine-repos — journal de execução contra Postgres real", () => {
       `INSERT INTO engine_tool_calls (tenant_id, agent_id, turn_id, run_id, call_id, ordinal,
           tool_name, args_json, args_hash, request_id, state,
           handler_started_at, dispatch_token, reservation_token)
-       VALUES ($1,$2,$3,$4,$5,0,'maia_fixture_echo','{}'::jsonb,$6,$7,'handler_started',
+       VALUES ($1,$2,$3,$4,$5,0,'fixture_echo','{}'::jsonb,$6,$7,'handler_started',
                now(), $8, 'res-1')`,
       [
         TENANT,
@@ -2214,7 +2214,7 @@ d("engine-repos — journal de execução contra Postgres real", () => {
       `INSERT INTO engine_tool_calls (tenant_id, agent_id, turn_id, run_id, call_id, ordinal,
           tool_name, args_json, args_hash, request_id, state, effect_evidence, finished_at, result_json,
           handler_started_at, dispatch_token, reservation_token)
-       VALUES ($1,$2,$3,$4,$5,$6,'maia_fixture_echo','{}'::jsonb,$7,$8,$9,$10,
+       VALUES ($1,$2,$3,$4,$5,$6,'fixture_echo','{}'::jsonb,$7,$8,$9,$10,
                ${conciliada ? "now()" : "NULL"}, ${conciliada ? "'{}'::jsonb" : "NULL"},
                ${precisaMarcador ? "now()" : "NULL"},
                ${precisaMarcador ? "gen_random_uuid()" : "NULL"},

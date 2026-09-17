@@ -33,7 +33,7 @@ def _tool_request(args: dict) -> str:
             "type": "tool.request",
             "run_id": RUN_ID,
             "call_seq": 0,
-            "name": "maia_fixture_echo",
+            "name": "fixture_echo",
             "args": args,
             "observed_session_id": None,
         }

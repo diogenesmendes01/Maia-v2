@@ -52,7 +52,7 @@ def _espera_linhas(buffer: io.BytesIO, quantas: int, timeout: float = 3.0) -> li
 def _invoca_em_thread(bridge: IpcBridge, caixa: dict) -> threading.Thread:
     def alvo() -> None:
         caixa["outcome"] = bridge.invoke(
-            "maia_fixture_echo", {"texto": "oi"}, observed_session_id="sess-1"
+            "fixture_echo", {"texto": "oi"}, observed_session_id="sess-1"
         )
 
     thread = threading.Thread(target=alvo, daemon=True)
@@ -122,7 +122,7 @@ def test_frame_emitido_e_um_tool_request_valido() -> None:
 def test_orcamento_de_tools_esgotado_recusa_sem_emitir_frame() -> None:
     writer, buffer = _writer()
     bridge = IpcBridge(writer, RUN_ID, max_tool_calls=0)
-    outcome = bridge.invoke("maia_fixture_echo", {}, observed_session_id=None)
+    outcome = bridge.invoke("fixture_echo", {}, observed_session_id=None)
     assert outcome.refusal_code == "budget_exhausted"
     assert _linhas(buffer) == []
 
@@ -133,7 +133,7 @@ def test_prazo_estourado_devolve_desconhecido_nao_falha() -> None:
     bridge = IpcBridge(
         writer, RUN_ID, max_tool_calls=4, deadline_monotonic=time.monotonic() - 1
     )
-    outcome = bridge.invoke("maia_fixture_echo", {}, observed_session_id=None)
+    outcome = bridge.invoke("fixture_echo", {}, observed_session_id=None)
     assert outcome.refusal_code == "effect_unknown"
 
 
@@ -156,7 +156,7 @@ def test_invoke_depois_do_fechamento_nao_cai_para_outro_backend() -> None:
     bridge = IpcBridge(writer, RUN_ID, max_tool_calls=4)
     bridge.close()
     with pytest.raises(BridgeUnavailable):
-        bridge.invoke("maia_fixture_echo", {}, observed_session_id=None)
+        bridge.invoke("fixture_echo", {}, observed_session_id=None)
 
 
 def test_resolve_de_call_seq_desconhecido_e_descartado() -> None:

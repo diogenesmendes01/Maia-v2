@@ -138,13 +138,17 @@ CASOS_TS = [
     ("frame_tool_request", {
         "protocol": "maia.hermes.worker.v1", "type": "tool.request",
         "run_id": "3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70", "call_seq": 0,
-        "name": "maia_fixture_echo", "args": {"texto": "oi"},
+        "name": "fixture_echo", "args": {"texto": "oi"},
         "observed_session_id": None,
     },
-     '{"args":{"texto":"oi"},"call_seq":0,"name":"maia_fixture_echo",'
+     '{"args":{"texto":"oi"},"call_seq":0,"name":"fixture_echo",'
      '"observed_session_id":null,"protocol":"maia.hermes.worker.v1",'
      '"run_id":"3f7c1f4e-6a1b-4c6d-9f1a-2b3c4d5e6f70","type":"tool.request"}',
-     "4e3c230cd48a2aae8ec1c2d48eebeebcc6089fe2d290a72419b43e1135150683"),
+     # Regerado pelo encoder TS (Node v22.23.2) quando o nome da tool de
+     # fixture perdeu o prefixo reservado `maia_*`, que K-19 proíbe (C27). O
+     # mesmo script reproduziu o digest antigo 4e3c230c… com o nome antigo antes
+     # de gerar este — prova de que o valor veio do TS, não de Python.
+     "e0b51a3205d6d817731d62676e6451803c8a80b5bd4fe2806041be7a7ba688c7"),
 ]
 
 

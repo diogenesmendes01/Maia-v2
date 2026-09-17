@@ -199,7 +199,7 @@ describe('MaiaEngine — start e proposta terminal', () => {
           call_id: `${RUN}:0`,
           ordinal: 0,
           iteration: null,
-          name: 'maia_fixture_echo',
+          name: 'fixture_echo',
           args: { texto: 'oi' },
         });
         return { ...TERMINAL_SIMPLES, observed_tool_call_ids: [`${RUN}:0`] };

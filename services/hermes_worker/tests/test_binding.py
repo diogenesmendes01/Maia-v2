@@ -18,7 +18,7 @@ def _binding(**over) -> WorkerBinding:
         "task_id": "task-3f7c1f4e",
         "initial_session_id": "sess-1",
         "manifest_digest": DIGEST,
-        "allowed_tool_names": ("maia_fixture_echo",),
+        "allowed_tool_names": ("fixture_echo",),
         "mode": "live",
     }
     kwargs.update(over)
@@ -27,8 +27,8 @@ def _binding(**over) -> WorkerBinding:
 
 def test_binding_valido_expoe_allowlist_exata() -> None:
     binding = _binding()
-    assert binding.allows("maia_fixture_echo")
-    assert not binding.allows("maia_fixture_ECHO")
+    assert binding.allows("fixture_echo")
+    assert not binding.allows("fixture_ECHO")
     assert not binding.allows("terminal")
 
 
@@ -60,7 +60,7 @@ def test_slots_impede_campo_novo_em_runtime() -> None:
 def test_allowlist_precisa_ser_tupla() -> None:
     """Uma ``list`` continuaria editável por dentro apesar do ``frozen=True``."""
     with pytest.raises(WorkerBindingError):
-        _binding(allowed_tool_names=["maia_fixture_echo"])
+        _binding(allowed_tool_names=["fixture_echo"])
 
 
 def test_allowlist_recusa_duplicata_e_vazio() -> None:

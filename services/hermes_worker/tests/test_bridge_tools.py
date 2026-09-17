@@ -32,7 +32,7 @@ TASK_ID = "task-3f7c1f4e"
 SEGREDO = "SALDO-SECRETO-4815162342"
 
 ENTRADA = {
-    "name": "maia_fixture_echo",
+    "name": "fixture_echo",
     "input_schema": {
         "type": "object",
         "properties": {"texto": {"type": "string"}},
@@ -48,7 +48,7 @@ def _spec(**over) -> ToolSpec:
     return ToolSpec.from_projection(entrada)
 
 
-def _binding(nomes=("maia_fixture_echo",)) -> WorkerBinding:
+def _binding(nomes=("fixture_echo",)) -> WorkerBinding:
     return WorkerBinding(
         execution_id=RUN_ID,
         task_id=TASK_ID,
@@ -257,7 +257,7 @@ def test_registro_feliz_usa_schema_interno_e_toolset_proprio() -> None:
     nomes = register_bridge_tools(
         registry, (_spec(),), _binding(), BridgeFake(), result_limit_chars=4096
     )
-    assert nomes == ("maia_fixture_echo",)
+    assert nomes == ("fixture_echo",)
     chamada = registry.chamadas[0]
     assert chamada["toolset"] == "maia_bridge_v1"
     assert chamada["override"] is False
@@ -267,7 +267,7 @@ def test_registro_feliz_usa_schema_interno_e_toolset_proprio() -> None:
 
 
 def test_colisao_de_nome_falha_alto() -> None:
-    registry = RegistryFake(ocupado=("maia_fixture_echo",))
+    registry = RegistryFake(ocupado=("fixture_echo",))
     with pytest.raises(ToolRegistrationError, match="tool_name_collision"):
         register_bridge_tools(
             registry, (_spec(),), _binding(), BridgeFake(), result_limit_chars=4096
@@ -301,6 +301,6 @@ def test_tool_fora_do_binding_nao_se_registra() -> None:
 
 
 def test_digest_da_superficie_independe_da_ordem_das_tools() -> None:
-    outra = _spec(name="maia_fixture_outro")
+    outra = _spec(name="fixture_outro")
     assert tool_schema_digest((_spec(), outra)) == tool_schema_digest((outra, _spec()))
     assert tool_schema_digest((_spec(),)) != tool_schema_digest((outra,))

@@ -144,7 +144,7 @@ async function mkCall(
     `INSERT INTO engine_tool_calls (
        id, tenant_id, agent_id, turn_id, run_id, call_id, ordinal, tool_name, args_json, args_hash,
        request_id, state, effect_evidence)
-     VALUES ($1,$2,$3,$4,$5,$6,$7,'maia_fixture_echo','{"texto":"oi"}'::jsonb,$8,$9,$10,$11)`,
+     VALUES ($1,$2,$3,$4,$5,$6,$7,'fixture_echo','{"texto":"oi"}'::jsonb,$8,$9,$10,$11)`,
     [
       id,
       tenant,
