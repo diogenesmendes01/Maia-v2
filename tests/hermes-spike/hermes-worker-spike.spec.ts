@@ -25,7 +25,19 @@
  * Comando local:
  *   MAIA_HERMES_WORKER_PYTHON=<upstream>/.venv/Scripts/python.exe \
  *   MAIA_HERMES_UPSTREAM=<upstream> \
- *   npx vitest run tests/reliability/hermes-worker-spike.spec.ts
+ *   npm run test:hermes-spike
+ *
+ * ─── Por que NÃO mora em `tests/reliability` ────────────────────────────────
+ *
+ * Morava, e isso reprovou o job obrigatório `fault injection (#510)` na PR #766:
+ * aquela lane roda `tests/reliability` inteiro com `--max-pulados 0`, e o job não
+ * tem (nem deve ganhar sem decisão do dono) Python e o checkout do Hermes. Esta
+ * spec não é injeção de falha de processo da #510 — é o spike de ABI do P00.4.
+ * Aqui ela continua sendo coletada pela suíte comum, onde pula sem teto. O
+ * contrato `tests/unit/ci/lane-de-fault-injection-no-ci.spec.ts` impede que uma
+ * spec com guarda de ambiente ausente no job volte para a lane. Rodá-la de fato
+ * no CI exige um job próprio com Python + Hermes pinado: decisão registrada, não
+ * tomada aqui.
  */
 import { describe, it, expect, afterEach } from 'vitest';
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
