@@ -37,7 +37,7 @@
  *
  * Skipped sem `TEST_DB_URL`.
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, afterEach } from "vitest";
 import pg from "pg";
 import { randomUUID } from "node:crypto";
 import { runWithTenantContext } from "@/db/tenant-context.js";
@@ -132,6 +132,51 @@ async function mkTurnoRetido(
     [turn_id, tenant, agente, status, mensagem_id, stream_key, ingress_seq],
   );
   return turn_id;
+}
+
+/** Os dois tenants desta spec — nenhuma outra spec os usa (conferido por grep). */
+const TENANTS_DA_SPEC = [TENANT, OUTRO_TENANT];
+
+/**
+ * Turnos COM STREAM que continuam vivos (fora dos estados terminais) nos tenants
+ * desta spec. É exatamente o que `snapshotStreamScheduling` conta — e ele conta
+ * CROSS-TENANT, por desenho. Resíduo daqui vira número errado na spec GLOBAL de
+ * fairness (`turn-stream-fairness-real-db`), que foi o que reprovou o CI da #766:
+ * `expected '6' to be '2'`, com os 4 turnos vivos dos casos 16 a 19.
+ */
+/**
+ * Apaga o que os casos criam em turnos e journal, na ordem das FKs `ON DELETE
+ * RESTRICT`: `engine_runs` → `engine_turn_bindings` → `agent_turns` (inputs em
+ * CASCADE) → contadores e mensagens. Controles e comandos NÃO são apagados:
+ * comando tem FK RESTRICT para controle e é histórico; o `afterAll` aposenta os
+ * comandos. Se um caso futuro usar `pinEngineAndPrepareRun`, ele grava eventos
+ * append-only e o DELETE do run passa a falhar — aí o turno precisa virar
+ * terminal em vez de apagado.
+ */
+async function limparResiduo(): Promise<void> {
+  for (const tabela of [
+    "engine_runs",
+    "engine_turn_bindings",
+    "agent_turn_inputs",
+    "agent_turns",
+    "agent_stream_sequences",
+    "mensagens",
+  ]) {
+    await pool.query(`DELETE FROM ${tabela} WHERE tenant_id = ANY($1::text[])`, [
+      TENANTS_DA_SPEC,
+    ]);
+  }
+}
+
+async function vivosComStream(): Promise<number> {
+  const r = await pool.query(
+    `SELECT count(*)::int AS n FROM agent_turns
+      WHERE tenant_id = ANY($1::text[])
+        AND stream_key IS NOT NULL
+        AND status NOT IN ('completed','ignored','superseded','dead_letter')`,
+    [TENANTS_DA_SPEC],
+  );
+  return r.rows[0].n;
 }
 
 async function lerTurno(
@@ -231,9 +276,19 @@ d("resumeConversationTx — a devolução da automação", () => {
     await seed();
     await seed(TENANT, OUTRO_AGENTE);
     await seed(OUTRO_TENANT, AGENT);
+    // Resíduo de rodada anterior no banco local da worktree.
+    await limparResiduo();
+  });
+
+  // Depois de CADA caso, e não só no fim: a spec de fairness é global e os
+  // arquivos rodam em paralelo no CI, então quanto menor a janela com turno
+  // vivo, menor a chance de outra spec contá-lo.
+  afterEach(async () => {
+    await limparResiduo();
   });
 
   afterAll(async () => {
+    if (pool) await limparResiduo();
     // Guarda de poluição: o índice de outbox dos comandos é parcial e
     // CROSS-TENANT. Aposenta em vez de deletar (FK `ON DELETE RESTRICT`).
     if (pool) {
@@ -690,5 +745,32 @@ d("resumeConversationTx — a devolução da automação", () => {
     expect(r.backlog_cancelled).toBe(1);
     expect((await lerTurno(ordenavel)).status).toBe("ignored");
     expect((await lerTurno(semSeq)).status).toBe("queued");
+  });
+
+  // ─── Higiene: esta spec não pode deixar turno vivo com stream no banco ─────
+  //
+  // Os casos abaixo dependem da ORDEM do arquivo (rodam depois dos anteriores).
+  // Com `-t` isolado eles passam sem medir nada — limite dito, não escondido.
+
+  it("22. higiene: nenhum turno vivo com stream sobrevive aos casos anteriores", async () => {
+    expect(await vivosComStream()).toBe(0);
+  });
+
+  it("23. a sonda de higiene enxerga as duas formas que o descarte preserva de propósito", async () => {
+    // Sem este caso, uma sonda quebrada (tenant errado, estado errado) deixaria o
+    // caso 22 verde sem ter olhado nada. `running` e `queued` com run aberto são
+    // exatamente os turnos que o descarte NÃO toca (casos 16 e 17).
+    const antes = await vivosComStream();
+    const { control_id, stream_key } = await mkControleHumano();
+    await mkTurnoRetido(stream_key, 1, "running");
+    const comRun = await mkTurnoRetido(stream_key, 2);
+    await mkRunAberto(comRun, control_id);
+    expect((await vivosComStream()) - antes).toBe(2);
+  });
+
+  it("24. a limpeza atravessa a cadeia de FKs RESTRICT (run → binding → turno)", async () => {
+    // Roda depois do 23, que deixou um run aberto com binding: se a limpeza não
+    // respeitasse a ordem das FKs, o DELETE falharia e sobraria turno vivo aqui.
+    expect(await vivosComStream()).toBe(0);
   });
 });
