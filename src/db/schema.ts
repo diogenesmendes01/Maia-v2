@@ -4238,7 +4238,10 @@ export const conversation_controls = pgTable(
      * `bot`. `mode: 'bigint'` (e não `number`) porque o contrato serializa
      * epoch como decimal e um contador de banco não deve depender de 2^53.
      */
-    control_epoch: bigint('control_epoch', { mode: 'bigint' }).notNull().default(0n),
+    // Default SQL, não `0n`: o drizzle-kit serializa o snapshot com
+    // `JSON.stringify`, que lança com BigInt e é engolido pelo gerador (PR #766;
+    // `tests/unit/db/schema-defaults-serializable.spec.ts`).
+    control_epoch: bigint('control_epoch', { mode: 'bigint' }).notNull().default(sql`0`),
     /** `app_users.id` é text. */
     owner_app_user_id: text('owner_app_user_id'),
     reason_code: text('reason_code'),
@@ -4407,7 +4410,10 @@ export const engine_runs = pgTable(
     closed_reason: text('closed_reason'),
     closed_at: timestamp('closed_at', { withTimezone: true }),
     last_error_code: text('last_error_code'),
-    last_event_sequence: bigint('last_event_sequence', { mode: 'bigint' }).notNull().default(0n),
+    // Default SQL, não `0n` — mesma razão de `conversation_controls.control_epoch`.
+    last_event_sequence: bigint('last_event_sequence', { mode: 'bigint' })
+      .notNull()
+      .default(sql`0`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
