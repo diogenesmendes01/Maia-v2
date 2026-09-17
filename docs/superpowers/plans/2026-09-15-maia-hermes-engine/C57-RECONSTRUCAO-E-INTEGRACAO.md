@@ -2,10 +2,11 @@
 
 > **Estado: preparado localmente, NÃO publicado.** Nada daqui foi empurrado,
 > mergeado na `main` ou aberto como PR. Em 17/09/2026 não existia branch remota
-> nem PR para a épica ou para as branches de agente (`git ls-remote --heads
-> origin` e `gh pr list --state all` vazios), então publicar esta linha é um
-> `push` de branch NOVA — não um force-push — e continua exigindo autorização
-> explícita do dono.
+> nem PR para a épica ou para as branches de agente: `git ls-remote --heads
+> origin` (374 heads) filtrado por `hermes|mh-|integracao` voltou vazio, e
+> `gh pr list --state all` com `--search hermes` e com `--head` de cada uma das
+> quatro branches voltou vazio. Publicar esta linha é um `push` de branch NOVA —
+> não um force-push — e continua exigindo autorização explícita do dono.
 
 ## 1. Por que existe
 
@@ -67,7 +68,15 @@ que não identifiquei** — não por comando meu nem dos investigadores somente-
 O primeiro commit rejeitado é `378999e1`, cujo pai é `001a0098`. Tudo até
 `001a0098` — inclusive os dois merges da épica (`7058b5fc`, `cda8263e`) — fica
 com os MESMOS SHAs. Reconstruídos: 20 commits lineares da épica
-(`378999e1..8003ee05`) + 17 dos agentes (6 + 9 + 2) = **37**.
+(`001a0098..8003ee05` na notação do git, que exclui o ponto de partida — de
+`378999e1` a `8003ee05`, inclusive) + 17 dos agentes (6 + 9 + 2) = **37**.
+
+**Convenção de intervalo.** Neste documento, `A..B` segue a semântica do git
+(exclui `A`). As mensagens dos três merges escrevem o intervalo de forma
+INCLUSIVA (`3edb9420..8a309b3d` para "seis commits"); já estão gravadas e não
+foram reescritas. **Nota sobre a mensagem de `155d0902`:** é cópia byte a byte
+de `8003ee05` e por isso ainda diz "trailers de IA em 7 commits" — o número
+certo é 6 (seção 1); mudar a mensagem quebraria a cópia fiel.
 
 ## 5. Método e critério de equivalência
 
@@ -167,6 +176,12 @@ Base original `7993e563` → base nova `18e9843e` (mesma árvore). Tip `5627eda0
 | `ed0cd748` | `merge(p06): integra o contrato do gateway de inferência e a contabilidade de custo` | `9a22fc21` + `fbfb61f2` |
 | `3b7fe541` | `merge(p07): integra a política pura do supervisor` | `ed0cd748` + `3cb3b2af` |
 | `afde96d7` | `fix(hermes): nome da tool de fixture obedece K-19 (C27)` | `3b7fe541` |
+| `2608feb2` | `docs(plans): registra a integração local do C57 e o C27, com o mapeamento de commits` | `afde96d7` |
+| `a5730a0f` | `fix(migrations): restaura LF no ledger RESERVATIONS.md…` (achado da revisão adversarial) | `2608feb2` |
+| `95aed007` | `test(hermes): guarda do C27 cobre progress.tool_name e as linhas cruas` (achado da revisão) | `a5730a0f` |
+
+Commits posteriores a esta tabela (correções de documentação) estão no log do git
+e no VERIFICATION-LOG; um documento não consegue citar o SHA do commit que o grava.
 
 Ordem P05 → P06 → P07: a spec (cap. 10, linhas 2627-2629) declara P06
 dependendo de P05 e P07 de P03–P06, e os relatórios dos agentes apontam os
@@ -187,8 +202,12 @@ alterar o script:
 | `3b7fe541` (integração, antes do C27) | **0** | `passou: 55 de 60 commit(s) do intervalo inspecionado(s)` |
 | sem `GITHUB_EVENT_PATH` | 0 | `pulado` — **não conta como aprovação** |
 
-A execução na tip FINAL fica registrada no log de verificação (V-047), porque
-este commit não pode citar o próprio SHA.
+~~A execução na tip FINAL fica registrada no log de verificação (V-047).~~
+**Corrigido:** essa frase prometia um registro que o V-047 não tinha (achado da
+revisão adversarial). As execuções nas tips posteriores — `afde96d7` (56 de 61),
+`2608feb2` (57 de 62), `a5730a0f` e `95aed007` — estão no V-049. A execução na
+tip do commit que grava estas linhas não pode ser registrada por ele mesmo; ela
+é informada ao dono no relatório da integração.
 
 ## 8. Como ler SHAs antigos nos documentos
 
@@ -198,7 +217,9 @@ REQUIREMENTS-MATRIX e dos AGENT-REPORT citam SHAs da linha ORIGINAL (por exemplo
 foram reescritos**: reescrevê-los dentro dos commits reconstruídos mudaria as
 árvores e destruiria a prova de equivalência da seção 5. Para localizar o commit
 correspondente na linha integrada, use as tabelas da seção 6. Os originais
-seguem alcançáveis pelas branches originais e pelos backups.
+seguem alcançáveis **só LOCALMENTE**, pelas branches originais e pelos backups —
+nenhuma delas está no remoto. Para quem revisar no GitHub depois de um push, os
+SHAs antigos não resolvem, e a tabela da seção 6 é a ÚNICA tradução.
 
 ## 9. O que ainda exige autorização
 
