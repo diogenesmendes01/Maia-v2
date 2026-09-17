@@ -346,6 +346,13 @@ export const BROKER_REFUSAL_REASONS = [
    */
   'too_deep',
   'resource_out_of_acl',
+  /**
+   * Um seletor de recurso declarado trouxe forma que não é id (número, objeto,
+   * lista dentro de lista). Não é "o recurso não é seu" — ninguém decidiu
+   * pertencimento —, é payload malformado, e por isso vai ao wire como erro de
+   * protocolo, junto de `reserved_argument`/`unknown_argument`.
+   */
+  'invalid_resource_selector',
   'shadow_write_blocked',
 ] as const;
 
@@ -389,6 +396,7 @@ export function refusalWireCode(reason: BrokerRefusalReason): BrokerWireRefusalC
     case 'reserved_argument':
     case 'unknown_argument':
     case 'too_deep':
+    case 'invalid_resource_selector':
       return 'protocol_error';
     default: {
       const _never: never = reason;
@@ -507,8 +515,13 @@ export function decideToolCall(input: ToolCallDecisionInputV1): ToolAdmissionV1 
     // `scan_truncated` NÃO é "o recurso não é seu" — é "não enxerguei o payload
     // inteiro". Reportá-lo como `resource_out_of_acl` afirmaria uma decisão de
     // pertencimento que ninguém tomou.
+    // `invalid_selector` também não é decisão de pertencimento: é forma ilegível.
     return recusa(
-      acl.reason === 'scan_truncated' ? 'too_deep' : 'resource_out_of_acl',
+      acl.reason === 'scan_truncated'
+        ? 'too_deep'
+        : acl.reason === 'invalid_selector'
+          ? 'invalid_resource_selector'
+          : 'resource_out_of_acl',
       `campo ${acl.field} (${acl.reason})`,
     );
   }

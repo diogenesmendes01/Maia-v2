@@ -252,7 +252,9 @@ describe('P05 — T24: ACL de recurso decide por PERTENCIMENTO', () => {
   });
 
   it('16. nenhum recurso pedido é permitido — não há o que autorizar', () => {
-    expect(authorizeResourceRefs(binding(), { refs: [], truncated: null }).kind).toBe('allow');
+    expect(
+      authorizeResourceRefs(binding(), { refs: [], truncated: null, invalid: null }).kind,
+    ).toBe('allow');
   });
 
   it('17. campo que NÃO é seletor declarado não vira recurso', () => {
@@ -260,6 +262,89 @@ describe('P05 — T24: ACL de recurso decide por PERTENCIMENTO', () => {
     // ACL passaria a depender de heurística de nome de campo.
     const varredura = collectResourceRefs({ observacao: ENTIDADE_B }, seletores);
     expect(varredura.refs).toEqual([]);
+  });
+});
+
+describe('P05 — T24: seletor declarado recebendo LISTA ou valor não-string (PR #766)', () => {
+  // Achado de revisão da PR #766: a coleta só reconhecia o id quando o valor do
+  // seletor era string. Com `{ entidade_ids: [B] }` o array era visitado elemento
+  // a elemento, o nome da chave se perdia, nenhum `ResourceRefV1` nascia e a ACL
+  // AUTORIZAVA — inclusive com ACL vazia. Já existem ferramentas que recebem
+  // `entidade_ids` como array (`compare_entities`, `generate_report`,
+  // `register_custom_holiday`).
+  const seletores = {
+    pessoa_id: 'pessoa',
+    conversa_id: 'conversa',
+    entidade_id: 'entidade',
+    entidade_ids: 'entidade',
+  } as const;
+
+  const decidir = (args: unknown, b = binding()) =>
+    authorizeResourceRefs(b, collectResourceRefs(args, seletores));
+
+  it('13d. lista com id de outro cliente é RECUSADA, nomeando o elemento e sem ecoar o id', () => {
+    const d = decidir({ entidade_ids: [ENTIDADE_B] });
+    expect(d).toEqual({ kind: 'deny', reason: 'out_of_acl', field: 'entidade_ids[0]' });
+    expect(JSON.stringify(d)).not.toContain(ENTIDADE_B);
+  });
+
+  it('13e. lista MISTA (permitido + proibido) é recusada no elemento proibido', () => {
+    expect(decidir({ entidade_ids: [ENTIDADE_A, ENTIDADE_B] })).toEqual({
+      kind: 'deny',
+      reason: 'out_of_acl',
+      field: 'entidade_ids[1]',
+    });
+  });
+
+  it('13f. lista contra ACL VAZIA recusa por contexto vazio (G-AUTH)', () => {
+    const vazia = binding({ acl: { pessoa_ids: [], conversa_ids: [], entidade_ids: [] } });
+    const d = decidir({ entidade_ids: [ENTIDADE_A] }, vazia);
+    expect(d).toEqual({ kind: 'deny', reason: 'empty_acl', field: 'entidade_ids[0]' });
+  });
+
+  it('13g. chave SINGULAR recebendo lista também é vista e recusada', () => {
+    expect(decidir({ entidade_id: [ENTIDADE_B] }).kind).toBe('deny');
+  });
+
+  it('13h. lista ANINHADA sob seletor é vista e recusada', () => {
+    expect(decidir({ filtro: { entidade_ids: [ENTIDADE_B] } })).toEqual({
+      kind: 'deny',
+      reason: 'out_of_acl',
+      field: 'filtro.entidade_ids[0]',
+    });
+  });
+
+  it('13i. forma que a ACL não sabe ler sob seletor declarado RECUSA como seletor inválido', () => {
+    // Número, objeto e lista dentro de lista não são id: a ACL não pode decidir
+    // sobre eles, e "não entendi" jamais pode significar "não há recurso".
+    for (const args of [
+      { entidade_ids: [[ENTIDADE_B]] },
+      { entidade_ids: [ENTIDADE_A, 7] },
+      { entidade_id: 123 },
+      { entidade_id: { valor: ENTIDADE_B } },
+    ]) {
+      const d = decidir(args);
+      expect(d.kind, JSON.stringify(args)).toBe('deny');
+      if (d.kind !== 'deny') continue;
+      expect(d.reason, JSON.stringify(args)).toBe('invalid_selector');
+      expect(JSON.stringify(d)).not.toContain(ENTIDADE_B);
+    }
+  });
+
+  it('13j. controles: lista só com ids da ACL é permitida e VIRA referência', () => {
+    const varredura = collectResourceRefs({ entidade_ids: [ENTIDADE_A] }, seletores);
+    // Sem esta contagem, uma coleta que continuasse ignorando listas passaria
+    // pelo `allow` abaixo sem ter olhado id nenhum.
+    expect(varredura.refs).toEqual([{ kind: 'entidade', id: ENTIDADE_A, field: 'entidade_ids[0]' }]);
+    expect(authorizeResourceRefs(binding(), varredura)).toEqual({ kind: 'allow' });
+    expect(decidir({ entidade_ids: [ENTIDADE_A, ENTIDADE_A] })).toEqual({ kind: 'allow' });
+  });
+
+  it('13k. controles: lista vazia, seletor nulo e lista em campo NÃO declarado não recusam', () => {
+    expect(decidir({ entidade_ids: [] })).toEqual({ kind: 'allow' });
+    expect(decidir({ entidade_id: null })).toEqual({ kind: 'allow' });
+    expect(collectResourceRefs({ observacao: [ENTIDADE_B] }, seletores).refs).toEqual([]);
+    expect(decidir({ observacao: [ENTIDADE_B] })).toEqual({ kind: 'allow' });
   });
 });
 

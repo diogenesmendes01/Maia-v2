@@ -510,6 +510,65 @@ describe('P05 — a decisão por chamada segue a ordem do §6.9.1', () => {
     expect(JSON.stringify(d)).not.toContain(ENTIDADE_B);
   });
 
+  describe('26b–26f. T24 ponta a ponta com LISTA de ids (achado da PR #766)', () => {
+    const comLista = manifesto([
+      tool({
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: { entidade_ids: { type: 'array', items: { type: 'string' } } },
+        },
+      }),
+    ]);
+    const chamar = (args: unknown, over: Parameters<typeof binding>[0] = {}) =>
+      decideToolCall({
+        binding: binding({ manifest_digest: computeManifestDigest(comLista), ...over }),
+        manifest: comLista,
+        frame: { run_id: RUN_A, name: NOME, args: args as Record<string, unknown>, call_seq: 0 },
+        surface: superficie(),
+        selectors: { entidade_ids: 'entidade' },
+      });
+
+    it('26b. lista com id de outro cliente RECUSA a chamada, sem ecoar o id', () => {
+      const d = chamar({ entidade_ids: [ENTIDADE_B] });
+      expect(d.kind).toBe('refuse');
+      if (d.kind !== 'refuse') return;
+      expect(d.reason).toBe('resource_out_of_acl');
+      expect(JSON.stringify(d)).not.toContain(ENTIDADE_B);
+    });
+
+    it('26c. lista MISTA recusa a chamada', () => {
+      const d = chamar({ entidade_ids: [ENTIDADE_A, ENTIDADE_B] });
+      expect(d.kind).toBe('refuse');
+      if (d.kind !== 'refuse') return;
+      expect(d.reason).toBe('resource_out_of_acl');
+    });
+
+    it('26d. lista contra ACL VAZIA recusa a chamada', () => {
+      const d = chamar(
+        { entidade_ids: [ENTIDADE_A] },
+        { acl: { pessoa_ids: [PESSOA_A], conversa_ids: [CONVERSA_A], entidade_ids: [] } },
+      );
+      expect(d.kind).toBe('refuse');
+      if (d.kind !== 'refuse') return;
+      expect(d.reason).toBe('resource_out_of_acl');
+    });
+
+    it('26e. forma ilegível sob seletor recusa como seletor inválido, erro de protocolo no wire', () => {
+      // Não é "o recurso não é seu": ninguém decidiu pertencimento. Dizer
+      // `resource_out_of_acl` afirmaria uma decisão que não foi tomada.
+      const d = chamar({ entidade_ids: [[ENTIDADE_B]] });
+      expect(d.kind).toBe('refuse');
+      if (d.kind !== 'refuse') return;
+      expect(d.reason).toBe('invalid_resource_selector');
+      expect(refusalWireCode(d.reason)).toBe('protocol_error');
+    });
+
+    it('26f. controle: lista só com ids da ACL é ADMITIDA', () => {
+      expect(chamar({ entidade_ids: [ENTIDADE_A] }).kind).toBe('admit');
+    });
+  });
+
   it('27. INV-10: em shadow, ferramenta com efeito é bloqueada', () => {
     const escrita = manifesto([
       tool({ side_effect: 'write', effect_class: 'idempotent', audit_action: 'fact_saved' }),

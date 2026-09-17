@@ -197,11 +197,21 @@ export interface ResourceScanV1 {
   refs: ResourceRefV1[];
   /** Caminho onde a varredura PAROU por profundidade; `null` = varreu até o fim. */
   truncated: string | null;
+  /**
+   * Primeiro caminho em que um seletor DECLARADO trouxe uma forma que não é id
+   * (número, objeto, lista dentro de lista); `null` = nenhum. Recusa pela mesma
+   * razão do `truncated`: a ACL não decide sobre o que não consegue ler.
+   */
+  invalid: string | null;
 }
 
 export type ResourceAclDecisionV1 =
   | { kind: 'allow' }
-  | { kind: 'deny'; reason: 'out_of_acl' | 'empty_acl' | 'scan_truncated'; field: string };
+  | {
+      kind: 'deny';
+      reason: 'out_of_acl' | 'empty_acl' | 'scan_truncated' | 'invalid_selector';
+      field: string;
+    };
 
 export const MAX_REF_DEPTH = 16;
 
@@ -224,6 +234,7 @@ export function collectResourceRefs(
 ): ResourceScanV1 {
   const refs: ResourceRefV1[] = [];
   let truncated: string | null = null;
+  let invalid: string | null = null;
   const visitar = (valor: unknown, caminho: string, profundidade: number): void => {
     if (valor === null || typeof valor !== 'object') return;
     // Estourar o teto REGISTRA a desistência em vez de voltar calado. A ACL não
@@ -240,15 +251,34 @@ export function collectResourceRefs(
     for (const [chave, v] of Object.entries(valor as Record<string, unknown>)) {
       const caminhoFilho = caminho ? `${caminho}.${chave}` : chave;
       const kind = selectors[chave];
-      if (kind && typeof v === 'string') {
-        refs.push({ kind, id: v, field: caminhoFilho });
+      if (kind) {
+        // O seletor DECLARADO governa o valor inteiro, qualquer que seja a forma.
+        // A versão anterior só reconhecia string e mandava todo o resto para
+        // `visitar` — que, numa lista, visita cada elemento já SEM o nome da
+        // chave, então `{ entidade_ids: [idDeOutroCliente] }` não gerava
+        // referência nenhuma e a ACL autorizava (achado da PR #766).
+        if (typeof v === 'string') {
+          refs.push({ kind, id: v, field: caminhoFilho });
+        } else if (Array.isArray(v)) {
+          v.forEach((item, i) => {
+            if (typeof item === 'string') {
+              refs.push({ kind, id: item, field: `${caminhoFilho}[${i}]` });
+            } else {
+              invalid ??= `${caminhoFilho}[${i}]`;
+            }
+          });
+        } else if (v !== null && v !== undefined) {
+          // Ausente (null/undefined) não seleciona nada; qualquer outra forma é
+          // ilegível para a ACL e contamina a decisão.
+          invalid ??= caminhoFilho;
+        }
         continue;
       }
       visitar(v, caminhoFilho, profundidade + 1);
     }
   };
   visitar(args, '', 0);
-  return { refs, truncated };
+  return { refs, truncated, invalid };
 }
 
 /**
@@ -278,6 +308,12 @@ export function authorizeResourceRefs(
   // (G-AUTH), um sobre contexto vazio e outro sobre visão incompleta.
   if (scan.truncated !== null) {
     return { kind: 'deny', reason: 'scan_truncated', field: scan.truncated };
+  }
+  // Mesmo princípio, outra forma de visão incompleta: um seletor declarado que
+  // trouxe algo que não é id. `!== null` (e não truthiness) de propósito: um scan
+  // montado à mão sem o campo também recusa.
+  if (scan.invalid !== null) {
+    return { kind: 'deny', reason: 'invalid_selector', field: String(scan.invalid) };
   }
   for (const ref of scan.refs) {
     const permitidos =
