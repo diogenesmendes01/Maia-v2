@@ -80,3 +80,30 @@ regexes = [
   '''^trocar_''',
   '''\.\.\.$''',
 ]
+
+# ----------------------------------------------------------------------------
+# Synthetic request_key in the maia.hermes.worker.v1 contract fixtures (PR #766)
+# ----------------------------------------------------------------------------
+# One hand-written UUID is the idempotency key of the run in the Hermes wire
+# contract fixtures and tests. It is not a credential; generic-api-key trips on
+# the key-shaped field name plus the token shape and entropy (3.898 > 3.5).
+#
+# Why [[rules]] + [[rules.allowlists]] and NOT a top-level [[allowlists]]:
+#   gitleaks-action@v3 installs gitleaks 8.24.3. Its ViperConfig reads only a
+#   singular top-level [allowlist] (no `condition`); the top-level
+#   [[allowlists]] array exists only from 8.25.0 and is silently ignored before
+#   that. Rule-level allowlists ARE merged into the default rule of the same id
+#   when extending the default config, and rule validation runs after the merge.
+#
+# Scope is minimal (condition = "AND"): the finding must be in one of the listed
+# test files AND the extracted secret must be exactly the synthetic UUID. The
+# same value anywhere else, or any other token in these files, is still reported.
+# tests/unit/ci/gitleaks-fixture-allowlist.spec.ts pins this shape and scope.
+[[rules]]
+id = "generic-api-key"
+
+[[rules.allowlists]]
+description = "Synthetic request_key UUID in the maia.hermes.worker.v1 contract fixtures (PR #766) - not a credential"
+condition = "AND"
+paths = ['''(?:^|/)(?:tests/fixtures/hermes-wire/frames\.json|tests/unit/(?:hermes-wire-contract|agent-engine-contract|maia-engine)\.spec\.ts|services/hermes_worker/tests/test_(?:protocol_fixtures|ipc|bootstrap)\.py)$''']
+regexes = ['''^8a1e2c3d-4b5a-4c7d-8e9f-0a1b2c3d4e5f$''']
