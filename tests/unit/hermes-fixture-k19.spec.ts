@@ -40,6 +40,7 @@ const RAIZ = resolve(__dirname, '../..');
 type Frame = {
   type?: string;
   name?: string;
+  tool_name?: string | null;
   effective_tool_names?: string[];
   manifest?: { tools?: Array<{ name?: string }> };
 };
@@ -52,8 +53,14 @@ const fixture = JSON.parse(
   readFileSync(join(RAIZ, 'tests/fixtures/hermes-wire/frames.json'), 'utf8'),
 ) as Fixture;
 
-/** Cada nome de tool com a POSIÇÃO de onde veio — a mensagem de falha diz onde. */
-function nomesDaFixture(): Array<{ onde: string; nome: string }> {
+/**
+ * Cada nome de tool com a POSIÇÃO de onde veio — a mensagem de falha diz onde.
+ *
+ * Recebe a fixture como argumento para que o caso 4 possa provar a EXTRAÇÃO
+ * com frames sintéticos: a fixture real não exercita toda chave do wire, e uma
+ * extração que esquecesse uma chave ficaria verde sobre ela sem ter olhado nada.
+ */
+function nomesDe(fx: Fixture): Array<{ onde: string; nome: string }> {
   const achados: Array<{ onde: string; nome: string }> = [];
   const doFrame = (onde: string, f: Frame | undefined): void => {
     if (!f) return;
@@ -63,14 +70,19 @@ function nomesDaFixture(): Array<{ onde: string; nome: string }> {
     if (f.type === 'tool.request' && typeof f.name === 'string') {
       achados.push({ onde: `${onde}.name`, nome: f.name });
     }
+    // `progress.tool_name` é nullable no wire (protocol.ts): `iteration_started`
+    // não tem tool. Nulo não é nome, então só a string entra.
+    if (f.type === 'progress' && typeof f.tool_name === 'string') {
+      achados.push({ onde: `${onde}.tool_name`, nome: f.tool_name });
+    }
     for (const t of f.manifest?.tools ?? []) {
       if (typeof t.name === 'string') {
         achados.push({ onde: `${onde}.manifest.tools[].name`, nome: t.name });
       }
     }
   };
-  for (const c of fixture.cases) doFrame(`cases[${c.id}]`, c.frame);
-  for (const r of fixture.raw_line_cases) {
+  for (const c of fx.cases) doFrame(`cases[${c.id}]`, c.frame);
+  for (const r of fx.raw_line_cases) {
     // Linhas cruas podem ser JSON inválido de propósito — é o que elas testam.
     let frame: Frame | undefined;
     try {
@@ -84,14 +96,49 @@ function nomesDaFixture(): Array<{ onde: string; nome: string }> {
   return achados;
 }
 
+const nomesDaFixture = (): Array<{ onde: string; nome: string }> => nomesDe(fixture);
+
 describe('C27 — nomes de tool da fixture compartilhada obedecem K-19', () => {
-  it('a varredura NÃO é vácua: acha nome nas três posições que o protocolo carrega', () => {
-    // Sem isto, um refactor da fixture que apagasse as posições deixaria o
-    // caso seguinte verde sem ter olhado nome nenhum.
-    const posicoes = new Set(nomesDaFixture().map(({ onde }) => onde.replace(/^[^\]]*\]\./, '')));
+  it('a varredura NÃO é vácua: acha nome nas posições que a fixture exercita, inclusive em linha crua', () => {
+    // Sem isto, um refactor da fixture — ou da extração — que apagasse posições
+    // deixaria o caso seguinte verde sem ter olhado nome nenhum. A exigência de
+    // origem `raw_line_cases` existe porque, sem ela, remover a leitura das
+    // linhas cruas não derrubava caso nenhum (achado da revisão adversarial).
+    const achados = nomesDaFixture();
+    const posicoes = new Set(achados.map(({ onde }) => onde.replace(/^[^\]]*\]\./, '')));
     expect(posicoes).toContain('effective_tool_names');
     expect(posicoes).toContain('name');
     expect(posicoes).toContain('manifest.tools[].name');
+    expect(achados.some(({ onde }) => onde.startsWith('raw_line_cases['))).toBe(true);
+  });
+
+  it('a EXTRAÇÃO cobre as quatro chaves em que o wire carrega nome de tool', () => {
+    // As quatro chaves do protocolo (src/integrations/hermes/protocol.ts):
+    // `ready.effective_tool_names[]`, `tool.request.name`, `progress.tool_name`
+    // e `start.manifest.tools[].name`. A fixture real não tem frame `progress`,
+    // então só frames SINTÉTICOS provam que a extração lê essa chave — e uma
+    // linha crua prova o mesmo pelo caminho do JSON escapado.
+    const sintetica: Fixture = {
+      cases: [
+        { id: 'r', frame: { type: 'ready', effective_tool_names: ['n_ready'] } },
+        { id: 't', frame: { type: 'tool.request', name: 'n_request' } },
+        { id: 'p', frame: { type: 'progress', tool_name: 'n_progress' } },
+        { id: 's', frame: { type: 'start', manifest: { tools: [{ name: 'n_manifest' }] } } },
+        // `name` fora de `tool.request` NÃO é nome de tool — não pode entrar.
+        { id: 'x', frame: { type: 'result', name: 'nao_e_tool' } },
+      ],
+      raw_line_cases: [
+        { id: 'cru', line: JSON.stringify({ type: 'progress', tool_name: 'n_cru' }) },
+        { id: 'invalido', line: '{nao json' },
+      ],
+    };
+    expect(nomesDe(sintetica)).toEqual([
+      { onde: 'cases[r].effective_tool_names', nome: 'n_ready' },
+      { onde: 'cases[t].name', nome: 'n_request' },
+      { onde: 'cases[p].tool_name', nome: 'n_progress' },
+      { onde: 'cases[s].manifest.tools[].name', nome: 'n_manifest' },
+      { onde: 'raw_line_cases[cru].tool_name', nome: 'n_cru' },
+    ]);
   });
 
   it('nenhum nome de tool da fixture é reservado por K-19 nem está no deny inicial', () => {
@@ -106,10 +153,15 @@ describe('C27 — nomes de tool da fixture compartilhada obedecem K-19', () => {
     expect(violacoes).toEqual([]);
   });
 
-  it('o nome reservado antigo não sobrevive em harness de teste, fora dos casos NEGATIVOS do P05', () => {
+  it('o LITERAL do nome antigo não sobrevive em harness de teste, fora dos casos NEGATIVOS do P05', () => {
     // Cobre o que a fixture não cobre: os literais dos testes Python e TS que
-    // usam o nome da tool de fixture como nome VÁLIDO. Varredura por
+    // usavam o nome da tool de fixture como nome VÁLIDO. Varredura por
     // diretório, para que arquivo novo também seja pego.
+    //
+    // LIMITE, dito no título e aqui: este caso procura SÓ o literal do nome
+    // antigo. Outro nome reservado (`maia_x`, `mcp:a:b`, `all`) escrito direto
+    // num frame de teste NÃO é detectado por ele — quem aplica a regra real é o
+    // caso 2, e só sobre a fixture compartilhada.
     const PERMITIDOS = new Set([
       'tests/unit/hermes-manifest-contract.spec.ts',
       'tests/unit/hermes-tool-broker-policy.spec.ts',
