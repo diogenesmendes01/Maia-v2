@@ -138,6 +138,7 @@ export type PauseConversationRefusal =
 
 type ComandoRow = {
   id: string;
+  control_id: string;
   request_hash: string;
   status: string;
   outcome_code: string | null;
@@ -149,83 +150,186 @@ type ComandoRow = {
   updated_at: Date;
 };
 
+/**
+ * Versão do contrato da identidade de comando. Entra no digest: mudar o que a
+ * identidade cobre muda o valor, e um retry que atravesse essa mudança vira
+ * conflito em vez de casar por acaso.
+ */
+export const CONVERSATION_CONTROL_COMMAND_CONTRACT =
+  'maia.conversation_control_command/v1' as const;
+
+/** Tudo o que distingue um comando de outro que reuse a mesma chave. */
+export type ConversationControlCommandIdentity = {
+  kind: 'pause' | 'resume';
+  control_id: string;
+  expected_epoch: string;
+  requested_by_app_user_id: string;
+  reason_code: string;
+  resume_policy: string | null;
+  request_payload: unknown;
+};
+
+/**
+ * O `request_hash` do comando (§8.3.2): "versão do contrato, principal
+ * autenticado, tipo de comando, controle/conversa, epoch esperado e payload
+ * validado".
+ *
+ * A primeira versão cobria só `request_payload` — achado de revisão da PR #766.
+ * A mesma chave com o mesmo payload, noutra conversa, por outro operador, com
+ * outro epoch ou noutra operação, voltava como replay ACEITO do comando
+ * anterior: sucesso sem pausar nada. O §8.3.2 manda o contrário: "reuso
+ * divergente, inclusive em outra conversa ou tipo de comando, dá conflito".
+ *
+ * Tenant e agente não entram: a busca e a unique da 141 já são escopadas pelos
+ * dois, então nunca comparam hashes de escopos diferentes.
+ */
+export function conversationControlCommandDigest(
+  identity: ConversationControlCommandIdentity,
+): string {
+  return canonicalDigest({
+    contract: CONVERSATION_CONTROL_COMMAND_CONTRACT,
+    kind: identity.kind,
+    control_id: identity.control_id,
+    expected_epoch: identity.expected_epoch,
+    requested_by_app_user_id: identity.requested_by_app_user_id,
+    reason_code: identity.reason_code,
+    resume_policy: identity.resume_policy,
+    request_payload: identity.request_payload ?? null,
+  });
+}
+
+/**
+ * O comando já gravado com esta chave, no escopo corrente.
+ *
+ * `trancar` só na leitura que ABRE a operação, antes do lock do controle — a de
+ * sempre. A releitura que acontece DEPOIS do lock do controle é um SELECT
+ * simples: trancar o comando ali criaria a aresta controle → comando na ordem de
+ * locks, e nada precisa dela.
+ */
+async function lerComandoPorChave(
+  tx: Executor,
+  escopo: { tenant_id: string; agent_id: string },
+  idempotency_key: string,
+  trancar: boolean,
+): Promise<ComandoRow | undefined> {
+  return linhas<ComandoRow>(
+    await tx.execute(sql`
+      SELECT id, control_id, request_hash, status, outcome_code,
+             result_epoch::text AS result_epoch,
+             barrier_committed, drain_status, inflight_effects,
+             unknown_deliveries, updated_at
+        FROM conversation_control_commands
+       WHERE tenant_id = ${escopo.tenant_id} AND agent_id = ${escopo.agent_id}
+         AND idempotency_key = ${idempotency_key}
+       ${trancar ? sql`FOR UPDATE` : sql``}`),
+  )[0];
+}
+
+/**
+ * A recusa devida a um comando já gravado com a mesma chave, ou `null` quando
+ * ele é o MESMO comando, aceito — e aí quem chama responde o replay.
+ */
+async function recusaDoComandoGravado(
+  tx: Executor,
+  existente: ComandoRow,
+  request_hash: string,
+  control_id_pedido: string,
+): Promise<{ ok: false; reason: PauseConversationRefusal; command_id?: string } | null> {
+  // Mesma chave com identidade divergente é CONFLITO, nunca última-escrita-vence
+  // (§8.2.4). Guardar só a chave tornaria os dois indistinguíveis.
+  if (existente.request_hash !== request_hash) {
+    await auditTx(tx, {
+      acao: 'conversation_control_conflict',
+      metadata: {
+        command_id: existente.id,
+        control_id: control_id_pedido,
+        outcome_code: 'payload_conflict',
+      },
+    });
+    // Sem `command_id`: o comando gravado é de OUTRA identidade, e o §8.2.4
+    // manda "não devolver resultados de outra identidade que reutilize uma
+    // chave". O vínculo fica na trilha, não na resposta.
+    return { ok: false, reason: 'payload_conflict' };
+  }
+  if (existente.status !== 'accepted') {
+    // A identidade BATEU — o que há é um comando guardado que não foi aceito.
+    // Devolver `payload_conflict` aqui seria mentir sobre a causa, e era o que a
+    // primeira versão da pausa fazia: um ramo sem teste, com o tipo satisfeito e
+    // a semântica errada. O desfecho correto é o que está PERSISTIDO, e o
+    // `_outcome_chk` da 141 garante que ele existe — status `conflict`/`failed`
+    // exige `outcome_code` não nulo.
+    //
+    // Pausa e retomada só escrevem `accepted`, então hoje o ramo é alcançável
+    // apenas por linha escrita por outra fatia (ou à mão). "Inalcançável hoje"
+    // não é razão para devolver resposta errada: é a mesma régua do C39.
+    return {
+      ok: false,
+      reason: (existente.outcome_code ?? 'forbidden') as PauseConversationRefusal,
+      command_id: existente.id,
+    };
+  }
+  return null;
+}
+
 type ControleAtualizado = {
   mode: string;
   control_epoch: string;
   updated_at: Date;
 };
 
+/** A resposta da pausa diante de um comando já gravado com a mesma chave. */
+async function responderPausaGravada(
+  tx: Executor,
+  existente: ComandoRow,
+  request_hash: string,
+  control_id_pedido: string,
+): Promise<PauseConversationResult> {
+  const recusa = await recusaDoComandoGravado(tx, existente, request_hash, control_id_pedido);
+  if (recusa) return recusa;
+  // Replay: devolve o MESMO desfecho e NÃO audita de novo — a operação não
+  // aconteceu de novo (mesma régua de `requestCommandWithAuditInTx`). O
+  // `control_id` é o GRAVADO: com a identidade conferida ele é igual ao pedido,
+  // mas a resposta descreve o comando, não ecoa a requisição.
+  return {
+    ok: true,
+    idempotent: true,
+    command_id: existente.id,
+    control_id: existente.control_id,
+    mode: 'pausing',
+    epoch: existente.result_epoch ?? '0',
+    barrier_committed: existente.barrier_committed,
+    drain_status: existente.drain_status,
+    inflight_effects: Number(existente.inflight_effects),
+    unknown_deliveries: Number(existente.unknown_deliveries),
+    updated_at: existente.updated_at,
+  };
+}
+
 async function pauseInTx(
   tx: Executor,
   input: PauseConversationInput,
 ): Promise<PauseConversationResult> {
   const { tenant_id, agent_id } = scope();
-  const request_hash = canonicalDigest(input.request_payload ?? null);
+  const request_hash = conversationControlCommandDigest({
+    kind: 'pause',
+    control_id: input.control_id,
+    expected_epoch: input.expected_epoch,
+    requested_by_app_user_id: input.requested_by_app_user_id,
+    reason_code: input.reason_code,
+    resume_policy: null,
+    request_payload: input.request_payload,
+  });
 
   // PASSO 2 do §8.2.3 — idempotência ANTES de tocar no controle. Um retry não
   // pode chegar sequer a trancar a row: o §8.2.1 manda devolver "o resultado do
   // mesmo comando, sem novo incremento".
-  const existente = linhas<ComandoRow>(
-    await tx.execute(sql`
-      SELECT id, request_hash, status, outcome_code,
-             result_epoch::text AS result_epoch,
-             barrier_committed, drain_status, inflight_effects,
-             unknown_deliveries, updated_at
-        FROM conversation_control_commands
-       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
-         AND idempotency_key = ${input.idempotency_key}
-       FOR UPDATE`),
-  )[0];
-
-  if (existente) {
-    // Mesma chave com payload divergente é CONFLITO, nunca última-escrita-vence
-    // (§8.2.4). Guardar só a chave tornaria os dois indistinguíveis.
-    if (existente.request_hash !== request_hash) {
-      await auditTx(tx, {
-        acao: 'conversation_control_conflict',
-        metadata: {
-          command_id: existente.id,
-          control_id: input.control_id,
-          outcome_code: 'payload_conflict',
-        },
-      });
-      return { ok: false, reason: 'payload_conflict', command_id: existente.id };
-    }
-    if (existente.status !== 'accepted') {
-      // O payload BATEU — o que há é um comando guardado que não foi aceito.
-      // Devolver `payload_conflict` aqui seria mentir sobre a causa, e era o
-      // que a primeira versão desta função fazia: um ramo sem teste, com o
-      // tipo satisfeito e a semântica errada. O desfecho correto é o que está
-      // PERSISTIDO, e o `_outcome_chk` da 141 garante que ele existe — status
-      // `conflict`/`failed` exige `outcome_code` não nulo.
-      //
-      // Esta fatia só escreve `accepted`, então hoje o ramo é alcançável
-      // apenas por linha escrita por outra fatia (ou à mão). "Inalcançável
-      // hoje" não é razão para devolver resposta errada: é a mesma régua que
-      // me fez recusar o argumento no C39.
-      return {
-        ok: false,
-        reason: (existente.outcome_code ??
-          'forbidden') as PauseConversationRefusal,
-        command_id: existente.id,
-      };
-    }
-    // Replay: devolve o MESMO desfecho e NÃO audita de novo — a operação não
-    // aconteceu de novo (mesma régua de `requestCommandWithAuditInTx`).
-    return {
-      ok: true,
-      idempotent: true,
-      command_id: existente.id,
-      control_id: input.control_id,
-      mode: 'pausing',
-      epoch: existente.result_epoch ?? '0',
-      barrier_committed: existente.barrier_committed,
-      drain_status: existente.drain_status,
-      inflight_effects: Number(existente.inflight_effects),
-      unknown_deliveries: Number(existente.unknown_deliveries),
-      updated_at: existente.updated_at,
-    };
-  }
+  const existente = await lerComandoPorChave(
+    tx,
+    { tenant_id, agent_id },
+    input.idempotency_key,
+    true,
+  );
+  if (existente) return responderPausaGravada(tx, existente, request_hash, input.control_id);
 
   // PASSO 3 — o controle é o PRIMEIRO degrau da ordem de locks (§5.6.3,
   // §8.2.3). O SQL vem de `conversation-control-sql.ts`, dono único.
@@ -239,6 +343,24 @@ async function pauseInTx(
     // Nenhuma linha de comando é criada: o comando não tem a que se referir, e
     // a FK composta o recusaria de qualquer forma.
     return { ok: false, reason: 'control_not_found' };
+  }
+
+  // A MESMA chave, relida sob o lock do controle — achado de revisão da PR
+  // #766. A leitura do passo 2 não enxerga o INSERT ainda não comitado de uma
+  // entrega concorrente, e o FOR UPDATE não tranca linha que não existe. As duas
+  // entregas passavam por ela vazias; a que esperou o lock via o epoch já
+  // incrementado pela outra e respondia `epoch_mismatch` — com auditoria de
+  // conflito — a um comando ACEITO. Todo comando desta chave neste controle é
+  // gravado segurando este lock, e o commit o libera: sob READ COMMITTED, esta
+  // leitura já enxerga a linha comitada.
+  const gravadoNaEspera = await lerComandoPorChave(
+    tx,
+    { tenant_id, agent_id },
+    input.idempotency_key,
+    false,
+  );
+  if (gravadoNaEspera) {
+    return responderPausaGravada(tx, gravadoNaEspera, request_hash, input.control_id);
   }
 
   // Epoch ANTES de modo: o epoch é o marcador de autoridade, e quem chega com
@@ -313,7 +435,8 @@ async function pauseInTx(
          ${input.expected_epoch}::bigint, ${atualizado.control_epoch}::bigint,
          ${input.requested_by_app_user_id}, 'accepted',
          true, 'pending', ${JSON.stringify({ reason_code: input.reason_code })}::jsonb)
-   RETURNING id, request_hash, status, result_epoch::text AS result_epoch,
+   RETURNING id, control_id, request_hash, status, outcome_code,
+             result_epoch::text AS result_epoch,
              barrier_committed, drain_status, inflight_effects,
              unknown_deliveries, updated_at`),
   )[0]!;
@@ -624,69 +747,66 @@ type ControleResumido = {
   resume_after_ingress_seq: string;
 };
 
+/** A resposta da retomada diante de um comando já gravado com a mesma chave. */
+async function responderRetomadaGravada(
+  tx: Executor,
+  existente: ComandoRow,
+  request_hash: string,
+  control_id_pedido: string,
+): Promise<ResumeConversationResult> {
+  const recusa = await recusaDoComandoGravado(tx, existente, request_hash, control_id_pedido);
+  if (recusa) return recusa;
+  const { tenant_id, agent_id } = scope();
+  // Replay: devolve o desfecho guardado e NÃO reaudita. O estado lido é o do
+  // controle DO COMANDO — com a identidade conferida, o mesmo do pedido.
+  const atual = linhas<ControleResumido>(
+    await tx.execute(sql`
+      SELECT mode, control_epoch::text AS control_epoch, updated_at,
+             coalesce(resume_after_ingress_seq, 0)::text AS resume_after_ingress_seq
+        FROM conversation_controls
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+         AND id = ${existente.control_id}`),
+  )[0];
+  return {
+    ok: true,
+    idempotent: true,
+    command_id: existente.id,
+    control_id: existente.control_id,
+    mode: atual?.mode ?? 'bot',
+    epoch: existente.result_epoch ?? '0',
+    resume_after_ingress_seq: atual?.resume_after_ingress_seq ?? '0',
+    // Replay NÃO redescarta. O backlog do comando original já foi fechado, e
+    // turnos que chegaram depois são justamente o "future" que a política
+    // preserva — descartá-los aqui transformaria um retry de rede em perda
+    // de mensagem.
+    backlog_cancelled: 0,
+    updated_at: existente.updated_at,
+  };
+}
+
 async function resumeInTx(
   tx: Executor,
   input: ResumeConversationInput,
 ): Promise<ResumeConversationResult> {
   const { tenant_id, agent_id } = scope();
-  const request_hash = canonicalDigest(input.request_payload ?? null);
+  const request_hash = conversationControlCommandDigest({
+    kind: 'resume',
+    control_id: input.control_id,
+    expected_epoch: input.expected_epoch,
+    requested_by_app_user_id: input.requested_by_app_user_id,
+    reason_code: input.reason_code,
+    resume_policy: input.resume_policy,
+    request_payload: input.request_payload,
+  });
 
-  const existente = linhas<ComandoRow>(
-    await tx.execute(sql`
-      SELECT id, request_hash, status, outcome_code,
-             result_epoch::text AS result_epoch,
-             barrier_committed, drain_status, inflight_effects,
-             unknown_deliveries, updated_at
-        FROM conversation_control_commands
-       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
-         AND idempotency_key = ${input.idempotency_key}
-       FOR UPDATE`),
-  )[0];
-
+  const existente = await lerComandoPorChave(
+    tx,
+    { tenant_id, agent_id },
+    input.idempotency_key,
+    true,
+  );
   if (existente) {
-    if (existente.request_hash !== request_hash) {
-      await auditTx(tx, {
-        acao: 'conversation_control_conflict',
-        metadata: {
-          command_id: existente.id,
-          control_id: input.control_id,
-          outcome_code: 'payload_conflict',
-        },
-      });
-      return { ok: false, reason: 'payload_conflict', command_id: existente.id };
-    }
-    if (existente.status !== 'accepted') {
-      return {
-        ok: false,
-        reason: (existente.outcome_code ??
-          'forbidden') as PauseConversationRefusal,
-        command_id: existente.id,
-      };
-    }
-    // Replay: devolve o desfecho guardado e NÃO reaudita.
-    const atual = linhas<ControleResumido>(
-      await tx.execute(sql`
-        SELECT mode, control_epoch::text AS control_epoch, updated_at,
-               coalesce(resume_after_ingress_seq, 0)::text AS resume_after_ingress_seq
-          FROM conversation_controls
-         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
-           AND id = ${input.control_id}`),
-    )[0];
-    return {
-      ok: true,
-      idempotent: true,
-      command_id: existente.id,
-      control_id: input.control_id,
-      mode: atual?.mode ?? 'bot',
-      epoch: existente.result_epoch ?? '0',
-      resume_after_ingress_seq: atual?.resume_after_ingress_seq ?? '0',
-      // Replay NÃO redescarta. O backlog do comando original já foi fechado, e
-      // turnos que chegaram depois são justamente o "future" que a política
-      // preserva — descartá-los aqui transformaria um retry de rede em perda
-      // de mensagem.
-      backlog_cancelled: 0,
-      updated_at: existente.updated_at,
-    };
+    return responderRetomadaGravada(tx, existente, request_hash, input.control_id);
   }
 
   const controle = linhas<{ id: string; mode: string; control_epoch: string }>(
@@ -696,6 +816,20 @@ async function resumeInTx(
   )[0];
 
   if (!controle) return { ok: false, reason: 'control_not_found' };
+
+  // A chave relida sob o lock do controle, pela mesma razão da pausa: uma
+  // entrega concorrente do MESMO comando que ganhou o lock já incrementou o
+  // epoch, e sem esta leitura a que esperou responderia `epoch_mismatch` a um
+  // comando aceito.
+  const gravadoNaEspera = await lerComandoPorChave(
+    tx,
+    { tenant_id, agent_id },
+    input.idempotency_key,
+    false,
+  );
+  if (gravadoNaEspera) {
+    return responderRetomadaGravada(tx, gravadoNaEspera, request_hash, input.control_id);
+  }
 
   // Epoch antes de modo, como nas outras duas operações e pela mesma razão.
   if (controle.control_epoch !== input.expected_epoch) {
@@ -812,7 +946,7 @@ async function resumeInTx(
          ${input.requested_by_app_user_id}, 'accepted',
          true, 'complete',
          ${JSON.stringify({ reason_code: input.reason_code, resume_policy: input.resume_policy })}::jsonb)
-   RETURNING id, request_hash, status, outcome_code,
+   RETURNING id, control_id, request_hash, status, outcome_code,
              result_epoch::text AS result_epoch,
              barrier_committed, drain_status, inflight_effects,
              unknown_deliveries, updated_at`),

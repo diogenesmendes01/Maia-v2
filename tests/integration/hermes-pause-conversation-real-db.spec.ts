@@ -504,4 +504,191 @@ d("pauseConversationTx — a barreira do controle humano", () => {
     expect(rb.command_id).not.toBe(ra.command_id);
     expect(rb.idempotent).toBe(false);
   });
+
+  // ─── A identidade do comando não é só o payload (§8.3.2) ──────────────────
+  //
+  // Achado de revisão da PR #766. Nos casos abaixo a chave E o payload são os da
+  // primeira pausa; varia um campo da operação. Com o hash cobrindo só o payload,
+  // todos voltavam `ok: true, idempotent: true` com o comando de OUTRA
+  // identidade — sucesso sem pausar nada e sem auditar.
+
+  async function pausaAceita(
+    control_id: string,
+    chave: string,
+  ): Promise<{ command_id: string }> {
+    const r = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx(
+        pedidoPausa(control_id, { idempotency_key: chave }),
+      ),
+    );
+    expect(r.ok).toBe(true);
+    if (!r.ok) throw new Error("fixture: a primeira pausa não foi aceita");
+    return { command_id: r.command_id };
+  }
+
+  async function contarComandos(control_id: string): Promise<number> {
+    const r = await pool.query(
+      "SELECT count(*)::int AS n FROM conversation_control_commands WHERE control_id = $1",
+      [control_id],
+    );
+    return r.rows[0].n;
+  }
+
+  it("13. mesma chave e payload noutra CONVERSA é conflito, e a outra conversa não pausa", async () => {
+    const chave = randomUUID();
+    const a = await mkControle();
+    const b = await mkControle();
+    const primeira = await pausaAceita(a, chave);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx(
+        pedidoPausa(b, { idempotency_key: chave }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("payload_conflict");
+    // §8.2.4: o comando gravado é de outra identidade — nada dele volta.
+    expect(r).not.toHaveProperty("command_id");
+    const c = await lerControle(b);
+    expect(c.mode).toBe("bot");
+    expect(c.control_epoch).toBe("0");
+    expect(c.owner_app_user_id).toBeNull();
+    expect(await contarComandos(b)).toBe(0);
+    expect(await contarAuditoria(primeira.command_id)).toBe(1);
+    // O vínculo com o comando alheio não volta na resposta, mas fica na trilha:
+    // é por ela que se investiga quem reusou a chave.
+    const conflito = await pool.query(
+      `SELECT metadata FROM audit_log
+        WHERE acao = 'conversation_control_conflict' AND metadata->>'control_id' = $1`,
+      [b],
+    );
+    expect(conflito.rows).toHaveLength(1);
+    expect(conflito.rows[0].metadata).toMatchObject({
+      outcome_code: "payload_conflict",
+      command_id: primeira.command_id,
+    });
+  });
+
+  it("14. mesma chave e payload por OUTRO operador é conflito, e a posse não muda", async () => {
+    const chave = randomUUID();
+    const control_id = await mkControle();
+    await pausaAceita(control_id, chave);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx(
+        pedidoPausa(control_id, {
+          idempotency_key: chave,
+          requested_by_app_user_id: "operador-2",
+        }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("payload_conflict");
+    expect((await lerControle(control_id)).owner_app_user_id).toBe(OPERADOR);
+  });
+
+  it("15. mesma chave e payload com OUTRO epoch esperado é conflito, não `epoch_mismatch`", async () => {
+    const chave = randomUUID();
+    const control_id = await mkControle();
+    await pausaAceita(control_id, chave);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx(
+        pedidoPausa(control_id, { idempotency_key: chave, expected_epoch: "1" }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    // A chave já tem dono: responder pelo estado do controle seria tratar a
+    // requisição como operação nova.
+    expect(r.reason).toBe("payload_conflict");
+    expect((await lerControle(control_id)).control_epoch).toBe("1");
+  });
+
+  it("16. mesma chave e payload com OUTRO motivo é conflito, e o motivo gravado fica", async () => {
+    const chave = randomUUID();
+    const control_id = await mkControle();
+    await pausaAceita(control_id, chave);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx(
+        pedidoPausa(control_id, { idempotency_key: chave, reason_code: "safety_review" }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("payload_conflict");
+    expect((await lerControle(control_id)).reason_code).toBe("operator_takeover");
+  });
+
+  it("17. chave já usada por uma RETOMADA não vira pausa aceita noutra conversa", async () => {
+    const chave = randomUUID();
+    const payload = { note: "mesmo texto nos dois comandos" };
+    const humano = await mkControle();
+    await pool.query(
+      `UPDATE conversation_controls
+          SET mode='human', control_epoch=1, owner_app_user_id=$2,
+              paused_at=now(), reason_code='operator_takeover', updated_at=now()
+        WHERE id=$1`,
+      [humano, OPERADOR],
+    );
+    const retomada = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx({
+        control_id: humano,
+        expected_epoch: "1",
+        idempotency_key: chave,
+        requested_by_app_user_id: OPERADOR,
+        reason_code: "human_resolved",
+        resume_policy: "future_only",
+        request_payload: payload,
+      }),
+    );
+    expect(retomada.ok).toBe(true);
+
+    const bot = await mkControle();
+    const r = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx(
+        pedidoPausa(bot, { idempotency_key: chave, request_payload: payload }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("payload_conflict");
+    expect((await lerControle(bot)).mode).toBe("bot");
+  });
+
+  it("18. controle positivo: replay com as chaves do payload em outra ORDEM continua replay", async () => {
+    const chave = randomUUID();
+    const control_id = await mkControle();
+    const primeira = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx(
+        pedidoPausa(control_id, {
+          idempotency_key: chave,
+          request_payload: { note: "n", canal: "whatsapp" },
+        }),
+      ),
+    );
+    const segunda = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx(
+        pedidoPausa(control_id, {
+          idempotency_key: chave,
+          request_payload: { canal: "whatsapp", note: "n" },
+        }),
+      ),
+    );
+
+    expect(primeira.ok && segunda.ok).toBe(true);
+    if (!primeira.ok || !segunda.ok) return;
+    expect(segunda.idempotent).toBe(true);
+    expect(segunda.command_id).toBe(primeira.command_id);
+    expect(segunda.control_id).toBe(control_id);
+    expect(segunda.epoch).toBe("1");
+  });
 });

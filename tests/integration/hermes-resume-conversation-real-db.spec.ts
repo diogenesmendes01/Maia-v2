@@ -747,6 +747,159 @@ d("resumeConversationTx — a devolução da automação", () => {
     expect((await lerTurno(semSeq)).status).toBe("queued");
   });
 
+  // ─── A identidade do comando não é só o payload (§8.3.2) ──────────────────
+  //
+  // Achado de revisão da PR #766, o par dos casos 13–18 da pausa. Chave e payload
+  // repetidos; varia a conversa, o operador, o epoch ou a operação. Com o hash
+  // cobrindo só o payload, todos voltavam como replay aceito de outro comando.
+
+  it("25. mesma chave e payload noutra CONVERSA é conflito, e o backlog dela fica retido", async () => {
+    const chave = randomUUID();
+    const a = await mkControleHumano();
+    const b = await mkControleHumano();
+    const retidoEmB = await mkTurnoRetido(b.stream_key, 1);
+    const primeira = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(a.control_id, { idempotency_key: chave }),
+      ),
+    );
+    expect(primeira.ok).toBe(true);
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(b.control_id, { idempotency_key: chave }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("payload_conflict");
+    expect(r).not.toHaveProperty("command_id");
+    const c = await lerControle(b.control_id);
+    expect(c.mode).toBe("human");
+    expect(c.control_epoch).toBe("1");
+    expect(c.resume_after_ingress_seq).toBeNull();
+    expect(await contarAuditoria("conversation_automation_resumed", b.control_id)).toBe(0);
+    expect(await contarAuditoria("conversation_control_conflict", b.control_id)).toBe(1);
+    // A automação não voltou, então nenhuma mensagem do cliente foi descartada.
+    expect((await lerTurno(retidoEmB)).status).toBe("queued");
+  });
+
+  it("26. mesma chave e payload por OUTRO operador é conflito", async () => {
+    const chave = randomUUID();
+    const { control_id } = await mkControleHumano();
+    await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(control_id, { idempotency_key: chave }),
+      ),
+    );
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(control_id, {
+          idempotency_key: chave,
+          requested_by_app_user_id: "operador-2",
+        }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("payload_conflict");
+  });
+
+  it("27. mesma chave e payload com OUTRO epoch esperado é conflito", async () => {
+    const chave = randomUUID();
+    const { control_id } = await mkControleHumano();
+    await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(control_id, { idempotency_key: chave }),
+      ),
+    );
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(control_id, { idempotency_key: chave, expected_epoch: "2" }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("payload_conflict");
+    expect((await lerControle(control_id)).control_epoch).toBe("2");
+  });
+
+  it("28. chave já usada por uma PAUSA não vira retomada aceita", async () => {
+    // O pior caso da reprodução: sem a operação na identidade, a retomada voltava
+    // `ok: true, idempotent: true, mode: "human"` — o operador lia "automação
+    // devolvida" numa conversa que continuava parada.
+    const chave = randomUUID();
+    const payload = { nota: "mesmo texto nos dois comandos" };
+    const control_id = randomUUID();
+    await pool.query(
+      `INSERT INTO conversation_controls (id, tenant_id, agent_id, stream_key, stream_key_version, channel_id)
+       VALUES ($1,$2,$3,$4,1,$5)`,
+      [control_id, TENANT, AGENT, `stream-${control_id}`, randomUUID()],
+    );
+    const pausa = await noEscopo(() =>
+      conversationControlRepo.pauseConversationTx({
+        control_id,
+        expected_epoch: "0",
+        idempotency_key: chave,
+        requested_by_app_user_id: OPERADOR,
+        reason_code: "operator_takeover",
+        request_payload: payload,
+      }),
+    );
+    expect(pausa.ok).toBe(true);
+    // A drenagem não é desta spec: a fixture leva o controle a `human` direto.
+    await pool.query(
+      "UPDATE conversation_controls SET mode='human', updated_at=now() WHERE id=$1",
+      [control_id],
+    );
+
+    const r = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(control_id, { idempotency_key: chave, request_payload: payload }),
+      ),
+    );
+
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("payload_conflict");
+    expect((await lerControle(control_id)).mode).toBe("human");
+    expect(await contarAuditoria("conversation_automation_resumed", control_id)).toBe(0);
+  });
+
+  it("29. controle positivo: replay com as chaves do payload em outra ORDEM continua replay", async () => {
+    const chave = randomUUID();
+    const { control_id } = await mkControleHumano();
+    const a = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(control_id, {
+          idempotency_key: chave,
+          request_payload: { nota: "n", canal: "whatsapp" },
+        }),
+      ),
+    );
+    const b = await noEscopo(() =>
+      conversationControlRepo.resumeConversationTx(
+        pedido(control_id, {
+          idempotency_key: chave,
+          request_payload: { canal: "whatsapp", nota: "n" },
+        }),
+      ),
+    );
+
+    expect(a.ok && b.ok).toBe(true);
+    if (!a.ok || !b.ok) return;
+    expect(b.idempotent).toBe(true);
+    expect(b.command_id).toBe(a.command_id);
+    expect(b.control_id).toBe(control_id);
+    expect(b.mode).toBe("bot");
+    expect(b.epoch).toBe("2");
+  });
+
   // ─── Higiene: esta spec não pode deixar turno vivo com stream no banco ─────
   //
   // Os casos abaixo dependem da ORDEM do arquivo (rodam depois dos anteriores).
