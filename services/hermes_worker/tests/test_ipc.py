@@ -15,9 +15,10 @@ import threading
 import time
 
 import pytest
+from conftest import WIRE_FIXTURES
 
 from hermes_worker.bridge_tools import BridgeUnavailable
-from hermes_worker.ipc import ControlPump, IpcBridge
+from hermes_worker.ipc import ControlPump, IpcBridge, read_start_frame
 from hermes_worker.protocol import (
     HERMES_WORKER_PROTOCOL_VERSION,
     FrameWriter,
@@ -303,3 +304,128 @@ def test_pump_trata_segundo_start_como_erro_de_protocolo() -> None:
     )
     pump.handle(parse_maia_frame(start))
     assert eventos["erro"] == ["start_duplicado"]
+
+
+# ─── frames que chegam no MESMO read() do start ─────────────────────────────
+#
+# Achado de revisão da PR #766: ``read_start_frame`` extraía todos os frames da
+# leitura, devolvia o primeiro e descartava o resto. Um ``cancel`` colado ao
+# ``start`` sumia, e um segundo ``start`` no mesmo bloco escapava da recusa de
+# duplicidade. A bomba só vê o que o leitor ainda não consumiu — então o que
+# sobrou do bootstrap precisa chegar a ela, na ordem do pipe.
+
+
+def _start_da_fixture() -> dict:
+    casos = json.loads(WIRE_FIXTURES.read_text(encoding="utf-8"))["cases"]
+    return next(caso["frame"] for caso in casos if caso["id"] == "start-ok")
+
+
+def _linha(frame: dict) -> bytes:
+    return (json.dumps(frame) + "\n").encode("utf-8")
+
+
+def _cancel(run_id: str) -> dict:
+    return {
+        "protocol": HERMES_WORKER_PROTOCOL_VERSION,
+        "type": "cancel",
+        "run_id": run_id,
+        "reason": "ownership_lost",
+        "grace_deadline_at": "2026-09-15T23:00:00.000Z",
+    }
+
+
+START = _linha(_start_da_fixture())
+CANCEL = _linha(_cancel(RUN_ID))
+CANCEL_ALHEIO = _linha(_cancel(OUTRO_RUN))
+
+
+class _Blocos:
+    """Pipe roteirizado: cada ``read`` devolve um bloco; sem blocos, EOF."""
+
+    def __init__(self, blocos: list[bytes]) -> None:
+        self._blocos = list(blocos)
+
+    def read(self, _n: int) -> bytes:
+        return self._blocos.pop(0) if self._blocos else b""
+
+
+def _bootstrap_e_bomba(blocos: list[bytes]):
+    """O caminho do ``run_worker``: lê o start, entrega o excedente, roda a bomba."""
+    stream = _Blocos(blocos)
+    reader = NdjsonFrameReader("maia_to_worker")
+    primeiro, excedentes = read_start_frame(stream, reader)
+    eventos: list[tuple[str, str]] = []
+    pump = ControlPump(
+        stream,
+        reader,
+        run_id=RUN_ID,
+        bridge=_BridgeEspiao(),
+        on_cancel=lambda motivo: eventos.append(("cancel", motivo)),
+        on_result_ack=lambda digest: eventos.append(("ack", digest)),
+        on_protocol_error=lambda erro: eventos.append(("erro", erro)),
+    )
+    for parsed in excedentes:
+        pump.handle(parsed)
+    pump.run()
+    return primeiro, eventos, pump
+
+
+def test_cancel_no_mesmo_read_do_start_chega_a_bomba() -> None:
+    primeiro, eventos, _ = _bootstrap_e_bomba([START + CANCEL])
+    assert (primeiro.frame or {}).get("type") == "start"
+    assert eventos == [("cancel", "ownership_lost")]
+
+
+def test_segundo_start_no_mesmo_read_e_recusado_por_duplicidade() -> None:
+    _, eventos, _ = _bootstrap_e_bomba([START + START])
+    assert eventos == [("erro", "start_duplicado")]
+
+
+def test_excedentes_preservam_a_ordem_do_pipe() -> None:
+    _, eventos, _ = _bootstrap_e_bomba([START + CANCEL + START])
+    assert eventos == [("cancel", "ownership_lost"), ("erro", "start_duplicado")]
+
+
+def test_linha_invalida_no_mesmo_read_e_contada() -> None:
+    _, eventos, pump = _bootstrap_e_bomba([START + b"isto nao e json\n"])
+    assert pump.invalid_frames == 1
+    assert eventos == []
+
+
+def test_cancel_de_outra_execucao_no_mesmo_read_e_recusado() -> None:
+    _, eventos, pump = _bootstrap_e_bomba([START + CANCEL_ALHEIO])
+    assert pump.foreign_frames == 1
+    assert eventos == []
+
+
+def test_controle_start_sem_newline_antes_do_eof_nao_tem_excedente() -> None:
+    primeiro, eventos, _ = _bootstrap_e_bomba([START.rstrip(b"\n")])
+    assert (primeiro.frame or {}).get("type") == "start"
+    assert eventos == []
+
+
+def test_controle_cancel_em_read_separado() -> None:
+    _, eventos, _ = _bootstrap_e_bomba([START, CANCEL])
+    assert eventos == [("cancel", "ownership_lost")]
+
+
+def test_controle_so_start_nao_gera_evento() -> None:
+    _, eventos, pump = _bootstrap_e_bomba([START])
+    assert eventos == []
+    assert pump.invalid_frames == 0
+
+
+@pytest.mark.parametrize("corte", [1, 40, len(CANCEL) - 1])
+def test_controle_cancel_partido_entre_reads_entrega_uma_vez(corte: int) -> None:
+    _, eventos, _ = _bootstrap_e_bomba([START + CANCEL[:corte], CANCEL[corte:]])
+    assert eventos == [("cancel", "ownership_lost")]
+
+
+def test_controle_cancel_sem_newline_antes_do_eof_entrega_uma_vez() -> None:
+    _, eventos, _ = _bootstrap_e_bomba([START + CANCEL.rstrip(b"\n")])
+    assert eventos == [("cancel", "ownership_lost")]
+
+
+def test_controle_primeiro_frame_nao_start_continua_sendo_o_primeiro() -> None:
+    primeiro, _, _ = _bootstrap_e_bomba([CANCEL + START])
+    assert (primeiro.frame or {}).get("type") == "cancel"

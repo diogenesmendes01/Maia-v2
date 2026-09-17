@@ -395,4 +395,58 @@ d('spike sintético — worker + AIAgent real contra provider STUB', () => {
     worker.send({ protocol: PROTOCOL, type: 'result_ack', run_id, terminal_digest: 'c'.repeat(64) });
     await worker.exit();
   }, 120_000);
+
+  // Achado de revisão da PR #766: o bootstrap descartava o que vinha colado ao
+  // `start`. Aqui os dois frames saem num ÚNICO write. O pipe pode entregá-los
+  // num read só (o caso do achado) ou em dois (a bomba lê o cancel durante a
+  // construção) — nos dois o §6.7.3 item 2 exige o mesmo: sem `ready`, sem loop.
+  it('cancel escrito junto com o start: sem ready, sem inferência, desfecho cancelado', async () => {
+    const stub = await startStubProvider({ script: [{ kind: 'text', content: 'não deveria sair' }] });
+    stubs.push(stub);
+    const home = novoHome();
+    const worker = spawnWorker(home);
+    workers.push(worker);
+
+    const run_id = randomUUID();
+    const cancel = {
+      protocol: PROTOCOL,
+      type: 'cancel',
+      run_id,
+      reason: 'operator',
+      grace_deadline_at: '2026-12-31T23:59:59.000Z',
+    };
+    worker.child.stdin.write(
+      `${JSON.stringify(startFrame(stub, run_id, randomUUID()))}\n${JSON.stringify(cancel)}\n`,
+    );
+
+    const result = await worker.waitFor('result');
+    expect(result.stop).toEqual({ kind: 'cancelled', reason: 'operator' });
+    expect(result.iterations).toBe(0);
+    expect(result.observed_tool_call_seqs).toEqual([]);
+    worker.send({ protocol: PROTOCOL, type: 'result_ack', run_id, terminal_digest: 'c'.repeat(64) });
+    expect(await worker.exit()).toBe(0);
+
+    expect(worker.frames.map((f) => f.type)).toEqual(['cancel_ack', 'result']);
+    expect(stub.requests.filter((r) => r.path.endsWith('/chat/completions'))).toHaveLength(0);
+  }, 120_000);
+
+  it('segundo start escrito junto com o primeiro: encerra com erro de protocolo, sem frame nenhum', async () => {
+    const stub = await startStubProvider({ script: [{ kind: 'text', content: 'não deveria sair' }] });
+    stubs.push(stub);
+    const home = novoHome();
+    const worker = spawnWorker(home);
+    workers.push(worker);
+
+    // `exit` pode chegar antes do último `data` do stdout; "nenhum frame" só
+    // vale depois do fim do stream.
+    const fimDoStdout = new Promise<void>((r) => worker.child.stdout.once('end', () => r()));
+    const linha = `${JSON.stringify(startFrame(stub, randomUUID(), randomUUID()))}\n`;
+    worker.child.stdin.write(linha + linha);
+
+    // EXIT_PROTOCOL = 4 em services/hermes_worker/main.py.
+    expect(await worker.exit()).toBe(4);
+    await fimDoStdout;
+    expect(worker.frames).toEqual([]);
+    expect(stub.requests.filter((r) => r.path.endsWith('/chat/completions'))).toHaveLength(0);
+  }, 120_000);
 });

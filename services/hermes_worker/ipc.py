@@ -272,19 +272,28 @@ class ControlPump(threading.Thread):
             self._on_protocol_error("start_duplicado")
 
 
-def read_start_frame(stream: Any, reader: NdjsonFrameReader) -> ParsedFrame:
+def read_start_frame(
+    stream: Any, reader: NdjsonFrameReader
+) -> tuple[ParsedFrame, tuple[ParsedFrame, ...]]:
     """Lê o PRIMEIRO frame do pipe, que precisa ser o ``start``.
 
-    Usa o mesmo ``NdjsonFrameReader`` que a bomba usará depois: um leitor novo
-    perderia os bytes que já vieram grudados na mesma leitura do pipe.
+    Devolve ``(primeiro, excedentes)``. Usa o mesmo ``NdjsonFrameReader`` que a
+    bomba usará depois, então os bytes de uma linha ainda incompleta ficam nele.
+    Mas as linhas COMPLETAS que vieram no mesmo ``read`` já saíram do leitor: se
+    não forem devolvidas aqui, a bomba nunca as vê — um ``cancel`` colado ao
+    ``start`` sumiria e um segundo ``start`` escaparia da recusa (§6.4.2). Quem
+    chama entrega os excedentes à bomba, na ordem, antes de ela começar a ler.
     """
     while True:
         chunk = stream.read(_READ_CHUNK)
         if not chunk:
             trailing = reader.close()
             if trailing:
-                return trailing[0]
-            return ParsedFrame("invalid", code="not_json", detail="pipe fechado sem start")
+                return trailing[0], tuple(trailing[1:])
+            return (
+                ParsedFrame("invalid", code="not_json", detail="pipe fechado sem start"),
+                (),
+            )
         frames = reader.feed(chunk)
         if frames:
-            return frames[0]
+            return frames[0], tuple(frames[1:])

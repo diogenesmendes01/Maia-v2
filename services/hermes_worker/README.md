@@ -103,6 +103,25 @@ e **não testa `interrupted`**, então um turno cancelado volta com
 | `cancel` com `reason=policy` | `cancelled/operator` | `cancelled` só admite `ownership_lost`/`operator`/`shutdown` |
 | `interrupted=True` sem `cancel` | `cancelled/shutdown` | o contrato não tem "o motor se interrompeu sozinho"; inventar um `reply` seria pior |
 
+**Controle que chega antes do loop (§6.7.2 item 3, §6.7.3 item 2).** O que vem
+colado ao `start` no mesmo `read` do pipe é entregue à bomba, na ordem, antes de
+ela começar a ler (`read_start_frame` devolve `(primeiro, excedentes)`). Duas
+barreiras rodam antes do loop: antes de importar o Hermes e antes do `ready`.
+Não há janela depois da segunda — quem recebe o controle grava o estado antes de
+olhar o agente, então ou a barreira o vê ou o agente é interrompido. Também são
+decisão deste pacote:
+
+| Situação | O que o worker faz | Por quê |
+|---|---|---|
+| `cancel` antes do loop | `cancel_ack` e `result` com o desfecho do cancelamento, `iterations: 0`, nenhum `ready`, sai com 0 | o executor resolveu sem loop, e o `result` é o que diz isso ao supervisor; `ready` afirmaria readiness que não houve |
+| segundo `start` antes do loop | nenhum frame além de `cancel_ack` já emitido, sai com `EXIT_PROTOCOL` (4) | canal que violou o protocolo não fecha turno; o erro prevalece sobre um `cancel` recebido junto |
+| segundo `start` durante o loop | interrompe o agente, `result` com `failed/protocol_error`, sai com 4 | nenhum texto é candidato depois da violação; as tools já estão fechadas |
+
+Limite: que um `hard_interrupt` feito entre o `ready` e a entrada do loop encerre
+o turno é propriedade do motor. O spike (`tests/hermes-spike`) prova o cancel
+colado ao `start` e o cancel durante o turno contra o `AIAgent` real, não essa
+janela específica.
+
 **`usage.source` nunca é `provider_accounted`.** O worker não fala com o
 provider. Com `session_db=None`, o uso auxiliar tem trilha própria e não entra
 nos acumuladores da instância (`agent/aux_accounting.py:27-91`), então declarar

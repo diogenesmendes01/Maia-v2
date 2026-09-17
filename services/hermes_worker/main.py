@@ -353,6 +353,11 @@ class _RunState:
         self.protocol_error: str | None = None
         self.lock = threading.Lock()
 
+    def snapshot(self) -> tuple[str | None, str | None]:
+        """``(protocol_error, cancel_reason)`` lidos juntos, sob o lock."""
+        with self.lock:
+            return self.protocol_error, self.cancel_reason
+
 
 def run_worker() -> int:
     """Executa UM turno e encerra. Nunca reutiliza o processo (§6.7.2, item 8)."""
@@ -364,7 +369,7 @@ def run_worker() -> int:
     try:
         home = require_ephemeral_home()
         frame_reader = NdjsonFrameReader("maia_to_worker")
-        parsed = read_start_frame(reader_stream, frame_reader)
+        parsed, surplus = read_start_frame(reader_stream, frame_reader)
         if parsed.kind != "ok" or (parsed.frame or {}).get("type") != "start":
             print(
                 f"[hermes-worker] start inválido: {parsed.code}: {parsed.detail}",
@@ -418,8 +423,60 @@ def run_worker() -> int:
 
         def on_protocol_error(detail: str) -> None:
             with state.lock:
-                state.protocol_error = detail
+                if state.protocol_error is None:
+                    state.protocol_error = detail
             bridge.close()
+            local_agent = agent
+            if local_agent is not None:
+                # Canal que violou o protocolo não é mais autoridade (§6.4.2):
+                # o loop não continua gastando inferência com as tools fechadas.
+                local_agent.hard_interrupt(tool_reason=CANCEL_TOOL_REASON)
+
+        def send_result(stop: Mapping[str, Any], raw: Mapping[str, Any] | None) -> None:
+            writer.send(
+                {
+                    "protocol": HERMES_WORKER_PROTOCOL_VERSION,
+                    "type": "result",
+                    "run_id": run_id,
+                    "request_key": start["request_key"],
+                    "stop": dict(stop),
+                    "iterations": _bounded_iterations(raw),
+                    "observed_tool_call_seqs": list(bridge.allocated_call_seqs),
+                    "usage": project_usage(raw),
+                    "observed": project_observed(raw),
+                }
+            )
+            # O ACK é do supervisor; sua ausência não muda o desfecho, só o registro.
+            state.result_acked.wait(timeout=30.0)
+
+        def stop_before_loop() -> int | None:
+            """Barreira antes do loop (§6.7.3 item 2; §6.7.2 item 3).
+
+            Sem janela entre a barreira e o loop: ``on_cancel`` e
+            ``on_protocol_error`` gravam o estado ANTES de olhar ``agent``. Se
+            viram ``agent`` vazio, a barreira seguinte (que roda depois da
+            atribuição) vê o estado; se viram o agente, interrompem-no.
+            """
+            protocol_error, cancel_reason = state.snapshot()
+            if protocol_error is not None:
+                print(
+                    f"[hermes-worker] erro de protocolo antes do loop: {protocol_error}",
+                    file=sys.stderr,
+                )
+                return EXIT_PROTOCOL
+            if cancel_reason is None:
+                return None
+            # Executor resolvido sem loop: o `result` diz isso ao supervisor
+            # (zero iterações, nenhuma tool), sem `ready` — não houve readiness.
+            send_result(
+                project_stop(
+                    None,
+                    cancel_reason=cancel_reason,
+                    max_iterations=limits["max_iterations"],
+                ),
+                None,
+            )
+            return EXIT_OK
 
         pump = ControlPump(
             reader_stream,
@@ -430,7 +487,15 @@ def run_worker() -> int:
             on_result_ack=lambda _digest: state.result_acked.set(),
             on_protocol_error=on_protocol_error,
         )
+        # O que chegou no mesmo `read` do `start` é despachado ANTES de a bomba
+        # ler o pipe, para manter a ordem em que a Maia escreveu.
+        for frame in surplus:
+            pump.handle(frame)
         pump.start()
+
+        exit_code = stop_before_loop()
+        if exit_code is not None:
+            return exit_code
 
         # ── imports do Hermes: só agora, com FDs e home já fixados ──
         from tools.registry import registry  # noqa: PLC0415
@@ -451,6 +516,11 @@ def run_worker() -> int:
         )
         effective = verify_effective_surface(agent, binding.allowed_tool_names)
 
+        # Cancelamento ou segundo `start` recebidos durante a construção.
+        exit_code = stop_before_loop()
+        if exit_code is not None:
+            return exit_code
+
         writer.send(
             {
                 "protocol": HERMES_WORKER_PROTOCOL_VERSION,
@@ -468,27 +538,19 @@ def run_worker() -> int:
 
         raw_result = _run_turn(agent, start, binding)
 
-        with state.lock:
-            cancel_reason = state.cancel_reason
-        stop = project_stop(
+        protocol_error, cancel_reason = state.snapshot()
+        if protocol_error is not None:
+            # Nenhum texto é candidato depois de o canal violar o protocolo.
+            send_result({"kind": "failed", "code": "protocol_error"}, raw_result)
+            return EXIT_PROTOCOL
+        send_result(
+            project_stop(
+                raw_result,
+                cancel_reason=cancel_reason,
+                max_iterations=limits["max_iterations"],
+            ),
             raw_result,
-            cancel_reason=cancel_reason,
-            max_iterations=limits["max_iterations"],
         )
-        result_frame = {
-            "protocol": HERMES_WORKER_PROTOCOL_VERSION,
-            "type": "result",
-            "run_id": run_id,
-            "request_key": start["request_key"],
-            "stop": stop,
-            "iterations": _bounded_iterations(raw_result),
-            "observed_tool_call_seqs": list(bridge.allocated_call_seqs),
-            "usage": project_usage(raw_result),
-            "observed": project_observed(raw_result),
-        }
-        writer.send(result_frame)
-        # O ACK é do supervisor; sua ausência não muda o desfecho, só o registro.
-        state.result_acked.wait(timeout=30.0)
         return EXIT_OK
 
     except BootstrapError as exc:
