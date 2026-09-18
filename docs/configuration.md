@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 194 | 20 |
+| `runtime` | 195 | 20 |
 | `admin-ui` | 28 | 6 |
 | `migrator` | 15 | 2 |
 | `backup` | 44 | 7 |
@@ -235,6 +235,7 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | Variável | Tipo | Default | Segredo | Serviços | Restart | Descrição |
 |---|---|---|---|---|---|---|
 | `MAIA_HERMES_ENABLED` | string | `false` | não | `runtime` | sim | Integração Hermes (spec §9.3). Com true, o processo HTTP registra o gateway de inferência interno; com false, nada Hermes entra no servidor. Desligar não apaga ledger nem fences. |
+| `MAIA_HERMES_INFERENCE_ALLOWED_SOURCES` | string | — | não | `runtime` | sim | Origens, além da loopback, que podem chamar o gateway de inferência Hermes: IPv4/CIDR ou IPv6 exato, separados por vírgula (ex.: a rede do container worker). Vazio = só loopback. Nunca a rede do proxy da borda. |
 | `FEATURE_MCP_TOOLS` | string | `false` | não | `runtime`, `admin-ui` | sim | MCP externo v1 (#478). Fail-closed: PROIBIDO em produção até o gate G4 (threat model + pentest). Ativa apenas em: development, staging. |
 | `FEATURE_PROACTIVE_MESSAGES` | string | `false` | não | `runtime` | sim | Mensagens proativas do agente. |
 | `FEATURE_OFX_IMPORT` | string | `false` | não | `runtime`, `maintenance` | sim | Importação de extratos OFX. |

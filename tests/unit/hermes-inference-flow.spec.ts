@@ -17,6 +17,7 @@ import {
   estimateExposureMicrousd,
   inputTokensUpperBound,
   isInternalRequest,
+  parseSourceAllowlist,
   projectChatCompletion,
   renderChatCompletionSse,
 } from '@/integrations/hermes/inference-flow.js';
@@ -249,30 +250,51 @@ describe('renderChatCompletionSse', () => {
   });
 });
 
-describe('isInternalRequest — rota não pública', () => {
+describe('isInternalRequest — allowlist positiva', () => {
+  const allowed = parseSourceAllowlist('10.1.0.0/16, 172.18.0.5, fd00::10')!;
+
   it.each([
-    ['127.0.0.1', true],
-    ['::1', true],
-    ['::ffff:127.0.0.1', true],
-    ['10.1.2.3', true],
-    ['172.16.0.1', true],
-    ['172.31.255.255', true],
-    ['192.168.1.1', true],
-    ['fd12:3456::1', true],
-    ['172.32.0.1', false],
-    ['8.8.8.8', false],
-    ['2001:db8::1', false],
-  ])('%s → %s', (addr, ok) => {
-    expect(isInternalRequest({ remote_address: addr, headers: {} })).toBe(ok);
+    ['127.0.0.1', [], true],
+    ['127.9.9.9', [], true],
+    ['::1', [], true],
+    ['::ffff:127.0.0.1', [], true],
+    // IP privado NÃO basta: o proxy da borda também fala da rede privada.
+    ['10.1.2.3', [], false],
+    ['192.168.1.1', [], false],
+    ['10.1.2.3', allowed, true],
+    ['::ffff:10.1.2.3', allowed, true],
+    ['10.2.0.1', allowed, false],
+    ['172.18.0.5', allowed, true],
+    ['172.18.0.6', allowed, false],
+    ['fd00::10', allowed, true],
+    ['fd00::11', allowed, false],
+    ['8.8.8.8', allowed, false],
+  ] as const)('%s com %j → %s', (addr, rules, ok) => {
+    expect(isInternalRequest({ remote_address: addr, headers: {}, allowed: rules })).toBe(ok);
   });
 
-  it('qualquer cabeçalho de proxy recusa, mesmo vindo de rede privada', () => {
+  it('qualquer cabeçalho de proxy recusa, até da loopback', () => {
     for (const h of ['x-forwarded-for', 'forwarded', 'x-real-ip', 'x-forwarded-host', 'via']) {
-      expect(isInternalRequest({ remote_address: '10.0.0.2', headers: { [h]: '1.2.3.4' } })).toBe(false);
+      expect(isInternalRequest({ remote_address: '127.0.0.1', headers: { [h]: '1.2.3.4' } })).toBe(false);
     }
   });
 
   it('sem endereço recusa', () => {
     expect(isInternalRequest({ remote_address: undefined, headers: {} })).toBe(false);
   });
+});
+
+describe('parseSourceAllowlist', () => {
+  it('vazio é só loopback; lista válida vira regras', () => {
+    expect(parseSourceAllowlist(undefined)).toEqual([]);
+    expect(parseSourceAllowlist('  ')).toEqual([]);
+    expect(parseSourceAllowlist('10.0.0.0/8')).toHaveLength(1);
+  });
+
+  it.each(['10.0.0.256', '10.0.0.0/33', 'abc', '10.0.0.0/8,,', 'fd00::zz'])(
+    'entrada inválida (%s) recusa a lista inteira',
+    (t) => {
+      expect(parseSourceAllowlist(t)).toBeNull();
+    },
+  );
 });

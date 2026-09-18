@@ -15,13 +15,21 @@ import { inferenceRepo } from '@/db/repositories/inference-repos.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { createChatCompletionsRelay } from '@/lib/llm/providers/chat-completions-relay.js';
 import { _internal, getToolCallingModels } from '@/lib/openrouter-models.js';
+import { parseSourceAllowlist } from './inference-flow.js';
 import { registerHermesInferenceRoute } from './inference-route.js';
 import { createCatalogTariff } from './inference-tariff.js';
 
 export const OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 
 export async function registerHermesInferenceGateway(app: FastifyInstance): Promise<void> {
+  // Allowlist ilegível derruba o boot: uma regra descartada em silêncio mudaria
+  // quem pode chamar a rota sem ninguém ter decidido.
+  const allowed_sources = parseSourceAllowlist(config.MAIA_HERMES_INFERENCE_ALLOWED_SOURCES);
+  if (allowed_sources === null) {
+    throw new Error('MAIA_HERMES_INFERENCE_ALLOWED_SOURCES inválida');
+  }
   await registerHermesInferenceRoute(app, {
+    allowed_sources,
     ledger: inferenceRepo,
     relay: createChatCompletionsRelay({
       provider: 'openrouter',

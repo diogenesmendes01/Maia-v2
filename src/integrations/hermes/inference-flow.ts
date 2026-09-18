@@ -12,13 +12,17 @@
  *  - como a resposta do provider vira o formato estrito do contrato?
  *  - como a resposta validada volta ao filho em SSE, que é o que o cliente
  *    pinado pede sempre (`stream: true`, medido no SHA 5d59366)?
- *  - a requisição veio da rede interna, sem passar pelo proxy público?
+ *  - a requisição veio de uma origem autorizada, sem passar pelo proxy público?
  *
  * Dinheiro é inteiro: tarifas em NANOusd por token e resultados em microusd,
  * com arredondamento PARA CIMA — a reserva nunca sai menor que a conta.
  */
 import { canonicalDigest } from './canonical-json.js';
-import type { InferenceRequestV1, InferenceResponseV1, InferenceUsageObservedV1 } from './inference-gateway.js';
+import type {
+  InferenceRequestV1,
+  InferenceResponseV1,
+  InferenceUsageObservedV1,
+} from './inference-gateway.js';
 
 // ─── superfície ─────────────────────────────────────────────────────────────
 
@@ -136,7 +140,8 @@ export function costFromUsage(
 ): string | null {
   if (usage === null || tariff === null) return null;
   const total =
-    nano(usage.prompt_tokens, 'prompt_tokens') * nano(tariff.input_nanousd_per_token, 'input_rate') +
+    nano(usage.prompt_tokens, 'prompt_tokens') *
+      nano(tariff.input_nanousd_per_token, 'input_rate') +
     nano(usage.completion_tokens, 'completion_tokens') *
       nano(tariff.output_nanousd_per_token, 'output_rate');
   return ceilMicro(total);
@@ -159,14 +164,20 @@ export function projectChatCompletion(raw: unknown): unknown {
   const choices = raw.choices.map((c: unknown) => {
     if (!isObj(c) || !isObj(c.message)) return c;
     const m = c.message;
-    const message: Record<string, unknown> = { role: m.role, content: m.content ?? null };
+    const message: Record<string, unknown> = {
+      role: m.role,
+      content: m.content ?? null,
+    };
     if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
       message.tool_calls = m.tool_calls.map((tc: unknown) =>
         isObj(tc) && isObj(tc.function)
           ? {
               id: tc.id,
               type: tc.type,
-              function: { name: tc.function.name, arguments: tc.function.arguments },
+              function: {
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+              },
             }
           : tc,
       );
@@ -194,6 +205,26 @@ export function projectChatCompletion(raw: unknown): unknown {
     };
   }
   return out;
+}
+
+/**
+ * Uso de uma resposta que NÃO passou no contrato (tool fora da superfície,
+ * campo faltando): ainda assim a chamada foi paga, e o uso, se inteiro, entra
+ * na conta. Qualquer outra forma — `null`, corpo vazio, uso parcial — é uso
+ * desconhecido.
+ */
+export function usageFromProjected(projected: unknown): InferenceUsageObservedV1 | null {
+  if (!isObj(projected) || !isObj(projected.usage)) return null;
+  const u = projected.usage;
+  return typeof u.prompt_tokens === 'number' &&
+    typeof u.completion_tokens === 'number' &&
+    typeof u.total_tokens === 'number'
+    ? {
+        prompt_tokens: u.prompt_tokens,
+        completion_tokens: u.completion_tokens,
+        total_tokens: u.total_tokens,
+      }
+    : null;
 }
 
 /**
@@ -231,7 +262,10 @@ export function renderChatCompletionSse(
               index: i,
               id: tc.id,
               type: 'function',
-              function: { name: tc.function.name, arguments: tc.function.arguments },
+              function: {
+                name: tc.function.name,
+                arguments: tc.function.arguments,
+              },
             },
           ],
         },
@@ -252,32 +286,76 @@ export function renderChatCompletionSse(
 
 const PROXY_HEADERS = ['x-forwarded-for', 'forwarded', 'x-real-ip', 'x-forwarded-host', 'via'];
 
-function isPrivateAddress(addr: string): boolean {
-  const a = addr.startsWith('::ffff:') ? addr.slice(7) : addr;
-  if (a === '::1') return true;
-  const v4 = /^(\d{1,3})\.(\d{1,3})\.\d{1,3}\.\d{1,3}$/.exec(a);
-  if (v4) {
-    const o1 = Number(v4[1]);
-    const o2 = Number(v4[2]);
-    return (
-      o1 === 127 || o1 === 10 || (o1 === 172 && o2 >= 16 && o2 <= 31) || (o1 === 192 && o2 === 168)
-    );
-  }
-  // IPv6 unique local (fc00::/7).
-  return /^f[cd][0-9a-f]{2}:/i.test(a);
+/** Origem autorizada: um bloco IPv4 ou um endereço IPv6 exato. */
+export type SourceRuleV1 =
+  | { kind: 'ipv4'; base: number; mask: number }
+  | { kind: 'ipv6'; addr: string };
+
+const IPV4_RE = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+function ipv4ToInt(addr: string): number | null {
+  const m = IPV4_RE.exec(addr);
+  if (!m) return null;
+  const octetos = m.slice(1, 5).map(Number);
+  if (octetos.some((o) => o > 255)) return null;
+  return (
+    (((octetos[0]! << 24) >>> 0) + (octetos[1]! << 16) + (octetos[2]! << 8) + octetos[3]!) >>> 0
+  );
 }
 
 /**
- * A rota não é pública (§9.1). Qualquer cabeçalho de proxy significa que a
- * requisição atravessou o proxy da borda — e a borda publica o host inteiro.
- * Sem cabeçalho de proxy, só endereço de loopback ou de rede privada.
+ * Lê a allowlist de origens (`10.0.0.0/8, 172.18.0.5, fd00::10`). Entrada
+ * inválida RECUSA a lista inteira: uma regra ilegível descartada em silêncio
+ * mudaria quem pode chamar a rota sem ninguém ter decidido.
+ */
+export function parseSourceAllowlist(text: string | undefined): SourceRuleV1[] | null {
+  if (text === undefined || text.trim() === '') return [];
+  const rules: SourceRuleV1[] = [];
+  for (const raw of text.split(',')) {
+    const item = raw.trim();
+    if (item.includes(':')) {
+      if (!/^[0-9a-f:]+$/i.test(item)) return null;
+      rules.push({ kind: 'ipv6', addr: item.toLowerCase() });
+      continue;
+    }
+    const [ip, bits] = item.split('/');
+    const base = ipv4ToInt(ip ?? '');
+    const prefix = bits === undefined ? 32 : Number(bits);
+    if (base === null || !Number.isInteger(prefix) || prefix < 0 || prefix > 32) return null;
+    const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+    rules.push({ kind: 'ipv4', base: (base & mask) >>> 0, mask });
+  }
+  return rules;
+}
+
+function isLoopback(addr: string): boolean {
+  if (addr === '::1') return true;
+  const v4 = ipv4ToInt(addr);
+  return v4 !== null && v4 >>> 24 === 127;
+}
+
+/**
+ * A rota não é pública (§9.1). Allowlist POSITIVA: loopback sempre, e só as
+ * origens configuradas além dela. "Qualquer IP privado" não serve — o proxy da
+ * borda também fala da rede privada, e nem todo proxy acrescenta cabeçalho.
+ * Cabeçalho de proxy recusa de qualquer jeito.
  */
 export function isInternalRequest(input: {
   remote_address: string | undefined;
   headers: Readonly<Record<string, unknown>>;
+  allowed?: readonly SourceRuleV1[];
 }): boolean {
   for (const h of PROXY_HEADERS) {
     if (input.headers[h] !== undefined) return false;
   }
-  return typeof input.remote_address === 'string' && isPrivateAddress(input.remote_address);
+  if (typeof input.remote_address !== 'string') return false;
+  const raw = input.remote_address.toLowerCase();
+  const addr = raw.startsWith('::ffff:') && IPV4_RE.test(raw.slice(7)) ? raw.slice(7) : raw;
+  if (isLoopback(addr)) return true;
+  const v4 = ipv4ToInt(addr);
+  for (const rule of input.allowed ?? []) {
+    if (rule.kind === 'ipv4' && v4 !== null && (v4 & rule.mask) >>> 0 === rule.base) return true;
+    if (rule.kind === 'ipv6' && rule.addr === addr) return true;
+  }
+  return false;
 }
