@@ -43,16 +43,19 @@ describe('credencial de inferência', () => {
 
   it('superfície: nome → digest do schema, e recusa nome repetido ou reservado', () => {
     const schema = { type: 'object', properties: {}, additionalProperties: false };
-    expect(toolSurfaceOf([{ name: 'x', input_schema: schema }])).toEqual({
+    expect(toolSurfaceOf([{ name: 'x', input_schema: schema }], 'm')).toEqual({
       x: canonicalDigest(schema),
     });
     expect(() =>
-      toolSurfaceOf([
-        { name: 'x', input_schema: schema },
-        { name: 'x', input_schema: schema },
-      ]),
+      toolSurfaceOf(
+        [
+          { name: 'x', input_schema: schema },
+          { name: 'x', input_schema: schema },
+        ],
+        'm',
+      ),
     ).toThrow(TypeError);
-    expect(() => toolSurfaceOf([{ name: '__proto__', input_schema: schema }])).toThrow(TypeError);
+    expect(() => toolSurfaceOf([{ name: '__proto__', input_schema: schema }], 'm')).toThrow(TypeError);
   });
 
   it('superfície é o digest do schema que o Hermes envia, não do manifest cru', () => {
@@ -72,11 +75,22 @@ describe('credencial de inferência', () => {
       },
       additionalProperties: false,
     };
-    expect(toolSurfaceOf([{ name: 'r', input_schema: record }])).toEqual({
+    expect(toolSurfaceOf([{ name: 'r', input_schema: record }], 'm')).toEqual({
       r: canonicalDigest(enviado),
     });
     expect(() =>
-      toolSurfaceOf([{ name: 'r', input_schema: { type: 'object', properties: { 'a b': {} } } }]),
+      toolSurfaceOf([{ name: 'r', input_schema: { type: 'object', properties: { 'a b': {} } } }], 'm'),
     ).toThrow(TypeError);
+  });
+
+  it('Kimi: a superfície inclui a reescrita Moonshot (mesmo manifest, digest outro)', () => {
+    const schema = {
+      type: 'object',
+      properties: { a: { type: 'string' } },
+      additionalProperties: false,
+    };
+    const kimi = toolSurfaceOf([{ name: 'k', input_schema: schema }], 'moonshotai/kimi-k2');
+    expect(kimi).toEqual({ k: canonicalDigest({ ...schema, required: [] }) });
+    expect(kimi).not.toEqual(toolSurfaceOf([{ name: 'k', input_schema: schema }], 'm'));
   });
 });

@@ -20,7 +20,11 @@
  * do JS); ela decide a ordem do `required` herdado e quem vence entre `type` em
  * array e `anyOf`/`nullable` do mesmo nó.
  *
- * Paridade provada contra o sanitizador Python real em
+ * Para modelo Kimi/Moonshot o transporte do Hermes aplica ainda
+ * `agent/moonshot_schema.sanitize_moonshot_tools`, também portado aqui: a
+ * superfície depende do modelo do grant.
+ *
+ * Paridade provada contra o Python real em
  * `tests/hermes-spike/hermes-schema-normalizer-spike.spec.ts`.
  */
 
@@ -222,13 +226,9 @@ function stripRefSiblings(node: unknown): unknown {
   });
 }
 
-/**
- * O `parameters` que o Hermes pinado envia para um `input_schema` do manifest.
- * Lança `HermesSchemaUnsupportedError` no que o porte não reproduz.
- */
-export function hermesToolParameters(inputSchema: unknown): Obj {
+/** `_sanitize_single_tool` do `tools/schema_sanitizer.py`, para o `parameters`. */
+function genericParameters(inputSchema: unknown): Obj {
   if (!isObj(inputSchema)) return emptyObject();
-  assertSafeKeys(inputSchema);
   const sanitized = sanitizeNode(inputSchema);
   let top: Obj = isObj(sanitized) ? sanitized : {};
   top.type = 'object';
@@ -237,4 +237,142 @@ export function hermesToolParameters(inputSchema: unknown): Obj {
   top = isObj(collapsed) ? { ...collapsed } : {};
   for (const k of TOP_LEVEL_FORBIDDEN_KEYS) delete top[k];
   return stripRefSiblings(top) as Obj;
+}
+
+// ─── Moonshot (Kimi) ────────────────────────────────────────────────────────
+// `agent/transports/chat_completions._base_kwargs` aplica, DEPOIS do genérico,
+// `agent/moonshot_schema.sanitize_moonshot_tools` quando `is_moonshot_model`.
+
+/** `agent/moonshot_schema.is_moonshot_model`. */
+export function isMoonshotModel(model: string | null | undefined): boolean {
+  if (!model) return false;
+  const bare = model.trim().toLowerCase();
+  const tail = bare.slice(bare.lastIndexOf('/') + 1);
+  if (tail.startsWith('kimi-') || tail === 'kimi') return true;
+  if (tail === 'k3' || tail.startsWith('k3.') || tail.startsWith('k3-')) return true;
+  return bare.includes('moonshot') || bare.includes('/kimi') || bare.startsWith('kimi');
+}
+
+const MS_MAP_KEYS = new Set(['properties', 'patternProperties', '$defs', 'definitions']);
+const MS_LIST_KEYS = new Set(['anyOf', 'oneOf', 'allOf', 'prefixItems']);
+const MS_NODE_KEYS = new Set(['items', 'contains', 'not', 'additionalProperties', 'propertyNames']);
+const MS_SCALAR_TYPES = new Set(['string', 'integer', 'number', 'boolean']);
+
+/** `type` que o Python não consegue comparar (dict) derruba o Hermes: recusa. */
+function assertHashableType(node: Obj): void {
+  if (isObj(node.type)) throw new HermesSchemaUnsupportedError('type objeto');
+}
+
+function ensureRequiredArray(node: Obj): Obj {
+  const props = node.properties;
+  const req = node.required;
+  if (Array.isArray(req)) {
+    if (isObj(props)) {
+      if (req.some((r) => isObj(r) || Array.isArray(r))) {
+        throw new HermesSchemaUnsupportedError('required com objeto');
+      }
+      node.required = req.filter((r) => typeof r === 'string' && own(props, r));
+    }
+  } else {
+    node.required = [];
+  }
+  return node;
+}
+
+function enumSampleType(sample: unknown): string {
+  if (typeof sample === 'boolean') return 'boolean';
+  if (typeof sample === 'number') {
+    // O JSON do JS escreve inteiro a partir de 1e21 em notação científica, que
+    // o Python lê como float.
+    return Number.isInteger(sample) && Math.abs(sample) < 1e21 ? 'integer' : 'number';
+  }
+  return 'string';
+}
+
+function fillMissingType(node: Obj): Obj {
+  const t = node.type;
+  if (Array.isArray(t)) {
+    const concrete = t.find((x) => typeof x === 'string' && x !== '' && x !== 'null');
+    return { ...node, type: concrete ?? 'string' };
+  }
+  if (own(node, 'type') && t !== null && t !== '') return node;
+  let inferred: string;
+  if (own(node, 'properties') || own(node, 'required') || own(node, 'additionalProperties')) {
+    inferred = 'object';
+  } else if (own(node, 'items') || own(node, 'prefixItems')) {
+    inferred = 'array';
+  } else if (Array.isArray(node.enum) && node.enum.length > 0) {
+    inferred = enumSampleType(node.enum[0]);
+  } else {
+    inferred = 'string';
+  }
+  return { ...node, type: inferred };
+}
+
+function repairMoonshot(node: unknown): unknown {
+  if (Array.isArray(node)) return node.map(repairMoonshot);
+  if (!isObj(node)) return node;
+  let r: Obj = {};
+  for (const key of keysOf(node)) {
+    const value = node[key];
+    if (MS_MAP_KEYS.has(key) && isObj(value)) {
+      const m: Obj = {};
+      for (const k of keysOf(value)) m[k] = repairMoonshot(value[k]);
+      r[key] = m;
+    } else if (
+      (MS_LIST_KEYS.has(key) && Array.isArray(value)) ||
+      (MS_NODE_KEYS.has(key) && isObj(value))
+    ) {
+      r[key] = repairMoonshot(value);
+    } else {
+      r[key] = value;
+    }
+  }
+  assertHashableType(r);
+  if (Array.isArray(r.anyOf)) {
+    delete r.type;
+    const variants = r.anyOf as unknown[];
+    const nonNull = variants.filter((b) => isObj(b) && b.type !== 'null');
+    if (nonNull.length === 0 || nonNull.length === variants.length) return r;
+    if (nonNull.length > 1) {
+      r.anyOf = nonNull;
+      return r;
+    }
+    const rest: Obj = {};
+    for (const k of Object.keys(r)) if (k !== 'anyOf') rest[k] = r[k];
+    r = { ...rest, ...(nonNull[0] as Obj) };
+    assertHashableType(r);
+  }
+  delete r.nullable;
+  if (!own(r, '$ref')) r = fillMissingType(r);
+  if (Array.isArray(r.enum) && Array.isArray(r.type)) {
+    throw new HermesSchemaUnsupportedError('type lista com enum');
+  }
+  if (Array.isArray(r.enum) && typeof r.type === 'string' && MS_SCALAR_TYPES.has(r.type)) {
+    const cleaned = (r.enum as unknown[]).filter((v) => v !== null && v !== '');
+    if (cleaned.length > 0) r.enum = cleaned;
+    else delete r.enum;
+  }
+  if (r.type === 'object') r = ensureRequiredArray(r);
+  return r;
+}
+
+/** `sanitize_moonshot_tool_parameters`. */
+function moonshotParameters(parameters: Obj): Obj {
+  const repaired = repairMoonshot(parameters);
+  if (!isObj(repaired)) return { type: 'object', properties: {}, required: [] };
+  const top: Obj = { ...repaired, type: 'object' };
+  if (!own(top, 'properties')) top.properties = {};
+  return ensureRequiredArray(top);
+}
+
+/**
+ * O `parameters` que o Hermes pinado envia, para um `input_schema` do manifest
+ * e o modelo do grant. Lança `HermesSchemaUnsupportedError` no que o porte não
+ * reproduz.
+ */
+export function hermesToolParameters(inputSchema: unknown, model: string): Obj {
+  assertSafeKeys(inputSchema);
+  const generic = genericParameters(inputSchema);
+  return isMoonshotModel(model) ? moonshotParameters(generic) : generic;
 }

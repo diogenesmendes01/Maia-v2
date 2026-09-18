@@ -45,8 +45,9 @@ export function bearerTokenOf(header: string | string[] | undefined): string | n
 
 /**
  * A superfície que o grant autoriza: nome da tool → digest canônico do schema
- * que o Hermes pinado ENVIA para aquele `input_schema` (o sanitizador dele
- * reescreve o schema antes de cada chamada; ver `hermes-schema-normalizer.ts`).
+ * que o Hermes pinado ENVIA para aquele `input_schema` e o modelo do grant (o
+ * sanitizador dele reescreve o schema antes de cada chamada, e reescreve mais
+ * para Kimi/Moonshot; ver `hermes-schema-normalizer.ts`).
  * É o que permite conferir nomes E schemas (§9.1 validação 4). Lança se um
  * schema não for JSON canônico ou tiver forma que o porte não reproduz — quem
  * emite o grant não pode emitir superfície que o gateway não conseguiria
@@ -54,6 +55,7 @@ export function bearerTokenOf(header: string | string[] | undefined): string | n
  */
 export function toolSurfaceOf(
   tools: ReadonlyArray<{ name: string; input_schema: Record<string, unknown> }>,
+  model: string,
 ): Record<string, string> {
   const surface = new Map<string, string>();
   for (const t of tools) {
@@ -62,7 +64,7 @@ export function toolSurfaceOf(
       throw new TypeError('toolSurfaceOf: nome de tool reservado');
     }
     if (surface.has(t.name)) throw new TypeError('toolSurfaceOf: tool repetida');
-    surface.set(t.name, canonicalDigest(hermesToolParameters(t.input_schema)));
+    surface.set(t.name, canonicalDigest(hermesToolParameters(t.input_schema, model)));
   }
   return Object.fromEntries(surface);
 }

@@ -20,7 +20,7 @@ delete process.env.MAIA_HERMES_UPSTREAM;
 const d = PYTHON && UPSTREAM ? describe : describe.skip;
 const SEP = process.platform === 'win32' ? ';' : ':';
 
-type Entry = { name: string; input_schema: unknown };
+type Entry = { name: string; model: string; input_schema: unknown };
 
 function sanitizePython(entries: Entry[]): Map<string, unknown> {
   const dir = mkdtempSync(join(tmpdir(), 'maia-hermes-sanitize-'));
@@ -71,20 +71,26 @@ d('spike — porte do sanitizador contra o Hermes pinado', () => {
     const { REGISTRY } = await import('@/tools/_registry.js');
     const { buildToolSchema } = await import('@/tools/schema-json.js');
     const entries: Entry[] = [];
-    for (const tool of Object.values(REGISTRY)) {
-      const built = buildToolSchema(tool);
-      if (built) entries.push({ name: built.name, input_schema: built.input_schema });
+    // Um modelo do caminho genérico e um Kimi (reescrita Moonshot por cima).
+    for (const model of ['anthropic/claude-sonnet-4.6', 'moonshotai/kimi-k2']) {
+      for (const tool of Object.values(REGISTRY)) {
+        const built = buildToolSchema(tool);
+        if (built) {
+          entries.push({ name: `${model}:${built.name}`, model, input_schema: built.input_schema });
+        }
+      }
     }
-    expect(entries.length).toBeGreaterThan(40);
+    expect(entries.length).toBeGreaterThan(80);
     const py = sanitizePython(entries);
     const reescritas: string[] = [];
     for (const e of entries) {
-      const ts = canonicalJsonStringify(hermesToolParameters(e.input_schema));
+      const ts = canonicalJsonStringify(hermesToolParameters(e.input_schema, e.model));
       expect(ts, e.name).toBe(canonicalJsonStringify(py.get(e.name)));
       if (ts !== canonicalJsonStringify(e.input_schema)) reescritas.push(e.name);
     }
-    // O sanitizador reescreve parte das tools reais: sem o porte, cada uma
-    // delas seria `tool_surface_mismatch` no gateway.
-    expect(reescritas.length).toBeGreaterThan(0);
+    // O Hermes reescreve parte das tools reais: sem o porte, cada uma delas
+    // seria `tool_surface_mismatch` no gateway.
+    expect(reescritas.filter((n) => n.startsWith('anthropic/')).length).toBeGreaterThan(0);
+    expect(reescritas.filter((n) => n.startsWith('moonshotai/')).length).toBeGreaterThan(0);
   }, 120_000);
 });

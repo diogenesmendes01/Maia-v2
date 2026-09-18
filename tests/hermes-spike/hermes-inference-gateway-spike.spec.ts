@@ -92,7 +92,7 @@ function grantState(model: string, tools: readonly SpikeTool[]): InferenceGrantS
       revoked_at: null,
       max_inference_calls: 4,
     },
-    tool_surface: toolSurfaceOf(tools),
+    tool_surface: toolSurfaceOf(tools, model),
     max_output_tokens: 256,
     run_phase: 'running',
     run_manifest_digest: 'a'.repeat(64),
@@ -291,7 +291,13 @@ d('spike — gateway de inferência com o cliente Hermes real', () => {
     expect(JSON.stringify(upstream)).not.toContain(token);
   }, 120_000);
 
-  it('schema reescrito pelo sanitizador do Hermes (record, anulável) confere', async () => {
+  it.each([
+    [MODEL, { meta: { properties: {} }, valor: { type: 'number', nullable: true } }],
+    [
+      'moonshotai/kimi-k2',
+      { meta: { properties: {}, required: [] }, valor: { type: 'number' } },
+    ],
+  ])('schema reescrito pelo Hermes (record, anulável) confere — %s', async (model, esperado) => {
     const stub = await startStubProvider({
       script: [
         { kind: 'tool_calls', calls: [{ name: 'fixture_registro', arguments: { meta: { a: 'b' } } }] },
@@ -300,9 +306,9 @@ d('spike — gateway de inferência com o cliente Hermes real', () => {
     });
     cleanup.push(() => stub.close());
     const token = mintInferenceToken();
-    const gw = await gateway(stub, token, MODEL, TOOLS_REESCRITAS);
+    const gw = await gateway(stub, token, model, TOOLS_REESCRITAS);
     const worker = spawnWorker(token);
-    const start = startFrame(gw.base, MODEL, TOOLS_REESCRITAS);
+    const start = startFrame(gw.base, model, TOOLS_REESCRITAS);
     worker.send(start);
     const pedido = await worker.waitFor('tool.request');
     expect(pedido).toMatchObject({ name: 'fixture_registro', args: { meta: { a: 'b' } } });
@@ -327,10 +333,7 @@ d('spike — gateway de inferência com o cliente Hermes real', () => {
     const [up] = stub.requests.filter((r) => r.path.endsWith('/chat/completions'));
     const params = (up!.body.tools as Array<{ function: { parameters: Record<string, unknown> } }>)[0]!
       .function.parameters;
-    expect(params.properties).toMatchObject({
-      meta: { properties: {} },
-      valor: { type: 'number', nullable: true },
-    });
+    expect(params.properties).toMatchObject(esperado);
   }, 120_000);
 
   it('deepseek: o `reasoning_content` que o cliente repõe no replay passa', async () => {
