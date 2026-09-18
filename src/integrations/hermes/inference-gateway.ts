@@ -635,11 +635,14 @@ const responseChoiceSchema = z
   })
   .strict();
 
+/** Teto `int4` do ledger: contagem maior que isso é uso que não se registra. */
+const tokenCount = () => z.number().int().min(0).max(2_147_483_647);
+
 const usageObservedSchema = z
   .object({
-    prompt_tokens: z.number().int().min(0),
-    completion_tokens: z.number().int().min(0),
-    total_tokens: z.number().int().min(0),
+    prompt_tokens: tokenCount(),
+    completion_tokens: tokenCount(),
+    total_tokens: tokenCount(),
   })
   .strict();
 

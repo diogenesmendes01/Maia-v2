@@ -149,6 +149,11 @@ export function costFromUsage(
 
 // ─── resposta ───────────────────────────────────────────────────────────────
 
+/** Contagem de tokens que cabe numa coluna `int4 >= 0`. */
+export const MAX_TOKEN_COUNT = 2_147_483_647;
+const isTokenCount = (v: unknown): v is number =>
+  typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= MAX_TOKEN_COUNT;
+
 const isObj = (v: unknown): v is Record<string, unknown> =>
   v !== null && typeof v === 'object' && !Array.isArray(v);
 
@@ -191,12 +196,14 @@ export function projectChatCompletion(raw: unknown): unknown {
     model: raw.model,
     choices,
   };
+  // Uso fora do que o ledger registra (negativo, fracionário, > int4) sai da
+  // resposta: o filho recebe a resposta e o custo fica desconhecido.
   const u = raw.usage;
   if (
     isObj(u) &&
-    typeof u.prompt_tokens === 'number' &&
-    typeof u.completion_tokens === 'number' &&
-    typeof u.total_tokens === 'number'
+    isTokenCount(u.prompt_tokens) &&
+    isTokenCount(u.completion_tokens) &&
+    isTokenCount(u.total_tokens)
   ) {
     out.usage = {
       prompt_tokens: u.prompt_tokens,
@@ -216,9 +223,10 @@ export function projectChatCompletion(raw: unknown): unknown {
 export function usageFromProjected(projected: unknown): InferenceUsageObservedV1 | null {
   if (!isObj(projected) || !isObj(projected.usage)) return null;
   const u = projected.usage;
-  return typeof u.prompt_tokens === 'number' &&
-    typeof u.completion_tokens === 'number' &&
-    typeof u.total_tokens === 'number'
+  // Só o que cabe nas colunas `int4 >= 0` do ledger: o resto é desconhecido.
+  return isTokenCount(u.prompt_tokens) &&
+    isTokenCount(u.completion_tokens) &&
+    isTokenCount(u.total_tokens)
     ? {
         prompt_tokens: u.prompt_tokens,
         completion_tokens: u.completion_tokens,

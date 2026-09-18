@@ -185,6 +185,16 @@ describe('projectChatCompletion + parseInferenceResponse', () => {
     expect(parsed.kind === 'ok' && parsed.response.usage).toBeNull();
   });
 
+  it.each([
+    ['negativo', -1],
+    ['fracionário', 1.5],
+    ['acima do int4 do ledger', 2_147_483_648],
+  ])('contagem de tokens %s: uso desconhecido, não registrado', (_n, n) => {
+    const ruim = { ...RAW, usage: { prompt_tokens: n, completion_tokens: 2, total_tokens: 12 } };
+    const parsed = parseInferenceResponse(projectChatCompletion(ruim), ['fixture_echo']);
+    expect(parsed.kind === 'ok' && parsed.response.usage).toBeNull();
+  });
+
   it('tool fora da superfície continua recusada depois da projeção', () => {
     expect(parseInferenceResponse(projectChatCompletion(RAW), ['outra']).kind).toBe('invalid');
   });
