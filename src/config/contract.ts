@@ -1438,6 +1438,19 @@ export const ENV_CONTRACT = {
   },
 
   // ---- feature flags ----------------------------------------------------
+  MAIA_HERMES_ENABLED: {
+    name: 'MAIA_HERMES_ENABLED',
+    description:
+      'Integração Hermes (spec §9.3). Com true, o processo HTTP registra o gateway de inferência interno; com false, nada Hermes entra no servidor. Desligar não apaga ledger nem fences.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_MCP_TOOLS: {
     name: 'FEATURE_MCP_TOOLS',
     description:

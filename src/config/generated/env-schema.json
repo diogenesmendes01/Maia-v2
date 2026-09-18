@@ -1671,6 +1671,21 @@
         "5"
       ]
     },
+    "MAIA_HERMES_ENABLED": {
+      "type": "string",
+      "description": "Integração Hermes (spec §9.3). Com true, o processo HTTP registra o gateway de inferência interno; com false, nada Hermes entra no servidor. Desligar não apaga ledger nem fences.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
     "FEATURE_MCP_TOOLS": {
       "type": "string",
       "description": "MCP externo v1 (#478). Fail-closed: PROIBIDO em produção até o gate G4 (threat model + pentest).",
