@@ -55,7 +55,7 @@ describe('createCatalogTariff', () => {
     expect(outro?.version).not.toBe(t?.version);
   });
 
-  it('preço real do Sonnet 4.6: busca e escrita de cache são inalcançáveis pelo gateway', async () => {
+  it('preço real do Sonnet 4.6: busca é inalcançável; entrada pela maior taxa, escrita de cache 1h', async () => {
     // Objeto `pricing` do catálogo OpenRouter (2026-09-18).
     const sonnet = {
       prompt: '0.000003',
@@ -66,7 +66,30 @@ describe('createCatalogTariff', () => {
       input_cache_write_1h: '0.000006',
     };
     expect(await tariff([model(sonnet)])(ID)).toMatchObject({
-      input_nanousd_per_token: 3000,
+      input_nanousd_per_token: 6000,
+      output_nanousd_per_token: 15000,
+    });
+  });
+
+  it('GPT-5.6: escrita de cache automática (sem campo no pedido) acima do prompt, na faixa', async () => {
+    // `openai/gpt-5.6-sol` no catálogo OpenRouter (2026-09-18).
+    const sol = {
+      prompt: '0.000002',
+      completion: '0.0000075',
+      input_cache_read: '0.0000002',
+      input_cache_write: '0.0000025',
+      overrides: [
+        {
+          min_prompt_tokens: 272000,
+          prompt: '0.000004',
+          completion: '0.000015',
+          input_cache_read: '0.0000004',
+          input_cache_write: '0.000005',
+        },
+      ],
+    };
+    expect(await tariff([model(sol)])(ID)).toMatchObject({
+      input_nanousd_per_token: 5000,
       output_nanousd_per_token: 15000,
     });
   });
@@ -91,10 +114,11 @@ describe('createCatalogTariff', () => {
     expect(t).toMatchObject({ input_nanousd_per_token: 2500, output_nanousd_per_token: 20000 });
   });
 
-  it('raciocínio até a taxa de completion é coberto; acima, sem tarifa', async () => {
+  it('raciocínio conta em completion_tokens: saída pela maior taxa', async () => {
     const base = { prompt: '0.000002', completion: '0.000006' };
-    expect(await tariff([model({ ...base, internal_reasoning: '0.000006' })])(ID)).not.toBeNull();
-    expect(await tariff([model({ ...base, internal_reasoning: '0.000007' })])(ID)).toBeNull();
+    expect(await tariff([model({ ...base, internal_reasoning: '0.000007' })])(ID)).toMatchObject({
+      output_nanousd_per_token: 7000,
+    });
   });
 
   it.each([
@@ -125,6 +149,25 @@ describe('createCatalogTariff', () => {
       },
     ],
     [
+      'faixa dentro de faixa',
+      {
+        prompt: '0.000001',
+        completion: '0.000002',
+        overrides: [
+          {
+            min_prompt_tokens: 100000,
+            prompt: '0.000001',
+            completion: '0.000002',
+            overrides: [{ min_prompt_tokens: 200000, prompt: '0.00001', completion: '0.00002' }],
+          },
+        ],
+      },
+    ],
+    [
+      'taxa de entrada fora de forma',
+      { prompt: '0.000002', completion: '0.000006', input_cache_write: 'grátis' },
+    ],
+    [
       'overrides fora de forma',
       { prompt: '0.000002', completion: '0.000006', overrides: { a: 1 } },
     ],
@@ -147,6 +190,8 @@ describe('createCatalogTariff', () => {
   });
 });
 
+// Só entra aqui cobrança que exige campo no pedido. Cobrança automática (ex.
+// escrita de cache da OpenAI) não tem gatilho para recusar: entra na taxa.
 describe('componentes ignorados só são ignoráveis porque o contrato recusa quem os dispara', () => {
   const base = { model: 'm', messages: [{ role: 'user', content: 'oi' }] };
   const parte = (p: Record<string, unknown>) => ({
@@ -160,13 +205,6 @@ describe('componentes ignorados só são ignoráveis porque o contrato recusa qu
       { ...base, web_search_options: {} },
       { ...base, tools: [{ type: 'web_search' }] },
     ],
-    input_cache_write: [
-      { ...base, cache_control: { type: 'ephemeral' } },
-      parte({ type: 'text', text: 'x', cache_control: { type: 'ephemeral' } }),
-    ],
-    input_cache_write_1h: [
-      parte({ type: 'text', text: 'x', cache_control: { type: 'ephemeral', ttl: '1h' } }),
-    ],
     image: [parte({ type: 'image_url', image_url: { url: 'https://x/y.png' } })],
     audio: [parte({ type: 'input_audio', input_audio: { data: 'AA==', format: 'wav' } })],
     input_audio_cache: [
@@ -179,10 +217,8 @@ describe('componentes ignorados só são ignoráveis porque o contrato recusa qu
     ],
   };
 
-  it('a lista de ignorados é exatamente estes gatilhos mais a leitura de cache', () => {
-    expect([...TARIFF_UNREACHABLE_COMPONENTS].sort()).toEqual(
-      [...Object.keys(gatilhos), 'input_cache_read'].sort(),
-    );
+  it('a lista de ignorados é exatamente estes gatilhos', () => {
+    expect([...TARIFF_UNREACHABLE_COMPONENTS].sort()).toEqual(Object.keys(gatilhos).sort());
   });
 
   it.each(Object.entries(gatilhos))('%s: todo gatilho é recusado', (_c, pedidos) => {

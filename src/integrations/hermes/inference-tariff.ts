@@ -5,21 +5,22 @@
  * Só preço BUSCADO vale: a lista fixa de fallback do `openrouter-models.ts` não
  * tem `pricing_raw`, e um número que ninguém conferiu não vira teto duro.
  *
- * Duas taxas por token (prompt, completion) têm de cobrir tudo o que uma
- * chamada PELO GATEWAY pode custar. Por componente do preço cru:
+ * Duas taxas por token têm de cobrir tudo o que uma chamada PELO GATEWAY pode
+ * custar. Por componente do preço cru:
  *
+ *  - taxa de ENTRADA é a maior entre `prompt`, leitura e escrita de cache: o
+ *    token de prompt pode ser cobrado como qualquer um deles, e a OpenAI grava
+ *    cache sozinha (GPT-5.6+ cobra a escrita a 1,25× o prompt, sem campo no
+ *    pedido);
+ *  - taxa de SAÍDA é a maior entre `completion` e `internal_reasoning`: o
+ *    raciocínio conta em `completion_tokens`;
  *  - inalcançável pelo contrato estrito do §9.1 — busca web (`plugins`,
- *    `web_search_options`), escrita de cache (`cache_control`), imagem/áudio
- *    de entrada (conteúdo em partes) e de saída (`modalities`) são recusados na
- *    entrada, e o Hermes pinado só marca cache com base_url do OpenRouter, não
- *    a do gateway — ignorado;
- *  - leitura de cache — mais barata que o prompt: cobrar o prompt superestima;
- *  - `internal_reasoning` — o raciocínio conta em `completion_tokens`: coberto
- *    se não passar da taxa de completion, senão sem tarifa;
+ *    `web_search_options`), imagem/áudio de entrada (conteúdo em partes) e de
+ *    saída (`modalities`) são recusados na entrada — ignorado;
  *  - faixas (`overrides`, por tamanho do prompt ou janela UTC) — vale a MAIOR
  *    taxa entre a base e as faixas, qualquer que seja a condição;
  *  - qualquer outro componente diferente de zero (ex. taxa por request) ou
- *    forma desconhecida — sem tarifa.
+ *    forma desconhecida (inclusive faixa dentro de faixa) — sem tarifa.
  *
  * Sem tarifa, a policy da admissão decide (o default `deny` não admite). A
  * conversão lê a string decimal do catálogo e ARREDONDA PARA CIMA, como toda
@@ -54,19 +55,26 @@ export function nanousdPerTokenCeil(usdPerToken: unknown): number | null {
 /**
  * Cobranças que só existem com campo ou forma de conteúdo que o contrato do
  * gateway recusa (teste em `hermes-inference-tariff.spec.ts` amarra as duas
- * listas), mais a leitura de cache.
+ * listas).
  */
 export const TARIFF_UNREACHABLE_COMPONENTS: ReadonlySet<string> = new Set([
   'web_search',
-  'input_cache_write',
-  'input_cache_write_1h',
   'image',
   'audio',
   'input_audio_cache',
   'image_output',
   'audio_output',
-  'input_cache_read',
 ]);
+
+/** Taxas por token de prompt: vale a maior. */
+const TAXAS_DE_ENTRADA = [
+  'prompt',
+  'input_cache_read',
+  'input_cache_write',
+  'input_cache_write_1h',
+];
+/** Taxas por token de saída: vale a maior. */
+const TAXAS_DE_SAIDA = ['completion', 'internal_reasoning'];
 
 /** Chaves de uma faixa que são CONDIÇÃO de aplicação, não preço. */
 const CONDICOES_DE_FAIXA = new Set(['min_prompt_tokens', 'utc_days', 'utc_start', 'utc_end']);
@@ -77,17 +85,29 @@ const isObj = (v: unknown): v is Readonly<Record<string, unknown>> =>
   typeof v === 'object' && v !== null && !Array.isArray(v);
 
 function taxasDaFaixa(faixa: Readonly<Record<string, unknown>>, faixaExtra: boolean): Taxas | null {
-  const input = nanousdPerTokenCeil(faixa.prompt);
-  const output = nanousdPerTokenCeil(faixa.completion);
+  // `prompt` e `completion` são obrigatórios; as outras taxas, se vierem, contam.
+  const maior = (chaves: readonly string[]): number | null => {
+    let m = nanousdPerTokenCeil(faixa[chaves[0]!]);
+    if (m === null) return null;
+    for (const c of chaves.slice(1)) {
+      if (!Object.hasOwn(faixa, c)) continue;
+      const v = nanousdPerTokenCeil(faixa[c]);
+      if (v === null) return null;
+      m = Math.max(m, v);
+    }
+    return m;
+  };
+  const input = maior(TAXAS_DE_ENTRADA);
+  const output = maior(TAXAS_DE_SAIDA);
   if (input === null || output === null) return null;
   for (const [chave, valor] of Object.entries(faixa)) {
-    if (chave === 'prompt' || chave === 'completion' || chave === 'overrides') continue;
+    if (TAXAS_DE_ENTRADA.includes(chave) || TAXAS_DE_SAIDA.includes(chave)) continue;
     if (TARIFF_UNREACHABLE_COMPONENTS.has(chave)) continue;
+    // `overrides` só no preço base (tratado em `taxasDoPreco`); numa faixa é forma desconhecida.
+    if (!faixaExtra && chave === 'overrides') continue;
     if (faixaExtra && CONDICOES_DE_FAIXA.has(chave)) continue;
     const nano = nanousdPerTokenCeil(valor);
-    if (nano === null) return null;
-    if (chave === 'internal_reasoning' && nano <= output) continue;
-    if (nano > 0) return null;
+    if (nano === null || nano > 0) return null;
   }
   return { input, output };
 }
