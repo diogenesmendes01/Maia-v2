@@ -3,15 +3,16 @@
 // Fala o mesmo protocolo do `services/hermes_worker` pelo stdin/stdout, sem
 // Python e sem Hermes, para exercitar spawn, pipe, cancelamento e kill reais.
 //
-// argv: <cenário> <tool_schema_digest>
+// argv: <cenário> <tool_schema_digest> [arquivo para o pid do neto]
 //
 // Antes de tudo confere o AMBIENTE: sai com 9 se faltar variável obrigatória,
 // se o HERMES_HOME não for absoluto, existente e vazio, ou se aparecer qualquer
 // variável fora da allowlist do supervisor.
+import { spawn } from 'node:child_process';
 import { existsSync, readdirSync, writeFileSync, mkdirSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 
-const [, , scenario = 'happy', digest = '0'.repeat(64)] = process.argv;
+const [, , scenario = 'happy', digest = '0'.repeat(64), pidFile = ''] = process.argv;
 const PROTOCOL = 'maia.hermes.worker.v1';
 
 const ALLOWED = new Set([
@@ -41,6 +42,7 @@ let start = null;
 const waiters = [];
 let buffer = '';
 let acks = 0;
+const received = [];
 
 function onFrame(frame) {
   if (start === null) {
@@ -48,6 +50,7 @@ function onFrame(frame) {
     void main();
     return;
   }
+  received.push(frame);
   if (frame.type === 'result_ack') acks += 1;
   if (frame.type === 'cancel') onCancel(frame);
   const i = waiters.findIndex((w) => w.match(frame));
@@ -67,6 +70,8 @@ process.stdin.on('data', (chunk) => {
 
 const waitFor = (match, ms = 5_000) =>
   new Promise((resolve) => {
+    const ja = received.find(match);
+    if (ja) return resolve(ja);
     const timer = setTimeout(() => resolve(null), ms);
     waiters.push({ match, resolve: (f) => { clearTimeout(timer); resolve(f); } });
   });
@@ -120,6 +125,12 @@ const describeOutcome = (f) =>
 
 async function finishWithAck(stop, seqs, expectedAcks = 1) {
   result(stop, seqs);
+  await waitAckThenExit(expectedAcks);
+}
+
+// Como o `main.py`: depois do `result` o worker ESPERA o `result_ack` (lá,
+// até 30s). Sem ACK ele só sai pela tolerância do cancel, morto.
+async function waitAckThenExit(expectedAcks = 1) {
   const deadline = Date.now() + 3_000;
   while (acks < expectedAcks && Date.now() < deadline) await new Promise((r) => setTimeout(r, 20));
   process.exit(acks >= expectedAcks ? 0 : 7);
@@ -130,7 +141,13 @@ function onCancel() {
   if (!cooperative) return;
   send({ type: 'cancel_ack', run_id: start.run_id, received_at: nowIso() });
   result({ kind: 'cancelled', reason: 'operator' });
-  setTimeout(() => process.exit(0), 50);
+  void waitAckThenExit();
+}
+
+// Neto no MESMO grupo de processos, sem herdar os pipes do protocolo.
+function spawnGrandchild() {
+  const gc = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+  if (pidFile) writeFileSync(pidFile, String(gc.pid));
 }
 
 async function main() {
@@ -237,6 +254,42 @@ async function main() {
       result({ kind: 'reply', raw_text: 'fica' });
       hangForever();
       return;
+    case 'slow_ready':
+      await new Promise((r) => setTimeout(r, 400));
+      ready();
+      return finishWithAck({ kind: 'reply', raw_text: 'tarde' }, []);
+    case 'tool_before_ready': {
+      toolRequest(0, start.manifest.tools[0].name);
+      await new Promise((r) => setTimeout(r, 100));
+      ready();
+      const r = await waitFor((f) => f.type === 'tool.result' && f.call_seq === 0);
+      return finishWithAck({ kind: 'reply', raw_text: `tool=${describeOutcome(r)}` }, []);
+    }
+    case 'violation_then_result':
+      ready();
+      // `progress` com chave a mais: o schema fechado recusa.
+      send({
+        type: 'progress',
+        run_id: start.run_id,
+        seq: 0,
+        event: 'iteration_started',
+        call_seq: null,
+        tool_name: null,
+        tenant_id: 'outro',
+      });
+      result({ kind: 'reply', raw_text: 'texto de canal violado' });
+      hangForever();
+      return;
+    case 'grandchild_hang':
+      cooperative = false;
+      spawnGrandchild();
+      ready();
+      hangForever();
+      return;
+    case 'grandchild_exit':
+      spawnGrandchild();
+      ready();
+      return finishWithAck({ kind: 'reply', raw_text: 'oi' }, []);
     default:
       process.exit(3);
   }

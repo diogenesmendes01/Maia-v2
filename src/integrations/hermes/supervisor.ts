@@ -315,6 +315,7 @@ export type LaunchRefusalV1 =
   | 'duplicate_run'
   | 'shutting_down'
   | 'invalid_start'
+  | 'deadline_exceeded'
   | 'home_unavailable'
   | 'spawn_failed';
 
@@ -435,14 +436,26 @@ export function createHermesSupervisor(
   const sessions = new Map<string, WorkerSessionV1 | null>();
   let shuttingDown = false;
 
-  async function launch(spec: WorkerLaunchSpecV1): Promise<LaunchResultV1> {
+  /** Launches ainda em andamento: o shutdown espera por eles também. */
+  const pending = new Set<Promise<LaunchResultV1>>();
+
+  function launch(spec: WorkerLaunchSpecV1): Promise<LaunchResultV1> {
+    const p = doLaunch(spec);
+    pending.add(p);
+    void p.finally(() => pending.delete(p));
+    return p;
+  }
+
+  async function doLaunch(spec: WorkerLaunchSpecV1): Promise<LaunchResultV1> {
     if (shuttingDown) return { kind: 'refused', reason: 'shutting_down' };
     const run_id = spec.start.run_id;
     if (sessions.has(run_id)) return { kind: 'refused', reason: 'duplicate_run' };
 
     let startLine: string;
+    let expectedSchemaDigest: string;
     try {
       startLine = serializeFrame(spec.start);
+      expectedSchemaDigest = computeToolSchemaDigest(spec.start.manifest.tools);
     } catch {
       return { kind: 'refused', reason: 'invalid_start' };
     }
@@ -453,6 +466,7 @@ export function createHermesSupervisor(
     ) {
       return { kind: 'refused', reason: 'invalid_start' };
     }
+    if (spec.execution_deadline_ms <= now()) return { kind: 'refused', reason: 'deadline_exceeded' };
 
     // Reserva ANTES do primeiro await: dois launches do mesmo run no mesmo tick
     // não criam dois processos.
@@ -469,6 +483,9 @@ export function createHermesSupervisor(
     } catch {
       return refuse('home_unavailable');
     }
+    // Daqui até o registro da sessão não há await: um shutdown que começou
+    // durante o mkdtemp é visto aqui; um que começa depois vê a sessão.
+    if (shuttingDown) return refuse('shutting_down', home);
 
     let env: Record<string, string>;
     try {
@@ -512,6 +529,7 @@ export function createHermesSupervisor(
       child,
       home,
       startLine,
+      expectedSchemaDigest,
       config,
       now,
       incarnation,
@@ -533,8 +551,12 @@ export function createHermesSupervisor(
     get: (run_id) => sessions.get(run_id) ?? undefined,
     async shutdown() {
       shuttingDown = true;
+      // Um launch em voo termina recusado ou com sessão; a sessão também cai.
+      const inflight = await Promise.all([...pending]);
+      const all = new Set<WorkerSessionV1>(live());
+      for (const r of inflight) if (r.kind === 'launched') all.add(r.session);
       await Promise.all(
-        live().map(async (s) => {
+        [...all].map(async (s) => {
           await s.requestCancel('shutdown');
           await s.exited;
         }),
@@ -551,28 +573,31 @@ function createSession(args: {
   child: ChildProcessWithoutNullStreams;
   home: string;
   startLine: string;
+  expectedSchemaDigest: string;
   config: Readonly<HermesSupervisorConfigV1>;
   now: () => number;
   incarnation: string;
   onRelease: () => void;
 }): WorkerSessionV1 {
-  const { spec, child, home, config, now } = args;
+  const { spec, child, home, config, now, expectedSchemaDigest } = args;
   const run_id = spec.start.run_id;
   const worker_instance_id = randomUUID();
   const hooks = spec.hooks;
   const toolNames = new Set(spec.start.manifest.tools.map((t) => t.name));
-  const expectedSchemaDigest = computeToolSchemaDigest(spec.start.manifest.tools);
 
   const readyD = deferred<ReadyOutcomeV1>();
   const exitedD = deferred<WorkerExitReportV1>();
   const releasedD = deferred<void>();
-  const goneD = deferred<void>();
+  /** O SO confirmou o fim do processo (`exit`/`close`). É o que a escada espera. */
+  const osExitD = deferred<void>();
 
   let readiness: 'pending' | 'verified' | 'refused' = 'pending';
   let readinessRefusal: ReadinessRefusalV1 | null = null;
+  let readyFrameSeen = false;
   let executorState: ExecutorObservedStateV1 = 'admitted';
   let capabilitiesRevoked = false;
   let journalRevoked = false;
+  let journalRevoking: Promise<void> | null = null;
   let protocolViolation: string | null = null;
   let cancel: { reason: CancelReasonV1; sent: boolean; ack_received: boolean } | null = null;
   let cancelSentD: Deferred<void> | null = null;
@@ -581,13 +606,18 @@ function createSession(args: {
   let terminal: WorkerSessionSnapshotV1['terminal'] = null;
   let terminalFrameDigest: string | null = null;
   let forwardedCalls = 0;
+  /**
+   * Chamadas cujo efeito ficou incerto: broker que falhou, `in_progress`
+   * (efeito em voo) ou em voo quando o processo acabou. Só um `result` do
+   * broker para a mesma chamada tira a marca.
+   */
   const unreconciledSeqs = new Set<number>();
   let exitReport: WorkerExitReportV1 | null = null;
   let exitCode: number | null = null;
   let exitSignal: string | null = null;
-  /** O SO disse que o processo saiu (evento `exit`/`close`). Síncrono. */
-  let exitObserved = false;
-  /** Pipes drenados, frames finais processados, autoridade encerrada. */
+  /** O SO disse que o processo saiu. Síncrono, no evento. */
+  let osExited = false;
+  /** Pipes drenados e frames finais processados. */
   let processGone = false;
   let pipeBroken = false;
   let stderrBytes = 0;
@@ -610,7 +640,7 @@ function createSession(args: {
   });
 
   function send(frame: MaiaToWorkerFrame): boolean {
-    if (pipeBroken || exitObserved || child.stdin.destroyed || !child.stdin.writable) return false;
+    if (pipeBroken || osExited || child.stdin.destroyed || !child.stdin.writable) return false;
     let line: string;
     try {
       line = serializeFrame(frame);
@@ -633,29 +663,65 @@ function createSession(args: {
       run_id,
       call_seq,
     };
-    if (!send({ ...base, outcome }) && !exitObserved && !pipeBroken) {
+    if (!send({ ...base, outcome }) && !osExited && !pipeBroken) {
       // Resultado fora do contrato (grande demais, por exemplo): recusa curta.
       send({ ...base, outcome: { kind: 'refused', code: 'protocol_error' } });
     }
   }
 
+  // ── tempo: prazo absoluto e horizonte MÓVEL da lease (§5.8.1) ──
+  function leaseHorizon(t: number): number {
+    let lease: number;
+    try {
+      lease = hooks.leaseHorizonMs();
+    } catch {
+      return t;
+    }
+    // Só +Infinity significa "sem lease". NaN, -Infinity e não-número são
+    // getter quebrado ou horizonte perdido: vale como lease vencida.
+    if (typeof lease !== 'number' || Number.isNaN(lease) || lease === Number.NEGATIVE_INFINITY) {
+      return t;
+    }
+    return lease;
+  }
+
+  /** `null` = dentro do prazo; senão, o motivo do cancelamento devido. */
+  function timeExpired(): CancelReasonV1 | null {
+    const t = now();
+    const lease = leaseHorizon(t);
+    if (t >= lease && lease <= spec.execution_deadline_ms) return 'ownership_lost';
+    if (t >= spec.execution_deadline_ms) return 'deadline';
+    if (t >= lease) return 'ownership_lost';
+    return null;
+  }
+
   function childHasAuthority(): boolean {
-    return (
-      readiness === 'verified' &&
-      !capabilitiesRevoked &&
-      terminal === null &&
-      !exitObserved &&
-      !pipeBroken &&
-      protocolViolation === null
-    );
+    if (
+      readiness !== 'verified' ||
+      capabilitiesRevoked ||
+      terminal !== null ||
+      osExited ||
+      pipeBroken ||
+      protocolViolation !== null
+    ) {
+      return false;
+    }
+    // Prazo e lease valem por chamada, não só no tick do watchdog.
+    const expired = timeExpired();
+    if (expired !== null) {
+      void requestCancel(expired);
+      return false;
+    }
+    return true;
   }
 
   // ── revogação: local síncrona, autoritativa pelo hook (com teto) ──
-  async function revokeInJournal(reason_code: string): Promise<void> {
+  function revokeInJournal(reason_code: string): Promise<void> {
     capabilitiesRevoked = true;
-    if (journalRevoked) return;
+    if (journalRevoked) return journalRevoking ?? Promise.resolve();
     journalRevoked = true;
-    await callHook(() => hooks.onRevoke(reason_code), config.hook_timeout_ms, undefined);
+    journalRevoking = callHook(() => hooks.onRevoke(reason_code), config.hook_timeout_ms, undefined);
+    return journalRevoking;
   }
 
   // ── escada de cancelamento (§6.7.3), dirigida por decideCancellation ──
@@ -681,7 +747,7 @@ function createSession(args: {
           cancel_sent: cancel!.sent,
           cancel_ack_received: cancel!.ack_received,
           grace_exceeded: graceExceeded,
-          process_exit_confirmed: processGone,
+          process_exit_confirmed: osExited,
           unreconciled_effect_calls: unreconciledSeqs.size,
         });
         switch (d) {
@@ -701,13 +767,13 @@ function createSession(args: {
             cancelSentD!.resolve();
             break;
           case 'await_grace':
-            await Promise.race([goneD.promise, sleep(graceDeadline - now())]);
-            if (!processGone && now() >= graceDeadline) graceExceeded = true;
+            await Promise.race([osExitD.promise, sleep(graceDeadline - now())]);
+            if (!osExited && now() >= graceDeadline) graceExceeded = true;
             break;
           case 'kill_process_group':
             killWorker(child);
-            await Promise.race([goneD.promise, sleep(config.exit_wait_ms)]);
-            if (!processGone) return { kind: 'exit_unconfirmed' };
+            await Promise.race([osExitD.promise, sleep(config.exit_wait_ms)]);
+            if (!osExited) return { kind: 'exit_unconfirmed' };
             break;
           case 'reconcile_effects':
             return { kind: 'reconcile_effects', unreconciled_calls: unreconciledSeqs.size };
@@ -736,9 +802,7 @@ function createSession(args: {
     // O `ready` recusado só resolve depois que o processo foi tratado: é o que
     // permite a quem chama distinguir "nunca aceito e morto" de "não sei".
     const ladder: Promise<unknown> = cancellation ?? Promise.resolve();
-    void ladder.then(() =>
-      readyD.resolve({ kind: 'refused', reason, exit_confirmed: processGone }),
-    );
+    void ladder.then(() => readyD.resolve({ kind: 'refused', reason, exit_confirmed: osExited }));
   }
 
   function violation(code: string): void {
@@ -749,10 +813,14 @@ function createSession(args: {
   }
 
   async function onReady(frame: ReadyFrame): Promise<void> {
-    if (readiness !== 'pending') {
+    if (readyFrameSeen) {
       violation('duplicate_ready');
       return;
     }
+    readyFrameSeen = true;
+    // O único `ready` pode cruzar com uma recusa local (prazo do ready, dono
+    // abortou): chega atrasado, não é violação, e não muda nada.
+    if (readiness !== 'pending') return;
     const check = verifyReadiness(frame, {
       run_id,
       hermes_sha: config.hermes_sha,
@@ -766,9 +834,14 @@ function createSession(args: {
     }
     const ok = await callHook(() => hooks.revalidate(), config.hook_timeout_ms, false);
     // Algo decidiu enquanto revalidava: prazo, cancelamento, violação ou exit.
-    if (readiness !== 'pending' || exitObserved) return;
+    if (readiness !== 'pending' || osExited) return;
     if (ok !== true) {
       refuseReadiness('revalidation_failed', 'ownership_lost');
+      return;
+    }
+    const expired = timeExpired();
+    if (expired !== null) {
+      refuseReadiness('revalidation_failed', expired);
       return;
     }
     if (cancel !== null) {
@@ -784,7 +857,8 @@ function createSession(args: {
   // ── ferramentas: FIFO, uma por vez (§5.7.4 item 4) ──
   function onToolRequest(frame: ToolRequestFrame): void {
     const seq = frame.call_seq;
-    if (readiness === 'refused' || capabilitiesRevoked || terminal !== null) {
+    // Antes do `ready` conferido não há autoridade: nem fila.
+    if (readiness !== 'verified' || capabilitiesRevoked || terminal !== null) {
       replyTool(seq, { kind: 'refused', code: 'run_not_authorized' });
       return;
     }
@@ -805,6 +879,11 @@ function createSession(args: {
     void pump();
   }
 
+  function isOutcome(value: unknown): value is ToolOutcomeV1 {
+    const kind = (value as { kind?: unknown } | null)?.kind;
+    return kind === 'result' || kind === 'in_progress' || kind === 'refused';
+  }
+
   async function pump(): Promise<void> {
     if (pumping || readiness !== 'verified') return;
     pumping = true;
@@ -820,16 +899,17 @@ function createSession(args: {
         forwardedCalls += 1;
         let outcome: ToolOutcomeV1;
         try {
-          outcome = await hooks.onToolRequest(frame);
+          const got: unknown = await hooks.onToolRequest(frame);
+          // Broker que responde fora do contrato: o efeito é incerto.
+          outcome = isOutcome(got) ? got : { kind: 'refused', code: 'effect_unknown' };
         } catch {
           // O broker falhou depois de receber a chamada: o efeito é incerto.
           outcome = { kind: 'refused', code: 'effect_unknown' };
         }
         inflightSeq = null;
-        if (outcome.kind === 'refused' && outcome.code === 'effect_unknown') {
+        if (outcome.kind === 'result') unreconciledSeqs.delete(frame.call_seq);
+        else if (outcome.kind === 'in_progress' || outcome.code === 'effect_unknown') {
           unreconciledSeqs.add(frame.call_seq);
-        } else {
-          unreconciledSeqs.delete(frame.call_seq);
         }
         // Resposta tardia não alimenta um filho sem autoridade (§6.7.3 item 6).
         if (!childHasAuthority()) {
@@ -845,6 +925,9 @@ function createSession(args: {
 
   // ── terminal ──
   async function onResult(frame: ResultFrame): Promise<void> {
+    // Canal que violou o protocolo não é mais fonte de candidato (o worker
+    // aplica a mesma regra a si mesmo). O run segue para reconciliação.
+    if (protocolViolation !== null) return;
     if (frame.request_key !== spec.start.request_key) {
       violation('request_key_mismatch');
       return;
@@ -870,11 +953,16 @@ function createSession(args: {
     if (readiness !== 'verified') {
       // `result` sem `ready` só é legítimo como resposta a um cancelamento
       // anterior ao loop (README do worker). Não vira candidato: o run nunca
-      // foi aceito.
+      // foi aceito, e sem ACK o worker sai pela tolerância do cancel.
       if (cancel === null) violation('result_before_ready');
       return;
     }
-    const current = { frame, persisted: false, terminal_digest: null as string | null, conflict: false };
+    const current = {
+      frame,
+      persisted: false,
+      terminal_digest: null as string | null,
+      conflict: false,
+    };
     terminal = current;
     terminalFrameDigest = digest;
     executorState =
@@ -885,19 +973,20 @@ function createSession(args: {
           : 'completed';
     // Terminal recebido: o filho não pede mais nada.
     capabilitiesRevoked = true;
-    // Falha de close/exit é observável (§6.7.2 item 8): o filho tem prazo.
-    arm(() => {
-      if (!processGone) void requestCancel('policy');
-    }, config.post_result_exit_ms);
+    // Revogação em curso termina ANTES de o terminal ser gravado.
+    if (journalRevoking) await journalRevoking;
 
     const persisted = await callHook<ResultPersistenceV1>(
       () => hooks.onResult(frame),
       config.hook_timeout_ms,
       { kind: 'not_persisted' },
     );
-    if (persisted.kind === 'persisted' && !current.conflict) {
+    if (persisted.kind === 'persisted' && !current.conflict && protocolViolation === null) {
       current.persisted = true;
       current.terminal_digest = persisted.terminal_digest;
+      // `result_ready` no journal já fecha os callbacks do run: um kill por
+      // exit atrasado não precisa de outra revogação.
+      journalRevoked = true;
       send({
         protocol: HERMES_WORKER_PROTOCOL_VERSION,
         type: 'result_ack',
@@ -905,6 +994,11 @@ function createSession(args: {
         terminal_digest: persisted.terminal_digest,
       });
     }
+    // Falha de close/exit é observável (§6.7.2 item 8): o prazo conta a partir
+    // do ACK (ou da recusa em gravar), não do tempo do nosso próprio banco.
+    arm(() => {
+      if (!processGone) void requestCancel('policy');
+    }, config.post_result_exit_ms);
   }
 
   // ── leitura do pipe, em ordem ──
@@ -966,20 +1060,36 @@ function createSession(args: {
   });
 
   // ── fim do processo ──
+  function markOsExit(): void {
+    if (osExited) return;
+    osExited = true;
+    capabilitiesRevoked = true;
+    // Chamada em voo quando o processo acabou: efeito incerto.
+    if (inflightSeq !== null) unreconciledSeqs.add(inflightSeq);
+    // O grupo inteiro acaba com o filho: nenhum descendente segue com a
+    // credencial de inferência no env.
+    if (process.platform !== 'win32' && typeof child.pid === 'number') {
+      try {
+        process.kill(-child.pid, 'SIGKILL');
+      } catch {
+        // grupo já vazio
+      }
+    }
+    osExitD.resolve();
+  }
+
   let finalizing = false;
   async function finalize(): Promise<void> {
     if (finalizing) return;
     finalizing = true;
-    exitObserved = true;
+    markOsExit();
     feed(splitter.end());
     // Os frames finais (um `result` colado ao exit) são processados; um hook
     // pendurado não segura o fim além do seu próprio teto.
     await Promise.race([chain, sleep(config.hook_timeout_ms + 100)]);
     processGone = true;
-    capabilitiesRevoked = true;
     for (const t of timers) clearTimeout(t);
     clearInterval(watchdog);
-    if (inflightSeq !== null) unreconciledSeqs.add(inflightSeq);
 
     if (terminal === null) {
       executorState = cancel !== null ? 'cancelled' : 'unknown';
@@ -989,7 +1099,6 @@ function createSession(args: {
       readinessRefusal = cancel !== null ? 'cancelled_before_ready' : 'exited_before_ready';
       readyD.resolve({ kind: 'refused', reason: readinessRefusal, exit_confirmed: true });
     }
-    goneD.resolve();
     // Pipe perdido = autoridade perdida: o journal também fica sabendo.
     if (!journalRevoked && terminal === null) {
       await revokeInJournal('worker_exited');
@@ -1019,7 +1128,7 @@ function createSession(args: {
   child.on('exit', (code, signal) => {
     exitCode = code;
     exitSignal = signal;
-    exitObserved = true;
+    markOsExit();
     // `close` espera os pipes; um neto que herde o stdout não pode segurar a
     // finalização para sempre.
     const t = setTimeout(() => {
@@ -1036,16 +1145,9 @@ function createSession(args: {
 
   // ── prazo: watchdog independente do pipe (§5.8.1) ──
   const watchdog = setInterval(() => {
-    if (processGone) return;
-    let lease: number;
-    try {
-      lease = hooks.leaseHorizonMs();
-    } catch {
-      lease = Number.NaN;
-    }
+    if (osExited) return;
     const t = now();
-    // NaN é getter quebrado: vale como lease vencida. +Infinity = sem lease.
-    if (typeof lease !== 'number' || Number.isNaN(lease)) lease = t;
+    const lease = leaseHorizon(t);
     const posture = deadlinePosture({
       now_ms: t,
       execution_deadline_ms: spec.execution_deadline_ms,
@@ -1053,8 +1155,7 @@ function createSession(args: {
       grace_ms: config.cancel_grace_ms,
     });
     if (posture === 'within_deadline') return;
-    const leaseFirst = lease < spec.execution_deadline_ms && t >= lease;
-    void requestCancel(leaseFirst ? 'ownership_lost' : 'deadline');
+    void requestCancel(timeExpired() ?? 'deadline');
     // Escada travada não mantém processo vivo.
     if (posture === 'kill_due') killWorker(child);
   }, config.watchdog_interval_ms);

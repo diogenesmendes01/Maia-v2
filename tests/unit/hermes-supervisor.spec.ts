@@ -9,7 +9,7 @@
  * variável fora da allowlist — todo caso "feliz" prova a allowlist de novo.
  */
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { afterAll, afterEach, describe, expect, it, vi } from 'vitest';
@@ -24,6 +24,7 @@ import {
   type HermesSupervisorV1,
   type ToolOutcomeV1,
   type WorkerSessionHooksV1,
+  type WorkerSessionV1,
 } from '@/integrations/hermes/supervisor.js';
 import { computeToolSchemaDigest } from '@/integrations/hermes/tool-schema-digest.js';
 
@@ -367,13 +368,26 @@ describe('supervisor — readiness recusada fecha o processo', () => {
 
 describe('supervisor — cancelamento (§6.7.3)', () => {
   it('worker cooperativo: revoga ANTES de pedir, e o terminal de cancelamento é gravado', async () => {
-    const { session, trace } = await launch('cooperative');
+    // O que o hook de revogação vê: o `cancel` ainda NÃO saiu (§6.7.3 item 1).
+    const cancelJaSaiu: Array<boolean | undefined> = [];
+    const ref: { session?: WorkerSessionV1 } = {};
+    const { session, trace } = await launch('cooperative', {
+      hooks: {
+        onRevoke: async (code) => {
+          cancelJaSaiu.push(ref.session?.snapshot().cancel?.sent);
+          trace.push(`revoke:${code}`);
+        },
+      },
+    });
+    ref.session = session;
     await session.ready;
     expect(await session.requestCancel('operator')).toBe('requested');
     expect(await session.cancellation).toEqual({ kind: 'settled' });
-    await session.exited;
-    expect(trace.indexOf('revoke:cancel:operator')).toBeGreaterThanOrEqual(0);
-    expect(trace.indexOf('revoke:cancel:operator')).toBeLessThan(trace.indexOf('result:cancelled'));
+    const exit = await session.exited;
+    expect(cancelJaSaiu).toEqual([false]);
+    expect(trace).toEqual(['revoke:cancel:operator', 'result:cancelled']);
+    // Terminal de cancelamento gravado → ACK → o worker sai sozinho.
+    expect(exit.code).toBe(0);
     const snap = session.snapshot();
     expect(snap.cancel).toEqual({ reason: 'operator', sent: true, ack_received: true });
     expect(snap.executor_state).toBe('cancelled');
@@ -560,6 +574,118 @@ describe('supervisor — fail-closed no pipe', () => {
   });
 });
 
+describe('supervisor — regressões da revisão', () => {
+  it('result depois de violação de protocolo NÃO vira candidato nem recebe ACK', async () => {
+    const { session, hooks: h } = await launch('violation_then_result');
+    await session.exited;
+    const snap = session.snapshot();
+    expect(snap.protocol_violation).toBe('invalid_frame:schema');
+    expect(h.onResult).not.toHaveBeenCalled();
+    expect(snap.terminal).toBeNull();
+  });
+
+  it('in_progress do broker = efeito em voo: cancelar depois exige reconciliação', async () => {
+    const { session } = await launch('tool_then_hang', {
+      hooks: { onToolRequest: async () => ({ kind: 'in_progress', retry_after_ms: 5_000 }) },
+    });
+    await session.ready;
+    await vi.waitFor(() => expect(session.snapshot().unreconciled_calls).toBe(1));
+    await session.requestCancel('operator');
+    expect(await session.cancellation).toEqual({ kind: 'reconcile_effects', unreconciled_calls: 1 });
+  });
+
+  it('exit confirmado pelo SO não espera o hook pendente para ser "confirmado"', async () => {
+    const { session } = await launch('result_no_exit', {
+      hooks: {
+        onResult: () =>
+          new Promise((r) =>
+            setTimeout(() => r({ kind: 'persisted' as const, terminal_digest: 'c'.repeat(64) }), 1_500),
+          ),
+      },
+      config: { hook_timeout_ms: 3_000, exit_wait_ms: 300, cancel_grace_ms: 100 },
+    });
+    await session.ready;
+    await vi.waitFor(() => expect(session.snapshot().terminal).not.toBeNull());
+    await session.requestCancel('operator');
+    expect(await session.cancellation).toEqual({ kind: 'settled' });
+  });
+
+  it('lease -Infinity vale como vencida (ownership_lost), não como "sem lease"', async () => {
+    const { session } = await launch('hang', {
+      hooks: { leaseHorizonMs: () => Number.NEGATIVE_INFINITY },
+    });
+    await session.exited;
+    expect(session.snapshot().cancel?.reason).toBe('ownership_lost');
+    expect(session.snapshot().readiness).not.toBe('verified');
+  });
+
+  it('prazo que vence durante o bootstrap recusa o ready, sem esperar o watchdog', async () => {
+    const { session, hooks: h } = await launch('slow_ready', {
+      deadline_ms: Date.now() + 200,
+      config: { watchdog_interval_ms: 60_000 },
+    });
+    expect(await session.ready).toMatchObject({ kind: 'refused', reason: 'revalidation_failed' });
+    expect(session.snapshot().cancel?.reason).toBe('deadline');
+    expect(h.onResult).not.toHaveBeenCalled();
+  });
+
+  it('ready atrasado depois do ready_timeout não é violação de protocolo', async () => {
+    const { session } = await launch('slow_ready', { config: { ready_timeout_ms: 150 } });
+    expect(await session.ready).toMatchObject({ kind: 'refused', reason: 'ready_timeout' });
+    await session.exited;
+    expect(session.snapshot().protocol_violation).toBeNull();
+  });
+
+  it('tool.request antes do ready é recusado, não enfileirado', async () => {
+    const { session, hooks: h } = await launch('tool_before_ready');
+    await session.exited;
+    expect(h.onToolRequest).not.toHaveBeenCalled();
+    expect(session.snapshot().terminal?.frame.stop).toEqual({
+      kind: 'reply',
+      raw_text: 'tool=refused:run_not_authorized',
+    });
+  });
+
+  const posix = it.skipIf(process.platform === 'win32');
+  const vivo = (pid: number): boolean => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  posix('kill da escada leva o GRUPO: o neto do worker morre junto', async () => {
+    const pidFile = join(HOME_ROOT, `gc-${randomUUID()}.pid`);
+    const start = startFrame();
+    const { session } = await launch('grandchild_hang', {
+      start,
+      config: {
+        worker_args: [FAKE, 'grandchild_hang', computeToolSchemaDigest(start.manifest.tools), pidFile],
+      },
+    });
+    await session.ready;
+    const gc = Number(readFileSync(pidFile, 'utf8'));
+    expect(vivo(gc)).toBe(true);
+    await session.requestCancel('operator');
+    await session.exited;
+    await vi.waitFor(() => expect(vivo(gc)).toBe(false), { timeout: 3_000 });
+  });
+
+  posix('worker que sai sozinho não deixa descendente vivo', async () => {
+    const pidFile = join(HOME_ROOT, `gc-${randomUUID()}.pid`);
+    const start = startFrame([]);
+    const { session } = await launch('grandchild_exit', {
+      start,
+      config: { worker_args: [FAKE, 'grandchild_exit', computeToolSchemaDigest([]), pidFile] },
+    });
+    expect((await session.exited).code).toBe(0);
+    const gc = Number(readFileSync(pidFile, 'utf8'));
+    await vi.waitFor(() => expect(vivo(gc)).toBe(false), { timeout: 3_000 });
+  });
+});
+
 describe('supervisor — launch', () => {
   it('recusa run duplicado e start fora do contrato', async () => {
     const start = startFrame();
@@ -581,8 +707,10 @@ describe('supervisor — launch', () => {
 
   it('executável inexistente: spawn_failed e home removido', async () => {
     const start = startFrame();
+    const raiz = mkdtempSync(join(tmpdir(), 'maia-hermes-spawnfail-'));
     const sup = createHermesSupervisor({
       ...config('happy', start),
+      home_root: raiz,
       python_executable: join(HOME_ROOT, 'nao-existe.exe'),
     });
     supervisors.push(sup);
@@ -596,6 +724,43 @@ describe('supervisor — launch', () => {
     });
     expect(res).toEqual({ kind: 'refused', reason: 'spawn_failed' });
     expect(sup.get(start.run_id)).toBeUndefined();
+    expect(readdirSync(raiz)).toEqual([]);
+    rmSync(raiz, { recursive: true, force: true });
+  });
+
+  it('prazo já vencido: recusa sem criar processo', async () => {
+    const start = startFrame();
+    const sup = createHermesSupervisor(config('happy', start));
+    supervisors.push(sup);
+    const res = await sup.launch({
+      start,
+      inference_key: 'k',
+      execution_deadline_ms: Date.now() - 1,
+      max_tool_calls: 1,
+      signal: new AbortController().signal,
+      hooks: hooks([]),
+    });
+    expect(res).toEqual({ kind: 'refused', reason: 'deadline_exceeded' });
+  });
+
+  it('shutdown durante um launch em voo: nada sobra vivo depois que ele resolve', async () => {
+    const start = startFrame();
+    const sup = createHermesSupervisor(config('no_tools', start));
+    const h = hooks([]);
+    const p = sup.launch({
+      start,
+      inference_key: 'k',
+      execution_deadline_ms: Date.now() + 10_000,
+      max_tool_calls: 1,
+      signal: new AbortController().signal,
+      hooks: h,
+    });
+    await sup.shutdown();
+    const r = await p;
+    expect(sup.activeCount()).toBe(0);
+    if (r.kind === 'launched') expect(r.session.snapshot().exit).not.toBeNull();
+    else expect(r.reason).toBe('shutting_down');
+    expect(h.onToolRequest).not.toHaveBeenCalled();
   });
 
   it('config inválida falha alto', () => {
