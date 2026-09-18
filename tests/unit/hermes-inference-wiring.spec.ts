@@ -5,6 +5,7 @@
  */
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it } from 'vitest';
+import { config } from '@/config/env.js';
 import { INFERENCE_GATEWAY_COMPLETIONS_PATH } from '@/integrations/hermes/inference-gateway.js';
 import { registerHermesInferenceGateway } from '@/integrations/hermes/inference-wiring.js';
 
@@ -36,5 +37,18 @@ describe('registerHermesInferenceGateway', () => {
       payload: '{}',
     });
     expect(publica.statusCode).toBe(404);
+  });
+
+  it('ligado sem credencial do provider: falha no boot, não registra rota', async () => {
+    const cfg = config as { OPENROUTER_API_KEY?: string };
+    const antes = cfg.OPENROUTER_API_KEY;
+    cfg.OPENROUTER_API_KEY = '';
+    try {
+      const app = Fastify();
+      apps.push(app);
+      await expect(registerHermesInferenceGateway(app)).rejects.toThrow(/OPENROUTER_API_KEY/);
+    } finally {
+      cfg.OPENROUTER_API_KEY = antes;
+    }
   });
 });

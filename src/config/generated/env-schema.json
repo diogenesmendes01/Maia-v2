@@ -1688,7 +1688,7 @@
     },
     "MAIA_HERMES_INFERENCE_ALLOWED_SOURCES": {
       "type": "string",
-      "description": "Origens, além da loopback, que podem chamar o gateway de inferência Hermes: IPv4/CIDR ou IPv6 exato, separados por vírgula (ex.: a rede do container worker). Vazio = só loopback. Nunca a rede do proxy da borda.",
+      "description": "Origens, além da loopback, que podem chamar o gateway de inferência Hermes: IPv4/CIDR ou IPv6 exato, separados por vírgula (ex.: a rede do container worker). Ausente = só loopback. Nunca a rede do proxy da borda.",
       "x-maia-type": "string",
       "x-maia-group": "feature-flags",
       "x-maia-secret": false,

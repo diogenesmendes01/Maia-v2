@@ -1454,7 +1454,7 @@ export const ENV_CONTRACT = {
   MAIA_HERMES_INFERENCE_ALLOWED_SOURCES: {
     name: 'MAIA_HERMES_INFERENCE_ALLOWED_SOURCES',
     description:
-      'Origens, além da loopback, que podem chamar o gateway de inferência Hermes: IPv4/CIDR ou IPv6 exato, separados por vírgula (ex.: a rede do container worker). Vazio = só loopback. Nunca a rede do proxy da borda.',
+      'Origens, além da loopback, que podem chamar o gateway de inferência Hermes: IPv4/CIDR ou IPv6 exato, separados por vírgula (ex.: a rede do container worker). Ausente = só loopback. Nunca a rede do proxy da borda.',
     group: 'feature-flags',
     secret: false,
     services: ['runtime'],

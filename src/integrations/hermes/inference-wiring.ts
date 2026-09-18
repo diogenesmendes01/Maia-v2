@@ -28,6 +28,11 @@ export async function registerHermesInferenceGateway(app: FastifyInstance): Prom
   if (allowed_sources === null) {
     throw new Error('MAIA_HERMES_INFERENCE_ALLOWED_SOURCES inválida');
   }
+  // Ligado sem provider é incompleto (§9.3): falha no boot, não em cada turno
+  // gastando o teto de chamadas do run com 503.
+  if (!config.OPENROUTER_API_KEY) {
+    throw new Error('MAIA_HERMES_ENABLED=true exige OPENROUTER_API_KEY');
+  }
   await registerHermesInferenceRoute(app, {
     allowed_sources,
     ledger: inferenceRepo,
