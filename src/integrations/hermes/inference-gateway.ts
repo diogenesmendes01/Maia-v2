@@ -144,12 +144,20 @@ const INFERENCE_ERROR_MESSAGE: Record<InferenceErrorCode, string> = {
   tool_surface_mismatch: 'requested tool surface does not match the approved one',
   run_not_active: 'execution is not accepting inference',
   payload_too_large: 'request exceeds the configured size limits',
-  budget_exhausted: 'budget is exhausted for this scope',
-  inference_limit_exceeded: 'inference call limit reached for this execution',
+  budget_exhausted: 'budget quota is exhausted for this scope',
+  inference_limit_exceeded: 'inference quota is exhausted for this execution',
   admission_unavailable: 'admission control is unavailable',
   provider_unavailable: 'upstream provider is unavailable',
 };
 
+/**
+ * `quota_error` e a palavra "quota" nas duas recusas 429 NÃO são estética. O
+ * cliente pinado (SHA 5d59366) tem retry próprio, que não lê `x-should-retry`:
+ * `agent/error_classifier.py` classifica um 429 cujo corpo cita `rate_limit`
+ * como limite de taxa RETENTÁVEL, e um 429 que fala em cota, sem sinal de
+ * janela, como `billing`, terminal. Medido com o classificador real; o spike
+ * `hermes-inference-refusals-spike` confere cada código do vocabulário.
+ */
 const INFERENCE_ERROR_TYPE: Record<InferenceErrorCode, string> = {
   invalid_request: 'invalid_request_error',
   unsupported_parameter: 'invalid_request_error',
@@ -159,8 +167,8 @@ const INFERENCE_ERROR_TYPE: Record<InferenceErrorCode, string> = {
   tool_surface_mismatch: 'permission_error',
   run_not_active: 'conflict_error',
   payload_too_large: 'invalid_request_error',
-  budget_exhausted: 'rate_limit_error',
-  inference_limit_exceeded: 'rate_limit_error',
+  budget_exhausted: 'quota_error',
+  inference_limit_exceeded: 'quota_error',
   admission_unavailable: 'service_unavailable_error',
   provider_unavailable: 'service_unavailable_error',
 };
