@@ -9,6 +9,7 @@
  */
 import { createHash, randomBytes } from 'node:crypto';
 import { canonicalDigest } from './canonical-json.js';
+import { hermesToolParameters } from './hermes-schema-normalizer.js';
 
 /** Público a que todo grant de inferência é emitido e contra o qual é conferido. */
 export const INFERENCE_GRANT_AUDIENCE = 'maia.hermes.inference.v1';
@@ -43,10 +44,13 @@ export function bearerTokenOf(header: string | string[] | undefined): string | n
 }
 
 /**
- * A superfície que o grant autoriza: nome da tool → digest canônico do
- * `input_schema`. É o que permite conferir nomes E schemas (§9.1 validação 4).
- * Lança se um schema não for JSON canônico — quem emite o grant não pode
- * emitir superfície que o gateway não conseguiria conferir.
+ * A superfície que o grant autoriza: nome da tool → digest canônico do schema
+ * que o Hermes pinado ENVIA para aquele `input_schema` (o sanitizador dele
+ * reescreve o schema antes de cada chamada; ver `hermes-schema-normalizer.ts`).
+ * É o que permite conferir nomes E schemas (§9.1 validação 4). Lança se um
+ * schema não for JSON canônico ou tiver forma que o porte não reproduz — quem
+ * emite o grant não pode emitir superfície que o gateway não conseguiria
+ * conferir.
  */
 export function toolSurfaceOf(
   tools: ReadonlyArray<{ name: string; input_schema: Record<string, unknown> }>,
@@ -58,7 +62,7 @@ export function toolSurfaceOf(
       throw new TypeError('toolSurfaceOf: nome de tool reservado');
     }
     if (surface.has(t.name)) throw new TypeError('toolSurfaceOf: tool repetida');
-    surface.set(t.name, canonicalDigest(t.input_schema));
+    surface.set(t.name, canonicalDigest(hermesToolParameters(t.input_schema)));
   }
   return Object.fromEntries(surface);
 }

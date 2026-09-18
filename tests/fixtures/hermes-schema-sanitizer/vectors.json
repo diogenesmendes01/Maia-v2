@@ -1,0 +1,744 @@
+{
+  "source": "hermes 5d59366 tools/schema_sanitizer.sanitize_tool_schemas",
+  "vectors": [
+    {
+      "name": "ja_limpo",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "texto": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "texto"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "texto": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "texto"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "record",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meta": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "meta": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "anulavel_aninhado",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "valor": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "x",
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "valor": {
+            "type": "number",
+            "nullable": true,
+            "description": "x",
+            "default": null
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "type_array",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "b": {
+            "type": [
+              "number",
+              "string"
+            ]
+          },
+          "c": {
+            "type": [
+              "null"
+            ]
+          },
+          "d": {
+            "type": []
+          },
+          "e": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "nullable": false
+          },
+          "f": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string",
+            "nullable": true
+          },
+          "b": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "c": {
+            "type": "null"
+          },
+          "d": {
+            "type": "object",
+            "properties": {}
+          },
+          "e": {
+            "nullable": false,
+            "type": "integer"
+          },
+          "f": {
+            "type": "object",
+            "nullable": true,
+            "properties": {}
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "uniao_no_topo",
+      "input_schema": {
+        "type": "object",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "tipo": {
+                "const": "a"
+              }
+            },
+            "required": [
+              "tipo"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "tipo": {
+                "const": "b"
+              }
+            }
+          }
+        ],
+        "properties": {}
+      },
+      "expected": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "topo_anulavel",
+      "input_schema": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "d"
+      },
+      "expected": {
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "nullable": true,
+        "description": "d"
+      }
+    },
+    {
+      "name": "ref_com_default",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "r": {
+            "$ref": "#/$defs/R",
+            "default": "x"
+          },
+          "s": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/R"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "y",
+            "title": "S"
+          }
+        },
+        "$defs": {
+          "R": {
+            "type": "object"
+          }
+        }
+      },
+      "expected": {
+        "$defs": {
+          "R": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "properties": {
+          "r": {
+            "$ref": "#/$defs/R"
+          },
+          "s": {
+            "$ref": "#/$defs/R",
+            "nullable": true,
+            "title": "S"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "string_nua",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "s": "string",
+          "o": "object",
+          "w": "weird",
+          "l": {
+            "type": "array",
+            "items": "integer"
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "l": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "o": {
+            "type": "object",
+            "properties": {}
+          },
+          "s": {
+            "type": "string"
+          },
+          "w": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "required_icado",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string",
+            "required": true
+          },
+          "b": {
+            "type": "string",
+            "required": false
+          },
+          "c": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "c",
+          "ghost"
+        ]
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "b": {
+            "type": "string"
+          },
+          "c": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "c",
+          "a"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "required_vazio",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "n": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "zz"
+        ]
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "n": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "literal_reescrito",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "d": {
+            "type": "object",
+            "default": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "enum": [
+              {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            ],
+            "examples": [
+              "string"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "d": {
+            "default": {
+              "type": "string",
+              "nullable": true
+            },
+            "enum": [
+              {
+                "type": "string",
+                "nullable": true
+              }
+            ],
+            "examples": [
+              "string"
+            ],
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "bool_e_dependencias",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "arr": {
+            "type": "array",
+            "items": true
+          },
+          "u": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "k": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "dependencies": {
+          "arr": [
+            "u"
+          ],
+          "u": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": true
+      },
+      "expected": {
+        "additionalProperties": true,
+        "dependencies": {
+          "arr": [
+            "u"
+          ],
+          "u": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "properties": {
+          "arr": {
+            "items": true,
+            "type": "array"
+          },
+          "k": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "u": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "filhos_de_schema",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "p": {
+            "type": "array",
+            "prefixItems": [
+              "string",
+              {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            ]
+          },
+          "q": {
+            "not": {
+              "type": "null"
+            },
+            "if": {
+              "type": "object"
+            },
+            "then": "string",
+            "else": {
+              "type": "object",
+              "required": true
+            }
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "p": {
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer",
+                "nullable": true
+              }
+            ],
+            "type": "array"
+          },
+          "q": {
+            "else": {
+              "type": "object",
+              "properties": {}
+            },
+            "if": {
+              "type": "object",
+              "properties": {}
+            },
+            "not": {
+              "type": "null"
+            },
+            "then": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "uniao_dupla",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "n": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "T"
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "n": {
+            "type": "string",
+            "nullable": true,
+            "title": "T"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "combinadores_no_topo",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "enum": [
+          {}
+        ],
+        "not": {
+          "required": [
+            "x"
+          ]
+        },
+        "allOf": [
+          {}
+        ],
+        "oneOf": [
+          {}
+        ]
+      },
+      "expected": {
+        "properties": {},
+        "type": "object"
+      }
+    },
+    {
+      "name": "nao_objeto",
+      "input_schema": [],
+      "expected": {
+        "type": "object",
+        "properties": {}
+      }
+    },
+    {
+      "name": "mapas",
+      "input_schema": {
+        "type": "object",
+        "patternProperties": {
+          "^x": "string"
+        },
+        "definitions": {
+          "D": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "dependentSchemas": {
+          "a": {
+            "type": "object"
+          }
+        },
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        }
+      },
+      "expected": {
+        "definitions": {
+          "D": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "dependentSchemas": {
+          "a": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "patternProperties": {
+          "^x": {
+            "type": "string"
+          }
+        },
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "name": "type_array_vence_anyof",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "z": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              }
+            ],
+            "type": [
+              "number",
+              "string"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "z": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      }
+    }
+  ]
+}

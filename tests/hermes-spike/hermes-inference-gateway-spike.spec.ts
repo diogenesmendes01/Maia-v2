@@ -50,6 +50,24 @@ const TOOLS = [
     result_limit_chars: 4096,
   },
 ];
+/** Record e campo anulável: formas que o sanitizador do Hermes reescreve. */
+const TOOLS_REESCRITAS = [
+  {
+    name: 'fixture_registro',
+    input_schema: {
+      type: 'object',
+      description: 'Registra metadados.',
+      properties: {
+        meta: { type: 'object', additionalProperties: { type: 'string' } },
+        valor: { anyOf: [{ type: 'number' }, { type: 'null' }] },
+      },
+      required: ['meta'],
+      additionalProperties: false,
+    },
+    result_limit_chars: 4096,
+  },
+];
+type SpikeTool = (typeof TOOLS)[number] | (typeof TOOLS_REESCRITAS)[number];
 const HOME_ROOT = mkdtempSync(join(tmpdir(), 'maia-hermes-gwspike-'));
 afterAll(() => rmSync(HOME_ROOT, { recursive: true, force: true }));
 
@@ -58,7 +76,7 @@ afterEach(async () => {
   for (const c of cleanup.splice(0).reverse()) await c();
 });
 
-function grantState(model: string): InferenceGrantStateV1 {
+function grantState(model: string, tools: readonly SpikeTool[]): InferenceGrantStateV1 {
   return {
     grant_id: randomUUID(),
     grant: {
@@ -69,12 +87,12 @@ function grantState(model: string): InferenceGrantStateV1 {
       audience: INFERENCE_GRANT_AUDIENCE,
       model,
       manifest_digest: 'a'.repeat(64),
-      allowed_tool_names: TOOLS.map((t) => t.name),
+      allowed_tool_names: tools.map((t) => t.name),
       expires_at: new Date(Date.now() + 120_000).toISOString(),
       revoked_at: null,
       max_inference_calls: 4,
     },
-    tool_surface: toolSurfaceOf(TOOLS),
+    tool_surface: toolSurfaceOf(tools),
     max_output_tokens: 256,
     run_phase: 'running',
     run_manifest_digest: 'a'.repeat(64),
@@ -86,8 +104,13 @@ function grantState(model: string): InferenceGrantStateV1 {
   };
 }
 
-async function gateway(stub: StubProvider, token: string, model = MODEL) {
-  const st = grantState(model);
+async function gateway(
+  stub: StubProvider,
+  token: string,
+  model = MODEL,
+  tools: readonly SpikeTool[] = TOOLS,
+) {
+  const st = grantState(model, tools);
   const admitted: string[] = [];
   const settled: SettleOutcomeV1[] = [];
   const app: FastifyInstance = Fastify();
@@ -182,7 +205,11 @@ function spawnWorker(token: string) {
   };
 }
 
-function startFrame(base_url: string, model = MODEL): StartFrame {
+function startFrame(
+  base_url: string,
+  model = MODEL,
+  tools: readonly SpikeTool[] = TOOLS,
+): StartFrame {
   const run_id = randomUUID();
   return {
     protocol: 'maia.hermes.worker.v1',
@@ -196,7 +223,11 @@ function startFrame(base_url: string, model = MODEL): StartFrame {
       manifest_digest: 'b'.repeat(64),
       mode: 'live',
     },
-    manifest: { schema: 'maia-hermes-runtime-manifest/v1', tools: TOOLS, result_limit_chars: 4096 },
+    manifest: {
+      schema: 'maia-hermes-runtime-manifest/v1',
+      tools: tools as StartFrame['manifest']['tools'],
+      result_limit_chars: 4096,
+    },
     context: {
       system: 'Você é um atendente de teste. Responda curto.',
       user_message: '<user_message>diga oi</user_message>',
@@ -258,6 +289,48 @@ d('spike — gateway de inferência com o cliente Hermes real', () => {
     expect(upstream).toHaveLength(2);
     expect(upstream.every((r) => r.body.stream === false)).toBe(true);
     expect(JSON.stringify(upstream)).not.toContain(token);
+  }, 120_000);
+
+  it('schema reescrito pelo sanitizador do Hermes (record, anulável) confere', async () => {
+    const stub = await startStubProvider({
+      script: [
+        { kind: 'tool_calls', calls: [{ name: 'fixture_registro', arguments: { meta: { a: 'b' } } }] },
+        { kind: 'text', content: 'registrado' },
+      ],
+    });
+    cleanup.push(() => stub.close());
+    const token = mintInferenceToken();
+    const gw = await gateway(stub, token, MODEL, TOOLS_REESCRITAS);
+    const worker = spawnWorker(token);
+    const start = startFrame(gw.base, MODEL, TOOLS_REESCRITAS);
+    worker.send(start);
+    const pedido = await worker.waitFor('tool.request');
+    expect(pedido).toMatchObject({ name: 'fixture_registro', args: { meta: { a: 'b' } } });
+    worker.send({
+      protocol: 'maia.hermes.worker.v1',
+      type: 'tool.result',
+      run_id: start.run_id,
+      call_seq: 0,
+      outcome: { kind: 'result', result: { ok: true }, is_error: false },
+    });
+    const result = await worker.waitFor('result');
+    worker.send({
+      protocol: 'maia.hermes.worker.v1',
+      type: 'result_ack',
+      run_id: start.run_id,
+      terminal_digest: 'c'.repeat(64),
+    });
+    expect(await worker.exit()).toBe(0);
+    expect(result.stop).toEqual({ kind: 'reply', raw_text: 'registrado' });
+    expect(gw.settled.map((s) => s.kind)).toEqual(['completed', 'completed']);
+    // O que chegou ao upstream é o schema reescrito, não o do manifest.
+    const [up] = stub.requests.filter((r) => r.path.endsWith('/chat/completions'));
+    const params = (up!.body.tools as Array<{ function: { parameters: Record<string, unknown> } }>)[0]!
+      .function.parameters;
+    expect(params.properties).toMatchObject({
+      meta: { properties: {} },
+      valor: { type: 'number', nullable: true },
+    });
   }, 120_000);
 
   it('família gpt-5: `max_completion_tokens` e `developer` do cliente pinado passam', async () => {

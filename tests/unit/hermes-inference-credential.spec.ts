@@ -54,4 +54,29 @@ describe('credencial de inferência', () => {
     ).toThrow(TypeError);
     expect(() => toolSurfaceOf([{ name: '__proto__', input_schema: schema }])).toThrow(TypeError);
   });
+
+  it('superfície é o digest do schema que o Hermes envia, não do manifest cru', () => {
+    const record = {
+      type: 'object',
+      properties: {
+        meta: { type: 'object', additionalProperties: { type: 'string' } },
+        valor: { anyOf: [{ type: 'number' }, { type: 'null' }] },
+      },
+      additionalProperties: false,
+    };
+    const enviado = {
+      type: 'object',
+      properties: {
+        meta: { type: 'object', additionalProperties: { type: 'string' }, properties: {} },
+        valor: { type: 'number', nullable: true },
+      },
+      additionalProperties: false,
+    };
+    expect(toolSurfaceOf([{ name: 'r', input_schema: record }])).toEqual({
+      r: canonicalDigest(enviado),
+    });
+    expect(() =>
+      toolSurfaceOf([{ name: 'r', input_schema: { type: 'object', properties: { 'a b': {} } } }]),
+    ).toThrow(TypeError);
+  });
 });
