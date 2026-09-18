@@ -100,9 +100,22 @@ describe('checkRequestSurface — nomes E schemas', () => {
 
 describe('enforceOutputCap', () => {
   it('ausente vira o teto; igual passa; acima recusa', () => {
-    expect(enforceOutputCap(req(), 256)).toEqual({ ok: true, max_tokens: 256 });
-    expect(enforceOutputCap(req({ max_tokens: 256 }), 256)).toEqual({ ok: true, max_tokens: 256 });
+    expect(enforceOutputCap(req(), 256)).toEqual({ ok: true, field: 'max_tokens', max_tokens: 256 });
+    expect(enforceOutputCap(req({ max_tokens: 256 }), 256)).toEqual({
+      ok: true,
+      field: 'max_tokens',
+      max_tokens: 256,
+    });
     expect(enforceOutputCap(req({ max_tokens: 257 }), 256)).toEqual({ ok: false });
+  });
+
+  it('max_completion_tokens: mesmo teto, no mesmo campo', () => {
+    expect(enforceOutputCap(req({ max_completion_tokens: 100 }), 256)).toEqual({
+      ok: true,
+      field: 'max_completion_tokens',
+      max_tokens: 100,
+    });
+    expect(enforceOutputCap(req({ max_completion_tokens: 257 }), 256)).toEqual({ ok: false });
   });
 });
 

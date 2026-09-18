@@ -74,15 +74,21 @@ export function checkRequestSurface(
 /**
  * Teto de saída (§9.1 validação 5). Ausente vira o teto do grant; acima dele é
  * recusa, não corte silencioso — o cliente pinado manda o valor do `start`,
- * que já é o do grant.
+ * que já é o do grant. O teto segue no MESMO campo que o cliente usou
+ * (`max_completion_tokens` nas famílias OpenAI que recusam `max_tokens`).
  */
 export function enforceOutputCap(
   request: InferenceRequestV1,
   cap: number,
-): { ok: true; max_tokens: number } | { ok: false } {
-  if (request.max_tokens === undefined) return { ok: true, max_tokens: cap };
-  if (request.max_tokens > cap) return { ok: false };
-  return { ok: true, max_tokens: request.max_tokens };
+):
+  | { ok: true; field: 'max_tokens' | 'max_completion_tokens'; max_tokens: number }
+  | { ok: false } {
+  const field =
+    request.max_completion_tokens !== undefined ? 'max_completion_tokens' : 'max_tokens';
+  const pedido = request[field];
+  if (pedido === undefined) return { ok: true, field, max_tokens: cap };
+  if (pedido > cap) return { ok: false };
+  return { ok: true, field, max_tokens: pedido };
 }
 
 // ─── dinheiro ───────────────────────────────────────────────────────────────

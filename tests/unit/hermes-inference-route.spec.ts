@@ -210,6 +210,12 @@ describe('rota — contrato, superfície e autoridade', () => {
       'tool_surface_mismatch',
     ],
     ['max_tokens acima do teto do grant', body({ max_tokens: 257 }), 400, 'invalid_request'],
+    [
+      'max_completion_tokens acima do teto do grant',
+      body({ max_tokens: undefined, max_completion_tokens: 257 }),
+      400,
+      'invalid_request',
+    ],
   ])('%s → %i %s', async (_n, payload, status, c) => {
     const { app, ledger, relay } = await setup();
     const r = await post(app, payload);
@@ -307,6 +313,24 @@ describe('rota — admissão, relay e liquidação', () => {
         source: 'gateway_estimated',
       },
     ]);
+  });
+
+  it('max_completion_tokens (famílias OpenAI no cliente pinado) segue no mesmo campo', async () => {
+    const { app, relayed } = await setup();
+    const r = await post(
+      app,
+      body({
+        max_tokens: undefined,
+        max_completion_tokens: 100,
+        messages: [
+          { role: 'developer', content: 'regras' },
+          { role: 'user', content: 'oi' },
+        ],
+      }),
+    );
+    expect(r.statusCode).toBe(200);
+    expect(relayed[0]!.max_completion_tokens).toBe(100);
+    expect(relayed[0]).not.toHaveProperty('max_tokens');
   });
 
   it('SSE quando o cliente pede stream (sempre, no cliente pinado)', async () => {

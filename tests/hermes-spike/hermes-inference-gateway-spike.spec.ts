@@ -58,7 +58,7 @@ afterEach(async () => {
   for (const c of cleanup.splice(0).reverse()) await c();
 });
 
-function grantState(): InferenceGrantStateV1 {
+function grantState(model: string): InferenceGrantStateV1 {
   return {
     grant_id: randomUUID(),
     grant: {
@@ -67,7 +67,7 @@ function grantState(): InferenceGrantStateV1 {
       agent_id: 'agent-spike',
       control_epoch: '0',
       audience: INFERENCE_GRANT_AUDIENCE,
-      model: MODEL,
+      model,
       manifest_digest: 'a'.repeat(64),
       allowed_tool_names: TOOLS.map((t) => t.name),
       expires_at: new Date(Date.now() + 120_000).toISOString(),
@@ -86,8 +86,8 @@ function grantState(): InferenceGrantStateV1 {
   };
 }
 
-async function gateway(stub: StubProvider, token: string) {
-  const st = grantState();
+async function gateway(stub: StubProvider, token: string, model = MODEL) {
+  const st = grantState(model);
   const admitted: string[] = [];
   const settled: SettleOutcomeV1[] = [];
   const app: FastifyInstance = Fastify();
@@ -182,7 +182,7 @@ function spawnWorker(token: string) {
   };
 }
 
-function startFrame(base_url: string): StartFrame {
+function startFrame(base_url: string, model = MODEL): StartFrame {
   const run_id = randomUUID();
   return {
     protocol: 'maia.hermes.worker.v1',
@@ -210,7 +210,7 @@ function startFrame(base_url: string): StartFrame {
       run_budget_seconds: 120,
       deadline_at: new Date(Date.now() + 120_000).toISOString(),
     },
-    inference: { base_url, model: MODEL, provider: 'openai', api_mode: 'chat_completions' },
+    inference: { base_url, model, provider: 'openai', api_mode: 'chat_completions' },
   };
 }
 
@@ -258,5 +258,29 @@ d('spike — gateway de inferência com o cliente Hermes real', () => {
     expect(upstream).toHaveLength(2);
     expect(upstream.every((r) => r.body.stream === false)).toBe(true);
     expect(JSON.stringify(upstream)).not.toContain(token);
+  }, 120_000);
+
+  it('família gpt-5: `max_completion_tokens` e `developer` do cliente pinado passam', async () => {
+    const stub = await startStubProvider({ script: [{ kind: 'text', content: 'oi' }] });
+    cleanup.push(() => stub.close());
+    const token = mintInferenceToken();
+    const gw = await gateway(stub, token, 'openai/gpt-5');
+    const worker = spawnWorker(token);
+    const start = startFrame(gw.base, 'openai/gpt-5');
+    worker.send(start);
+    const result = await worker.waitFor('result');
+    worker.send({
+      protocol: 'maia.hermes.worker.v1',
+      type: 'result_ack',
+      run_id: start.run_id,
+      terminal_digest: 'c'.repeat(64),
+    });
+    expect(await worker.exit()).toBe(0);
+    expect(result.stop).toEqual({ kind: 'reply', raw_text: 'oi' });
+    expect(gw.settled.map((s) => s.kind)).toEqual(['completed']);
+    const [up] = stub.requests.filter((r) => r.path.endsWith('/chat/completions'));
+    expect(up!.body.max_completion_tokens).toBe(256);
+    expect(up!.body).not.toHaveProperty('max_tokens');
+    expect((up!.body.messages as Array<{ role: string }>)[0]!.role).toBe('developer');
   }, 120_000);
 });

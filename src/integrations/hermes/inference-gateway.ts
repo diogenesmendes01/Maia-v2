@@ -39,6 +39,12 @@
  * pelo cliente fixado**" — este módulo implementa `max_tokens` porque é o nome
  * que a spec grafa, e um segundo nome só entra com a captura na mão. Inventar
  * aqui o alias de outro SDK seria fechar D09 por suposição.
+ *
+ * Captura no SHA `5d59366`: `AIAgent._max_tokens_param` troca `max_tokens` por
+ * `max_completion_tokens` nas famílias gpt-4o/4.1/5/o1/o3/o4
+ * (`utils.model_forces_max_completion_tokens`), e `_swap_developer_role` manda
+ * o prompt de sistema como `developer` para gpt-5/codex. Os dois entram; os
+ * dois nomes de limite juntos são recusa.
  */
 import { z } from 'zod';
 import type { EngineRunPhaseV1 } from '@/runtime/engines/contracts.js';
@@ -65,6 +71,7 @@ export const INFERENCE_ADMITTED_FIELDS = [
   'temperature',
   'top_p',
   'max_tokens',
+  'max_completion_tokens',
   'stream',
   'stream_options',
 ] as const;
@@ -221,6 +228,7 @@ const toolCallSchema = z
  */
 const messageSchema = z.discriminatedUnion('role', [
   z.object({ role: z.literal('system'), content: z.string() }).strict(),
+  z.object({ role: z.literal('developer'), content: z.string() }).strict(),
   z.object({ role: z.literal('user'), content: z.string() }).strict(),
   z
     .object({
@@ -270,6 +278,12 @@ const inferenceRequestSchema = z
     temperature: z.number().finite().min(0).max(2).optional(),
     top_p: z.number().finite().min(0).max(1).optional(),
     max_tokens: z.number().int().min(1).max(INFERENCE_LIMITS.max_output_tokens).optional(),
+    max_completion_tokens: z
+      .number()
+      .int()
+      .min(1)
+      .max(INFERENCE_LIMITS.max_output_tokens)
+      .optional(),
     stream: z.boolean().optional(),
     stream_options: z.object({ include_usage: z.boolean() }).strict().optional(),
   })
@@ -331,6 +345,16 @@ export function parseInferenceRequest(raw: unknown): ParsedInferenceRequest {
         reason: 'unknown_parameter',
       };
     }
+  }
+
+  // Dois nomes para o mesmo teto: qual valeria é ambíguo, e ambíguo recusa.
+  if ('max_tokens' in body && 'max_completion_tokens' in body) {
+    return {
+      kind: 'invalid',
+      code: 'invalid_request',
+      field: 'max_completion_tokens',
+      reason: 'schema',
+    };
   }
 
   // 2. Limites: recusa determinística, nunca truncamento.

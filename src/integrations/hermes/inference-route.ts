@@ -269,7 +269,7 @@ export async function registerHermesInferenceRoute(
           // Filho que já saiu não ganha tentativa nem reserva.
           if (clienteSaiu()) return reply;
 
-          const forward = { ...request, max_tokens: cap.max_tokens };
+          const forward = { ...request, [cap.field]: cap.max_tokens };
           const attempt_id = randomUUID();
           let admitted: AdmitAttemptResult;
           try {
