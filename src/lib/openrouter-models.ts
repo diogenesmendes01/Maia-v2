@@ -19,6 +19,12 @@ export type OpenRouterModel = {
     completion_per_million: number; // USD per 1M output tokens
   };
   supports_tools: boolean;
+  /**
+   * O objeto `pricing` cru do catálogo (strings por token, faixas em
+   * `overrides`). Só existe em modelo BUSCADO: a lista de fallback não tem.
+   * Consumido pela tarifa do gateway Hermes, que precisa do preço exato.
+   */
+  pricing_raw?: Readonly<Record<string, unknown>>;
 };
 
 const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
@@ -69,7 +75,7 @@ const FALLBACK_TOOL_MODELS: OpenRouterModel[] = [
   },
 ];
 
-type RawPricing = { prompt?: string; completion?: string };
+type RawPricing = { prompt?: string; completion?: string } & Record<string, unknown>;
 type RawModel = {
   id?: string;
   name?: string;
@@ -95,6 +101,7 @@ function parseRawModel(raw: RawModel): OpenRouterModel | null {
       completion_per_million: Math.round(completionPerToken * 1_000_000 * 1000) / 1000,
     },
     supports_tools: true,
+    ...(raw.pricing ? { pricing_raw: raw.pricing } : {}),
   };
 }
 
