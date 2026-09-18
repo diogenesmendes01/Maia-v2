@@ -3,6 +3,8 @@
  * relay dublês. Prova a ordem do §9.1: rede interna → credencial → contrato →
  * superfície → autoridade → admissão → relay → validação → liquidação.
  */
+import { request as httpRequest } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import Fastify, { type FastifyInstance } from 'fastify';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type {
@@ -95,6 +97,7 @@ async function setup(
     states?: Array<InferenceGrantStateV1 | null>;
     admit?: AdmitAttemptResult | Error;
     relay?: RelayOutcomeV1;
+    relayImpl?: (b: Readonly<Record<string, unknown>>, o: { signal: AbortSignal }) => Promise<RelayOutcomeV1>;
     resolve?: 'ok' | 'null' | 'throw';
   } = {},
 ) {
@@ -120,8 +123,9 @@ async function setup(
   const relayed: Array<Record<string, unknown>> = [];
   const relay = {
     provider: 'openrouter',
-    relay: vi.fn(async (b: Readonly<Record<string, unknown>>) => {
+    relay: vi.fn(async (b: Readonly<Record<string, unknown>>, o: { signal: AbortSignal; timeout_ms: number }) => {
       relayed.push({ ...b });
+      if (over.relayImpl) return over.relayImpl(b, o);
       return over.relay ?? { kind: 'ok' as const, raw: COMPLETION };
     }),
   };
@@ -345,6 +349,66 @@ describe('rota — admissão, relay e liquidação', () => {
     expect([r.statusCode, code(r)]).toEqual([403, 'tool_surface_mismatch']);
     expect(r.body).not.toContain('terminal');
     expect(settled[0]).toMatchObject({ kind: 'completed', cost_microusd: '450' });
+  });
+
+  it('corpo 2xx vazio ou null do provider: liquida como desconhecido e responde provider_unavailable', async () => {
+    for (const raw of [null, undefined, '']) {
+      const { app, settled } = await setup({ relay: { kind: 'ok', raw } });
+      const r = await post(app, body());
+      expect([r.statusCode, code(r)]).toEqual([503, 'provider_unavailable']);
+      expect(settled).toEqual([
+        {
+          kind: 'completed',
+          prompt_tokens: null,
+          completion_tokens: null,
+          cost_microusd: null,
+          source: 'unavailable',
+        },
+      ]);
+    }
+  });
+
+  it('exceção nossa depois da admissão ainda liquida (nada fica reserved)', async () => {
+    const { app, settled } = await setup({
+      relayImpl: async () => {
+        throw new Error('bug');
+      },
+    });
+    const r = await post(app, body());
+    expect([r.statusCode, code(r)]).toEqual([503, 'provider_unavailable']);
+    expect(settled).toEqual([{ kind: 'failed_after_send', error_code: 'handler_error' }]);
+  });
+
+  it('filho que desconecta corta o upstream (socket real)', async () => {
+    let abortado = false;
+    const { app, relay, settled } = await setup({
+      relayImpl: (_b, o) =>
+        new Promise<RelayOutcomeV1>((resolve) => {
+          o.signal.addEventListener('abort', () => {
+            abortado = true;
+            resolve({ kind: 'failed_after_send', code: 'aborted' });
+          });
+          setTimeout(() => resolve({ kind: 'ok', raw: COMPLETION }), 3_000);
+        }),
+    });
+    await app.listen({ host: '127.0.0.1', port: 0 });
+    const port = (app.server.address() as AddressInfo).port;
+    const req = httpRequest({
+      host: '127.0.0.1',
+      port,
+      method: 'POST',
+      path: INFERENCE_GATEWAY_COMPLETIONS_PATH,
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${TOKEN}` },
+    });
+    req.on('error', () => undefined);
+    req.end(JSON.stringify(body()));
+    // Só derruba o socket com a chamada ao provider em voo.
+    await vi.waitFor(() => expect(relay.relay).toHaveBeenCalled(), { timeout: 2_000 });
+    req.destroy();
+    await vi.waitFor(() => expect(abortado).toBe(true), { timeout: 2_000 });
+    await vi.waitFor(() =>
+      expect(settled).toEqual([{ kind: 'failed_after_send', error_code: 'aborted' }]),
+    );
   });
 
   it('resposta sem uso: custo desconhecido, nunca zero', async () => {

@@ -97,6 +97,22 @@ describe('createChatCompletionsRelay', () => {
     expect(out).toEqual({ kind: 'failed_after_send', code: 'timeout' });
   });
 
+  it('prazo vale também para o CORPO: cabeçalho cedo e corpo aos poucos não passam do prazo', async () => {
+    const baseURL = await server((_req, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      const t = setInterval(() => res.write(' '), 100);
+      setTimeout(() => {
+        clearInterval(t);
+        res.end('{}');
+      }, 3_000);
+    });
+    const relay = createChatCompletionsRelay({ provider: 'x', apiKey: 'k', baseURL });
+    const t0 = Date.now();
+    const out = await relay.relay(BODY, { signal: new AbortController().signal, timeout_ms: 400 });
+    expect(out).toEqual({ kind: 'failed_after_send', code: 'timeout' });
+    expect(Date.now() - t0).toBeLessThan(2_000);
+  });
+
   it('abort do chamador durante o envio é failed_after_send', async () => {
     const baseURL = await server(() => undefined);
     const relay = createChatCompletionsRelay({ provider: 'x', apiKey: 'k', baseURL });

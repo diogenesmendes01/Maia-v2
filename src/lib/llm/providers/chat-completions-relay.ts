@@ -96,14 +96,21 @@ export function createChatCompletionsRelay(cfg: {
         ...rest,
         stream: false,
       } as unknown as OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming;
+      // O `timeout` do SDK só vale até os cabeçalhos; um corpo que chega aos
+      // poucos passaria do prazo do run. O prazo entra no SINAL, que também
+      // corta a leitura do corpo.
+      const prazo = AbortSignal.timeout(Math.max(1, opts.timeout_ms));
+      const signal = AbortSignal.any([opts.signal, prazo]);
       try {
         const raw = await c.chat.completions.create(params, {
-          signal: opts.signal,
+          signal,
           timeout: Math.max(1, opts.timeout_ms),
           maxRetries: 0,
         });
         return { kind: 'ok', raw };
       } catch (err) {
+        if (opts.signal.aborted) return { kind: 'failed_after_send', code: 'aborted' };
+        if (prazo.aborted) return { kind: 'failed_after_send', code: 'timeout' };
         return { kind: 'failed_after_send', code: classify(err) };
       }
     },

@@ -24,7 +24,7 @@
  * passa de novo pela admissão.
  */
 import { randomUUID } from 'node:crypto';
-import type { FastifyInstance, FastifyReply } from 'fastify';
+import type { FastifyInstance, FastifyReply, FastifyRequest } from 'fastify';
 import type { ChatCompletionsRelayV1 } from '@/lib/llm/providers/chat-completions-relay.js';
 import type {
   AdmitAttemptResult,
@@ -49,7 +49,9 @@ import {
   isInternalRequest,
   projectChatCompletion,
   renderChatCompletionSse,
+  usageFromProjected,
   type InferenceTariffV1,
+  type SourceRuleV1,
 } from './inference-flow.js';
 import {
   INFERENCE_GATEWAY_COMPLETIONS_PATH,
@@ -59,7 +61,6 @@ import {
   toWireError,
   validateInferenceGrant,
   type InferenceErrorCode,
-  type InferenceUsageObservedV1,
 } from './inference-gateway.js';
 
 /** O ledger visto pela rota. Implementado por `inferenceRepo`. */
@@ -80,7 +81,10 @@ export interface InferenceLedgerPortV1 {
     tariff_version: string | null;
     policy: AdmissionPolicyV1;
   }): Promise<AdmitAttemptResult>;
-  settleAttempt(input: { attempt_id: string; outcome: SettleOutcomeV1 }): Promise<SettleAttemptResult>;
+  settleAttempt(input: {
+    attempt_id: string;
+    outcome: SettleOutcomeV1;
+  }): Promise<SettleAttemptResult>;
 }
 
 export interface InferenceRouteDepsV1 {
@@ -99,6 +103,8 @@ export interface InferenceRouteDepsV1 {
    */
   running_wait_ms?: number;
   poll_ms?: number;
+  /** Origens além da loopback que podem chamar a rota (rede do worker). */
+  allowed_sources?: readonly SourceRuleV1[];
 }
 
 const WAITS_FOR_RUNNING = new Set(['submitting', 'submission_unknown']);
@@ -122,7 +128,13 @@ export async function registerHermesInferenceRoute(
   await app.register(async (scope) => {
     // Rota não pública: some ANTES de o corpo ser lido.
     scope.addHook('onRequest', async (req, reply) => {
-      if (!isInternalRequest({ remote_address: req.socket.remoteAddress, headers: req.headers })) {
+      if (
+        !isInternalRequest({
+          remote_address: req.socket.remoteAddress,
+          headers: req.headers,
+          allowed: deps.allowed_sources ?? [],
+        })
+      ) {
         return reply.code(404).send();
       }
     });
@@ -146,141 +158,190 @@ export async function registerHermesInferenceRoute(
         config: { rateLimit: false },
       },
       async (req, reply) => {
-        const token = bearerTokenOf(req.headers.authorization);
-        if (token === null || !isWellFormedInferenceToken(token)) {
-          return sendError(reply, 'invalid_inference_grant');
-        }
-        let grantScope: Awaited<ReturnType<InferenceLedgerPortV1['resolveGrantScope']>>;
+        // O filho desconectar (morto pelo supervisor, timeout dele) corta o
+        // upstream. É o `close` da RESPOSTA: o do request já disparou quando o
+        // Fastify terminou de ler o corpo.
+        const ac = new AbortController();
+        let foi = false;
+        const onClose = (): void => {
+          if (!reply.raw.writableFinished) {
+            foi = true;
+            ac.abort();
+          }
+        };
+        reply.raw.once('close', onClose);
         try {
-          grantScope = await deps.ledger.resolveGrantScope(hashInferenceToken(token));
-        } catch {
-          return sendError(reply, 'admission_unavailable');
+          return await handle(req, reply, ac, () => foi || reply.raw.destroyed);
+        } finally {
+          reply.raw.off('close', onClose);
         }
-        if (grantScope === null) return sendError(reply, 'invalid_inference_grant');
-        const { grant_id } = grantScope;
+      },
+    );
 
-        return deps.runInScope(
-          { tenant_id: grantScope.tenant_id, agent_id: grantScope.agent_id },
-          async () => {
-            const parsed = parseInferenceRequest(req.body);
-            if (parsed.kind !== 'ok') return sendError(reply, parsed.code);
-            const request = parsed.request;
+    async function handle(
+      req: FastifyRequest,
+      reply: FastifyReply,
+      ac: AbortController,
+      clienteSaiu: () => boolean,
+    ): Promise<FastifyReply> {
+      const token = bearerTokenOf(req.headers.authorization);
+      if (token === null || !isWellFormedInferenceToken(token)) {
+        return sendError(reply, 'invalid_inference_grant');
+      }
+      let grantScope: Awaited<ReturnType<InferenceLedgerPortV1['resolveGrantScope']>>;
+      try {
+        grantScope = await deps.ledger.resolveGrantScope(hashInferenceToken(token));
+      } catch {
+        return sendError(reply, 'admission_unavailable');
+      }
+      if (grantScope === null) return sendError(reply, 'invalid_inference_grant');
+      const { grant_id } = grantScope;
 
-            const load = async (): Promise<InferenceGrantStateV1 | null | 'error'> => {
-              try {
-                return await deps.ledger.loadGrantState(grant_id);
-              } catch {
-                return 'error';
-              }
-            };
-            let state = await load();
-            const limite = now() + runningWaitMs;
-            while (state !== null && state !== 'error' && WAITS_FOR_RUNNING.has(state.run_phase)) {
-              if (now() >= limite) break;
-              await sleep(pollMs);
-              state = await load();
+      return deps.runInScope(
+        { tenant_id: grantScope.tenant_id, agent_id: grantScope.agent_id },
+        async () => {
+          const parsed = parseInferenceRequest(req.body);
+          if (parsed.kind !== 'ok') return sendError(reply, parsed.code);
+          const request = parsed.request;
+
+          const load = async (): Promise<InferenceGrantStateV1 | null | 'error'> => {
+            try {
+              return await deps.ledger.loadGrantState(grant_id);
+            } catch {
+              return 'error';
             }
-            if (state === 'error') return sendError(reply, 'admission_unavailable');
-            if (state === null) return sendError(reply, 'invalid_inference_grant');
+          };
+          let state = await load();
+          const limite = now() + runningWaitMs;
+          while (state !== null && state !== 'error' && WAITS_FOR_RUNNING.has(state.run_phase)) {
+            if (now() >= limite) break;
+            await sleep(pollMs);
+            state = await load();
+          }
+          if (state === 'error') return sendError(reply, 'admission_unavailable');
+          if (state === null) return sendError(reply, 'invalid_inference_grant');
+          const st: InferenceGrantStateV1 = state;
 
-            const tool_names = (request.tools ?? []).map((t) => t.function.name);
-            // Pré-checagem sem lock: recusa cedo o que a admissão recusaria.
-            const v = validateInferenceGrant(state.grant, {
+          const tool_names = (request.tools ?? []).map((t) => t.function.name);
+          // Pré-checagem sem lock: recusa cedo o que a admissão recusaria.
+          const v = validateInferenceGrant(state.grant, {
+            presented_audience: INFERENCE_GRANT_AUDIENCE,
+            now: state.now,
+            run_phase: state.run_phase,
+            calls_so_far: state.calls_so_far,
+            model_requested: request.model,
+            manifest_digest_effective: state.run_manifest_digest,
+            tool_names_requested: tool_names,
+          });
+          if (v.kind === 'refused') return sendError(reply, v.code);
+          // Posse do turno (claim/lease/tentativa) e controle humano/epoch.
+          if (state.owner === 'stale_claim') return sendError(reply, 'run_revoked');
+          if (state.owner === 'turn_not_running') return sendError(reply, 'run_not_active');
+          if (!state.control_ok) return sendError(reply, 'run_revoked');
+          if (Date.parse(state.now) >= Date.parse(state.run_deadline_at)) {
+            return sendError(reply, 'run_not_active');
+          }
+          if (!checkRequestSurface(request, state.tool_surface).ok) {
+            return sendError(reply, 'tool_surface_mismatch');
+          }
+          const cap = enforceOutputCap(request, state.max_output_tokens);
+          if (!cap.ok) return sendError(reply, 'invalid_request');
+
+          let tariff: InferenceTariffV1 | null;
+          try {
+            tariff = await deps.tariffFor(request.model);
+          } catch {
+            tariff = null;
+          }
+          let estimate: string | null;
+          try {
+            estimate = estimateExposureMicrousd(
+              inputTokensUpperBound(request),
+              cap.max_tokens,
+              tariff,
+            );
+          } catch {
+            // Tarifa fora do formato é tarifa desconhecida: a policy decide.
+            tariff = null;
+            estimate = null;
+          }
+
+          // Filho que já saiu não ganha tentativa nem reserva.
+          if (clienteSaiu()) return reply;
+
+          const forward = { ...request, max_tokens: cap.max_tokens };
+          const attempt_id = randomUUID();
+          let admitted: AdmitAttemptResult;
+          try {
+            admitted = await deps.ledger.admitAttempt({
+              grant_id,
+              attempt_id,
+              request_hash: canonicalDigest(forward),
+              provider: deps.relay.provider,
               presented_audience: INFERENCE_GRANT_AUDIENCE,
-              now: state.now,
-              run_phase: state.run_phase,
-              calls_so_far: state.calls_so_far,
               model_requested: request.model,
-              manifest_digest_effective: state.run_manifest_digest,
               tool_names_requested: tool_names,
+              estimate_microusd: estimate,
+              tariff_version: tariff?.version ?? null,
+              policy: deps.policy,
             });
-            if (v.kind === 'refused') return sendError(reply, v.code);
-            // Posse do turno (claim/lease/tentativa) e controle humano/epoch.
-            if (state.owner === 'stale_claim') return sendError(reply, 'run_revoked');
-            if (state.owner === 'turn_not_running') return sendError(reply, 'run_not_active');
-            if (!state.control_ok) return sendError(reply, 'run_revoked');
-            if (Date.parse(state.now) >= Date.parse(state.run_deadline_at)) {
-              return sendError(reply, 'run_not_active');
-            }
-            if (!checkRequestSurface(request, state.tool_surface).ok) {
-              return sendError(reply, 'tool_surface_mismatch');
-            }
-            const cap = enforceOutputCap(request, state.max_output_tokens);
-            if (!cap.ok) return sendError(reply, 'invalid_request');
+          } catch {
+            return sendError(reply, 'admission_unavailable');
+          }
+          if (!admitted.ok) return sendError(reply, admitted.code);
 
-            let tariff: InferenceTariffV1 | null;
+          let liquidada = false;
+          const settle = async (outcome: SettleOutcomeV1): Promise<void> => {
+            liquidada = true;
             try {
-              tariff = await deps.tariffFor(request.model);
+              await deps.ledger.settleAttempt({ attempt_id, outcome });
             } catch {
-              tariff = null;
+              // A tentativa fica `reserved`: exposição, não custo zero.
             }
-            let estimate: string | null;
-            try {
-              estimate = estimateExposureMicrousd(
-                inputTokensUpperBound(request),
-                cap.max_tokens,
-                tariff,
-              );
-            } catch {
-              // Tarifa fora do formato é tarifa desconhecida: a policy decide.
-              tariff = null;
-              estimate = null;
-            }
+          };
 
-            const forward = { ...request, max_tokens: cap.max_tokens };
-            const attempt_id = randomUUID();
-            let admitted: AdmitAttemptResult;
-            try {
-              admitted = await deps.ledger.admitAttempt({
-                grant_id,
-                attempt_id,
-                request_hash: canonicalDigest(forward),
-                provider: deps.relay.provider,
-                presented_audience: INFERENCE_GRANT_AUDIENCE,
-                model_requested: request.model,
-                tool_names_requested: tool_names,
-                estimate_microusd: estimate,
-                tariff_version: tariff?.version ?? null,
-                policy: deps.policy,
+          // Filho que saiu entre a admissão e o envio: nada sai.
+          if (clienteSaiu()) {
+            await settle({ kind: 'not_sent', error_code: 'client_gone' });
+            return sendError(reply, 'provider_unavailable');
+          }
+
+          // Daqui em diante TODO caminho liquida: uma tentativa admitida nunca
+          // fica em `reserved` por exceção nossa.
+          try {
+            return await relayAndRespond();
+          } catch {
+            if (!liquidada)
+              await settle({
+                kind: 'failed_after_send',
+                error_code: 'handler_error',
               });
-            } catch {
-              return sendError(reply, 'admission_unavailable');
-            }
-            if (!admitted.ok) return sendError(reply, admitted.code);
+            return sendError(reply, 'provider_unavailable');
+          }
 
-            const settle = async (outcome: SettleOutcomeV1): Promise<void> => {
-              try {
-                await deps.ledger.settleAttempt({ attempt_id, outcome });
-              } catch {
-                // A tentativa fica `reserved`: exposição, não custo zero.
-              }
-            };
-
-            // Prazo restante do run; o filho desconectar também corta o upstream.
-            const ac = new AbortController();
-            const onClose = (): void => {
-              if (!reply.raw.writableEnded) ac.abort();
-            };
-            req.raw.once('close', onClose);
-            const remaining = Math.max(1, Date.parse(state.run_deadline_at) - now());
-            const out = await deps.relay.relay(forward, { signal: ac.signal, timeout_ms: remaining });
-            req.raw.off('close', onClose);
+          async function relayAndRespond(): Promise<FastifyReply> {
+            const remaining = Math.max(1, Date.parse(st.run_deadline_at) - now());
+            const out = await deps.relay.relay(forward, {
+              signal: ac.signal,
+              timeout_ms: remaining,
+            });
 
             if (out.kind === 'not_sent') {
               await settle({ kind: 'not_sent', error_code: out.code });
               return sendError(reply, 'provider_unavailable');
             }
             if (out.kind === 'failed_after_send') {
-              await settle({ kind: 'failed_after_send', error_code: out.code });
+              await settle({
+                kind: 'failed_after_send',
+                error_code: out.code,
+              });
               return sendError(reply, 'provider_unavailable');
             }
 
             const projected = projectChatCompletion(out.raw);
-            const response = parseInferenceResponse(projected, state.grant.allowed_tool_names);
-            const usage: InferenceUsageObservedV1 | null =
-              response.kind === 'ok'
-                ? response.response.usage
-                : ((projected as { usage?: InferenceUsageObservedV1 }).usage ?? null);
+            const response = parseInferenceResponse(projected, st.grant.allowed_tool_names);
+            const usage =
+              response.kind === 'ok' ? response.response.usage : usageFromProjected(projected);
             let cost: string | null;
             try {
               cost = costFromUsage(usage, tariff);
@@ -312,9 +373,9 @@ export async function registerHermesInferenceRoute(
             }
             const { usage: u, ...rest } = response.response;
             return reply.code(200).send(u === null ? rest : { ...rest, usage: u });
-          },
-        );
-      },
-    );
+          }
+        },
+      );
+    }
   });
 }
