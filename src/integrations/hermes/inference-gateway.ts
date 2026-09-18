@@ -44,7 +44,10 @@
  * `max_completion_tokens` nas famílias gpt-4o/4.1/5/o1/o3/o4
  * (`utils.model_forces_max_completion_tokens`), e `_swap_developer_role` manda
  * o prompt de sistema como `developer` para gpt-5/codex. Os dois entram; os
- * dois nomes de limite juntos são recusa.
+ * dois nomes de limite juntos são recusa. Para modelo com "deepseek" ou "mimo"
+ * no nome, `apply_reasoning_content_policy` põe `reasoning_content` em toda
+ * mensagem `assistant` reenviada (o pad `" "`, já que o gateway nunca devolve
+ * raciocínio); entra como texto e segue ao provider como veio.
  */
 import { z } from 'zod';
 import type { EngineRunPhaseV1 } from '@/runtime/engines/contracts.js';
@@ -235,6 +238,7 @@ const messageSchema = z.discriminatedUnion('role', [
       role: z.literal('assistant'),
       content: z.string().nullable(),
       tool_calls: z.array(toolCallSchema).max(INFERENCE_LIMITS.max_tools).optional(),
+      reasoning_content: z.string().optional(),
     })
     .strict(),
   z

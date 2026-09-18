@@ -223,6 +223,21 @@ describe('P06 — o piloto é TEXTUAL (§9.1)', () => {
     );
   });
 
+  it('12c. `reasoning_content` (pad do cliente pinado para deepseek/mimo) é texto no assistant', () => {
+    const replay = (extra: Record<string, unknown>, role = 'assistant') =>
+      parseInferenceRequest(
+        req({
+          messages: [
+            { role: 'user', content: 'oi' },
+            { role, content: 'ok', ...extra },
+          ],
+        }),
+      ).kind;
+    expect(replay({ reasoning_content: ' ' })).toBe('ok');
+    expect(replay({ reasoning_content: 42 })).toBe('invalid');
+    expect(replay({ reasoning_content: ' ' }, 'user')).toBe('invalid');
+  });
+
   it('12b. `developer` (prompt de sistema do gpt-5 no cliente pinado) é texto e passa', () => {
     const developer = (content: unknown) =>
       parseInferenceRequest(

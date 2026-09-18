@@ -333,6 +333,44 @@ d('spike — gateway de inferência com o cliente Hermes real', () => {
     });
   }, 120_000);
 
+  it('deepseek: o `reasoning_content` que o cliente repõe no replay passa', async () => {
+    const stub = await startStubProvider({
+      script: [
+        { kind: 'tool_calls', calls: [{ name: 'fixture_echo', arguments: { texto: 'eco' } }] },
+        { kind: 'text', content: 'feito' },
+      ],
+    });
+    cleanup.push(() => stub.close());
+    const token = mintInferenceToken();
+    const gw = await gateway(stub, token, 'deepseek/deepseek-chat');
+    const worker = spawnWorker(token);
+    const start = startFrame(gw.base, 'deepseek/deepseek-chat');
+    worker.send(start);
+    await worker.waitFor('tool.request');
+    worker.send({
+      protocol: 'maia.hermes.worker.v1',
+      type: 'tool.result',
+      run_id: start.run_id,
+      call_seq: 0,
+      outcome: { kind: 'result', result: { eco: 'eco' }, is_error: false },
+    });
+    const result = await worker.waitFor('result');
+    worker.send({
+      protocol: 'maia.hermes.worker.v1',
+      type: 'result_ack',
+      run_id: start.run_id,
+      terminal_digest: 'c'.repeat(64),
+    });
+    expect(await worker.exit()).toBe(0);
+    expect(result.stop).toEqual({ kind: 'reply', raw_text: 'feito' });
+    expect(gw.settled.map((s) => s.kind)).toEqual(['completed', 'completed']);
+    const ups = stub.requests.filter((r) => r.path.endsWith('/chat/completions'));
+    const replay = (ups[1]!.body.messages as Array<Record<string, unknown>>).find(
+      (m) => m.role === 'assistant',
+    );
+    expect(replay).toHaveProperty('reasoning_content');
+  }, 120_000);
+
   it('família gpt-5: `max_completion_tokens` e `developer` do cliente pinado passam', async () => {
     const stub = await startStubProvider({ script: [{ kind: 'text', content: 'oi' }] });
     cleanup.push(() => stub.close());
