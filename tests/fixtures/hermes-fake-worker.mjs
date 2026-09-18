@@ -208,7 +208,7 @@ async function main() {
       ready();
       toolRequest(5, start.manifest.tools[0].name);
       const r = await waitFor((f) => f.type === 'tool.result' && f.call_seq === 5);
-      return finishWithAck({ kind: 'reply', raw_text: `tool=${describeOutcome(r)}` }, []);
+      return finishWithAck({ kind: 'reply', raw_text: `tool=${describeOutcome(r)}` }, [5]);
     }
     case 'two_tools': {
       ready();
@@ -263,7 +263,7 @@ async function main() {
       await new Promise((r) => setTimeout(r, 100));
       ready();
       const r = await waitFor((f) => f.type === 'tool.result' && f.call_seq === 0);
-      return finishWithAck({ kind: 'reply', raw_text: `tool=${describeOutcome(r)}` }, []);
+      return finishWithAck({ kind: 'reply', raw_text: `tool=${describeOutcome(r)}` }, [0]);
     }
     case 'violation_then_result':
       ready();

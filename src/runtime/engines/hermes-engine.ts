@@ -50,6 +50,7 @@ import {
 } from '@/integrations/hermes/run-binding.js';
 import type {
   HermesSupervisorV1,
+  ResultContextV1,
   ResultPersistenceV1,
   ToolOutcomeV1,
   WorkerSessionV1,
@@ -218,11 +219,15 @@ export function planWorkerStart(input: {
   if (manifest.limits.max_inference_calls < 1) return refused('inference_not_allowed');
   const max_tool_calls = Math.min(request.limits.max_tool_calls, manifest.limits.max_tool_calls);
 
-  const tools = manifest.tools.map((t) => ({
-    name: t.name,
-    input_schema: t.input_schema,
-    result_limit_chars: t.limits.result_limit_chars,
-  }));
+  // Teto real 0 = nenhuma tool exposta: o modelo não tenta o que seria recusado.
+  const tools =
+    max_tool_calls === 0
+      ? []
+      : manifest.tools.map((t) => ({
+          name: t.name,
+          input_schema: t.input_schema,
+          result_limit_chars: t.limits.result_limit_chars,
+        }));
   const start: StartFrame = {
     protocol: HERMES_WORKER_PROTOCOL_VERSION,
     type: 'start',
@@ -275,15 +280,28 @@ export function planWorkerStart(input: {
 
 // ─── tradução frame ↔ porta (pura) ──────────────────────────────────────────
 
-/** `result` do worker → proposta da porta. `null` = fora do contrato da porta. */
-export function proposalFromResultFrame(frame: ResultFrame): EngineTerminalProposalV1 | null {
+/**
+ * `result` do worker → proposta da porta. `null` = fora do contrato da porta.
+ *
+ * Os `call_seq` que o supervisor recusou sem repassar ao broker saem da lista:
+ * o worker os reporta porque os alocou, mas o journal nunca os viu, e mantê-los
+ * faria todo terminal de run cancelado cair em `observed_calls_mismatch`. Um seq
+ * que o supervisor NÃO viu continua na lista — e o journal recusa, como deve.
+ */
+export function proposalFromResultFrame(
+  frame: ResultFrame,
+  context: ResultContextV1 = { locally_refused_call_seqs: [] },
+): EngineTerminalProposalV1 | null {
+  const refusedHere = new Set(context.locally_refused_call_seqs);
   const candidate = {
     version: 1 as const,
     run_id: frame.run_id,
     request_key: frame.request_key,
     stop: frame.stop,
     iterations: frame.iterations,
-    observed_tool_call_ids: frame.observed_tool_call_seqs.map((s) => deriveCallId(frame.run_id, s)),
+    observed_tool_call_ids: frame.observed_tool_call_seqs
+      .filter((s) => !refusedHere.has(s))
+      .map((s) => deriveCallId(frame.run_id, s)),
     usage: frame.usage,
   };
   const parsed = engineTerminalProposalV1Schema.safeParse(candidate);
@@ -291,6 +309,17 @@ export function proposalFromResultFrame(frame: ResultFrame): EngineTerminalPropo
 }
 
 // ─── o motor ────────────────────────────────────────────────────────────────
+
+/** Lease viva: horizonte numérico no futuro, ou +Infinity (sem lease). */
+function leaseAlive(context: HermesRunContextV1, now_ms: number): boolean {
+  let lease: number;
+  try {
+    lease = context.leaseHorizonMs();
+  } catch {
+    return false;
+  }
+  return typeof lease === 'number' && !Number.isNaN(lease) && lease > now_ms;
+}
 
 type RunRecord = {
   fingerprint: string;
@@ -356,6 +385,24 @@ export function createHermesEngine(deps: HermesEngineDepsV1): HermesEngineV1 {
     const binding = plan.binding;
     const run_id = binding.run_id;
 
+    // §6.11 "Só uma lease válida pode lançar"; §5.8.2 proíbe submeter sob
+    // claim expirado. Conferido ANTES do spawn: depois dele o filho já tem a
+    // credencial e o contexto.
+    if (io.signal.aborted || !leaseAlive(context, now())) return notAccepted('ownership_lost');
+    const valid = await Promise.race([
+      Promise.resolve()
+        .then(() => context.revalidate())
+        .then(
+          (ok) => ok === true,
+          () => false,
+        ),
+      new Promise<boolean>((r) => {
+        const t = setTimeout(() => r(false), sup.config.hook_timeout_ms);
+        t.unref?.();
+      }),
+    ]);
+    if (!valid || io.signal.aborted) return notAccepted('ownership_lost');
+
     const launched = await sup.launch({
       start: plan.start,
       inference_key: context.inference_credential,
@@ -385,8 +432,8 @@ export function createHermesEngine(deps: HermesEngineDepsV1): HermesEngineV1 {
           if (r.kind === 'in_progress') return { kind: 'in_progress', retry_after_ms: r.retry_after_ms };
           return { kind: 'refused', code: r.code };
         },
-        async onResult(frame: ResultFrame): Promise<ResultPersistenceV1> {
-          const proposal = proposalFromResultFrame(frame);
+        async onResult(frame: ResultFrame, rctx: ResultContextV1): Promise<ResultPersistenceV1> {
+          const proposal = proposalFromResultFrame(frame, rctx);
           if (!proposal) return { kind: 'not_persisted' };
           record.proposal = proposal;
           const res = await deps.journal.recordTerminal({ binding, proposal });

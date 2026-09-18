@@ -253,7 +253,7 @@ describe('planWorkerStart — o start só sai se as fontes concordam', () => {
     expect(plan.start.limits.run_budget_seconds).toBeLessThanOrEqual(30);
   });
 
-  it('manifest com zero tool calls: teto real 0, wire 1', () => {
+  it('manifest com zero tool calls: teto real 0, nenhuma tool exposta, wire 1', () => {
     const request = requestFor(randomUUID());
     const context = contextFor(request, {}, {});
     const manifest = manifestFor(request.run_id, {
@@ -268,6 +268,7 @@ describe('planWorkerStart — o start só sai se as fontes concordam', () => {
     if (plan.kind !== 'ok') throw new Error(plan.code);
     expect(plan.max_tool_calls).toBe(0);
     expect(plan.start.limits.max_tool_calls).toBe(1);
+    expect(plan.start.manifest.tools).toEqual([]);
   });
 
   const cases: Array<[string, (r: EngineRequestV1, c: HermesRunContextV1) => [EngineRequestV1, HermesRunContextV1]]> = [
@@ -378,6 +379,12 @@ describe('proposalFromResultFrame', () => {
       failure_code: null,
     },
   };
+
+  it('tira da lista os seqs que o supervisor recusou sem broker', () => {
+    expect(
+      proposalFromResultFrame(frame, { locally_refused_call_seqs: [1] })?.observed_tool_call_ids,
+    ).toEqual([`${run_id}:0`]);
+  });
 
   it('deriva os call_ids da Maia a partir do call_seq', () => {
     expect(proposalFromResultFrame(frame)?.observed_tool_call_ids).toEqual([
@@ -516,6 +523,55 @@ describe('HermesEngine — turno pela porta, com processo real', () => {
       code: 'run_context_unavailable',
     });
     expect(sup.get(request.run_id)).toBeUndefined();
+  });
+
+  it('posse perdida antes do spawn (sinal, lease, revalidação): rejected, nenhum processo', async () => {
+    const variantes: Array<(c: HermesRunContextV1) => HermesRunContextV1> = [
+      (c) => c,
+      (c) => ({ ...c, leaseHorizonMs: () => Date.now() - 1 }),
+      (c) => ({ ...c, leaseHorizonMs: () => Number.NaN }),
+      (c) => ({ ...c, revalidate: async () => false }),
+      (c) => ({
+        ...c,
+        revalidate: () => {
+          throw new Error('db fora');
+        },
+      }),
+    ];
+    for (const [i, muda] of variantes.entries()) {
+      const sup = supervisor('happy');
+      const request = requestFor(randomUUID());
+      const engine = createHermesEngine({
+        supervisor: sup,
+        resolveRunContext: async () => muda(contextFor(request)),
+        journal: journal(),
+      });
+      const sinal = i === 0 ? AbortSignal.abort() : new AbortController().signal;
+      const i0 = { ...io(), signal: sinal };
+      expect(await engine.start(request, i0)).toEqual({
+        kind: 'rejected',
+        definitely_not_accepted: true,
+        code: 'ownership_lost',
+      });
+      expect(sup.get(request.run_id)).toBeUndefined();
+    }
+  });
+
+  it('tool recusada pelo supervisor não quebra o terminal no journal', async () => {
+    const sup = supervisor('unlisted_tool');
+    const j = journal();
+    const request = requestFor(randomUUID());
+    const engine = createHermesEngine({
+      supervisor: sup,
+      resolveRunContext: async () => contextFor(request),
+      journal: j,
+    });
+    const start = await engine.start(request, io());
+    if (start.kind !== 'accepted') throw new Error(start.kind);
+    expect((await sup.get(request.run_id)!.exited).code).toBe(0);
+    const gravado = j.recordTerminal.mock.calls[0]![0] as { proposal: { observed_tool_call_ids: string[] } };
+    // O worker reportou o seq 0; ele foi recusado aqui e nunca chegou ao journal.
+    expect(gravado.proposal.observed_tool_call_ids).toEqual([]);
   });
 
   it('plano recusado: rejected com o código do plano, nenhum processo', async () => {

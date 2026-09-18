@@ -221,6 +221,16 @@ export type ResultPersistenceV1 =
   | { kind: 'persisted'; terminal_digest: string }
   | { kind: 'not_persisted' };
 
+/** O que só o supervisor sabe sobre as chamadas deste run, entregue com o `result`. */
+export interface ResultContextV1 {
+  /**
+   * `call_seq` que o supervisor recusou SEM repassar ao broker (sem autoridade,
+   * teto, tool fora do manifest). O worker os reporta como alocados, mas eles
+   * nunca chegaram ao journal — não são chamadas que o journal deva conhecer.
+   */
+  locally_refused_call_seqs: readonly number[];
+}
+
 /**
  * Os hooks da Maia. O supervisor nunca decide por eles, e nenhum recebe
  * contexto vindo do frame além do que o próprio protocolo carrega.
@@ -229,7 +239,7 @@ export interface WorkerSessionHooksV1 {
   /** Broker da Maia. Só é chamado com readiness conferida e capacidades vivas. */
   onToolRequest(frame: ToolRequestFrame): Promise<ToolOutcomeV1>;
   /** Grava o terminal (CAS/fence do journal). `persisted` libera o `result_ack`. */
-  onResult(frame: ResultFrame): Promise<ResultPersistenceV1>;
+  onResult(frame: ResultFrame, context: ResultContextV1): Promise<ResultPersistenceV1>;
   /** Revogação AUTORITATIVA (journal). Falhar não impede o kill. */
   onRevoke(reason_code: string): Promise<void>;
   /** Reconsulta lease/epoch/revogação depois do `ready`. Exceção = `false`. */
@@ -289,6 +299,8 @@ export interface WorkerSessionSnapshotV1 {
   protocol_violation: string | null;
   forwarded_calls: number;
   unreconciled_calls: number;
+  /** Recusados pelo supervisor sem chegar ao broker (e nunca repassados). */
+  locally_refused_call_seqs: number[];
   /** Preenchido só depois que o SO confirmou o fim do processo. */
   exit: WorkerExitReportV1 | null;
 }
@@ -316,6 +328,7 @@ export type LaunchRefusalV1 =
   | 'shutting_down'
   | 'invalid_start'
   | 'deadline_exceeded'
+  | 'ownership_lost'
   | 'home_unavailable'
   | 'spawn_failed';
 
@@ -420,6 +433,24 @@ function killWorker(child: ChildProcessWithoutNullStreams): void {
   }
 }
 
+/**
+ * Horizonte da lease pelo hook. Só +Infinity significa "sem lease"; NaN,
+ * -Infinity, não-número e exceção são getter quebrado ou horizonte perdido e
+ * valem como lease vencida (`t`).
+ */
+function leaseHorizonOf(hooks: WorkerSessionHooksV1, t: number): number {
+  let lease: number;
+  try {
+    lease = hooks.leaseHorizonMs();
+  } catch {
+    return t;
+  }
+  if (typeof lease !== 'number' || Number.isNaN(lease) || lease === Number.NEGATIVE_INFINITY) {
+    return t;
+  }
+  return lease;
+}
+
 /** Quanto esperar o `close` dos pipes depois do `exit` (neto segurando stdout). */
 const CLOSE_AFTER_EXIT_MS = 2_000;
 
@@ -467,6 +498,10 @@ export function createHermesSupervisor(
       return { kind: 'refused', reason: 'invalid_start' };
     }
     if (spec.execution_deadline_ms <= now()) return { kind: 'refused', reason: 'deadline_exceeded' };
+    // §6.11: "Só uma lease válida pode lançar." Posse perdida não ganha processo.
+    const ownershipLost = (): boolean =>
+      spec.signal.aborted || leaseHorizonOf(spec.hooks, now()) <= now();
+    if (ownershipLost()) return { kind: 'refused', reason: 'ownership_lost' };
 
     // Reserva ANTES do primeiro await: dois launches do mesmo run no mesmo tick
     // não criam dois processos.
@@ -486,6 +521,7 @@ export function createHermesSupervisor(
     // Daqui até o registro da sessão não há await: um shutdown que começou
     // durante o mkdtemp é visto aqui; um que começa depois vê a sessão.
     if (shuttingDown) return refuse('shutting_down', home);
+    if (ownershipLost()) return refuse('ownership_lost', home);
 
     let env: Record<string, string>;
     try {
@@ -612,6 +648,16 @@ function createSession(args: {
    * broker para a mesma chamada tira a marca.
    */
   const unreconciledSeqs = new Set<number>();
+  /** Chegaram ao broker (e portanto ao journal). */
+  const forwardedSeqs = new Set<number>();
+  /** Recusados aqui, sem broker. Ver `ResultContextV1`. */
+  const locallyRefusedSeqs = new Set<number>();
+  const refuseLocally = (seq: number, code: 'run_not_authorized' | 'budget_exhausted' | 'tool_not_allowed'): void => {
+    locallyRefusedSeqs.add(seq);
+    replyTool(seq, { kind: 'refused', code });
+  };
+  const refusedOnlyLocally = (): number[] =>
+    [...locallyRefusedSeqs].filter((seq) => !forwardedSeqs.has(seq)).sort((a, b) => a - b);
   let exitReport: WorkerExitReportV1 | null = null;
   let exitCode: number | null = null;
   let exitSignal: string | null = null;
@@ -670,20 +716,7 @@ function createSession(args: {
   }
 
   // ── tempo: prazo absoluto e horizonte MÓVEL da lease (§5.8.1) ──
-  function leaseHorizon(t: number): number {
-    let lease: number;
-    try {
-      lease = hooks.leaseHorizonMs();
-    } catch {
-      return t;
-    }
-    // Só +Infinity significa "sem lease". NaN, -Infinity e não-número são
-    // getter quebrado ou horizonte perdido: vale como lease vencida.
-    if (typeof lease !== 'number' || Number.isNaN(lease) || lease === Number.NEGATIVE_INFINITY) {
-      return t;
-    }
-    return lease;
-  }
+  const leaseHorizon = (t: number): number => leaseHorizonOf(hooks, t);
 
   /** `null` = dentro do prazo; senão, o motivo do cancelamento devido. */
   function timeExpired(): CancelReasonV1 | null {
@@ -859,15 +892,15 @@ function createSession(args: {
     const seq = frame.call_seq;
     // Antes do `ready` conferido não há autoridade: nem fila.
     if (readiness !== 'verified' || capabilitiesRevoked || terminal !== null) {
-      replyTool(seq, { kind: 'refused', code: 'run_not_authorized' });
+      refuseLocally(seq, 'run_not_authorized');
       return;
     }
     if (seq >= spec.max_tool_calls) {
-      replyTool(seq, { kind: 'refused', code: 'budget_exhausted' });
+      refuseLocally(seq, 'budget_exhausted');
       return;
     }
     if (!toolNames.has(frame.name)) {
-      replyTool(seq, { kind: 'refused', code: 'tool_not_allowed' });
+      refuseLocally(seq, 'tool_not_allowed');
       return;
     }
     // Reentrega do MESMO call_seq enquanto ele está na fila ou em voo: a
@@ -892,10 +925,11 @@ function createSession(args: {
         const frame = queue.shift()!;
         queuedSeqs.delete(frame.call_seq);
         if (!childHasAuthority()) {
-          replyTool(frame.call_seq, { kind: 'refused', code: 'run_not_authorized' });
+          refuseLocally(frame.call_seq, 'run_not_authorized');
           continue;
         }
         inflightSeq = frame.call_seq;
+        forwardedSeqs.add(frame.call_seq);
         forwardedCalls += 1;
         let outcome: ToolOutcomeV1;
         try {
@@ -977,7 +1011,7 @@ function createSession(args: {
     if (journalRevoking) await journalRevoking;
 
     const persisted = await callHook<ResultPersistenceV1>(
-      () => hooks.onResult(frame),
+      () => hooks.onResult(frame, { locally_refused_call_seqs: refusedOnlyLocally() }),
       config.hook_timeout_ms,
       { kind: 'not_persisted' },
     );
@@ -1206,6 +1240,7 @@ function createSession(args: {
       protocol_violation: protocolViolation,
       forwarded_calls: forwardedCalls,
       unreconciled_calls: unreconciledSeqs.size,
+      locally_refused_call_seqs: refusedOnlyLocally(),
       exit: exitReport,
     }),
   };

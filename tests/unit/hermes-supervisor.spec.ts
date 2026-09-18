@@ -477,13 +477,17 @@ describe('supervisor — prazo (§5.8.1)', () => {
   });
 
   it('getter de lease que lança conta como lease vencida', async () => {
+    // Válido no launch; quebra depois, com o processo já vivo.
+    const estado = { quebrado: false };
     const { session } = await launch('hang', {
       hooks: {
         leaseHorizonMs: () => {
+          if (!estado.quebrado) return Date.now() + 60_000;
           throw new Error('x');
         },
       },
     });
+    estado.quebrado = true;
     await session.exited;
     expect(session.snapshot().cancel).not.toBeNull();
   });
@@ -519,6 +523,10 @@ describe('supervisor — fail-closed no pipe', () => {
     const { session, hooks: h } = await launch('budget', { max_tool_calls: 2 });
     await session.exited;
     expect(h.onToolRequest).not.toHaveBeenCalled();
+    // O worker reporta o seq 5 (alocou); o supervisor diz ao journal que ele
+    // foi recusado aqui e nunca chegou ao broker.
+    expect(h.onResult).toHaveBeenCalledWith(expect.anything(), { locally_refused_call_seqs: [5] });
+    expect(session.snapshot().locally_refused_call_seqs).toEqual([5]);
     expect(session.snapshot().terminal?.frame.stop).toEqual({
       kind: 'reply',
       raw_text: 'tool=refused:budget_exhausted',
@@ -611,9 +619,13 @@ describe('supervisor — regressões da revisão', () => {
   });
 
   it('lease -Infinity vale como vencida (ownership_lost), não como "sem lease"', async () => {
+    const estado = { quebrado: false };
     const { session } = await launch('hang', {
-      hooks: { leaseHorizonMs: () => Number.NEGATIVE_INFINITY },
+      hooks: {
+        leaseHorizonMs: () => (estado.quebrado ? Number.NEGATIVE_INFINITY : Date.now() + 60_000),
+      },
     });
+    estado.quebrado = true;
     await session.exited;
     expect(session.snapshot().cancel?.reason).toBe('ownership_lost');
     expect(session.snapshot().readiness).not.toBe('verified');
@@ -726,6 +738,28 @@ describe('supervisor — launch', () => {
     expect(sup.get(start.run_id)).toBeUndefined();
     expect(readdirSync(raiz)).toEqual([]);
     rmSync(raiz, { recursive: true, force: true });
+  });
+
+  it('posse perdida antes do spawn: recusa sem criar processo', async () => {
+    for (const over of [
+      { signal: AbortSignal.abort() },
+      { hooks: hooks([], { leaseHorizonMs: () => Date.now() - 1 }) },
+    ]) {
+      const start = startFrame();
+      const sup = createHermesSupervisor(config('happy', start));
+      supervisors.push(sup);
+      const res = await sup.launch({
+        start,
+        inference_key: 'k',
+        execution_deadline_ms: Date.now() + 10_000,
+        max_tool_calls: 1,
+        signal: new AbortController().signal,
+        hooks: hooks([]),
+        ...over,
+      });
+      expect(res).toEqual({ kind: 'refused', reason: 'ownership_lost' });
+      expect(sup.get(start.run_id)).toBeUndefined();
+    }
   });
 
   it('prazo já vencido: recusa sem criar processo', async () => {
