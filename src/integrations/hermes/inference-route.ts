@@ -195,6 +195,9 @@ export async function registerHermesInferenceRoute(
               tool_names_requested: tool_names,
             });
             if (v.kind === 'refused') return sendError(reply, v.code);
+            // Posse do turno (claim/lease/tentativa) e controle humano/epoch.
+            if (state.owner === 'stale_claim') return sendError(reply, 'run_revoked');
+            if (state.owner === 'turn_not_running') return sendError(reply, 'run_not_active');
             if (!state.control_ok) return sendError(reply, 'run_revoked');
             if (Date.parse(state.now) >= Date.parse(state.run_deadline_at)) {
               return sendError(reply, 'run_not_active');

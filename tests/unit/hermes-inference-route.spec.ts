@@ -57,6 +57,7 @@ function state(over: Partial<InferenceGrantStateV1> = {}): InferenceGrantStateV1
     run_deadline_at: new Date(Date.now() + 60_000).toISOString(),
     calls_so_far: 0,
     control_ok: true,
+    owner: 'ok',
     now: new Date().toISOString(),
     ...over,
   };
@@ -212,6 +213,16 @@ describe('rota — contrato, superfície e autoridade', () => {
     expect(code(r)).toBe(c);
     expect(ledger.admitAttempt).not.toHaveBeenCalled();
     expect(relay.relay).not.toHaveBeenCalled();
+  });
+
+  it('turno perdeu a posse (lease/claim): 403 run_revoked; turno fora de running: 409', async () => {
+    const a = await setup({ states: [state({ owner: 'stale_claim' })] });
+    const ra = await post(a.app, body());
+    expect([ra.statusCode, code(ra)]).toEqual([403, 'run_revoked']);
+    const b = await setup({ states: [state({ owner: 'turn_not_running' })] });
+    const rb = await post(b.app, body());
+    expect([rb.statusCode, code(rb)]).toEqual([409, 'run_not_active']);
+    expect(a.relay.relay).not.toHaveBeenCalled();
   });
 
   it('controle humano/epoch mudou: 403 run_revoked', async () => {

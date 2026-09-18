@@ -52,7 +52,7 @@ async function ensureTenantAgent(tenant: string, agent: string): Promise<void> {
   );
 }
 
-type Run = { run_id: string; control_id: string; tenant: string; agent: string };
+type Run = { run_id: string; control_id: string; turn_id: string; tenant: string; agent: string };
 
 async function mkRun(
   tenant: string,
@@ -68,8 +68,9 @@ async function mkRun(
   const turn_id = randomUUID();
   const claim = randomUUID();
   await pool.query(
-    `INSERT INTO agent_turns (id, tenant_id, agent_id, representative_message_id, status, claim_token, attempt_count)
-     VALUES ($1, $2, $3, $4, 'running', $5, 1)`,
+    `INSERT INTO agent_turns (id, tenant_id, agent_id, representative_message_id, status, claim_token,
+                              attempt_count, claimed_by, lease_expires_at)
+     VALUES ($1, $2, $3, $4, 'running', $5, 1, 'worker-1', now() + interval '10 minutes')`,
     [turn_id, tenant, agent, mensagem_id, claim],
   );
   const control_id = randomUUID();
@@ -106,7 +107,7 @@ async function mkRun(
       over.deadline ?? '5 minutes',
     ],
   );
-  return { run_id, control_id, tenant, agent };
+  return { run_id, control_id, turn_id, tenant, agent };
 }
 
 const as = <T>(r: { tenant: string; agent: string }, fn: () => Promise<T>) =>
@@ -378,6 +379,38 @@ d('P06 — ledger do gateway de inferência (migration 144)', () => {
       const g5 = await grantFor(r5);
       await as(r5, () => inferenceRepo.revokeGrantsForRun({ run_id: r5.run_id, reason: 'x' }));
       expect(await admit(r5, g5.grant_id)).toMatchObject({ ok: false, code: 'run_revoked' });
+
+      // Posse do turno (§9.1 "lease a cada request"), o mesmo fence das tools.
+      const r7 = await mkRun(T_A, agent);
+      const g7 = await grantFor(r7);
+      await pool.query(`UPDATE agent_turns SET lease_expires_at = now() - interval '1 minute' WHERE id = $1`, [
+        r7.turn_id,
+      ]);
+      expect(await admit(r7, g7.grant_id)).toMatchObject({
+        ok: false,
+        code: 'run_revoked',
+        audit_reason: 'stale_claim',
+      });
+      expect(await as(r7, () => inferenceRepo.loadGrantState(g7.grant_id))).toMatchObject({
+        owner: 'stale_claim',
+      });
+
+      const r8 = await mkRun(T_A, agent);
+      const g8 = await grantFor(r8);
+      await pool.query(
+        `UPDATE agent_turns SET claim_token = $2, attempt_count = 2 WHERE id = $1`,
+        [r8.turn_id, randomUUID()],
+      );
+      expect(await admit(r8, g8.grant_id)).toMatchObject({ ok: false, code: 'run_revoked' });
+
+      const r9 = await mkRun(T_A, agent);
+      const g9 = await grantFor(r9);
+      await pool.query(`UPDATE agent_turns SET status = 'outbound_pending' WHERE id = $1`, [r9.turn_id]);
+      expect(await admit(r9, g9.grant_id)).toMatchObject({
+        ok: false,
+        code: 'run_not_active',
+        audit_reason: 'turn_not_running',
+      });
 
       const r6 = await mkRun(T_A, agent, { deadline: '1 second' });
       const g6 = await grantFor(r6);

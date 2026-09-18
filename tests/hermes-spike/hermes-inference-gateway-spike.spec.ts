@@ -81,6 +81,7 @@ function grantState(): InferenceGrantStateV1 {
     run_deadline_at: new Date(Date.now() + 120_000).toISOString(),
     calls_so_far: 0,
     control_ok: true,
+    owner: 'ok',
     now: new Date().toISOString(),
   };
 }

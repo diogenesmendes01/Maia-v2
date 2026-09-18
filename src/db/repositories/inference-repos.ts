@@ -12,8 +12,14 @@
  *  3. **Nenhuma TX durante I/O.** A admissão comita a reserva ANTES do provider;
  *     a liquidação é outra TX, depois.
  *  4. **Ordem de locks** (a do journal, estendida): `conversation_controls` →
- *     `engine_runs` → `engine_inference_grants` → `engine_budget_accounts` →
- *     `engine_inference_attempts`. Sem caminho inverso.
+ *     `agent_turns` → `engine_runs` → `engine_inference_grants` →
+ *     `engine_budget_accounts`. Sem caminho inverso. A admissão trava o run e o
+ *     grant com `FOR NO KEY UPDATE`, que não conflita com o `FOR KEY SHARE` que
+ *     toda FK de uma inserção toma; a liquidação trava o run (KEY SHARE) ANTES
+ *     da conta. Assim liquidar e admitir no mesmo run não formam ciclo.
+ *  5. **Posse do turno a cada request** (§9.1 "execução/epoch/lease"): o claim
+ *     do turno tem de ser o de origem do run, com lease viva e tentativa igual —
+ *     o mesmo fence que o broker aplica às tools.
  *
  * O que decide está nos módulos PUROS (`inference-gateway.ts`,
  * `cost-reservation.ts`); aqui eles recebem o estado LIDO SOB LOCK, dentro da
@@ -42,6 +48,7 @@ import type { EngineRunPhaseV1 } from "@/runtime/engines/contracts.js";
 import { db, withTx } from "../client.js";
 import { lockControlByRunSql, type ConversationControlLockRow } from "./conversation-control-sql.js";
 import {
+  agent_turns,
   engine_budget_accounts,
   engine_inference_attempts,
   engine_inference_grants,
@@ -86,8 +93,12 @@ export interface InferenceGrantStateV1 {
   calls_so_far: number;
   /** Conversa em `bot` e epoch do controle e do run iguais ao do grant. */
   control_ok: boolean;
+  /** O turno ainda é do dono que originou o run (claim, lease, tentativa, status). */
+  owner: TurnOwnershipV1;
   now: string;
 }
+
+export type TurnOwnershipV1 = "ok" | "stale_claim" | "turn_not_running";
 
 export type AdmitAttemptResult =
   | {
@@ -138,6 +149,9 @@ type GrantRow = {
 };
 
 type RunRow = {
+  turn_id: string;
+  origin_claim_token: string;
+  origin_turn_attempt: number | string;
   phase: string;
   control_epoch: string;
   manifest_digest: string;
@@ -157,7 +171,8 @@ const GRANT_COLS = sql`id, run_id, audience, model, control_epoch::text AS contr
   manifest_digest, tool_surface, max_inference_calls, max_output_tokens,
   ${ISO("expires_at")} AS expires_at, ${ISO("revoked_at")} AS revoked_at, tenant_id, agent_id`;
 
-const RUN_COLS = sql`phase, control_epoch::text AS control_epoch, manifest_digest,
+const RUN_COLS = sql`turn_id, origin_claim_token::text AS origin_claim_token, origin_turn_attempt,
+  phase, control_epoch::text AS control_epoch, manifest_digest,
   ${ISO("deadline_at")} AS deadline_at,
   ${ISO("capabilities_revoked_at")} AS capabilities_revoked_at`;
 
@@ -193,6 +208,38 @@ async function contarTentativas(tx: Executor, run_id: string): Promise<number> {
        WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND run_id = ${run_id}`),
   );
   return Number(r[0]?.n ?? 0);
+}
+
+/**
+ * O fence de posse do turno, o mesmo do broker (`engine-repos`): claim de
+ * origem, lease viva pelo relógio do banco, mesma tentativa e turno `running`.
+ * `travar` usa `FOR SHARE`: renovação e re-claim esperam a admissão comitar.
+ */
+async function posseDoTurno(tx: Executor, run: RunRow, travar: boolean): Promise<TurnOwnershipV1> {
+  const { tenant_id, agent_id } = scope();
+  const rows = linhas<{
+    status: string;
+    claim_token: string | null;
+    attempt_count: number | string;
+    lease_viva: boolean;
+  }>(
+    await tx.execute(sql`
+      SELECT status, claim_token::text AS claim_token, attempt_count,
+             (lease_expires_at IS NOT NULL AND lease_expires_at > clock_timestamp()) AS lease_viva
+        FROM ${agent_turns}
+       WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${run.turn_id}
+       ${travar ? sql`FOR SHARE` : sql``}`),
+  );
+  const t = rows[0];
+  if (
+    !t ||
+    t.claim_token !== run.origin_claim_token ||
+    t.lease_viva !== true ||
+    Number(t.attempt_count) !== Number(run.origin_turn_attempt)
+  ) {
+    return "stale_claim";
+  }
+  return t.status === "running" ? "ok" : "turn_not_running";
 }
 
 function controleOk(
@@ -319,6 +366,7 @@ export const inferenceRepo = {
       run_deadline_at: run.deadline_at,
       calls_so_far: await contarTentativas(db, g.run_id),
       control_ok: controleOk(controles[0] ?? null, run, g),
+      owner: await posseDoTurno(db, run, false),
       now: await agoraDb(db),
     };
   },
@@ -360,17 +408,28 @@ export const inferenceRepo = {
         linhas<ConversationControlLockRow>(
           await tx.execute(lockControlByRunSql({ tenant_id, agent_id, run_id })),
         )[0] ?? null;
+      // Leitura sem lock só para saber qual turno travar, na ordem.
+      const semLock = linhas<RunRow>(
+        await tx.execute(sql`
+          SELECT ${RUN_COLS} FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${run_id}`),
+      )[0];
+      if (!semLock) return recusa("invalid_inference_grant", "absent");
+      await tx.execute(sql`
+        SELECT id FROM ${agent_turns}
+         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${semLock.turn_id}
+         FOR SHARE`);
       const run = linhas<RunRow>(
         await tx.execute(sql`
           SELECT ${RUN_COLS} FROM ${engine_runs}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${run_id}
-           FOR UPDATE`),
+           FOR NO KEY UPDATE`),
       )[0];
       const grant = linhas<GrantRow>(
         await tx.execute(sql`
           SELECT ${GRANT_COLS} FROM ${engine_inference_grants}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.grant_id}
-           FOR UPDATE`),
+           FOR NO KEY UPDATE`),
       )[0];
       if (!run || !grant) return recusa("invalid_inference_grant", "absent");
 
@@ -386,7 +445,11 @@ export const inferenceRepo = {
         tool_names_requested: input.tool_names_requested,
       });
       if (validacao.kind === "refused") return recusa(validacao.code, validacao.audit_reason);
-      // O que o módulo puro não enxerga: controle humano/epoch e o prazo do run.
+      // O que o módulo puro não enxerga: posse do turno, controle humano/epoch
+      // e o prazo do run.
+      const posse = await posseDoTurno(tx, run, false);
+      if (posse === "stale_claim") return recusa("run_revoked", "stale_claim");
+      if (posse === "turn_not_running") return recusa("run_not_active", "turn_not_running");
       if (!controleOk(controle, run, grant)) return recusa("run_revoked", "control_changed");
       if (Date.parse(now) >= Date.parse(run.deadline_at)) {
         return recusa("run_not_active", "deadline_passed");
@@ -504,6 +567,12 @@ export const inferenceRepo = {
         conta("settle", "already");
         return { ok: true, already: true, accounting_status: tentativa.accounting_status };
       }
+      // Ordem do módulo: run ANTES da conta. O evento abaixo tem FK para o run,
+      // e tomar esse KEY SHARE depois da conta faria ciclo com a admissão.
+      await tx.execute(sql`
+        SELECT id FROM ${engine_runs}
+         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${tentativa.run_id}
+         FOR KEY SHARE`);
       await tx.execute(sql`
         SELECT id FROM ${engine_budget_accounts}
          WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${tentativa.account_id}
