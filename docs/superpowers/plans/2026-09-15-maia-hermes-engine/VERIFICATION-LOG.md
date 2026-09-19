@@ -2395,6 +2395,45 @@ nenhum outro teste entrou ou saiu.
 entrada do loop depende do motor (C71b); o zumbi sob hold sobrevive até o resume (C70). Push e CI
 destes commits vêm a seguir — nada aqui é evidência de CI.
 
+### V-052 · K-15 — `agent_engine_policies` (145), CAS e kill switch
+
+**Ambiente.** Worktree nova (branch `claude/hermes-engine-policies`, criada de
+`claude/repo-hygiene` = PR #769 em `35f298ff`). Node `v22.23.2`. Sem Docker: Postgres 17 em WASM
+(PGlite) servido por `pglite-socket` em `127.0.0.1:5435`. Banco gerado com
+`node apply.mjs <worktree> --roundtrip 145_agent_engine_policies --dump pr3.tar`:
+`aplicadas 149/149`, `down 145_agent_engine_policies ok`, `up 145_agent_engine_policies de novo ok`.
+PGlite é sessão única: não há concorrência real entre conexões. Nada aqui é evidência de CI.
+
+| Comando | Resultado |
+|---|---|
+| `npm run typecheck` | exit 0 |
+| `npm run lint` | exit 0 — `481 problems (0 errors, 481 warnings)`; nenhum aviso nos arquivos tocados |
+| `npm run config:generate`, depois `npm run config:check:drift` | 7 artefatos regenerados; `artefatos gerados estão em dia` |
+| `npm run migrate:reservations:check` | `149 reservation(s) cover 149 forward migration(s)` |
+| `npm run docs:ai:check` | `passed` |
+| `npx vitest run tests/unit/engine-selector.spec.ts tests/unit/config tests/unit/db/schema-defaults-serializable.spec.ts tests/unit/scripts/migration-number-uniqueness.spec.ts --retry=0` | 25 arquivos passaram, 1 pulado (`compose-config-differential`, 4 casos); 427 passados, 0 falhas. `engine-selector` 12/12 (5 antigos + 7 novos) |
+| `npx vitest run tests/unit/migrations` + 4 specs de `tests/unit/scripts/migrat*` + `ops-migrations-shape` + `doctor-checks`, `--retry=0` | 17 arquivos, 368/368 |
+| specs que leem o contrato de config fora de `tests/unit/config` (5 arquivos) e as de lifecycle/role-config (64 arquivos), `--retry=0` | 104/104 e 1079/1079 |
+| `TEST_WORKTREE_SCOPE=off TEST_DB_URL=… DATABASE_URL=… npx vitest run tests/integration/hermes-engine-policies-real-db.spec.ts tests/integration/migration-145-agent-engine-policies-real-db.spec.ts tests/integration/schema-migrations-parity-real-db.spec.ts --no-file-parallelism --retry=0` | 3 arquivos, 16/16, 0 pulados (10 + 4 + 2) |
+
+**Mutação.** Um mutante por vez, rodando as 4 specs acima; arquivo restaurado da cópia e conferido
+por sha256 depois de cada um. 9/9 mortos.
+
+| # | Mutante | Morto por |
+|---|---|---|
+| M1 | `resolveEngineForNewTurn` ignora o kill switch | unit "kill switch vence a linha hermes" |
+| M2 | erro de leitura vira `maia_react` | unit + real-db caso 10 |
+| M3 | `find` sem tenant/agente no WHERE | real-db caso 2 |
+| M4 | UPDATE sem `row_version` no WHERE | real-db caso 5 |
+| M5 | porta de leitura não confere o escopo do ALS | real-db caso 10 |
+| M6 | FK com colunas referenciadas trocadas | migration spec (up falha, 4 casos) |
+| M6b | FK simples `channel_id → channels(id)` | migration spec, caso do catálogo |
+| M7 | down sem recusa | migration spec, caso do down |
+| M8 | espelho Drizzle com nome errado | paridade + real-db (9 casos) |
+
+**Não feito aqui:** `npm test` completo; Postgres 16 e Redis reais (CI); duas conexões concorrentes
+reais (o caso 6 serializa no PGlite); `agent_execution_limits`.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |

@@ -1911,6 +1911,21 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  MAIA_HERMES_KILL_SWITCH: {
+    name: 'MAIA_HERMES_KILL_SWITCH',
+    description:
+      'Kill switch do Hermes (K-15): true força maia_react em todo turno novo, por cima de ' +
+      'agent_engine_policies. Só desliga; nunca liga o Hermes — ligar é linha por ' +
+      '(tenant, agente, canal). Não muda turno já pinado.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: boolFlag('false'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
 
   // ---- probe ------------------------------------------------------------
   MAIA_SYNTHETIC_PROBE: {
