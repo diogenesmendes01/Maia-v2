@@ -43,6 +43,19 @@ describe('createChatCompletionsRelay', () => {
     expect(await relay.relay(BODY, opts())).toEqual({ kind: 'not_sent', code: 'configuration' });
   });
 
+  it('sinal já abortado antes do envio: not_sent `aborted`, nada chega ao provider', async () => {
+    const stub = await startStubProvider({ script: [{ kind: 'text', content: 'olá' }] });
+    stubs.push(stub);
+    const relay = createChatCompletionsRelay({ provider: 'x', apiKey: 'k', baseURL: stub.baseUrl });
+    const ac = new AbortController();
+    ac.abort();
+    expect(await relay.relay(BODY, { signal: ac.signal, timeout_ms: 2_000 })).toEqual({
+      kind: 'not_sent',
+      code: 'aborted',
+    });
+    expect(stub.requests.filter((r) => r.path.endsWith('/chat/completions'))).toHaveLength(0);
+  });
+
   it('encaminha sem streaming e devolve a resposta crua', async () => {
     const stub = await startStubProvider({ script: [{ kind: 'text', content: 'olá' }] });
     stubs.push(stub);

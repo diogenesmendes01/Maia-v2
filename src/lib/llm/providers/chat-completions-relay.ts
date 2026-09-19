@@ -37,7 +37,11 @@ export type RelayFailureCodeV1 =
 
 export type RelayOutcomeV1 =
   | { kind: 'ok'; raw: unknown }
-  | { kind: 'not_sent'; code: 'configuration' | 'invalid_body' }
+  /**
+   * Comprovadamente não saiu: sem credencial (`configuration`) ou sinal já
+   * abortado antes do envio (`aborted` — o cliente saiu ou o prazo venceu).
+   */
+  | { kind: 'not_sent'; code: 'configuration' | 'aborted' }
   | { kind: 'failed_after_send'; code: RelayFailureCodeV1 };
 
 export interface ChatCompletionsRelayV1 {
@@ -88,7 +92,9 @@ export function createChatCompletionsRelay(cfg: {
     async relay(body, opts): Promise<RelayOutcomeV1> {
       const c = getClient();
       if (!c) return { kind: 'not_sent', code: 'configuration' };
-      if (opts.signal.aborted) return { kind: 'not_sent', code: 'invalid_body' };
+      // Cliente que saiu (ou prazo que venceu) antes do envio: nada sai, e o
+      // ledger registra desconexão, não pedido malformado.
+      if (opts.signal.aborted) return { kind: 'not_sent', code: 'aborted' };
       const { stream: _stream, stream_options: _opts, ...rest } = body;
       void _stream;
       void _opts;
