@@ -1,0 +1,12 @@
+# Saída de build e dependências.
+**/node_modules/**
+**/.next/**
+**/dist/**
+**/coverage/**
+# Gerados por script, conferidos por gate de drift: formatar aqui quebraria o gate.
+src/config/generated/**
+src/admin-ui/generated/**
+# Fixtures são dados comparados byte a byte (inclusive o wire congelado do Hermes).
+tests/fixtures/**
+**/__snapshots__/**
+**/package-lock.json
