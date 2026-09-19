@@ -2395,6 +2395,32 @@ nenhum outro teste entrou ou saiu.
 entrada do loop depende do motor (C71b); o zumbi sob hold sobrevive até o resume (C70). Push e CI
 destes commits vêm a seguir — nada aqui é evidência de CI.
 
+### V-052 · PR #768 — gateway de inferência servindo (P06), 19/09
+
+Checkout principal, branch `claude/hermes-p06-gateway`, Node 22.23.2 portátil. Postgres local =
+PGlite 0.3 (Postgres 17 em WASM) servido por `pglite-socket` na porta 5433, com as 149 migrations do
+branch aplicadas pelo harness (sem Docker). Hermes real = checkout pinado `5d59366` + venv do worker.
+
+| Comando | Resultado |
+|---|---|
+| harness `apply.mjs <repo> --roundtrip 144_hermes_inference_ledger` | 149/149 aplicadas; `down` da 144 ok; `up` de novo ok |
+| `vitest run tests/integration/hermes-inference-ledger-migration-real-db.spec.ts tests/integration/hermes-inference-ledger-real-db.spec.ts --no-file-parallelism` (`TEST_DB_URL` = PGlite) | **14/14**: up com 23 constraints e 2 triggers conferidos no catálogo; down recusado com conta exposta; down e up de novo; grant, admissão (inclusive recusa `unknown_price` sem tentativa nem reserva), liquidação idempotente, eventos append-only |
+| `vitest run tests/unit/hermes-* tests/unit/engine-* tests/unit/config tests/unit/openrouter-models.spec.ts` | **975 passados, 0 falhas, 4 pulados** (os 4 são specs que exigem banco) |
+| spikes com o Hermes real (`MAIA_HERMES_WORKER_PYTHON`, `MAIA_HERMES_UPSTREAM`): `hermes-inference-gateway-spike`, `hermes-inference-refusals-spike`, `hermes-schema-normalizer-spike` | **8/8**: turno com tool pela rota real (SSE, bearer, `/api/v1/models` 404); schemas reescritos pelo Hermes conferem (genérico e Kimi); `reasoning_content` do DeepSeek e `max_completion_tokens`/`developer` do gpt-5 passam; classificador pinado trata cota como terminal; porte do sanitizador idêntico ao Python em todas as tools do registry |
+| `npm run typecheck` / `npm run lint` | 0 erros / 0 erros (481 avisos, os mesmos do main) |
+| `npm run config:check:drift` / `npm run migrate:reservations:check` | em dia / 149 reservas cobrem 149 migrations |
+
+Mudanças que esta entrada cobre, além do que a PR já tinha: sem preço a admissão recusa com motivo
+tipado `unknown_price` (a variante que admitia sem preço saiu); não existe flag global que ligue o
+Hermes (`MAIA_HERMES_ENABLED` removida, rota sempre registrada, sem chave do provider a rota recusa
+antes da admissão); a conta de orçamento perdeu a coluna `currency` (só escopo, período, dinheiro,
+CAS e timestamps); o `down` da 144 resolve as tabelas pelo `search_path`. Quatro rodadas de revisão
+adversarial (lentes + verificador) confirmaram 17 defeitos; todos corrigidos com teste.
+
+**Não executado, e dito:** admissão com duas conexões concorrentes reais (T58 fica não verificado);
+smoke com provider pago (D02, G-COST); Linux. O CI destes commits vem depois do push e não é
+evidência aqui.
+
 ## Testes executados / falhos / pulados (acumulado)
 
 | Suíte | Executados | Falharam | Pulados | Observação |

@@ -1,0 +1,2305 @@
+{
+  "source": "hermes 5d59366 tools/schema_sanitizer.sanitize_tool_schemas + agent/moonshot_schema (is_moonshot_model, sanitize_moonshot_tools)",
+  "vectors": [
+    {
+      "name": "ja_limpo",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "texto": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "texto"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "texto": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "texto"
+        ],
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "record",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meta": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "meta": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "anulavel_aninhado",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "valor": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "x",
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "valor": {
+            "type": "number",
+            "nullable": true,
+            "description": "x",
+            "default": null
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "type_array",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "b": {
+            "type": [
+              "number",
+              "string"
+            ]
+          },
+          "c": {
+            "type": [
+              "null"
+            ]
+          },
+          "d": {
+            "type": []
+          },
+          "e": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "nullable": false
+          },
+          "f": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string",
+            "nullable": true
+          },
+          "b": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "c": {
+            "type": "null"
+          },
+          "d": {
+            "type": "object",
+            "properties": {}
+          },
+          "e": {
+            "nullable": false,
+            "type": "integer"
+          },
+          "f": {
+            "type": "object",
+            "nullable": true,
+            "properties": {}
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "uniao_no_topo",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "tipo": {
+                "const": "a"
+              }
+            },
+            "required": [
+              "tipo"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "tipo": {
+                "const": "b"
+              }
+            }
+          }
+        ],
+        "properties": {}
+      },
+      "expected": {
+        "properties": {},
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "topo_anulavel",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "d"
+      },
+      "expected": {
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "nullable": true,
+        "description": "d"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "ref_com_default",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "r": {
+            "$ref": "#/$defs/R",
+            "default": "x"
+          },
+          "s": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/R"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "y",
+            "title": "S"
+          }
+        },
+        "$defs": {
+          "R": {
+            "type": "object"
+          }
+        }
+      },
+      "expected": {
+        "$defs": {
+          "R": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "properties": {
+          "r": {
+            "$ref": "#/$defs/R"
+          },
+          "s": {
+            "$ref": "#/$defs/R",
+            "nullable": true,
+            "title": "S"
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "string_nua",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "s": "string",
+          "o": "object",
+          "w": "weird",
+          "l": {
+            "type": "array",
+            "items": "integer"
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "l": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "o": {
+            "type": "object",
+            "properties": {}
+          },
+          "s": {
+            "type": "string"
+          },
+          "w": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "required_icado",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string",
+            "required": true
+          },
+          "b": {
+            "type": "string",
+            "required": false
+          },
+          "c": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "c",
+          "ghost"
+        ]
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "b": {
+            "type": "string"
+          },
+          "c": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "c",
+          "a"
+        ],
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "required_vazio",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "n": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "zz"
+        ]
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "n": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "literal_reescrito",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "d": {
+            "type": "object",
+            "default": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "enum": [
+              {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            ],
+            "examples": [
+              "string"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "d": {
+            "default": {
+              "type": "string",
+              "nullable": true
+            },
+            "enum": [
+              {
+                "type": "string",
+                "nullable": true
+              }
+            ],
+            "examples": [
+              "string"
+            ],
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "bool_e_dependencias",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "arr": {
+            "type": "array",
+            "items": true
+          },
+          "u": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "k": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "dependencies": {
+          "arr": [
+            "u"
+          ],
+          "u": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": true
+      },
+      "expected": {
+        "additionalProperties": true,
+        "dependencies": {
+          "arr": [
+            "u"
+          ],
+          "u": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "properties": {
+          "arr": {
+            "items": true,
+            "type": "array"
+          },
+          "k": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "u": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "filhos_de_schema",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "p": {
+            "type": "array",
+            "prefixItems": [
+              "string",
+              {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            ]
+          },
+          "q": {
+            "not": {
+              "type": "null"
+            },
+            "if": {
+              "type": "object"
+            },
+            "then": "string",
+            "else": {
+              "type": "object",
+              "required": true
+            }
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "p": {
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer",
+                "nullable": true
+              }
+            ],
+            "type": "array"
+          },
+          "q": {
+            "else": {
+              "type": "object",
+              "properties": {}
+            },
+            "if": {
+              "type": "object",
+              "properties": {}
+            },
+            "not": {
+              "type": "null"
+            },
+            "then": {
+              "type": "string"
+            }
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "uniao_dupla",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "n": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "T"
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "n": {
+            "type": "string",
+            "nullable": true,
+            "title": "T"
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "combinadores_no_topo",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "enum": [
+          {}
+        ],
+        "not": {
+          "required": [
+            "x"
+          ]
+        },
+        "allOf": [
+          {}
+        ],
+        "oneOf": [
+          {}
+        ]
+      },
+      "expected": {
+        "properties": {},
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "nao_objeto",
+      "model": "maia-stub-model",
+      "input_schema": [],
+      "expected": {
+        "type": "object",
+        "properties": {}
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "mapas",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "patternProperties": {
+          "^x": "string"
+        },
+        "definitions": {
+          "D": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "dependentSchemas": {
+          "a": {
+            "type": "object"
+          }
+        },
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        }
+      },
+      "expected": {
+        "definitions": {
+          "D": {
+            "type": "string",
+            "nullable": true
+          }
+        },
+        "dependentSchemas": {
+          "a": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "patternProperties": {
+          "^x": {
+            "type": "string"
+          }
+        },
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "type_array_vence_anyof",
+      "model": "maia-stub-model",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "z": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              }
+            ],
+            "type": [
+              "number",
+              "string"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "z": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "kimi:ja_limpo",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "texto": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "texto"
+        ],
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "texto": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "texto"
+        ],
+        "type": "object"
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:record",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "meta": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            }
+          }
+        },
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "meta": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:anulavel_aninhado",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "valor": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "x",
+            "default": null
+          }
+        },
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "valor": {
+            "type": "number",
+            "description": "x",
+            "default": null
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:type_array",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "b": {
+            "type": [
+              "number",
+              "string"
+            ]
+          },
+          "c": {
+            "type": [
+              "null"
+            ]
+          },
+          "d": {
+            "type": []
+          },
+          "e": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "nullable": false
+          },
+          "f": {
+            "type": [
+              "object",
+              "null"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "b": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "c": {
+            "type": "null"
+          },
+          "d": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "e": {
+            "type": "integer"
+          },
+          "f": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:uniao_no_topo",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "tipo": {
+                "const": "a"
+              }
+            },
+            "required": [
+              "tipo"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "tipo": {
+                "const": "b"
+              }
+            }
+          }
+        ],
+        "properties": {}
+      },
+      "expected": {
+        "properties": {},
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:topo_anulavel",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "anyOf": [
+          {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "d"
+      },
+      "expected": {
+        "properties": {
+          "x": {
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "description": "d",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:ref_com_default",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "r": {
+            "$ref": "#/$defs/R",
+            "default": "x"
+          },
+          "s": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/R"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "y",
+            "title": "S"
+          }
+        },
+        "$defs": {
+          "R": {
+            "type": "object"
+          }
+        }
+      },
+      "expected": {
+        "$defs": {
+          "R": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        },
+        "properties": {
+          "r": {
+            "$ref": "#/$defs/R"
+          },
+          "s": {
+            "$ref": "#/$defs/R",
+            "title": "S"
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:string_nua",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "s": "string",
+          "o": "object",
+          "w": "weird",
+          "l": {
+            "type": "array",
+            "items": "integer"
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "l": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          },
+          "o": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          },
+          "s": {
+            "type": "string"
+          },
+          "w": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:required_icado",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string",
+            "required": true
+          },
+          "b": {
+            "type": "string",
+            "required": false
+          },
+          "c": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "c",
+          "ghost"
+        ]
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "b": {
+            "type": "string"
+          },
+          "c": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "c",
+          "a"
+        ],
+        "type": "object"
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:required_vazio",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "n": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "zz"
+        ]
+      },
+      "expected": {
+        "properties": {
+          "a": {
+            "type": "string"
+          },
+          "n": {
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:literal_reescrito",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "d": {
+            "type": "object",
+            "default": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ]
+            },
+            "enum": [
+              {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            ],
+            "examples": [
+              "string"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "d": {
+            "default": {
+              "type": "string",
+              "nullable": true
+            },
+            "enum": [
+              {
+                "type": "string",
+                "nullable": true
+              }
+            ],
+            "examples": [
+              "string"
+            ],
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:bool_e_dependencias",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "arr": {
+            "type": "array",
+            "items": true
+          },
+          "u": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "k": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "dependencies": {
+          "arr": [
+            "u"
+          ],
+          "u": {
+            "type": "object"
+          }
+        },
+        "additionalProperties": true
+      },
+      "expected": {
+        "additionalProperties": true,
+        "dependencies": {
+          "arr": [
+            "u"
+          ],
+          "u": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "properties": {
+          "arr": {
+            "items": true,
+            "type": "array"
+          },
+          "k": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "u": {
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:filhos_de_schema",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "p": {
+            "type": "array",
+            "prefixItems": [
+              "string",
+              {
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              }
+            ]
+          },
+          "q": {
+            "not": {
+              "type": "null"
+            },
+            "if": {
+              "type": "object"
+            },
+            "then": "string",
+            "else": {
+              "type": "object",
+              "required": true
+            }
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "p": {
+            "prefixItems": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "integer"
+              }
+            ],
+            "type": "array"
+          },
+          "q": {
+            "else": {
+              "type": "object",
+              "properties": {}
+            },
+            "if": {
+              "type": "object",
+              "properties": {}
+            },
+            "not": {
+              "type": "null"
+            },
+            "then": {
+              "type": "string"
+            },
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:uniao_dupla",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "n": {
+            "anyOf": [
+              {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "T"
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "n": {
+            "type": "string",
+            "title": "T"
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:combinadores_no_topo",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {},
+        "enum": [
+          {}
+        ],
+        "not": {
+          "required": [
+            "x"
+          ]
+        },
+        "allOf": [
+          {}
+        ],
+        "oneOf": [
+          {}
+        ]
+      },
+      "expected": {
+        "properties": {},
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:nao_objeto",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": [],
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:mapas",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "patternProperties": {
+          "^x": "string"
+        },
+        "definitions": {
+          "D": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "dependentSchemas": {
+          "a": {
+            "type": "object"
+          }
+        },
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        }
+      },
+      "expected": {
+        "definitions": {
+          "D": {
+            "type": "string"
+          }
+        },
+        "dependentSchemas": {
+          "a": {
+            "type": "object",
+            "properties": {}
+          }
+        },
+        "patternProperties": {
+          "^x": {
+            "type": "string"
+          }
+        },
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:type_array_vence_anyof",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "z": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              }
+            ],
+            "type": [
+              "number",
+              "string"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "z": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "string"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:ms_tipos_faltando",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "o": {
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            }
+          },
+          "r": {
+            "required": [
+              "x"
+            ]
+          },
+          "ap": {
+            "additionalProperties": {
+              "type": "string"
+            }
+          },
+          "arr": {
+            "items": {
+              "type": "string"
+            }
+          },
+          "pi": {
+            "prefixItems": [
+              {
+                "type": "string"
+              }
+            ]
+          },
+          "eb": {
+            "enum": [
+              true,
+              false
+            ]
+          },
+          "ei": {
+            "enum": [
+              1,
+              2
+            ]
+          },
+          "ef": {
+            "enum": [
+              1.5,
+              2
+            ]
+          },
+          "es": {
+            "enum": [
+              "a",
+              "b"
+            ]
+          },
+          "vazio": {}
+        },
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "ap": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object",
+            "required": []
+          },
+          "arr": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "eb": {
+            "enum": [
+              true,
+              false
+            ],
+            "type": "boolean"
+          },
+          "ef": {
+            "enum": [
+              1.5,
+              2
+            ],
+            "type": "number"
+          },
+          "ei": {
+            "enum": [
+              1,
+              2
+            ],
+            "type": "integer"
+          },
+          "es": {
+            "enum": [
+              "a",
+              "b"
+            ],
+            "type": "string"
+          },
+          "o": {
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            },
+            "type": "object",
+            "required": []
+          },
+          "pi": {
+            "prefixItems": [
+              {
+                "type": "string"
+              }
+            ],
+            "type": "array"
+          },
+          "r": {
+            "required": [
+              "x"
+            ],
+            "type": "object"
+          },
+          "vazio": {
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:ms_enum_nulo",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "s": {
+            "type": "string",
+            "enum": [
+              "a",
+              "",
+              null
+            ]
+          },
+          "so": {
+            "type": "string",
+            "enum": [
+              "",
+              null
+            ]
+          },
+          "n": {
+            "type": "number",
+            "enum": [
+              0,
+              null
+            ]
+          },
+          "x": {
+            "enum": [
+              null,
+              "a"
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "n": {
+            "enum": [
+              0
+            ],
+            "type": "number"
+          },
+          "s": {
+            "enum": [
+              "a"
+            ],
+            "type": "string"
+          },
+          "so": {
+            "type": "string"
+          },
+          "x": {
+            "enum": [
+              "a"
+            ],
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:ms_anyof",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "multi": {
+            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "todos": {
+            "type": "string",
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "so_nulo": {
+            "anyOf": [
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "nao_dict": {
+            "anyOf": [
+              "string",
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "multi": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          },
+          "nao_dict": {
+            "type": "string"
+          },
+          "so_nulo": {
+            "anyOf": [
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "todos": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "number"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:ms_ref_e_required",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "r": {
+            "$ref": "#/$defs/R"
+          },
+          "obj": {
+            "type": "object",
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "a",
+              "b"
+            ]
+          }
+        },
+        "required": [
+          "r",
+          "fantasma"
+        ],
+        "$defs": {
+          "R": {
+            "properties": {
+              "z": {
+                "type": "integer"
+              }
+            }
+          }
+        }
+      },
+      "expected": {
+        "$defs": {
+          "R": {
+            "properties": {
+              "z": {
+                "type": "integer"
+              }
+            },
+            "type": "object",
+            "required": []
+          }
+        },
+        "properties": {
+          "obj": {
+            "properties": {
+              "a": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "a"
+            ],
+            "type": "object"
+          },
+          "r": {
+            "$ref": "#/$defs/R"
+          }
+        },
+        "required": [
+          "r"
+        ],
+        "type": "object"
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:ms_filhos",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "c": {
+            "type": "array",
+            "contains": {
+              "enum": [
+                "a"
+              ]
+            }
+          },
+          "pn": {
+            "type": "object",
+            "propertyNames": {
+              "pattern": "^a"
+            }
+          },
+          "n": {
+            "not": {
+              "type": "string"
+            }
+          },
+          "one": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "properties": {}
+              }
+            ]
+          },
+          "all": {
+            "allOf": [
+              {
+                "type": "object"
+              }
+            ]
+          }
+        }
+      },
+      "expected": {
+        "properties": {
+          "all": {
+            "allOf": [
+              {
+                "type": "object",
+                "properties": {},
+                "required": []
+              }
+            ],
+            "type": "string"
+          },
+          "c": {
+            "contains": {
+              "enum": [
+                "a"
+              ],
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "n": {
+            "not": {
+              "type": "string"
+            },
+            "type": "string"
+          },
+          "one": {
+            "oneOf": [
+              {
+                "type": "string"
+              },
+              {
+                "properties": {},
+                "type": "object",
+                "required": []
+              }
+            ],
+            "type": "string"
+          },
+          "pn": {
+            "propertyNames": {
+              "pattern": "^a",
+              "type": "string"
+            },
+            "type": "object",
+            "properties": {},
+            "required": []
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "kimi:ms_topo_sem_required",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
+      "expected": {
+        "additionalProperties": false,
+        "properties": {
+          "a": {
+            "type": "string"
+          }
+        },
+        "type": "object",
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:moonshotai/kimi-k2",
+      "model": "moonshotai/kimi-k2",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:moonshotai/Kimi-K2.6",
+      "model": "moonshotai/Kimi-K2.6",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:nous/moonshotai/kimi-k2.6",
+      "model": "nous/moonshotai/kimi-k2.6",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:kimi-k2",
+      "model": "kimi-k2",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:kimi",
+      "model": "kimi",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:KIMI-latest",
+      "model": "KIMI-latest",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:k3",
+      "model": "k3",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:k3.1",
+      "model": "k3.1",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:k3-turbo",
+      "model": "k3-turbo",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:x/k3",
+      "model": "x/k3",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:moonshot-v1-8k",
+      "model": "moonshot-v1-8k",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:openrouter/moonshot",
+      "model": "openrouter/moonshot",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:acme/kimichat",
+      "model": "acme/kimichat",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:acme/xkimi",
+      "model": "acme/xkimi",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {}
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "modelo:anthropic/claude-sonnet-4.6",
+      "model": "anthropic/claude-sonnet-4.6",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {}
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "modelo:openai/gpt-5",
+      "model": "openai/gpt-5",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {}
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "modelo:deepseek/deepseek-chat",
+      "model": "deepseek/deepseek-chat",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {}
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "modelo:k30",
+      "model": "k30",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {}
+      },
+      "is_moonshot": false
+    },
+    {
+      "name": "modelo:  Kimi-K2  ",
+      "model": "  Kimi-K2  ",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {},
+        "required": []
+      },
+      "is_moonshot": true
+    },
+    {
+      "name": "modelo:",
+      "model": "",
+      "input_schema": {
+        "type": "object"
+      },
+      "expected": {
+        "type": "object",
+        "properties": {}
+      },
+      "is_moonshot": false
+    }
+  ]
+}

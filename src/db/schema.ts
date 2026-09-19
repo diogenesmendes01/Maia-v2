@@ -4592,3 +4592,145 @@ export type EngineRunEventRow = typeof engine_run_events.$inferSelect;
 export type NewEngineRunEventRow = typeof engine_run_events.$inferInsert;
 export type EngineProjectionRow = typeof engine_projections.$inferSelect;
 export type NewEngineProjectionRow = typeof engine_projections.$inferInsert;
+
+// ════════════════════════════════════════════════════════════════════════════
+// 144 — ledger do gateway de inferência Hermes (spec Maia+Hermes §9.1, §9.2).
+// Espelho das migrations, não a autoridade: CHECKs, FKs compostas e triggers
+// (grant imutável exceto revogação monotônica; eventos append-only) moram no
+// banco. Aqui ficam colunas, uniques e índices.
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Conta de orçamento por agente e dia UTC, em microusd inteiros. */
+export const engine_budget_accounts = pgTable(
+  'engine_budget_accounts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    period_start_utc: date('period_start_utc').notNull(),
+    limit_microusd: bigint('limit_microusd', { mode: 'bigint' }).notNull(),
+    reserved_microusd: bigint('reserved_microusd', { mode: 'bigint' })
+      .notNull()
+      .default(sql`0`),
+    settled_microusd: bigint('settled_microusd', { mode: 'bigint' })
+      .notNull()
+      .default(sql`0`),
+    row_version: bigint('row_version', { mode: 'number' }).notNull().default(0),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdUq: unique('engine_budget_accounts_scope_id_uq').on(t.tenant_id, t.agent_id, t.id),
+    periodUq: unique('engine_budget_accounts_period_uq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.period_start_utc,
+    ),
+  }),
+);
+
+/** Credencial curta de inferência de UM run, só pela hash. */
+export const engine_inference_grants = pgTable(
+  'engine_inference_grants',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    run_id: uuid('run_id').notNull(),
+    token_hash: text('token_hash').notNull(),
+    audience: text('audience').notNull(),
+    model: text('model').notNull(),
+    control_epoch: bigint('control_epoch', { mode: 'bigint' }).notNull(),
+    manifest_digest: text('manifest_digest').notNull(),
+    /** nome da tool -> digest canônico do input_schema. */
+    tool_surface: jsonb('tool_surface').notNull(),
+    max_inference_calls: integer('max_inference_calls').notNull(),
+    max_output_tokens: integer('max_output_tokens').notNull(),
+    expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
+    revoked_at: timestamp('revoked_at', { withTimezone: true }),
+    revoke_reason: text('revoke_reason'),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    scopeIdUq: unique('engine_inference_grants_scope_id_uq').on(t.tenant_id, t.agent_id, t.id),
+    /** GLOBAL: a credencial é resolvida antes de haver tenant. */
+    tokenHashUq: unique('engine_inference_grants_token_hash_uq').on(t.token_hash),
+    runIdx: index('engine_inference_grants_run_idx').on(t.tenant_id, t.agent_id, t.run_id),
+  }),
+);
+
+/**
+ * Uma linha por request admitido. `state`: reserved | not_sent | completed |
+ * failed_after_send. `accounting_status`: reserved | estimated | settled | unknown.
+ */
+export const engine_inference_attempts = pgTable(
+  'engine_inference_attempts',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    run_id: uuid('run_id').notNull(),
+    grant_id: uuid('grant_id').notNull(),
+    account_id: uuid('account_id').notNull(),
+    attempt_seq: integer('attempt_seq').notNull(),
+    provider: text('provider').notNull(),
+    model: text('model').notNull(),
+    request_hash: text('request_hash').notNull(),
+    state: text('state').notNull(),
+    accounting_status: text('accounting_status').notNull(),
+    reserved_microusd: bigint('reserved_microusd', { mode: 'bigint' }),
+    settled_microusd: bigint('settled_microusd', { mode: 'bigint' }),
+    tariff_version: text('tariff_version'),
+    prompt_tokens: integer('prompt_tokens'),
+    completion_tokens: integer('completion_tokens'),
+    last_error_code: text('last_error_code'),
+    started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
+    finished_at: timestamp('finished_at', { withTimezone: true }),
+  },
+  (t) => ({
+    scopeIdUq: unique('engine_inference_attempts_scope_id_uq').on(t.tenant_id, t.agent_id, t.id),
+    seqUq: unique('engine_inference_attempts_seq_uq').on(
+      t.tenant_id,
+      t.agent_id,
+      t.run_id,
+      t.attempt_seq,
+    ),
+    openIdx: index('engine_inference_attempts_open_idx')
+      .on(t.tenant_id, t.agent_id, t.started_at, t.id)
+      .where(sql`state = 'reserved' OR accounting_status = 'unknown'`),
+  }),
+);
+
+/** Eventos idempotentes de custo. Append-only; `delta_microusd` NULL = desconhecido. */
+export const engine_usage_events = pgTable(
+  'engine_usage_events',
+  {
+    id: uuid('id').primaryKey().defaultRandom(),
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    run_id: uuid('run_id').notNull(),
+    attempt_id: uuid('attempt_id').notNull(),
+    event_key: text('event_key').notNull(),
+    kind: text('kind').notNull(),
+    source: text('source').notNull(),
+    delta_microusd: bigint('delta_microusd', { mode: 'bigint' }),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    keyUq: unique('engine_usage_events_key_uq').on(t.tenant_id, t.agent_id, t.event_key),
+    attemptIdx: index('engine_usage_events_attempt_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.attempt_id,
+    ),
+  }),
+);
+
+export type EngineBudgetAccountRow = typeof engine_budget_accounts.$inferSelect;
+export type NewEngineBudgetAccountRow = typeof engine_budget_accounts.$inferInsert;
+export type EngineInferenceGrantRow = typeof engine_inference_grants.$inferSelect;
+export type NewEngineInferenceGrantRow = typeof engine_inference_grants.$inferInsert;
+export type EngineInferenceAttemptRow = typeof engine_inference_attempts.$inferSelect;
+export type NewEngineInferenceAttemptRow = typeof engine_inference_attempts.$inferInsert;
+export type EngineUsageEventRow = typeof engine_usage_events.$inferSelect;
+export type NewEngineUsageEventRow = typeof engine_usage_events.$inferInsert;

@@ -192,6 +192,17 @@ export async function buildServer() {
     return renderPrometheus();
   });
 
+  // Gateway de inferência Hermes (spec Maia+Hermes §9.1). Sempre registrado:
+  // sem grant emitido ele só recusa, e quem liga o Hermes é a policy por
+  // tenant+agente+canal (K-15), nunca uma flag global. ANTES das rotas de setup,
+  // cujo rate limit global (30/min por IP) seria aplicado a todo filho na loopback.
+  {
+    const { registerHermesInferenceGateway } = await import(
+      '@/integrations/hermes/inference-wiring.js'
+    );
+    await registerHermesInferenceGateway(app);
+  }
+
   // Setup pairing routes — mounted always (no flag gate). See spec §4.5.
   const { registerSetupRoutes } = await import('@/setup/index.js');
   await registerSetupRoutes(app);
