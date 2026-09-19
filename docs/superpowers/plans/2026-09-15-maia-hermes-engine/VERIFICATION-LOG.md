@@ -2395,7 +2395,7 @@ nenhum outro teste entrou ou saiu.
 entrada do loop depende do motor (C71b); o zumbi sob hold sobrevive até o resume (C70). Push e CI
 destes commits vêm a seguir — nada aqui é evidência de CI.
 
-### V-052 · K-15 — `agent_engine_policies` (145), CAS e kill switch
+### V-053 · K-15 — `agent_engine_policies` (145), CAS e kill switch
 
 **Ambiente.** Worktree nova (branch `claude/hermes-engine-policies`, criada de
 `claude/repo-hygiene` = PR #769 em `35f298ff`). Node `v22.23.2`. Sem Docker: Postgres 17 em WASM
@@ -2431,8 +2431,15 @@ por sha256 depois de cada um. 9/9 mortos.
 | M7 | down sem recusa | migration spec, caso do down |
 | M8 | espelho Drizzle com nome errado | paridade + real-db (9 casos) |
 
+**Kill switch falha fechado** (achado da revisão, corrigido depois): `boolFlag` lia `TRUE`, `yes`,
+`on` como `false`, o que deixaria o Hermes ligado para quem tentasse desligá-lo. O schema passou a
+ser `killSwitchFlag`: só `false`/`0` explícitos deixam o kill switch solto; qualquer outro valor o
+aciona. `tests/unit/config/hermes-kill-switch.spec.ts` + `tests/unit/config` + seletor: **415
+passados, 4 pulados** (`compose-config-differential`), 0 falhas; `config:check:drift` em dia.
+
 **Não feito aqui:** `npm test` completo; Postgres 16 e Redis reais (CI); duas conexões concorrentes
-reais (o caso 6 serializa no PGlite); `agent_execution_limits`.
+reais (o caso 6 serializa no PGlite); `agent_execution_limits`. A PR é empilhada sobre a #769 e o
+CI só roda em PR contra `main`: nada daqui é evidência de CI até ela ser reapontada.
 
 ## Testes executados / falhos / pulados (acumulado)
 
