@@ -691,13 +691,6 @@
           "restartRequired": true
         },
         {
-          "name": "MAIA_HERMES_ENABLED",
-          "secret": false,
-          "required": false,
-          "group": "feature-flags",
-          "restartRequired": true
-        },
-        {
           "name": "MAIA_HERMES_INFERENCE_ALLOWED_SOURCES",
           "secret": false,
           "required": false,
@@ -1509,7 +1502,6 @@
             "PRIVACY_EXPORT_TTL_DAYS",
             "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
-            "MAIA_HERMES_ENABLED",
             "MAIA_HERMES_INFERENCE_ALLOWED_SOURCES",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1711,7 +1703,6 @@
             "PRIVACY_EXPORT_TTL_DAYS",
             "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
-            "MAIA_HERMES_ENABLED",
             "MAIA_HERMES_INFERENCE_ALLOWED_SOURCES",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",
@@ -1912,7 +1903,6 @@
             "PRIVACY_EXPORT_TTL_DAYS",
             "PRIVACY_EXPORT_SWEEP_DRY_RUN",
             "DAILY_LLM_USD_THRESHOLD",
-            "MAIA_HERMES_ENABLED",
             "MAIA_HERMES_INFERENCE_ALLOWED_SOURCES",
             "FEATURE_MCP_TOOLS",
             "FEATURE_PROACTIVE_MESSAGES",

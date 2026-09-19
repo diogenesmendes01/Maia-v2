@@ -38,7 +38,6 @@ const G_A2 = 'hermes144-agent-a2';
 const SHA = 'a'.repeat(64);
 const MODEL = 'anthropic/claude-sonnet-4.6';
 const SURFACE = { fixture_echo: 'c'.repeat(64) };
-const DENY = { on_unpriced: 'deny' as const };
 
 let pool: pg.Pool;
 
@@ -151,7 +150,6 @@ function admit(
     model: string;
     tools: string[];
     audience: string;
-    policy: { on_unpriced: 'deny' | 'admit_unpriced' };
   }> = {},
 ) {
   return as(run, () =>
@@ -165,7 +163,6 @@ function admit(
       tool_names_requested: over.tools ?? ['fixture_echo'],
       estimate_microusd: over.estimate === undefined ? '1000' : over.estimate,
       tariff_version: 'tarifa-teste',
-      policy: over.policy ?? DENY,
     }),
   );
 }
@@ -301,7 +298,7 @@ d('P06 — ledger do gateway de inferência (migration 144)', () => {
       expect(await conta(run)).toEqual({ reserved: '2500', settled: '0' });
     });
 
-    it('recusas de orçamento: sem conta, sem preço (deny) e acima do limite', async () => {
+    it('recusas de orçamento: sem conta, sem preço (unknown_price) e acima do limite', async () => {
       const agent = await freshAgent(T_A);
       const run = await mkRun(T_A, agent);
       const g = await grantFor(run);
@@ -309,19 +306,23 @@ d('P06 — ledger do gateway de inferência (migration 144)', () => {
       await as(run, async () =>
         inferenceRepo.openBudgetAccount({ period_start_utc: await today(), limit_microusd: '1000' }),
       );
+      // Sem preço: recusa, com o motivo tipado na auditoria; o cliente vê cota.
       expect(await admit(run, g.grant_id, { estimate: null })).toMatchObject({
         ok: false,
         code: 'budget_exhausted',
+        audit_reason: 'admission_unknown_price',
       });
       expect(await admit(run, g.grant_id, { estimate: '1001' })).toMatchObject({
         ok: false,
         code: 'budget_exhausted',
       });
+      // Nenhuma recusa reserva nada nem cria tentativa (`null` nunca vira zero).
       expect(await conta(run)).toEqual({ reserved: '0', settled: '0' });
-      // admit_unpriced admite sem reservar (exposição sem teto, declarada).
-      expect(
-        await admit(run, g.grant_id, { estimate: null, policy: { on_unpriced: 'admit_unpriced' } }),
-      ).toMatchObject({ ok: true, reserved_microusd: null });
+      const tentativas = await pool.query<{ n: number }>(
+        `SELECT count(*)::int AS n FROM engine_inference_attempts WHERE grant_id = $1`,
+        [g.grant_id],
+      );
+      expect(tentativas.rows[0]!.n).toBe(0);
     });
 
     it('recusas de autoridade sob o estado travado', async () => {

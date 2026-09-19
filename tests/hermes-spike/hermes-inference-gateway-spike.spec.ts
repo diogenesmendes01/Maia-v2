@@ -133,7 +133,6 @@ async function gateway(
     },
     relay: createChatCompletionsRelay({ provider: 'stub', apiKey: 'upstream-key', baseURL: stub.baseUrl }),
     tariffFor: async () => ({ version: 'v', input_nanousd_per_token: 1000, output_nanousd_per_token: 1000 }),
-    policy: { on_unpriced: 'deny' },
     runInScope: (_s, fn) => fn(),
   });
   await app.listen({ host: '127.0.0.1', port: 0 });

@@ -31,7 +31,6 @@ import { incCounter } from "@/lib/metrics.js";
 import {
   applyAdmission,
   decideAdmission,
-  type AdmissionPolicyV1,
   type BudgetAccountV1,
 } from "@/integrations/hermes/cost-reservation.js";
 import type { UsageSource } from "@/integrations/hermes/cost-accounting.js";
@@ -105,8 +104,7 @@ export type AdmitAttemptResult =
       ok: true;
       attempt_id: string;
       attempt_seq: number;
-      /** `null` = admitido sem preço (policy `admit_unpriced`). */
-      reserved_microusd: string | null;
+      reserved_microusd: string;
     }
   | { ok: false; code: InferenceErrorCode; audit_reason: string };
 
@@ -386,7 +384,6 @@ export const inferenceRepo = {
     tool_names_requested: readonly string[];
     estimate_microusd: string | null;
     tariff_version: string | null;
-    policy: AdmissionPolicyV1;
   }): Promise<AdmitAttemptResult> {
     const { tenant_id, agent_id } = scope();
     return withTx(async (tx): Promise<AdmitAttemptResult> => {
@@ -483,20 +480,21 @@ export const inferenceRepo = {
 
       let decisao: ReturnType<typeof decideAdmission>;
       try {
-        decisao = decideAdmission(
-          account,
-          {
-            estimate_microusd: input.estimate_microusd,
-            calls_so_far,
-            max_inference_calls: grant.max_inference_calls,
-          },
-          input.policy,
-        );
+        decisao = decideAdmission(account, {
+          estimate_microusd: input.estimate_microusd,
+          calls_so_far,
+          max_inference_calls: grant.max_inference_calls,
+        });
       } catch {
         // Valor monetário fora do formato: não admitir é o único desfecho seguro.
         return recusa("admission_unavailable", "money_format");
       }
-      if (decisao.kind === "refuse") return recusa(decisao.code, `admission_${decisao.code}`);
+      if (decisao.kind === "refuse") {
+        // Sem preço, o cliente vê cota (429, terminal no classificador pinado);
+        // o motivo tipado fica na auditoria e na métrica.
+        const wire = decisao.code === "unknown_price" ? "budget_exhausted" : decisao.code;
+        return recusa(wire, `admission_${decisao.code}`);
+      }
       if (!account || !linhaConta) return recusa("admission_unavailable", "no_account");
 
       const proxima = applyAdmission(account, decisao);

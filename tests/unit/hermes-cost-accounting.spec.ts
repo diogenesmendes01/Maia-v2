@@ -335,7 +335,7 @@ describe('P06 — dinheiro é inteiro, nunca float', () => {
 
 describe('T58 — limite diário com admissões simultâneas', () => {
   it('24. admite enquanto cabe', () => {
-    const d = decideAdmission(conta(), { estimate_microusd: '1000', calls_so_far: 0, max_inference_calls: 10 }, { on_unpriced: 'deny' });
+    const d = decideAdmission(conta(), { estimate_microusd: '1000', calls_so_far: 0, max_inference_calls: 10 });
     expect(d).toMatchObject({ kind: 'admit', reserve_microusd: '1000' });
   });
 
@@ -343,7 +343,6 @@ describe('T58 — limite diário com admissões simultâneas', () => {
     const d = decideAdmission(
       conta({ limit_microusd: '1000', reserved_microusd: '900' }),
       { estimate_microusd: '200', calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'deny' },
     );
     expect(d).toMatchObject({ kind: 'refuse', code: 'budget_exhausted' });
   });
@@ -352,7 +351,6 @@ describe('T58 — limite diário com admissões simultâneas', () => {
     const d = decideAdmission(
       conta({ limit_microusd: '1000', reserved_microusd: '0', settled_microusd: '950' }),
       { estimate_microusd: '100', calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'deny' },
     );
     expect(d).toMatchObject({ kind: 'refuse', code: 'budget_exhausted' });
   });
@@ -367,7 +365,6 @@ describe('T58 — limite diário com admissões simultâneas', () => {
       const d = decideAdmission(
         c,
         { estimate_microusd: '30', calls_so_far: i, max_inference_calls: 100 },
-        { on_unpriced: 'deny' },
       );
       if (d.kind === 'admit') {
         admitidas++;
@@ -383,21 +380,19 @@ describe('T58 — limite diário com admissões simultâneas', () => {
     const cheia = decideAdmission(
       conta({ limit_microusd: '100', reserved_microusd: '40', settled_microusd: '30' }),
       { estimate_microusd: '30', calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'deny' },
     );
     expect(cheia.kind).toBe('admit');
 
     const estourada = decideAdmission(
       conta({ limit_microusd: '100', reserved_microusd: '40', settled_microusd: '30' }),
       { estimate_microusd: '31', calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'deny' },
     );
     expect(estourada).toMatchObject({ kind: 'refuse', code: 'budget_exhausted' });
   });
 
   it('28. cada admissão avança `row_version` (o CAS do §9.2)', () => {
     const c = conta();
-    const d = decideAdmission(c, { estimate_microusd: '10', calls_so_far: 0, max_inference_calls: 10 }, { on_unpriced: 'deny' });
+    const d = decideAdmission(c, { estimate_microusd: '10', calls_so_far: 0, max_inference_calls: 10 });
     if (d.kind !== 'admit') throw new Error('esperava admissão');
     expect(applyAdmission(c, d).row_version).toBe(c.row_version + 1);
   });
@@ -406,80 +401,64 @@ describe('T58 — limite diário com admissões simultâneas', () => {
     const d = decideAdmission(
       conta(),
       { estimate_microusd: '1', calls_so_far: 5, max_inference_calls: 5 },
-      { on_unpriced: 'deny' },
     );
     expect(d).toMatchObject({ kind: 'refuse', code: 'inference_limit_exceeded' });
   });
 
   it('30. store indisponível => NENHUMA inferência nova (§9.2)', () => {
-    const d = decideAdmission(null, { estimate_microusd: '1', calls_so_far: 0, max_inference_calls: 10 }, { on_unpriced: 'deny' });
+    const d = decideAdmission(null, { estimate_microusd: '1', calls_so_far: 0, max_inference_calls: 10 });
     expect(d).toMatchObject({ kind: 'refuse', code: 'admission_unavailable' });
   });
 });
 
 describe('T58 — sem promessa indevida de hard cap', () => {
   it('31. TODA decisão declara que a garantia é só de admissão', () => {
-    const admitida = decideAdmission(conta(), { estimate_microusd: '1', calls_so_far: 0, max_inference_calls: 10 }, { on_unpriced: 'deny' });
+    const admitida = decideAdmission(conta(), { estimate_microusd: '1', calls_so_far: 0, max_inference_calls: 10 });
     const recusada = decideAdmission(
       conta({ limit_microusd: '0' }),
       { estimate_microusd: '1', calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'deny' },
     );
     expect(ADMISSION_GUARANTEE).toBe('admission_only');
     expect(admitida.guarantee).toBe('admission_only');
     expect(recusada.guarantee).toBe('admission_only');
   });
 
-  it('32. sem preço verificável, a POLÍTICA decide — e ela é parâmetro', () => {
-    // §9.2: "sem preço/limite superior verificável, modo de hard cap fica
-    // desabilitado ou a admissão é negada conforme policy". Ler isso de uma
-    // constante do módulo seria política minha disfarçada de leitura.
-    const negada = decideAdmission(
-      conta(),
-      { estimate_microusd: null, calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'deny' },
-    );
-    expect(negada).toMatchObject({ kind: 'refuse', code: 'budget_exhausted' });
-
-    const admitida = decideAdmission(
-      conta(),
-      { estimate_microusd: null, calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'admit_unpriced' },
-    );
-    expect(admitida.kind).toBe('admit');
+  it('32. sem preço verificável, NÃO admite: motivo tipado `unknown_price`', () => {
+    // Decisão do dono para produção: a variante que admitia sem preço saiu, e
+    // não há parâmetro que a traga de volta.
+    const d = decideAdmission(conta(), {
+      estimate_microusd: null,
+      calls_so_far: 0,
+      max_inference_calls: 10,
+    });
+    expect(d).toMatchObject({ kind: 'refuse', code: 'unknown_price' });
+    expect(decideAdmission.length).toBe(2);
   });
 
-  it('33. admissão sem preço reserva `null`, NUNCA zero (T59 do lado da reserva)', () => {
-    const d = decideAdmission(
-      conta(),
-      { estimate_microusd: null, calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'admit_unpriced' },
-    );
-    if (d.kind !== 'admit') throw new Error('esperava admissão');
-    expect(d.reserve_microusd).toBeNull();
-    expect(d.hard_cap_enabled).toBe(false);
+  it('33. `null` nunca vira zero: sem preço não há reserva, nem de 0', () => {
+    const c = conta({ limit_microusd: '1000000' });
+    const sem = { estimate_microusd: null, calls_so_far: 0, max_inference_calls: 10 };
+    const d = decideAdmission(c, sem);
+    expect(d.kind).toBe('refuse');
+    expect(d).not.toHaveProperty('reserve_microusd');
+    // Mesmo com orçamento sobrando: a falta de preço não é tratada como custo zero.
+    expect(applyAdmission(c, d)).toEqual(c);
   });
 
-  it('34. admissão PRECIFICADA também não promete hard cap, mas o teto está ligado', () => {
-    const d = decideAdmission(conta(), { estimate_microusd: '10', calls_so_far: 0, max_inference_calls: 10 }, { on_unpriced: 'deny' });
+  it('34. admissão PRECIFICADA reserva exatamente a estimativa e não promete hard cap', () => {
+    const com = { estimate_microusd: '10', calls_so_far: 0, max_inference_calls: 10 };
+    const d = decideAdmission(conta(), com);
     if (d.kind !== 'admit') throw new Error('esperava admissão');
-    expect(d.hard_cap_enabled).toBe(true);
+    expect(d.reserve_microusd).toBe('10');
     expect(d.guarantee).toBe('admission_only');
   });
 
-  it('35. admissão sem preço NÃO move a exposição reservada', () => {
+  it('35. recusa sem preço NÃO move a conta nem o row_version', () => {
     const c = conta();
-    const d = decideAdmission(
-      c,
-      { estimate_microusd: null, calls_so_far: 0, max_inference_calls: 10 },
-      { on_unpriced: 'admit_unpriced' },
-    );
-    if (d.kind !== 'admit') throw new Error('esperava admissão');
-    const depois = applyAdmission(c, d);
-    expect(depois.reserved_microusd).toBe('0');
-    // ...mas a tentativa CONTA, então o row_version anda e o teto de chamadas
-    // continua sendo o freio.
-    expect(depois.row_version).toBe(c.row_version + 1);
+    const sem = { estimate_microusd: null, calls_so_far: 0, max_inference_calls: 10 };
+    const depois = applyAdmission(c, decideAdmission(c, sem));
+    expect(depois.reserved_microusd).toBe(c.reserved_microusd);
+    expect(depois.row_version).toBe(c.row_version);
   });
 });
 

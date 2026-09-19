@@ -99,6 +99,7 @@ async function setup(
     relay?: RelayOutcomeV1;
     relayImpl?: (b: Readonly<Record<string, unknown>>, o: { signal: AbortSignal }) => Promise<RelayOutcomeV1>;
     resolve?: 'ok' | 'null' | 'throw';
+    noProvider?: boolean;
   } = {},
 ) {
   const settled: SettleOutcomeV1[] = [];
@@ -133,9 +134,8 @@ async function setup(
   apps.push(app);
   await registerHermesInferenceRoute(app, {
     ledger,
-    relay,
+    relay: over.noProvider ? null : relay,
     tariffFor: async () => TARIFF,
-    policy: { on_unpriced: 'deny' },
     runInScope: (_s, fn) => fn(),
     running_wait_ms: 300,
     poll_ms: 20,
@@ -290,6 +290,15 @@ describe('rota — contrato, superfície e autoridade', () => {
 });
 
 describe('rota — admissão, relay e liquidação', () => {
+  it('sem credencial do provider: 503 antes da admissão, sem tentativa nem liquidação', async () => {
+    const { app, ledger, relay } = await setup({ noProvider: true });
+    const r = await post(app, body());
+    expect([r.statusCode, code(r)]).toEqual([503, 'provider_unavailable']);
+    expect(ledger.admitAttempt).not.toHaveBeenCalled();
+    expect(ledger.settleAttempt).not.toHaveBeenCalled();
+    expect(relay.relay).not.toHaveBeenCalled();
+  });
+
   it('JSON: reserva com estimativa, encaminha com o teto, liquida com o custo do uso', async () => {
     const { app, ledger, relayed, settled } = await setup();
     const r = await post(app, body({ max_tokens: undefined }));

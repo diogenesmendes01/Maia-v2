@@ -1,13 +1,16 @@
 /**
  * P06 — liga a rota do gateway de inferência ao processo HTTP da Maia.
  *
- * Só é importado por `buildServer()` quando `MAIA_HERMES_ENABLED=true`: com a
- * flag desligada nada disto entra no grafo do servidor. O provider é o da casa
- * (OpenRouter, com a chave que o processo já tem); o filho Hermes nunca vê
- * essa chave — ele recebe só a credencial curta do run.
+ * Registrada SEMPRE. Não existe flag global que ligue o Hermes (decisão do
+ * dono, INV-01): quem liga é a policy por tenant+agente+canal
+ * (`agent_engine_policies`, K-15), e sem grant emitido a rota só recusa. O
+ * provider é o da casa (OpenRouter, com a chave que o processo já tem); o filho
+ * Hermes nunca vê essa chave — ele recebe só a credencial curta do run.
  *
- * A policy de preço desconhecido é `deny`: sem tarifa verificável, o teto duro
- * não existe, e a admissão não finge que existe.
+ * Sem `OPENROUTER_API_KEY` a rota fica registrada e recusa ANTES da admissão
+ * (`provider_unavailable`): sem tentativa, sem reserva, sem consumir o teto de
+ * chamadas do run. Preço desconhecido é recusado pela admissão
+ * (`unknown_price`).
  */
 import type { FastifyInstance } from 'fastify';
 import { config } from '@/config/env.js';
@@ -28,30 +31,26 @@ export async function registerHermesInferenceGateway(app: FastifyInstance): Prom
   if (allowed_sources === null) {
     throw new Error('MAIA_HERMES_INFERENCE_ALLOWED_SOURCES inválida');
   }
-  // Ligado sem provider é incompleto (§9.3): falha no boot, não em cada turno
-  // gastando o teto de chamadas do run com 503.
-  if (!config.OPENROUTER_API_KEY) {
-    throw new Error('MAIA_HERMES_ENABLED=true exige OPENROUTER_API_KEY');
-  }
   await registerHermesInferenceRoute(app, {
     allowed_sources,
     ledger: inferenceRepo,
-    relay: createChatCompletionsRelay({
-      provider: 'openrouter',
-      apiKey: config.OPENROUTER_API_KEY,
-      baseURL: OPENROUTER_BASE_URL,
-      defaultHeaders: {
-        'HTTP-Referer': 'https://github.com/diogenesmendes01/Maia-v2',
-        'X-OpenRouter-Title': 'Maia',
-      },
-    }),
+    relay: config.OPENROUTER_API_KEY
+      ? createChatCompletionsRelay({
+          provider: 'openrouter',
+          apiKey: config.OPENROUTER_API_KEY,
+          baseURL: OPENROUTER_BASE_URL,
+          defaultHeaders: {
+            'HTTP-Referer': 'https://github.com/diogenesmendes01/Maia-v2',
+            'X-OpenRouter-Title': 'Maia',
+          },
+        })
+      : null,
     tariffFor: createCatalogTariff({
       async models() {
         const models = await getToolCallingModels();
         return { models, fallback: models === _internal.FALLBACK_TOOL_MODELS };
       },
     }),
-    policy: { on_unpriced: 'deny' },
     runInScope: runWithTenantContext,
   });
 }

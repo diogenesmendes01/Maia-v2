@@ -33,7 +33,6 @@ import type {
   SettleOutcomeV1,
 } from '@/db/repositories/inference-repos.js';
 import { canonicalDigest } from './canonical-json.js';
-import type { AdmissionPolicyV1 } from './cost-reservation.js';
 import {
   INFERENCE_GRANT_AUDIENCE,
   bearerTokenOf,
@@ -79,7 +78,6 @@ export interface InferenceLedgerPortV1 {
     tool_names_requested: readonly string[];
     estimate_microusd: string | null;
     tariff_version: string | null;
-    policy: AdmissionPolicyV1;
   }): Promise<AdmitAttemptResult>;
   settleAttempt(input: {
     attempt_id: string;
@@ -89,10 +87,10 @@ export interface InferenceLedgerPortV1 {
 
 export interface InferenceRouteDepsV1 {
   ledger: InferenceLedgerPortV1;
-  relay: ChatCompletionsRelayV1;
+  /** `null` = provider sem credencial: a rota recusa antes da admissão. */
+  relay: ChatCompletionsRelayV1 | null;
   /** Tarifa versionada do modelo aprovado. `null` = sem preço verificável. */
   tariffFor(model: string): Promise<InferenceTariffV1 | null>;
-  policy: AdmissionPolicyV1;
   /** `runWithTenantContext`, injetado para a rota não depender do ALS global. */
   runInScope<T>(scope: { tenant_id: string; agent_id: string }, fn: () => Promise<T>): Promise<T>;
   now?: () => number;
@@ -246,6 +244,10 @@ export async function registerHermesInferenceRoute(
           }
           const cap = enforceOutputCap(request, state.max_output_tokens);
           if (!cap.ok) return sendError(reply, 'invalid_request');
+          // Sem credencial do provider: recusa ANTES da admissão, sem tentativa
+          // nem reserva, e sem gastar o teto de chamadas do run.
+          if (deps.relay === null) return sendError(reply, 'provider_unavailable');
+          const upstream: ChatCompletionsRelayV1 = deps.relay;
 
           let tariff: InferenceTariffV1 | null;
           try {
@@ -261,7 +263,7 @@ export async function registerHermesInferenceRoute(
               tariff,
             );
           } catch {
-            // Tarifa fora do formato é tarifa desconhecida: a policy decide.
+            // Tarifa fora do formato é tarifa desconhecida: a admissão recusa.
             tariff = null;
             estimate = null;
           }
@@ -277,13 +279,12 @@ export async function registerHermesInferenceRoute(
               grant_id,
               attempt_id,
               request_hash: canonicalDigest(forward),
-              provider: deps.relay.provider,
+              provider: upstream.provider,
               presented_audience: INFERENCE_GRANT_AUDIENCE,
               model_requested: request.model,
               tool_names_requested: tool_names,
               estimate_microusd: estimate,
               tariff_version: tariff?.version ?? null,
-              policy: deps.policy,
             });
           } catch {
             return sendError(reply, 'admission_unavailable');
@@ -321,7 +322,7 @@ export async function registerHermesInferenceRoute(
 
           async function relayAndRespond(): Promise<FastifyReply> {
             const remaining = Math.max(1, Date.parse(st.run_deadline_at) - now());
-            const out = await deps.relay.relay(forward, {
+            const out = await upstream.relay(forward, {
               signal: ac.signal,
               timeout_ms: remaining,
             });
