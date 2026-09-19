@@ -94,8 +94,10 @@ export function redactErrorText(input: unknown): string {
   const raw =
     typeof input === 'string'
       ? input
-      : input && typeof input === 'object' && typeof (input as { message?: unknown }).message === 'string'
-        ? ((input as { message: string }).message)
+      : input &&
+          typeof input === 'object' &&
+          typeof (input as { message?: unknown }).message === 'string'
+        ? (input as { message: string }).message
         : String(input ?? '');
   let out = raw;
   for (const re of SECRET_PATTERNS) out = out.replace(re, '[redacted]');

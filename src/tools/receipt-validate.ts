@@ -205,10 +205,7 @@ export const receiptValidateTool: Tool<typeof inputSchema, typeof outputSchema> 
  * — the highest band is `plausible`, and a zero-confidence/empty parse is
  * `suspicious` so it surfaces for human review rather than silently passing.
  */
-function classifyAuthenticity(
-  confidence: number,
-  warningCount: number,
-): Output['authenticity'] {
+function classifyAuthenticity(confidence: number, warningCount: number): Output['authenticity'] {
   if (confidence <= 0) return 'suspicious';
   if (warningCount >= 2) return 'low_confidence';
   if (confidence >= 0.8 && warningCount === 0) return 'plausible';

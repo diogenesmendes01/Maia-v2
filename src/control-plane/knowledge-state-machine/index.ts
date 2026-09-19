@@ -11,11 +11,7 @@ export {
   assertAllowedTransition,
   IllegalTransitionError,
 } from './transitions.js';
-export {
-  knowledgeIsVisible,
-  getVisibilityTable,
-  VISIBLE_STATES,
-} from './visibility.js';
+export { knowledgeIsVisible, getVisibilityTable, VISIBLE_STATES } from './visibility.js';
 export { knowledgeRepos, KnowledgeConflictError } from './repos.js';
 export { KnowledgeRiskScorer } from './risk-scorer.js';
 

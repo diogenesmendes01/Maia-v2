@@ -89,7 +89,10 @@ export type ProbeTickDeps = {
   resolveInboundId: (wid: string) => Promise<string | null>;
   latestReplyText: (mensagem_id: string) => Promise<string | null>;
   repo: ProbeRepo;
-  judge: { enabled: boolean; run: (input: { intent: string; prompt: string; reply: string | null }) => Promise<JudgeVerdict> };
+  judge: {
+    enabled: boolean;
+    run: (input: { intent: string; prompt: string; reply: string | null }) => Promise<JudgeVerdict>;
+  };
   audit: (input: { acao: AuditAction; metadata?: Record<string, unknown> }) => Promise<void>;
   metrics: {
     inc: (name: string, labels?: Record<string, string>) => void;
@@ -100,7 +103,11 @@ export type ProbeTickDeps = {
   slowMs: number;
   alertAfterK: number;
   pollIntervalMs: number;
-  logger: { info: (o: unknown, m: string) => void; warn: (o: unknown, m: string) => void; error: (o: unknown, m: string) => void };
+  logger: {
+    info: (o: unknown, m: string) => void;
+    warn: (o: unknown, m: string) => void;
+    error: (o: unknown, m: string) => void;
+  };
 };
 
 export type ProbeTickResult = {
@@ -175,7 +182,10 @@ export async function runProbeTick(deps: ProbeTickDeps): Promise<ProbeTickResult
   // por linha não resolve o canal da sonda — fail-closed (no-op + audit), NUNCA
   // ativa o canal (um canal ativo derrubaria o ingresso real).
   if (deps.routingMode !== 'exact_first' && deps.routingMode !== 'strict') {
-    await deps.audit({ acao: 'synthetic_probe_prereq_unmet', metadata: { reason: 'routing_mode', routing_mode: deps.routingMode } });
+    await deps.audit({
+      acao: 'synthetic_probe_prereq_unmet',
+      metadata: { reason: 'routing_mode', routing_mode: deps.routingMode },
+    });
     deps.logger.warn({ routing_mode: deps.routingMode }, 'synthetic_probe.prereq_unmet');
     return { status: 'prereq_unmet', consecutiveFailures: 0 };
   }
@@ -191,7 +201,10 @@ export async function runProbeTick(deps: ProbeTickDeps): Promise<ProbeTickResult
     channel_id: PROBE_CHANNEL_ID,
   });
   if (!ready.ok) {
-    await deps.audit({ acao: 'synthetic_probe_prereq_unmet', metadata: { reason: 'channel_not_ready', detail: ready.reason } });
+    await deps.audit({
+      acao: 'synthetic_probe_prereq_unmet',
+      metadata: { reason: 'channel_not_ready', detail: ready.reason },
+    });
     deps.logger.warn({ reason: ready.reason }, 'synthetic_probe.channel_not_ready');
     return { status: 'prereq_unmet', consecutiveFailures: 0 };
   }
@@ -208,18 +221,32 @@ export async function runProbeTick(deps: ProbeTickDeps): Promise<ProbeTickResult
   });
 
   try {
-    const ingressRes = await deps.ingress(buildSyntheticMessage(deps.scenario.prompt, wid, startMs), {
-      botLineE164: PROBE_LINE_E164,
-    });
+    const ingressRes = await deps.ingress(
+      buildSyntheticMessage(deps.scenario.prompt, wid, startMs),
+      {
+        botLineE164: PROBE_LINE_E164,
+      },
+    );
     if (ingressRes !== 'handled') {
-      const cf = await applyOutcome(deps, runId, 'error', deps.now() - startMs, { stage: 'ingress', ingressRes }, null);
+      const cf = await applyOutcome(
+        deps,
+        runId,
+        'error',
+        deps.now() - startMs,
+        { stage: 'ingress', ingressRes },
+        null,
+      );
       deps.logger.warn({ ingressRes }, 'synthetic_probe.ingress_not_handled');
       return { status: 'ingress_failed', outcome: 'error', runId, consecutiveFailures: cf };
     }
 
     // Poll pelo efeito colateral + liveness até o SLO (§1.1 passo 4).
     let mensagemId: string | null = null;
-    let effect = { effect_satisfied: false, liveness: false, detail: {} as Record<string, unknown> };
+    let effect = {
+      effect_satisfied: false,
+      liveness: false,
+      detail: {} as Record<string, unknown>,
+    };
     const deadline = startMs + deps.sloMs;
     for (;;) {
       if (!mensagemId) mensagemId = await deps.resolveInboundId(wid);

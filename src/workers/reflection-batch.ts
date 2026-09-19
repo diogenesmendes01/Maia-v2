@@ -58,7 +58,9 @@ type TenantAgentRow = { tenant_id: string; agent_id: string };
  * predicados são belt-and-suspenders contra um futuro relaxamento do schema
  * ou uma migração de coluna que temporariamente permita NULL.
  */
-async function listTenantsWithCorrections(since: ReturnType<typeof sql>): Promise<TenantAgentRow[]> {
+async function listTenantsWithCorrections(
+  since: ReturnType<typeof sql>,
+): Promise<TenantAgentRow[]> {
   const result = await db.execute<TenantAgentRow>(sql`
     SELECT DISTINCT tenant_id, agent_id
     FROM ${audit_log}
@@ -160,10 +162,10 @@ async function tryAcquireTenantLock(
       if (released) return;
       released = true;
       try {
-        await client.query(
-          `SELECT pg_advisory_unlock(hashtextextended($1, $2))`,
-          [`${tenant_id}|${agent_id}`, REFLECTION_BATCH_LOCK_NAMESPACE.toString()],
-        );
+        await client.query(`SELECT pg_advisory_unlock(hashtextextended($1, $2))`, [
+          `${tenant_id}|${agent_id}`,
+          REFLECTION_BATCH_LOCK_NAMESPACE.toString(),
+        ]);
       } catch (err) {
         logger.warn(
           { err: (err as Error).message, tenant_id, agent_id },
@@ -232,10 +234,7 @@ export async function runReflectionBatch(): Promise<void> {
     const lock = await tryAcquireTenantLock(tenant_id, agent_id);
     if (!lock) {
       tenantsSkippedLocked++;
-      logger.info(
-        { tenant_id, agent_id },
-        'reflection_batch.tenant_skipped_locked',
-      );
+      logger.info({ tenant_id, agent_id }, 'reflection_batch.tenant_skipped_locked');
       continue;
     }
 
@@ -254,10 +253,7 @@ export async function runReflectionBatch(): Promise<void> {
       totalClusters += stats.clusters;
       totalLlmCalls += stats.llm_calls;
       tenantsProcessed++;
-      logger.info(
-        { tenant_id, agent_id, ...stats },
-        'reflection_batch.tenant_done',
-      );
+      logger.info({ tenant_id, agent_id, ...stats }, 'reflection_batch.tenant_done');
     } catch (err) {
       // Fail-isolated: o erro de UM tenant não afeta os demais. O run total
       // permanece "parcialmente ok" — telemetria distingue via
@@ -301,9 +297,7 @@ type ReflectionStats = {
   llm_calls: number;
 };
 
-async function runReflectionBatchInner(
-  since: ReturnType<typeof sql>,
-): Promise<ReflectionStats> {
+async function runReflectionBatchInner(since: ReturnType<typeof sql>): Promise<ReflectionStats> {
   // Defense-in-depth: filter audit_log explicitly by the current tenant/agent
   // pulled from the ALS context. The dispatcher in `runReflectionBatch`
   // already routed us here per (tenant_id, agent_id) — this extra predicate
@@ -427,7 +421,10 @@ async function runReflectionBatchInner(
 }
 
 async function proposeRule(cluster: Cluster): Promise<Proposal | null> {
-  const examples = cluster.signals.slice(0, 5).map((s, i) => `${i + 1}. ${s.descricao}`).join('\n');
+  const examples = cluster.signals
+    .slice(0, 5)
+    .map((s, i) => `${i + 1}. ${s.descricao}`)
+    .join('\n');
   const system =
     'Você é a Maia em modo reflexão noturna (modelo rápido). ' +
     'Receberá um cluster de correções repetidas do usuário sobre transações. ' +
@@ -448,10 +445,7 @@ async function proposeRule(cluster: Cluster): Promise<Proposal | null> {
   );
   const res = proposalResult.output;
   if (!res) {
-    logger.warn(
-      { status: proposalResult.status },
-      'reflection_batch.llm_failed_skipping',
-    );
+    logger.warn({ status: proposalResult.status }, 'reflection_batch.llm_failed_skipping');
     return null;
   }
   try {

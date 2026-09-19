@@ -74,10 +74,7 @@ describe('originGate (P8b §7)', () => {
 
   describe('strength < threshold → BLOQUEIO (qualquer origin)', () => {
     const origins: Array<
-      | 'founder_explicit'
-      | 'human_approved'
-      | 'tenant_culture_explicit'
-      | 'learned_strong_evidence'
+      'founder_explicit' | 'human_approved' | 'tenant_culture_explicit' | 'learned_strong_evidence'
     > = [
       'founder_explicit',
       'human_approved',

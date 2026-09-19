@@ -72,15 +72,12 @@ async function limpar(c: pg.PoolClient, l: Lixo) {
   // deixa rastro que a rodada seguinte herdaria como linha de base.
   if (l.gaps.length > 0) {
     await c
-      .query('DELETE FROM tool_request_aggregate_members WHERE gap_id = ANY($1::uuid[])', [
-        l.gaps,
-      ])
+      .query('DELETE FROM tool_request_aggregate_members WHERE gap_id = ANY($1::uuid[])', [l.gaps])
       .catch(() => undefined);
     await c
-      .query(
-        'DELETE FROM tool_request_aggregates WHERE representative_gap_id = ANY($1::uuid[])',
-        [l.gaps],
-      )
+      .query('DELETE FROM tool_request_aggregates WHERE representative_gap_id = ANY($1::uuid[])', [
+        l.gaps,
+      ])
       .catch(() => undefined);
   }
   // A proposta pode ter sido criada pelo código de produção com um id que o
@@ -216,9 +213,8 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
         }),
       );
 
-      const gap = (
-        await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId])
-      ).rows[0];
+      const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
+        .rows[0];
 
       const r = await runWithTenantContext({ tenant_id: T_A, agent_id: AG_A }, () =>
         proposer().proposeToolRequestForGap({ gap: gap as never }),
@@ -272,12 +268,8 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
         'deposito',
         'produto_id',
       ]);
-      expect(
-        spec.contract_draft.inputs.find((i) => i.name === 'produto_id')!.required,
-      ).toBe(true);
-      expect(spec.contract_draft.inputs.find((i) => i.name === 'deposito')!.required).toBe(
-        false,
-      );
+      expect(spec.contract_draft.inputs.find((i) => i.name === 'produto_id')!.required).toBe(true);
+      expect(spec.contract_draft.inputs.find((i) => i.name === 'deposito')!.required).toBe(false);
       expect(spec.contract_draft.zod_source).toContain('PROPOSTA — NÃO É CONTRATO VIGENTE');
     } finally {
       await limpar(c, lixo);
@@ -307,9 +299,8 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
         }),
       );
 
-      const gap = (
-        await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId])
-      ).rows[0];
+      const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
+        .rows[0];
 
       const r = await runWithTenantContext({ tenant_id: T_A, agent_id: AG_A }, () =>
         proposer().proposeToolRequestForGap({ gap: gap as never }),
@@ -320,9 +311,10 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
       expect(r.reason).toBe('tool_ja_existe');
       expect(r.detail).toBe('query_balance');
 
-      const n = await c.query('SELECT count(*)::int AS n FROM capability_proposals WHERE gap_id = $1', [
-        gapId,
-      ]);
+      const n = await c.query(
+        'SELECT count(*)::int AS n FROM capability_proposals WHERE gap_id = $1',
+        [gapId],
+      );
       expect(n.rows[0]!.n).toBe(0);
     } finally {
       await limpar(c, lixo);
@@ -341,9 +333,8 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
         tipo: 'knowledge',
       });
       lixo.gaps.push(gapId);
-      const gap = (
-        await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId])
-      ).rows[0];
+      const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
+        .rows[0];
 
       const r = await runWithTenantContext({ tenant_id: T_A, agent_id: AG_A }, () =>
         proposer().proposeToolRequestForGap({ gap: gap as never }),
@@ -365,9 +356,8 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
         descricao: 'emitir nota fiscal de servico',
       });
       lixo.gaps.push(gapId);
-      const gap = (
-        await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId])
-      ).rows[0];
+      const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
+        .rows[0];
 
       const r = await runWithTenantContext({ tenant_id: T_A, agent_id: AG_A }, () =>
         proposer().proposeToolRequestForGap({ gap: gap as never }),
@@ -399,9 +389,8 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
           args_tentados: { data: '2026-09-01' },
         }),
       );
-      const gap = (
-        await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId])
-      ).rows[0];
+      const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
+        .rows[0];
 
       const r = await runWithTenantContext({ tenant_id: T_A, agent_id: AG_A }, () =>
         proposer().proposeToolRequestForGap({ gap: gap as never }),
@@ -465,9 +454,8 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
         }),
       );
 
-      const gap = (
-        await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId])
-      ).rows[0];
+      const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
+        .rows[0];
       const r = await runWithTenantContext({ tenant_id: T_A, agent_id: AG_A }, () =>
         proposer().proposeToolRequestForGap({ gap: gap as never }),
       );
@@ -517,14 +505,12 @@ d('#636 — o pedido de ferramenta contra o banco real', () => {
       // do SQL deixaria passar com `=` em vez de `IS NOT DISTINCT FROM`: chave
       // ausente vira NULL, `NULL = '...'` vira NULL, e um CHECK que dá NULL
       // ACEITA a linha. Ver o comentário na migração 125.
-      await expect(
-        inserir({ contract_status: 'draft_proposal_not_in_force' }),
-      ).rejects.toThrow(/capability_proposals_tool_request_marking_check/);
-
-      // Spec vazio (o DEFAULT da coluna) → recusado pelo mesmo motivo.
-      await expect(inserir({})).rejects.toThrow(
+      await expect(inserir({ contract_status: 'draft_proposal_not_in_force' })).rejects.toThrow(
         /capability_proposals_tool_request_marking_check/,
       );
+
+      // Spec vazio (o DEFAULT da coluna) → recusado pelo mesmo motivo.
+      await expect(inserir({})).rejects.toThrow(/capability_proposals_tool_request_marking_check/);
 
       // Com a marcação completa → aceito. (Prova que o CHECK recusa a AUSÊNCIA
       // da marcação, e não o INSERT em si.)

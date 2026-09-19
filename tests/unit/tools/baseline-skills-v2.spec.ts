@@ -84,10 +84,9 @@ describe('BASELINE_CORE_PACK v2 — version and gap tool coverage (#448)', () =>
       'conversation_state_update',
     ];
     for (const t of gapTools) {
-      expect(
-        BASELINE_CORE_PACK.tools,
-        `BASELINE_CORE_PACK must contain gap tool ${t}`,
-      ).toContain(t);
+      expect(BASELINE_CORE_PACK.tools, `BASELINE_CORE_PACK must contain gap tool ${t}`).toContain(
+        t,
+      );
     }
   });
 
@@ -144,7 +143,6 @@ describe('baseline skills v2 — tool scope contracts (unit, #448)', () => {
       }
     }
   });
-
 });
 
 // -------------------------------------------------------------------------
@@ -152,9 +150,8 @@ describe('baseline skills v2 — tool scope contracts (unit, #448)', () => {
 // -------------------------------------------------------------------------
 describe('baseline-only agent — domain tools are NOT visible (#448 / invariant #5)', () => {
   it('a grant with only baseline.core shows all 10 baseline tools', async () => {
-    const { computeAgentVisibleTools, BASELINE_CORE_PACK } = await import(
-      '../../../src/tools/grant-math.js'
-    );
+    const { computeAgentVisibleTools, BASELINE_CORE_PACK } =
+      await import('../../../src/tools/grant-math.js');
     const grant = {
       granted_packs: ['baseline.core'],
       granted_tools: [] as string[],
@@ -209,5 +206,4 @@ describe('prompt_only skills — NOT in the v2 tool_mediated set (#448)', () => 
       ).not.toContain(skill);
     }
   });
-
 });

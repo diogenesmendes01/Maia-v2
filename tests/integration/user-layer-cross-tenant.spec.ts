@@ -57,34 +57,50 @@ let pessoaB: { id: string } | undefined;
 d('user-layer cross-tenant isolation (real DB)', () => {
   beforeAll(async () => {
     // Tenants + agents
-    await db.insert(tenants).values([
-      { id: T_A, nome: 'UL Iso A' },
-      { id: T_B, nome: 'UL Iso B' },
-    ]).onConflictDoNothing();
-    await db.insert(agents).values([
-      { id: AG_A, tenant_id: T_A, nome: 'UL A' },
-      { id: AG_B, tenant_id: T_B, nome: 'UL B' },
-    ]).onConflictDoNothing();
+    await db
+      .insert(tenants)
+      .values([
+        { id: T_A, nome: 'UL Iso A' },
+        { id: T_B, nome: 'UL Iso B' },
+      ])
+      .onConflictDoNothing();
+    await db
+      .insert(agents)
+      .values([
+        { id: AG_A, tenant_id: T_A, nome: 'UL A' },
+        { id: AG_B, tenant_id: T_B, nome: 'UL B' },
+      ])
+      .onConflictDoNothing();
 
     // Pessoas
-    const [pA] = await db.insert(pessoas).values({
-      tenant_id: T_A,
-      agent_id: AG_A,
-      nome: 'Pessoa A',
-      telefone_whatsapp: `+551199${Math.floor(Math.random() * 1e7).toString().padStart(7, '0')}`,
-      tipo: 'funcionario',
-      status: 'ativa',
-    }).returning();
+    const [pA] = await db
+      .insert(pessoas)
+      .values({
+        tenant_id: T_A,
+        agent_id: AG_A,
+        nome: 'Pessoa A',
+        telefone_whatsapp: `+551199${Math.floor(Math.random() * 1e7)
+          .toString()
+          .padStart(7, '0')}`,
+        tipo: 'funcionario',
+        status: 'ativa',
+      })
+      .returning();
     pessoaA = pA;
 
-    const [pB] = await db.insert(pessoas).values({
-      tenant_id: T_B,
-      agent_id: AG_B,
-      nome: 'Pessoa B',
-      telefone_whatsapp: `+551199${Math.floor(Math.random() * 1e7).toString().padStart(7, '0')}`,
-      tipo: 'funcionario',
-      status: 'ativa',
-    }).returning();
+    const [pB] = await db
+      .insert(pessoas)
+      .values({
+        tenant_id: T_B,
+        agent_id: AG_B,
+        nome: 'Pessoa B',
+        telefone_whatsapp: `+551199${Math.floor(Math.random() * 1e7)
+          .toString()
+          .padStart(7, '0')}`,
+        tipo: 'funcionario',
+        status: 'ativa',
+      })
+      .returning();
     pessoaB = pB;
 
     // Seed each table for BOTH tenants with a marker string we'll grep for.
@@ -341,15 +357,13 @@ d('user-layer cross-tenant isolation (real DB)', () => {
     });
 
     it('accepts when context matches', async () => {
-      const result = await runWithTenantContext(
-        { tenant_id: T_A, agent_id: AG_A },
-        () =>
-          buildUserSlice({
-            tenant_id: T_A,
-            pessoa_id: pessoaA!.id,
-            depth: 'minimal',
-            trace_id: 'iso-test',
-          }),
+      const result = await runWithTenantContext({ tenant_id: T_A, agent_id: AG_A }, () =>
+        buildUserSlice({
+          tenant_id: T_A,
+          pessoa_id: pessoaA!.id,
+          depth: 'minimal',
+          trace_id: 'iso-test',
+        }),
       );
       expect(result.slice.interlocutor.pessoa_id).toBe(pessoaA!.id);
     });

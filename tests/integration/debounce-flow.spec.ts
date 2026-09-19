@@ -156,7 +156,10 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
   async function cleanup(): Promise<void> {
     const c = await pool.connect();
     try {
-      await c.query('DELETE FROM mensagens WHERE conversa_id = $1 OR conversa_id IS NULL AND metadata->>\'telefone\' = $2', [conversa_id, telefone]);
+      await c.query(
+        "DELETE FROM mensagens WHERE conversa_id = $1 OR conversa_id IS NULL AND metadata->>'telefone' = $2",
+        [conversa_id, telefone],
+      );
       await c.query('DELETE FROM conversas WHERE id = $1', [conversa_id]);
       await c.query('DELETE FROM pessoas WHERE id = $1', [pessoa_id]);
     } finally {
@@ -170,9 +173,24 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const t0 = new Date(Date.now() - 3000);
       const t1 = new Date(Date.now() - 2000);
       const t2 = new Date(Date.now() - 1000);
-      const id1 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'Oi,', created_at: t0 });
-      const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'como vai', created_at: t1 });
-      const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a finança?', created_at: t2 });
+      const id1 = await insertInbound(c, {
+        conversa_id: null,
+        telefone,
+        conteudo: 'Oi,',
+        created_at: t0,
+      });
+      const id2 = await insertInbound(c, {
+        conversa_id: null,
+        telefone,
+        conteudo: 'como vai',
+        created_at: t1,
+      });
+      const id3 = await insertInbound(c, {
+        conversa_id: null,
+        telefone,
+        conteudo: 'a finança?',
+        created_at: t2,
+      });
 
       const { mensagensRepo } = repos();
       const rows = await withPrimaryTenant(() =>
@@ -202,8 +220,18 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
     try {
       const t0 = new Date(Date.now() - 3000);
       const t1 = new Date(Date.now() - 2000);
-      const id1 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a', created_at: t0 });
-      const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'b', created_at: t1 });
+      const id1 = await insertInbound(c, {
+        conversa_id: null,
+        telefone,
+        conteudo: 'a',
+        created_at: t0,
+      });
+      const id2 = await insertInbound(c, {
+        conversa_id: null,
+        telefone,
+        conteudo: 'b',
+        created_at: t1,
+      });
 
       const { mensagensRepo } = repos();
       await withPrimaryTenant(() => mensagensRepo.setConversaIdMany([id1, id2], conversa_id));
@@ -257,9 +285,24 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       const t0 = new Date(Date.now() - 3000);
       const t1 = new Date(Date.now() - 2000);
       const t2 = new Date(Date.now() - 1000);
-      const id1 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'Oi,', created_at: t0 });
-      const id2 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'como vai', created_at: t1 });
-      const id3 = await insertInbound(c, { conversa_id: null, telefone, conteudo: 'a finança?', created_at: t2 });
+      const id1 = await insertInbound(c, {
+        conversa_id: null,
+        telefone,
+        conteudo: 'Oi,',
+        created_at: t0,
+      });
+      const id2 = await insertInbound(c, {
+        conversa_id: null,
+        telefone,
+        conteudo: 'como vai',
+        created_at: t1,
+      });
+      const id3 = await insertInbound(c, {
+        conversa_id: null,
+        telefone,
+        conteudo: 'a finança?',
+        created_at: t2,
+      });
 
       const { mensagensRepo } = repos();
       const target = await withPrimaryTenant(() => mensagensRepo.findById(id3));
@@ -279,7 +322,9 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // Process id2 to simulate a partial run; the next aggregator call
       // should drop it from the merge.
       await withPrimaryTenant(() => mensagensRepo.markProcessed(id2, 0));
-      const after = await withPrimaryTenant(() => _internal.aggregateUnprocessedTexts(target!, null));
+      const after = await withPrimaryTenant(() =>
+        _internal.aggregateUnprocessedTexts(target!, null),
+      );
       expect(after.text).toBe('Oi,\na finança?');
       expect(after.merged_ids).toEqual([id1]);
     } finally {
@@ -313,10 +358,14 @@ d('debounce-flow — JSONB + aggregation + idempotency against live Postgres', (
       // does get overwritten (so the test reflects real behaviour).
       await withPrimaryTenant(() => mensagensRepo.markProcessed(id1, 999));
 
-      const r = await c.query<{ id: string; processada_em: Date | null; tokens_usados: number | null; conversa_id: string | null }>(
-        `SELECT id, processada_em, tokens_usados, conversa_id FROM mensagens WHERE id = ANY($1)`,
-        [[id1, id2, id3]],
-      );
+      const r = await c.query<{
+        id: string;
+        processada_em: Date | null;
+        tokens_usados: number | null;
+        conversa_id: string | null;
+      }>(`SELECT id, processada_em, tokens_usados, conversa_id FROM mensagens WHERE id = ANY($1)`, [
+        [id1, id2, id3],
+      ]);
       for (const row of r.rows) {
         expect(row.processada_em).not.toBeNull();
       }

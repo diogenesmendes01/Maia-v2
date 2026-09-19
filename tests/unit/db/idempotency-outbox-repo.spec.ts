@@ -304,8 +304,10 @@ const dbExecuteMock = vi.fn(async (query: unknown) => {
     const tenant_id = params[0] as string;
     const agent_id = params[1] as string;
     const limit = Number(params[2]);
-    const rows = stores.idempotency_effect_outbox!
-      .filter((r) => r.tenant_id === tenant_id && r.agent_id === agent_id && r.status === 'pending')
+    const rows = stores
+      .idempotency_effect_outbox!.filter(
+        (r) => r.tenant_id === tenant_id && r.agent_id === agent_id && r.status === 'pending',
+      )
       .slice(0, limit)
       .map((r) => ({
         id: r.id,
@@ -381,10 +383,7 @@ vi.mock('@/lib/logger.js', () => ({
 }));
 vi.mock('@/lib/metrics.js', () => ({ incCounter: vi.fn() }));
 
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 import type { PlannedEffect } from '@/governance/idempotency-effects.js';
 
 const A_CTX = { tenant_id: 'tenant-A', agent_id: 'agent-A' };
@@ -504,7 +503,9 @@ describe('idempotencyOutboxRepo.markCompletedWithEffect — atomic, fenced write
     expect(okAgain).toBe(true);
     // Still exactly ONE outbox row (the first effect; the second was deduped).
     expect(stores.idempotency_effect_outbox).toHaveLength(1);
-    expect((stores.idempotency_effect_outbox![0]!.effect_payload as PlannedEffect).text).toBe('olá');
+    expect((stores.idempotency_effect_outbox![0]!.effect_payload as PlannedEffect).text).toBe(
+      'olá',
+    );
   });
 
   it('TENANT ISOLATION: missing tenant context throws (no untenated enqueue)', async () => {

@@ -23,9 +23,7 @@ export default function AuthErrorPage() {
           </div>
         </div>
 
-        <h1 className="text-lg font-semibold tracking-tight text-zinc-900">
-          Erro de autenticação
-        </h1>
+        <h1 className="text-lg font-semibold tracking-tight text-zinc-900">Erro de autenticação</h1>
 
         <Alert tone="danger">
           <code className="font-mono">{error}</code>

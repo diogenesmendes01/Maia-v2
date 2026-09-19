@@ -121,9 +121,7 @@ describe('resolveIdentity — bind da conversa legada ao canal (review #496 alto
   });
 
   it('corrida perdida SEM conversa da linha ⇒ cria conversa nova COM o canal', async () => {
-    findActive
-      .mockResolvedValueOnce(legacyConversa())
-      .mockResolvedValueOnce(null);
+    findActive.mockResolvedValueOnce(legacyConversa()).mockResolvedValueOnce(null);
     bindChannelIfNull.mockResolvedValueOnce(false);
 
     const r = await resolveIdentity({

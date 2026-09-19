@@ -24,7 +24,12 @@ vi.mock('../../../src/db/repositories.js', () => ({
 }));
 
 vi.mock('../../../src/lib/logger.js', () => ({
-  logger: { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined },
+  logger: {
+    info: () => undefined,
+    warn: () => undefined,
+    error: () => undefined,
+    debug: () => undefined,
+  },
 }));
 
 beforeEach(() => {

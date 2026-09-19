@@ -13,18 +13,10 @@
  * resolver is unblocked but pending.
  */
 import { createHash } from 'node:crypto';
-import type {
-  BaseContextPacket,
-  PolicyRuleKind,
-  PolicySlice,
-} from '../../context-packet/types.js';
+import type { BaseContextPacket, PolicyRuleKind, PolicySlice } from '../../context-packet/types.js';
 import { sliceCacheKey, type SliceCache } from '../../context-packet/cache/slice-cache.js';
 import { getTTLForSlice } from '../../context-packet/cache/ttl-policy.js';
-import type {
-  SliceBuilder,
-  SliceBuilderInput,
-  SliceBuilderResult,
-} from './_types.js';
+import type { SliceBuilder, SliceBuilderInput, SliceBuilderResult } from './_types.js';
 
 export interface PolicyRequirements {
   depth: 'basic' | 'domain' | 'risk';
@@ -62,9 +54,7 @@ export const stubPolicyDescriptorResolver: PolicyDescriptorResolverPort = {
   },
 };
 
-export class PolicySliceBuilder
-  implements SliceBuilder<PolicyRequirements, PolicySlice>
-{
+export class PolicySliceBuilder implements SliceBuilder<PolicyRequirements, PolicySlice> {
   readonly name = 'policy' as const;
 
   constructor(
@@ -145,8 +135,5 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 function hashShort(obj: Record<string, unknown>): string {
-  return createHash('sha256')
-    .update(JSON.stringify(obj))
-    .digest('hex')
-    .substring(0, 12);
+  return createHash('sha256').update(JSON.stringify(obj)).digest('hex').substring(0, 12);
 }

@@ -95,12 +95,8 @@
  * import it.
  */
 
-import {
-  policyDescriptorResolver as p8eResolver,
-} from '@/control-plane/policy/policy-descriptor-resolver.js';
-import {
-  policyRulesRepo as p8ePolicyRulesRepo,
-} from '@/control-plane/policy/policy-rules-repo.js';
+import { policyDescriptorResolver as p8eResolver } from '@/control-plane/policy/policy-descriptor-resolver.js';
+import { policyRulesRepo as p8ePolicyRulesRepo } from '@/control-plane/policy/policy-rules-repo.js';
 import { RUNTIME_ENFORCED_WRITE_RISK_DESCRIPTORS } from '@/control-plane/policy/boleto-write-policies.js';
 import { evaluate as p9dEvaluate } from '@/governance/policy-dsl/evaluator.js';
 import { skillsRepo as p9aSkillsRepo } from '@/control-plane/skill-registry/skills-repo.js';
@@ -162,8 +158,8 @@ const policyDescriptorResolverAdapter: PolicyDescriptorResolver = {
       scope: query.scope?.channel
         ? { channel: query.scope.channel }
         : query.scope?.domain
-        ? { domain: query.scope.domain }
-        : undefined,
+          ? { domain: query.scope.domain }
+          : undefined,
     });
     // Map P8e ResolvedPolicy to DE ResolvedPolicy.
     // DE type: { policy_id, descriptor, applies_to_peps? }
@@ -245,19 +241,14 @@ const policyDSLEvaluatorAdapter: PolicyEvaluator = {
         // `escalate_to_human` and forward a severity. Forwarding the whole
         // metadata bag as `parameters` lets PEPs read `intent` / `approval_class`
         // / any future signal without another mapping layer.
-        const meta =
-          effect?.metadata && typeof effect.metadata === 'object'
-            ? effect.metadata
-            : {};
+        const meta = effect?.metadata && typeof effect.metadata === 'object' ? effect.metadata : {};
         const severity =
           (meta['severity'] as string | undefined) ??
           (bodyAsRecord['severity'] as string | undefined);
         if (severity && isValidSeverity(severity)) {
           verdict.severity = severity;
         }
-        const topLevelParams = bodyAsRecord['parameters'] as
-          | Record<string, unknown>
-          | undefined;
+        const topLevelParams = bodyAsRecord['parameters'] as Record<string, unknown> | undefined;
         const params: Record<string, unknown> = { ...meta, ...(topLevelParams ?? {}) };
         if (Object.keys(params).length > 0) {
           verdict.parameters = params;
@@ -284,13 +275,20 @@ const policyDSLEvaluatorAdapter: PolicyEvaluator = {
 
 function mapEffectAction(action: string | undefined): PolicyEvaluatorVerdict['action'] {
   switch (action) {
-    case 'block': return 'block';
-    case 'escalate': return 'escalate';
-    case 'warn': return 'warn_in_trace';
-    case 'warn_in_trace': return 'warn_in_trace';
-    case 'require_dual_approval': return 'require_dual_approval';
-    case 'reduce_tool_set': return 'reduce_tool_set';
-    case 'allow': return 'allow';
+    case 'block':
+      return 'block';
+    case 'escalate':
+      return 'escalate';
+    case 'warn':
+      return 'warn_in_trace';
+    case 'warn_in_trace':
+      return 'warn_in_trace';
+    case 'require_dual_approval':
+      return 'require_dual_approval';
+    case 'reduce_tool_set':
+      return 'reduce_tool_set';
+    case 'allow':
+      return 'allow';
     default:
       // Unknown effect action → block fail-closed
       return 'block';
@@ -338,9 +336,10 @@ function skillRowToSkill(row: {
   const applicable_to_role = Array.isArray(row.applicable_to_role)
     ? (row.applicable_to_role as string[])
     : [];
-  const hints = (typeof row.runtime_hints === 'object' && row.runtime_hints !== null)
-    ? (row.runtime_hints as Record<string, unknown>)
-    : {};
+  const hints =
+    typeof row.runtime_hints === 'object' && row.runtime_hints !== null
+      ? (row.runtime_hints as Record<string, unknown>)
+      : {};
   const when_to_use = typeof row.when_to_use === 'string' ? row.when_to_use : '';
   // Issue #409 — carry the native usage_policy JSONB through so the
   // SkillSelector candidate filter can admit/remove by audience before any tool
@@ -382,9 +381,8 @@ function skillRowToSkill(row: {
     runtime_hints: {
       allow_deep_context: hints['allow_deep_context'] === true,
     },
-    output_schema_ref: typeof hints['output_schema_ref'] === 'string'
-      ? hints['output_schema_ref']
-      : undefined,
+    output_schema_ref:
+      typeof hints['output_schema_ref'] === 'string' ? hints['output_schema_ref'] : undefined,
     // Issue #409 — native SkillUsagePolicy (raw JSONB; null = conservative
     // default at filter time).
     usage_policy,
@@ -640,12 +638,7 @@ export class LockdownReaderProdAdapter implements LockdownReader {
     const rows = await db
       .select()
       .from(permissoes)
-      .where(
-        and(
-          eq(permissoes.tenant_id, tenant_id),
-          eq(permissoes.status, 'suspensa'),
-        ),
-      );
+      .where(and(eq(permissoes.tenant_id, tenant_id), eq(permissoes.status, 'suspensa')));
     return rows.length > 0;
   }
 }
@@ -676,8 +669,7 @@ const lockdownReaderAdapter = new LockdownReaderProdAdapter();
 // match a stored policy row anyway, so short-circuit to the context agent —
 // the same outcome as the zero-row fallback below for an unconfigured (but
 // uuid-shaped) channel.
-const CHANNEL_ID_UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const CHANNEL_ID_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const channelPoliciesReaderAdapter: ChannelPoliciesReader = {
   async getForChannel(tenant_id, channel_id) {
@@ -689,10 +681,7 @@ const channelPoliciesReaderAdapter: ChannelPoliciesReader = {
       .select({ agent_id: channel_policies.agent_id })
       .from(channel_policies)
       .where(
-        and(
-          eq(channel_policies.tenant_id, tenant_id),
-          eq(channel_policies.channel_id, channel_id),
-        ),
+        and(eq(channel_policies.tenant_id, tenant_id), eq(channel_policies.channel_id, channel_id)),
       )
       .limit(1);
 
@@ -756,9 +745,7 @@ const haikuClientAdapter: HaikuClient = {
         signal: options?.signal,
       });
       const label = (response.content ?? '').trim().toLowerCase();
-      const matched = params.allowed_labels.find(
-        (l) => l.toLowerCase() === label,
-      ) ?? 'unknown';
+      const matched = params.allowed_labels.find((l) => l.toLowerCase() === label) ?? 'unknown';
       return { label: matched, confidence: 0.85 };
     } catch {
       return { label: 'unknown', confidence: 0 };
@@ -850,10 +837,7 @@ function intentLabelToTopicSignal(label: string): TopicSignal {
  * is clearly financial AND the base packet doesn't carry an authenticated actor
  * override — we want the heuristic to have a realistic floor, not over-block.
  */
-function derivedToolKinds(
-  topic: TopicSignal,
-  _base: BaseContextPacket,
-): ToolKind[] {
+function derivedToolKinds(topic: TopicSignal, _base: BaseContextPacket): ToolKind[] {
   if (topic === 'financial') {
     return ['transfer'];
   }

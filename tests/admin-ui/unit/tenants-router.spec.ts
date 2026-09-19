@@ -232,7 +232,12 @@ function makeRepos(
   };
 }
 
-function caller(role: string, tenantId: string, userId: string, repos: ReturnType<typeof makeRepos>) {
+function caller(
+  role: string,
+  tenantId: string,
+  userId: string,
+  repos: ReturnType<typeof makeRepos>,
+) {
   const ctx = {
     session: { user: { id: userId, role, tenant_id: tenantId } },
     userId,
@@ -265,9 +270,7 @@ describe('tenantsRouter.list — founder gate', () => {
     '%s gets FORBIDDEN',
     async (role) => {
       const repos = makeRepos();
-      await expect(caller(role, 'tenant-a', 'u1', repos).list()).rejects.toThrow(
-        TRPCError,
-      );
+      await expect(caller(role, 'tenant-a', 'u1', repos).list()).rejects.toThrow(TRPCError);
     },
   );
 });
@@ -284,9 +287,7 @@ describe('tenantsRouter.create — founder gate + audit', () => {
     expect(repos._inspect.audit.length).toBe(1);
     expect(repos._inspect.audit[0]!.action).toBe('tenant_create');
     expect(repos._inspect.audit[0]!.tenant_id).toBe('home-tenant');
-    expect(repos._inspect.audit[0]!.change_summary?.target_tenant_id).toBe(
-      'tenant-new',
-    );
+    expect(repos._inspect.audit[0]!.change_summary?.target_tenant_id).toBe('tenant-new');
   });
 
   it.each(['owner', 'compliance_officer', 'analyst', 'viewer'])(
@@ -366,9 +367,7 @@ describe('tenantsRouter.create — founder gate + audit', () => {
     expect(repos._inspect.tenants['tenant-new']).toBeDefined();
     expect(repos._inspect.audit.length).toBe(1);
     expect(repos._inspect.audit[0]!.action).toBe('tenant_create');
-    expect(repos._inspect.audit[0]!.change_summary?.target_tenant_id).toBe(
-      'tenant-new',
-    );
+    expect(repos._inspect.audit[0]!.change_summary?.target_tenant_id).toBe('tenant-new');
   });
 });
 
@@ -474,9 +473,7 @@ describe('tenantsRouter.updateStatus — gate + audit + invariants', () => {
     expect(repos._inspect.audit.length).toBe(1);
     expect(repos._inspect.audit[0]!.change_summary?.from_status).toBe('active');
     expect(repos._inspect.audit[0]!.change_summary?.to_status).toBe('suspended');
-    expect(repos._inspect.audit[0]!.change_summary?.reason).toBe(
-      'retry after rollback',
-    );
+    expect(repos._inspect.audit[0]!.change_summary?.reason).toBe('retry after rollback');
   });
 });
 

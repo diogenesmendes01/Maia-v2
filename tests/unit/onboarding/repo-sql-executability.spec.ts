@@ -62,9 +62,7 @@ beforeEach(() => {
 
 describe('onboarding-repos — SQL executável nos predicados de conjunto', () => {
   it('listForTenant não emite construtor de linha do lado direito de ALL/ANY', async () => {
-    const { onboardingRunsRepo } = await import(
-      '../../../src/db/repositories/onboarding-repos.js'
-    );
+    const { onboardingRunsRepo } = await import('../../../src/db/repositories/onboarding-repos.js');
     await onboardingRunsRepo.listForTenant({ tenant_id: 'acme' });
 
     expect(captured, 'nenhum WHERE capturado').toHaveLength(1);
@@ -76,9 +74,7 @@ describe('onboarding-repos — SQL executável nos predicados de conjunto', () =
   });
 
   it('expireStale não emite construtor de linha do lado direito de ALL/ANY', async () => {
-    const { onboardingRunsRepo } = await import(
-      '../../../src/db/repositories/onboarding-repos.js'
-    );
+    const { onboardingRunsRepo } = await import('../../../src/db/repositories/onboarding-repos.js');
     await onboardingRunsRepo.expireStale(new Date('2026-01-01T00:00:00Z'));
 
     expect(captured, 'nenhum WHERE capturado').toHaveLength(1);
@@ -96,9 +92,7 @@ describe('onboarding-repos — SQL executável nos predicados de conjunto', () =
    */
   it('snapshotExpiryBacklog mede EXATAMENTE as linhas que a varredura pegaria', async () => {
     const now = new Date('2026-01-01T00:00:00Z');
-    const { onboardingRunsRepo } = await import(
-      '../../../src/db/repositories/onboarding-repos.js'
-    );
+    const { onboardingRunsRepo } = await import('../../../src/db/repositories/onboarding-repos.js');
     await onboardingRunsRepo.expireStale(now);
     await onboardingRunsRepo.snapshotExpiryBacklog(now);
 
@@ -112,9 +106,7 @@ describe('onboarding-repos — SQL executável nos predicados de conjunto', () =
 
   it('o conjunto terminal vem de TERMINAL_STATES, não de literal duplicado', async () => {
     const { TERMINAL_STATES } = await import('../../../src/onboarding/state-machine.js');
-    const { onboardingRunsRepo } = await import(
-      '../../../src/db/repositories/onboarding-repos.js'
-    );
+    const { onboardingRunsRepo } = await import('../../../src/db/repositories/onboarding-repos.js');
     await onboardingRunsRepo.listForTenant({ tenant_id: 'acme' });
 
     // Um placeholder por estado terminal: se alguém acrescentar um estado
@@ -126,9 +118,7 @@ describe('onboarding-repos — SQL executável nos predicados de conjunto', () =
   });
 
   it('include_terminal remove o predicado de estado e mantém o de tenant', async () => {
-    const { onboardingRunsRepo } = await import(
-      '../../../src/db/repositories/onboarding-repos.js'
-    );
+    const { onboardingRunsRepo } = await import('../../../src/db/repositories/onboarding-repos.js');
     await onboardingRunsRepo.listForTenant({ tenant_id: 'acme', include_terminal: true });
 
     const sql = compile(captured[0]!);

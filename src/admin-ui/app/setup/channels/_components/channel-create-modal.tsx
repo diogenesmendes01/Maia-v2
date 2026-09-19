@@ -27,12 +27,7 @@ const CHANNEL_TYPES: ChannelType[] = [
   'other',
 ];
 
-export default function ChannelCreateModal({
-  tenantId,
-  agentId,
-  onClose,
-  onCreated,
-}: Props) {
+export default function ChannelCreateModal({ tenantId, agentId, onClose, onCreated }: Props) {
   const mutation = trpc.channelPolicies.createChannel.useMutation();
 
   const [channelType, setChannelType] = React.useState<ChannelType>('whatsapp');
@@ -74,9 +69,8 @@ export default function ChannelCreateModal({
       title="Novo canal"
       description={
         <>
-          Registra um canal de entrada para o agente{' '}
-          <code className="font-mono">{agentId}</code>. Depois de criado,
-          configure a política (papel padrão) do canal.
+          Registra um canal de entrada para o agente <code className="font-mono">{agentId}</code>.
+          Depois de criado, configure a política (papel padrão) do canal.
         </>
       }
       footer={

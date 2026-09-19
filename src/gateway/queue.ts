@@ -22,11 +22,7 @@ import {
   TURN_JOB_VERSION_VALUES,
   closedVocabulary,
 } from '@/observability/taxonomy.js';
-import {
-  recordElapsedSpan,
-  withSpan,
-  type SpanAttribution,
-} from '@/observability/tracer.js';
+import { recordElapsedSpan, withSpan, type SpanAttribution } from '@/observability/tracer.js';
 import {
   agentTurnJobId,
   jobVersionLabel,
@@ -272,12 +268,16 @@ export function startAgentWorker(processor: AgentJobProcessor): Worker<AgentQueu
             // deeper in the call stack (tool dispatch today, more later) lands
             // under it via ALS without threading a context object through the
             // hot path.
-            await withSpan(SPAN.TURN, () => runWithSystemContext(() => processor(job, parsed, facts)), {
-              attributes: { queue: 'agent', phase: attempt === 1 ? 'first' : 'retry' },
-              onAttribution: (attribution) => {
-                rootAttribution.value = attribution;
+            await withSpan(
+              SPAN.TURN,
+              () => runWithSystemContext(() => processor(job, parsed, facts)),
+              {
+                attributes: { queue: 'agent', phase: attempt === 1 ? 'first' : 'retry' },
+                onAttribution: (attribution) => {
+                  rootAttribution.value = attribution;
+                },
               },
-            });
+            );
             recordTurnOutcome(job, 'completed', t0, facts);
           } catch (err) {
             // A turn that throws with retries left is RETRYABLE, not failed —
@@ -301,12 +301,10 @@ export function startAgentWorker(processor: AgentJobProcessor): Worker<AgentQueu
             // consumidor: aqui não existe instante de armação a reportar.
             const armedAtMs = legacy?.enqueued_at_ms;
             if (queueWaitMs !== null && typeof armedAtMs === 'number') {
-              recordElapsedSpan(
-                SPAN.QUEUE_WAIT,
-                armedAtMs,
-                armedAtMs + queueWaitMs,
-                { queue: 'agent', ...(rootAttribution.value ?? {}) },
-              );
+              recordElapsedSpan(SPAN.QUEUE_WAIT, armedAtMs, armedAtMs + queueWaitMs, {
+                queue: 'agent',
+                ...(rootAttribution.value ?? {}),
+              });
             }
           }
         },
@@ -379,8 +377,7 @@ function recordTurnOutcome(
   // A caixa vence o payload porque um job V2 simplesmente não tem o campo — e
   // ler `job.data.received_at_ms` num payload V2 devolveria `undefined`,
   // apagando em silêncio o SLI ponta-a-ponta do caminho novo.
-  const received_at_ms =
-    facts.received_at_ms ?? ((job.data as AgentJob).received_at_ms ?? null);
+  const received_at_ms = facts.received_at_ms ?? (job.data as AgentJob).received_at_ms ?? null;
   if (typeof received_at_ms === 'number') {
     const e2e = Date.now() - received_at_ms;
     if (e2e >= 0) histogram(METRIC.TURN_E2E_LATENCY_MS, e2e, { outcome });
@@ -451,7 +448,9 @@ export class QueueRedisUnavailableError extends Error {
   readonly oom: boolean;
   constructor(opts?: { oom?: boolean }) {
     const cause = opts?.oom ? 'OOM (memory cap reached)' : 'unavailable';
-    super(`enqueueAgent: Redis ${cause} during agentQueue.add; message left pending for recovery sweep`);
+    super(
+      `enqueueAgent: Redis ${cause} during agentQueue.add; message left pending for recovery sweep`,
+    );
     this.name = 'QueueRedisUnavailableError';
     this.oom = opts?.oom ?? false;
   }

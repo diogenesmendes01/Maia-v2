@@ -45,7 +45,11 @@ vi.mock('bullmq', () => {
       capturedHandler.fn = handler;
     }
   }
-  return { Queue: FakeQueue, Worker: FakeWorker, DelayedError: class DelayedError extends Error {} };
+  return {
+    Queue: FakeQueue,
+    Worker: FakeWorker,
+    DelayedError: class DelayedError extends Error {},
+  };
 });
 
 vi.mock('ioredis', () => {

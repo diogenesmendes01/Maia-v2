@@ -7,16 +7,8 @@
  *
  * Budget target: <80ms (Haiku call is the worst case).
  */
-import type {
-  ContentResolver,
-  HaikuClient,
-  IntentClassifier,
-  MetricsClient,
-} from './types.js';
-import type {
-  BaseContextPacket,
-  DecisionPacket,
-} from '../context-packet/types.js';
+import type { ContentResolver, HaikuClient, IntentClassifier, MetricsClient } from './types.js';
+import type { BaseContextPacket, DecisionPacket } from '../context-packet/types.js';
 
 export interface IntentClassifierDeps {
   contentResolver: ContentResolver;
@@ -86,10 +78,7 @@ export class IntentClassifierImpl implements IntentClassifier {
   ): Promise<DecisionPacket['intent']> {
     const opts: { signal?: AbortSignal } = {};
     if (options?.signal) opts.signal = options.signal;
-    const text = await this.deps.contentResolver.text(
-      base.input.content_ref,
-      opts,
-    );
+    const text = await this.deps.contentResolver.text(base.input.content_ref, opts);
 
     // 1. Rules first.
     for (const h of HEURISTIC_INTENTS) {
@@ -108,8 +97,7 @@ export class IntentClassifierImpl implements IntentClassifier {
     }
 
     // 3. LLM only when ambiguous (spec §7.1 step 2).
-    const taxonomy =
-      TENANT_INTENT_TAXONOMY[base.tenant_id] ?? DEFAULT_TAXONOMY;
+    const taxonomy = TENANT_INTENT_TAXONOMY[base.tenant_id] ?? DEFAULT_TAXONOMY;
 
     this.deps.metrics?.increment('intent_classifier.llm_calls');
     try {

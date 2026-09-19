@@ -279,7 +279,9 @@ describe('#509 toOpenAITools — function shape + strict rollout', () => {
     expect((out[0].function as Record<string, unknown>).strict).toBe(true);
     const params = out[0].function.parameters as Record<string, unknown>;
     expect(params.additionalProperties).toBe(false);
-    expect((params.properties as Record<string, Record<string, unknown>>).a.maxLength).toBeUndefined();
+    expect(
+      (params.properties as Record<string, Record<string, unknown>>).a.maxLength,
+    ).toBeUndefined();
   });
 
   it('strict-capable model + non-convertible schema: falls back without strict', () => {
@@ -301,7 +303,11 @@ describe('#509 toOpenAITools — function shape + strict rollout', () => {
 describe('#509 provider equivalence — both providers get the same contract', () => {
   it('anthropic input_schema === openai parameters when strict is not applied', () => {
     const built = toolInputToJsonSchema(REGISTRY.cancel_transaction!);
-    const anthropic = { name: built.name, description: built.description, input_schema: built.input_schema };
+    const anthropic = {
+      name: built.name,
+      description: built.description,
+      input_schema: built.input_schema,
+    };
     const openai = toOpenAITools([anthropic], 'anthropic/claude-sonnet-4.6')!;
     expect(openai[0].function.name).toBe(anthropic.name);
     expect(openai[0].function.description).toBe(anthropic.description);

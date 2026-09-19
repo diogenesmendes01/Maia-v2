@@ -78,7 +78,10 @@ function makeProfile(opts: { principles?: string[] } = {}) {
   });
 }
 
-function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {
+function makeAgentMsg(
+  text: string,
+  id = 'm-' + Math.random().toString(36).slice(2),
+): DriftRecentMessage {
   return {
     id,
     from: 'agent',
@@ -164,9 +167,7 @@ describe('valoresDetector', () => {
   it('sem mensagens do agente → retorna null sem chamar Anthropic', async () => {
     const out = await valoresDetector.detect({
       profile_active: makeProfile(),
-      recent_messages: [
-        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
-      ],
+      recent_messages: [{ id: 'u1', from: 'user', text: 'oi', created_at: new Date() }],
     });
 
     expect(out).toBeNull();
@@ -187,9 +188,7 @@ describe('valoresDetector', () => {
   });
 
   it('drift_detected=true sem campos opcionais → defaults aplicados (severity medio)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: true }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: true }));
 
     const out = await valoresDetector.detect({
       profile_active: makeProfile(),

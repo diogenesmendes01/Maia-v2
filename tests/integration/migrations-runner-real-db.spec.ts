@@ -92,9 +92,7 @@ async function write(name: string, contents: string): Promise<void> {
  * que parte de um estado diferente. `{ present, valid }` é verdade sobre o
  * catálogo agora, independentemente de quantas vezes o teste rodou.
  */
-async function indexState(
-  name: string,
-): Promise<{ present: boolean; valid: boolean | null }> {
+async function indexState(name: string): Promise<{ present: boolean; valid: boolean | null }> {
   const { rows } = await pool.query<{ indisvalid: boolean }>(
     `SELECT i.indisvalid
        FROM pg_index i
@@ -170,7 +168,9 @@ d('migration runner — real Postgres (#516)', () => {
       status: string;
       execution_ms: number;
       runner_version: string;
-    }>('SELECT id, checksum_sha256, checksum_source, status, execution_ms, runner_version FROM schema_migrations ORDER BY id');
+    }>(
+      'SELECT id, checksum_sha256, checksum_source, status, execution_ms, runner_version FROM schema_migrations ORDER BY id',
+    );
     expect(rows.rows.map((r) => r.status)).toEqual(['applied', 'applied', 'applied']);
     expect(rows.rows[0]!.checksum_sha256).toBe(migrationChecksum(PLAIN));
     expect(rows.rows[0]!.checksum_source).toBe('computed');
@@ -216,10 +216,9 @@ d('migration runner — real Postgres (#516)', () => {
       const result = await runMigrations(deps(), { waitMs: 300, pollMs: 100 });
       expect(result.ok).toBe(false);
       expect(result.outcome).toBe('lock_unavailable');
-      const exists = await pool.query(
-        "SELECT to_regclass($1) IS NOT NULL AS present",
-        [`${SCHEMA}.schema_migrations`],
-      );
+      const exists = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
+        `${SCHEMA}.schema_migrations`,
+      ]);
       // It refused BEFORE creating anything.
       expect(exists.rows[0]).toEqual({ present: false });
     } finally {
@@ -239,7 +238,7 @@ d('migration runner — real Postgres (#516)', () => {
     expect(result.failure?.ledger_status).toBe('failed');
 
     // The whole file rolled back — t_ok must not exist.
-    const t = await pool.query("SELECT to_regclass($1) IS NOT NULL AS present", [`${SCHEMA}.t_ok`]);
+    const t = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [`${SCHEMA}.t_ok`]);
     expect(t.rows[0]).toEqual({ present: false });
 
     const row = await pool.query<{ status: string; applied_at: Date | null }>(
@@ -303,7 +302,7 @@ d('migration runner — real Postgres (#516)', () => {
     const blocked = await runMigrations(deps());
     expect(blocked.outcome).toBe('blocked');
     expect(blocked.blockers.map((b) => b.kind)).toContain('dirty_migration');
-    const later = await pool.query("SELECT to_regclass($1) IS NOT NULL AS present", [
+    const later = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
       `${SCHEMA}.t_later`,
     ]);
     expect(later.rows[0]).toEqual({ present: false });
@@ -327,7 +326,9 @@ d('migration runner — real Postgres (#516)', () => {
     const client = await pool.connect();
     try {
       await expect(
-        client.query('BEGIN;\nCREATE TABLE t_leaky (id TEXT);\nCOMMIT;\nSELECT nonexistent_fn();\n'),
+        client.query(
+          'BEGIN;\nCREATE TABLE t_leaky (id TEXT);\nCOMMIT;\nSELECT nonexistent_fn();\n',
+        ),
       ).rejects.toThrow();
       // Exactly what the old catch block did before recording `failed`.
       await client.query('ROLLBACK').catch(() => undefined);
@@ -420,14 +421,18 @@ d('migration runner — real Postgres (#516)', () => {
 
     const rerun = await runMigrations(deps());
     expect(rerun.applied).toEqual(['002_next.sql']);
-    const t = await pool.query("SELECT to_regclass($1) IS NOT NULL AS present", [`${SCHEMA}.t_next`]);
+    const t = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
+      `${SCHEMA}.t_next`,
+    ]);
     expect(t.rows[0]).toEqual({ present: true });
   }, 30_000);
 
   it('repair --as applied closes a dirty row and persists the reason', async () => {
     await write('001_plain.sql', PLAIN);
     await runMigrations(deps());
-    await pool.query("UPDATE schema_migrations SET status = 'dirty' WHERE id = $1", ['001_plain.sql']);
+    await pool.query("UPDATE schema_migrations SET status = 'dirty' WHERE id = $1", [
+      '001_plain.sql',
+    ]);
 
     const repaired = await repairMigration(deps(), {
       id: '001_plain.sql',
@@ -436,7 +441,12 @@ d('migration runner — real Postgres (#516)', () => {
     });
     expect(repaired.ok).toBe(true);
 
-    const row = await pool.query<{ status: string; repair_reason: string; repaired_at: Date; checksum_source: string }>(
+    const row = await pool.query<{
+      status: string;
+      repair_reason: string;
+      repaired_at: Date;
+      checksum_source: string;
+    }>(
       'SELECT status, repair_reason, repaired_at, checksum_source FROM schema_migrations WHERE id = $1',
       ['001_plain.sql'],
     );
@@ -582,7 +592,9 @@ d('migration runner — real Postgres (#516)', () => {
     await write('001_plain.sql', PLAIN);
     await runMigrations(deps());
     await expect(
-      pool.query("UPDATE schema_migrations SET status = 'whatever' WHERE id = $1", ['001_plain.sql']),
+      pool.query("UPDATE schema_migrations SET status = 'whatever' WHERE id = $1", [
+        '001_plain.sql',
+      ]),
     ).rejects.toThrow();
     await expect(
       pool.query("UPDATE schema_migrations SET checksum_source = 'guessed' WHERE id = $1", [
@@ -611,7 +623,11 @@ d('migration runner — real Postgres (#516)', () => {
     const mismatch = describeSchemaBootFailure(
       await getSchemaReadiness({ pool, migrationsDir: dir }),
     );
-    expect(mismatch).toMatchObject({ exit_code: 91, kind: 'checksum_mismatch', migration_id: '002_self.sql' });
+    expect(mismatch).toMatchObject({
+      exit_code: 91,
+      kind: 'checksum_mismatch',
+      migration_id: '002_self.sql',
+    });
     expect(mismatch!.expected_checksum).not.toBe(mismatch!.found_checksum);
     expect(mismatch!.message).toContain('SCHEMA BOOT REFUSED');
     await write('002_self.sql', SELF_TX);
@@ -625,14 +641,16 @@ d('migration runner — real Postgres (#516)', () => {
 
     // (d) migration obrigatória ausente: a linha some do ledger.
     await pool.query('DELETE FROM schema_migrations WHERE id = $1', ['002_self.sql']);
-    expect(describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir })))
-      .toMatchObject({ exit_code: 94, kind: 'schema_below_minimum' });
+    expect(
+      describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir })),
+    ).toMatchObject({ exit_code: 94, kind: 'schema_below_minimum' });
 
     // (e) ledger inteiro fora do ar ⇒ `unknown`, que também recusa.
     await admin.query(`DROP SCHEMA ${SCHEMA} CASCADE`);
     await admin.query(`CREATE SCHEMA ${SCHEMA}`);
-    expect(describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir })))
-      .toMatchObject({ exit_code: 97, state: 'unknown' });
+    expect(
+      describeSchemaBootFailure(await getSchemaReadiness({ pool, migrationsDir: dir })),
+    ).toMatchObject({ exit_code: 97, state: 'unknown' });
   }, 60_000);
 
   // ──────────────────────────────────────────────────────────────────────
@@ -756,14 +774,12 @@ d('migration runner — real Postgres (#516)', () => {
             // outra sessão deixa um índice inválido no mesmo schema.
             if (!injected && text.includes('t_dup_id_idx')) {
               injected = true;
-              await pool
-                .query('CREATE UNIQUE INDEX CONCURRENTLY t_dup_k_uq ON t_dup (k)')
-                .then(
-                  () => {
-                    throw new Error('a duplicata deveria ter reprovado a construcao do indice');
-                  },
-                  () => undefined,
-                );
+              await pool.query('CREATE UNIQUE INDEX CONCURRENTLY t_dup_k_uq ON t_dup (k)').then(
+                () => {
+                  throw new Error('a duplicata deveria ter reprovado a construcao do indice');
+                },
+                () => undefined,
+              );
             }
             return result;
           },
@@ -810,7 +826,7 @@ d('migration runner — real Postgres (#516)', () => {
     expect(readiness.state).toBe('unknown');
     expect(readiness.blockers[0]!.kind).toBe('ledger_missing');
     // Still read-only: it did not create the ledger it just complained about.
-    const exists = await pool.query("SELECT to_regclass($1) IS NOT NULL AS present", [
+    const exists = await pool.query('SELECT to_regclass($1) IS NOT NULL AS present', [
       `${SCHEMA}.schema_migrations`,
     ]);
     expect(exists.rows[0]).toEqual({ present: false });

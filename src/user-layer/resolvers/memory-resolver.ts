@@ -127,10 +127,7 @@ export const memoryResolver = {
       // PR #82 / PR #94 review: never surface unreviewed candidates.
       eq(memory_entry.needs_review, false),
       // Expired memories are filtered out: expires_at IS NULL or expires_at > now
-      or(
-        isNull(memory_entry.expires_at),
-        gt(memory_entry.expires_at, now),
-      ),
+      or(isNull(memory_entry.expires_at), gt(memory_entry.expires_at, now)),
     ];
 
     // PR #94 round-2 high: enforce agent isolation. The effective agent_id
@@ -159,10 +156,7 @@ export const memoryResolver = {
     }
     if (input.channel_id) {
       scopeOrs.push(
-        and(
-          eq(memory_entry.scope_type, 'channel'),
-          eq(memory_entry.subject_id, input.channel_id),
-        ),
+        and(eq(memory_entry.scope_type, 'channel'), eq(memory_entry.subject_id, input.channel_id)),
       );
     }
     if (input.conversa_id) {
@@ -189,9 +183,7 @@ export const memoryResolver = {
       conditions.push(inArray(memory_entry.memory_type, input.memory_types));
     }
     if (input.intent_filter) {
-      conditions.push(
-        ilike(memory_entry.content, `%${input.intent_filter}%`),
-      );
+      conditions.push(ilike(memory_entry.content, `%${input.intent_filter}%`));
     }
 
     const rows = await db
@@ -205,9 +197,7 @@ export const memoryResolver = {
   },
 
   async upsert(input: MemoryUpsertInput): Promise<MemoryItem> {
-    const expiresAt = input.ttl_days
-      ? new Date(Date.now() + input.ttl_days * 86400000)
-      : null;
+    const expiresAt = input.ttl_days ? new Date(Date.now() + input.ttl_days * 86400000) : null;
 
     const [inserted] = await db
       .insert(memory_entry)
@@ -256,10 +246,7 @@ export const memoryResolver = {
       eq(memory_entry.sensitivity, 'high'),
       isVisibleLifecycle(memory_entry.lifecycle_status),
       eq(memory_entry.needs_review, false),
-      or(
-        isNull(memory_entry.expires_at),
-        gt(memory_entry.expires_at, now),
-      ),
+      or(isNull(memory_entry.expires_at), gt(memory_entry.expires_at, now)),
     ];
 
     if (input.conversation_id) {

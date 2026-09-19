@@ -109,9 +109,8 @@ d('o briefing sai uma vez por dono, por dia — a dedup_key é o claim', () => {
     // depois do primeiro aviso — passaria no teste acima. E o risco é real:
     // `briefing_morning` e `briefing_weekly` disparam no MESMO horário toda
     // segunda-feira, então o período PRECISA estar na chave.
-    const { runMorningBriefing, runWeeklyBriefing } = await import(
-      '../../src/workers/briefings.js'
-    );
+    const { runMorningBriefing, runWeeklyBriefing } =
+      await import('../../src/workers/briefings.js');
 
     await runMorningBriefing();
     await runWeeklyBriefing();

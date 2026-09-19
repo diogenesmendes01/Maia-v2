@@ -48,10 +48,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
-import type {
-  AgentOperationalProfileVersion,
-  ProfileBody,
-} from '@/db/schema.js';
+import type { AgentOperationalProfileVersion, ProfileBody } from '@/db/schema.js';
 import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
 
 // ─── Hoisted mock: operationalProfileVersionsRepo.getActive ───────────────────
@@ -61,9 +58,8 @@ const { getActiveMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     operationalProfileVersionsRepo: {
@@ -112,8 +108,7 @@ const buildRow = (args: {
   approved_at: new Date('2026-01-01T00:00:00Z'),
   activated_at: new Date('2026-01-01T00:00:00Z'),
   frozen_at: args.status === 'frozen' ? new Date('2026-01-02T00:00:00Z') : null,
-  rolled_back_at:
-    args.status === 'rolled_back' ? new Date('2026-01-02T00:00:00Z') : null,
+  rolled_back_at: args.status === 'rolled_back' ? new Date('2026-01-02T00:00:00Z') : null,
   rollback_reason: null,
   created_at: new Date('2026-01-01T00:00:00Z'),
 });
@@ -165,9 +160,8 @@ describe('Issue #206 — identity cache invalidation on profile state change', (
     // across tests (and across vitest retries) by design. Clearing it before
     // each test gives a clean slate — otherwise a retry would observe the
     // primed cache from the failed first attempt.
-    const { getProductionBuilderSet } = await import(
-      '@/runtime/context-packet/production-builder-set.js'
-    );
+    const { getProductionBuilderSet } =
+      await import('@/runtime/context-packet/production-builder-set.js');
     const { cache } = getProductionBuilderSet();
     cache.clear();
   });
@@ -188,9 +182,8 @@ describe('Issue #206 — identity cache invalidation on profile state change', (
       }),
     );
 
-    const { getProductionBuilderSet } = await import(
-      '@/runtime/context-packet/production-builder-set.js'
-    );
+    const { getProductionBuilderSet } =
+      await import('@/runtime/context-packet/production-builder-set.js');
     const { builders } = getProductionBuilderSet();
 
     const first = await runWithTenantContext({ tenant_id, agent_id }, () =>
@@ -246,9 +239,8 @@ describe('Issue #206 — identity cache invalidation on profile state change', (
       }),
     );
 
-    const { getProductionBuilderSet } = await import(
-      '@/runtime/context-packet/production-builder-set.js'
-    );
+    const { getProductionBuilderSet } =
+      await import('@/runtime/context-packet/production-builder-set.js');
     const { builders } = getProductionBuilderSet();
 
     const first = await runWithTenantContext({ tenant_id, agent_id }, () =>
@@ -291,9 +283,8 @@ describe('Issue #206 — identity cache invalidation on profile state change', (
       }),
     );
 
-    const { getProductionBuilderSet } = await import(
-      '@/runtime/context-packet/production-builder-set.js'
-    );
+    const { getProductionBuilderSet } =
+      await import('@/runtime/context-packet/production-builder-set.js');
     const { builders } = getProductionBuilderSet();
 
     const first = await runWithTenantContext({ tenant_id, agent_id }, () =>
@@ -344,9 +335,8 @@ describe('Issue #206 — identity cache invalidation on profile state change', (
       }),
     );
 
-    const { getProductionBuilderSet } = await import(
-      '@/runtime/context-packet/production-builder-set.js'
-    );
+    const { getProductionBuilderSet } =
+      await import('@/runtime/context-packet/production-builder-set.js');
     const { builders } = getProductionBuilderSet();
 
     const first = await runWithTenantContext({ tenant_id, agent_id }, () =>

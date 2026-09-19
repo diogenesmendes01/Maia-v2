@@ -64,11 +64,7 @@
  * de três camadas da fatia A permanece intacta e não é enfraquecida por esta.
  */
 import { renderizarZodSource } from './contract-draft.js';
-import {
-  ContratoRascunhoSchema,
-  type CampoDoContrato,
-  type ContratoRascunho,
-} from './types.js';
+import { ContratoRascunhoSchema, type CampoDoContrato, type ContratoRascunho } from './types.js';
 
 /**
  * O estado do contrato de um agregado.
@@ -127,9 +123,7 @@ function conflitosDeUmLado(
     }
   }
   const conflitos: ConflitoDeContrato[] = [];
-  for (const [campo, zods] of [...porCampo.entries()].sort((a, b) =>
-    a[0].localeCompare(b[0]),
-  )) {
+  for (const [campo, zods] of [...porCampo.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
     if (zods.size <= 1) continue;
     const ordenados = [...zods.keys()].sort();
     conflitos.push({
@@ -216,9 +210,7 @@ export function fundirRascunhos(args: {
     throw new Error('fundirRascunhos: nenhum membro — um agregado sem pedido não existe');
   }
 
-  const nomes_propostos = [
-    ...new Set(membros.map((m) => m.rascunho.proposed_tool_name)),
-  ].sort();
+  const nomes_propostos = [...new Set(membros.map((m) => m.rascunho.proposed_tool_name))].sort();
 
   if (membros.length === 1) {
     return {
@@ -240,7 +232,13 @@ export function fundirRascunhos(args: {
     // representante, nem um "melhor esforço". Ver o cabeçalho: uma spec que
     // não descreve nenhum dos casos é pior que a ausência dela, porque o dev
     // não tem como saber que ela é um chute.
-    return { estado: 'divergent', rascunho: null, conflitos, variantes: [...membros], nomes_propostos };
+    return {
+      estado: 'divergent',
+      rascunho: null,
+      conflitos,
+      variantes: [...membros],
+      nomes_propostos,
+    };
   }
 
   const inputs = unirCampos(membros, 'input');
@@ -293,5 +291,11 @@ export function fundirRascunhos(args: {
     };
   }
 
-  return { estado: 'consistent', rascunho: validado.data, conflitos: [], variantes: [...membros], nomes_propostos };
+  return {
+    estado: 'consistent',
+    rascunho: validado.data,
+    conflitos: [],
+    variantes: [...membros],
+    nomes_propostos,
+  };
 }

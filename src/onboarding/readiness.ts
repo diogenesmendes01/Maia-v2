@@ -614,9 +614,10 @@ export function configurationFingerprint(facts: ReadinessFacts): string {
   const projection = {
     tenant: facts.tenant ? { id: facts.tenant.id, status: facts.tenant.status } : null,
     agent: facts.agent ? { id: facts.agent.id, status: facts.agent.status } : null,
-    profile: facts.profile && owns(facts.profile, req)
-      ? { version: facts.profile.version, status: facts.profile.status }
-      : null,
+    profile:
+      facts.profile && owns(facts.profile, req)
+        ? { version: facts.profile.version, status: facts.profile.status }
+        : null,
     grant: grant
       ? {
           packs: [...grant.granted_packs].sort(),

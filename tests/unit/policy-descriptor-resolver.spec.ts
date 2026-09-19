@@ -21,11 +21,7 @@ import {
   RESOLVER_FAILURE_DEFAULT,
   type PolicyResolverCache,
 } from '@/control-plane/policy/index.js';
-import type {
-  PolicyRule,
-  PolicyRulesRepo,
-  ResolvedPolicy,
-} from '@/control-plane/policy/index.js';
+import type { PolicyRule, PolicyRulesRepo, ResolvedPolicy } from '@/control-plane/policy/index.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 /**
@@ -53,9 +49,7 @@ function makeFakeRepo(rows: PolicyRule[]): {
       // Tenant-wide fallback
       const t = rows.find(
         (r) =>
-          r.rule_descriptor === args.descriptor &&
-          r.agent_id === null &&
-          r.status === 'active',
+          r.rule_descriptor === args.descriptor && r.agent_id === null && r.status === 'active',
       );
       return t ?? null;
     },
@@ -76,9 +70,7 @@ function makeFakeRepo(rows: PolicyRule[]): {
       // Tenant-wide fallback
       const t = rows.find(
         (r) =>
-          r.rule_descriptor === args.descriptor &&
-          r.agent_id === null &&
-          r.status === 'active',
+          r.rule_descriptor === args.descriptor && r.agent_id === null && r.status === 'active',
       );
       if (t) candidates.push(t);
       return candidates;
@@ -420,9 +412,7 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
       scope: { channel: 'telegram' },
     });
 
-    expect(out.failures).toEqual([
-      { descriptor: 'scoped', reason: 'scope_mismatch' },
-    ]);
+    expect(out.failures).toEqual([{ descriptor: 'scoped', reason: 'scope_mismatch' }]);
     expect(hasBlockingFailure(out)).toBe(false);
   });
 
@@ -434,21 +424,18 @@ describe('PolicyDescriptorResolver.resolveDescriptors', () => {
     const { repo } = makeFakeRepo([rule]);
     const resolver = createPolicyDescriptorResolver(repo, cache);
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'default' },
-      async () => {
-        const out = await resolver.resolveDescriptors({
-          tenant_id: 'tenant-b', // <-- mismatch
-          descriptors: ['sensitive', 'other'],
-        });
-        expect(out.resolved).toHaveLength(0);
-        expect(out.failures).toEqual([
-          { descriptor: 'sensitive', reason: 'tenant_mismatch' },
-          { descriptor: 'other', reason: 'tenant_mismatch' },
-        ]);
-        expect(hasBlockingFailure(out)).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
+      const out = await resolver.resolveDescriptors({
+        tenant_id: 'tenant-b', // <-- mismatch
+        descriptors: ['sensitive', 'other'],
+      });
+      expect(out.resolved).toHaveLength(0);
+      expect(out.failures).toEqual([
+        { descriptor: 'sensitive', reason: 'tenant_mismatch' },
+        { descriptor: 'other', reason: 'tenant_mismatch' },
+      ]);
+      expect(hasBlockingFailure(out)).toBe(true);
+    });
   });
 
   it('RESOLVER_FAILURE_DEFAULT invariant is pinned to "block"', () => {
@@ -632,9 +619,7 @@ describe('matchesScope helper', () => {
   });
 
   it('returns true when every set rule key matches input', () => {
-    expect(matchesScope({ channel: 'wa' }, { channel: 'wa', domain: 'x' })).toBe(
-      true,
-    );
+    expect(matchesScope({ channel: 'wa' }, { channel: 'wa', domain: 'x' })).toBe(true);
   });
 
   it('returns false when any rule key mismatches', () => {
@@ -651,8 +636,6 @@ describe('matchesScope helper', () => {
   });
 
   it('returns false if rule has multiple keys and input misses one', () => {
-    expect(matchesScope({ channel: 'wa', domain: 'finance' }, { channel: 'wa' })).toBe(
-      false,
-    );
+    expect(matchesScope({ channel: 'wa', domain: 'finance' }, { channel: 'wa' })).toBe(false);
   });
 });

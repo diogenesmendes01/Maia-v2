@@ -29,7 +29,11 @@ import {
 import { ONBOARDING_STEPS } from '../../../src/onboarding/state-machine.js';
 import { ONBOARDING_ERROR_CODES } from '../../../src/onboarding/errors.js';
 import { READINESS_CHECK_CODES } from '../../../src/onboarding/readiness.js';
-import { sanitizeLabels, _resetLabelGuardForTests, _cardinalityFor } from '../../../src/observability/labels.js';
+import {
+  sanitizeLabels,
+  _resetLabelGuardForTests,
+  _cardinalityFor,
+} from '../../../src/observability/labels.js';
 
 beforeEach(() => _resetLabelGuardForTests());
 

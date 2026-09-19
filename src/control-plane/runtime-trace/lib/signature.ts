@@ -74,9 +74,7 @@ export type EnvelopeSignatureVersion = 1 | 2;
  */
 export const CURRENT_ENVELOPE_SIGNATURE_VERSION: EnvelopeSignatureVersion = 2;
 
-export const SUPPORTED_ENVELOPE_SIGNATURE_VERSIONS: readonly EnvelopeSignatureVersion[] = [
-  1, 2,
-];
+export const SUPPORTED_ENVELOPE_SIGNATURE_VERSIONS: readonly EnvelopeSignatureVersion[] = [1, 2];
 
 export function isSupportedSignatureVersion(v: unknown): v is EnvelopeSignatureVersion {
   return v === ENVELOPE_SIGNATURE_V1 || v === ENVELOPE_SIGNATURE_V2;
@@ -119,9 +117,7 @@ export function normalizeAttempt(attempt: number | null | undefined): number {
 }
 
 /** Canonical material for v1. Frozen — do not add fields. */
-export function envelopeSignedPayloadV1(
-  fields: EnvelopeSignedFieldsV1,
-): Record<string, unknown> {
+export function envelopeSignedPayloadV1(fields: EnvelopeSignedFieldsV1): Record<string, unknown> {
   return {
     trace_id: fields.trace_id,
     tenant_id: fields.tenant_id,
@@ -143,9 +139,7 @@ export function envelopeSignedPayloadV1(
  * verifier cannot disagree over a value the DB CHECK constraint would have
  * rejected anyway.
  */
-export function envelopeSignedPayloadV2(
-  fields: EnvelopeSignedFieldsV2,
-): Record<string, unknown> {
+export function envelopeSignedPayloadV2(fields: EnvelopeSignedFieldsV2): Record<string, unknown> {
   return {
     ...envelopeSignedPayloadV1(fields),
     root_trace_id: fields.root_trace_id ?? null,

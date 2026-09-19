@@ -7,7 +7,7 @@ import {
   pending_questions,
   outbound_messages,
   workflows,
-  } from '../schema.js';
+} from '../schema.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import {
   getCurrentTenant,
@@ -95,9 +95,7 @@ export const conversasRepo = {
    * physically representable; scoping only the conversation would expose the
    * foreign person row to prompt/tool policy assembly.
    */
-  async byIdWithPessoa(
-    id: string,
-  ): Promise<{ conversa: Conversa; pessoa: Pessoa } | null> {
+  async byIdWithPessoa(id: string): Promise<{ conversa: Conversa; pessoa: Pessoa } | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
@@ -392,9 +390,7 @@ export const conversasRepo = {
         AND status = 'ativa'
         AND ${conversas.ultima_atividade_em} < now() - interval '7 days'
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 };
 
@@ -623,9 +619,7 @@ export const mensagensRepo = {
         AND direcao = 'in'
         AND created_at < ${cutoff.toISOString()}
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
   async findById(id: string): Promise<Mensagem | null> {
     const tenant_id = getCurrentTenant();
@@ -1020,7 +1014,9 @@ export const pendingQuestionsRepo = {
     const rows = await db
       .select()
       .from(pending_questions)
-      .where(and(eq(pending_questions.conversa_id, conversa_id), eq(pending_questions.status, 'aberta')))
+      .where(
+        and(eq(pending_questions.conversa_id, conversa_id), eq(pending_questions.status, 'aberta')),
+      )
       .orderBy(desc(pending_questions.created_at))
       .limit(1);
     return rows[0] ?? null;
@@ -1182,9 +1178,7 @@ export const pendingQuestionsRepo = {
           AND proxima_acao_em IS NOT NULL
           AND proxima_acao_em < now()
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 
   /**
@@ -1231,9 +1225,7 @@ export const pendingQuestionsRepo = {
           OR (metadata->>'last_reminder_at')::timestamptz < now() - interval '1 hour'
         )
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 
   // === B0 tx-aware additions ===
@@ -1254,10 +1246,7 @@ export const pendingQuestionsRepo = {
     return rows[0] ?? null;
   },
 
-  async findActiveForUpdate(
-    tx: typeof db,
-    conversa_id: string,
-  ): Promise<PendingQuestion | null> {
+  async findActiveForUpdate(tx: typeof db, conversa_id: string): Promise<PendingQuestion | null> {
     const rows = await tx
       .select()
       .from(pending_questions)
@@ -1390,10 +1379,7 @@ export const pendingQuestionsRepo = {
     return { cancelled_ids: result.rows.map((r) => (r as { id: string }).id) };
   },
 
-  async createTx(
-    tx: typeof db,
-    input: PendingQuestionInsert,
-  ): Promise<PendingQuestion> {
+  async createTx(tx: typeof db, input: PendingQuestionInsert): Promise<PendingQuestion> {
     // Insert inside the same tx as the cancel — required by the partial unique
     // index `(conversa_id) WHERE status='aberta'` from migration 004. Doing
     // the insert on the global pool would race with the in-flight cancel and
@@ -1556,11 +1542,7 @@ export const outboundMessagesRepo = {
    * 'sent' → 'failed', re-opening the row to reclaim → DOUBLE-SEND. The CAS
    * makes the call a no-op when a terminal status already won the race.
    */
-  async markFailed(
-    key: string,
-    error: string,
-    ambiguous: boolean,
-  ): Promise<void> {
+  async markFailed(key: string, error: string, ambiguous: boolean): Promise<void> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     await db

@@ -64,8 +64,10 @@ export async function checkWhatsApp(): Promise<HealthReport> {
  * collapses into one round-trip per window.
  */
 const HEALTH_CACHE_MS = 2_000;
-let healthCache: { at: number; value: { status: HealthStatus; components: HealthReport[] } } | null =
-  null;
+let healthCache: {
+  at: number;
+  value: { status: HealthStatus; components: HealthReport[] };
+} | null = null;
 
 export async function checkAll(): Promise<{ status: HealthStatus; components: HealthReport[] }> {
   const now = Date.now();

@@ -167,7 +167,12 @@ async function mkInboundComTurno(args: {
     await c.query(
       `INSERT INTO mensagens (id, tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata, processada_em)
        VALUES ($1, $2, $3, NULL, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
-      [mensagem_id, args.msg_tenant, args.msg_agent, `WAID-504V2-${randomInt(0, 1e9).toString(36)}`],
+      [
+        mensagem_id,
+        args.msg_tenant,
+        args.msg_agent,
+        `WAID-504V2-${randomInt(0, 1e9).toString(36)}`,
+      ],
     );
     await c.query(
       `INSERT INTO agent_turns (id, tenant_id, agent_id, representative_message_id, status, queued_at)
@@ -277,9 +282,7 @@ d('#504 — o resolvedor de escopo do job V2 fecha a fronteira (DB real)', () =>
 
   it('ADVERSARIAL: um job V2 apontando para o turno de OUTRO tenant é RECUSADO, e a mensagem da vítima não é tocada', async () => {
     const { runAgentTurnJob } = await import('../../src/runtime/turns/job-consumer.js');
-    const { TurnScopeUnresolvedError } = await import(
-      '../../src/runtime/turns/scope-resolver.js'
-    );
+    const { TurnScopeUnresolvedError } = await import('../../src/runtime/turns/scope-resolver.js');
 
     // A vítima é uma mensagem do par baseline, ainda não processada; o
     // ponteiro cruzado é um turno do ATACANTE apontando para ela. Nenhuma FK

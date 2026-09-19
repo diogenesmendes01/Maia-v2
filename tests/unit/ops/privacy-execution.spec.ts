@@ -157,7 +157,13 @@ describe('máquina de estados', () => {
   });
 
   it('permite denied e failed a partir de qualquer estado não terminal', () => {
-    for (const from of ['received', 'identity_pending', 'identity_verified', 'approved', 'in_progress'] as const) {
+    for (const from of [
+      'received',
+      'identity_pending',
+      'identity_verified',
+      'approved',
+      'in_progress',
+    ] as const) {
       expect(() => assertPrivacyTransition(from, 'denied')).not.toThrow();
       expect(() => assertPrivacyTransition(from, 'failed')).not.toThrow();
     }

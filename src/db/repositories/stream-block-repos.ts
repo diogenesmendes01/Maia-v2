@@ -65,7 +65,11 @@ export type StreamUnblockResult =
        * nenhum — a conversa foi liberada e não tem trabalho pendente, que é o
        * caso normal quando o único turno da fila era o próprio envenenado.
        */
-      head: { turn_id: string; representative_message_id: string; conversa_id: string | null } | null;
+      head: {
+        turn_id: string;
+        representative_message_id: string;
+        conversa_id: string | null;
+      } | null;
     }
   /** Não existe bloqueio ATIVO com este id NO ESCOPO corrente. */
   | { ok: false; conflict: 'not_blocked' };

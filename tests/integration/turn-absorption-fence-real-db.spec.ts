@@ -79,7 +79,11 @@ async function claimedTurn(): Promise<{ id: string; claim_token: string }> {
   const { agentTurnsRepo } = await loadRepos();
   const turn = await freshTurn();
   const claim = await inA(() =>
-    agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'absorvedor', lease_ms: LEASE_MS }),
+    agentTurnsRepo.claimNextEligibleTurn({
+      turn_id: turn.id,
+      worker_id: 'absorvedor',
+      lease_ms: LEASE_MS,
+    }),
   );
   if (!claim.ok) throw new Error('setup: o claim do absorvedor deveria ter sido concedido');
   return { id: turn.id, claim_token: claim.claim.claim_token };
@@ -311,7 +315,11 @@ d('#504 — absorção de irmão: o fence pertence a quem absorve (DB real)', ()
     const { agentTurnsRepo } = await loadRepos();
     const turn = await freshTurn();
     const claim = await inA(() =>
-      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turn.id, worker_id: 'dono', lease_ms: LEASE_MS }),
+      agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: turn.id,
+        worker_id: 'dono',
+        lease_ms: LEASE_MS,
+      }),
     );
     expect(claim.ok).toBe(true);
     if (!claim.ok) return;

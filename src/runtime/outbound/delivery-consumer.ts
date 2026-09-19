@@ -33,10 +33,7 @@
 import { logger } from '@/lib/logger.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { deliverOutbound, type DeliveryResult } from './delivery.js';
-import {
-  OutboundScopeUnresolvedError,
-  resolveOutboundDeliveryScope,
-} from './delivery-scope.js';
+import { OutboundScopeUnresolvedError, resolveOutboundDeliveryScope } from './delivery-scope.js';
 
 /**
  * Processa UM job de entrega. É o `processor` passado a

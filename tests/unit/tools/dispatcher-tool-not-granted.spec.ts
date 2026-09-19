@@ -22,7 +22,11 @@ const { auditMock } = vi.hoisted(() => ({ auditMock: vi.fn(async () => undefined
 // Configurable grant the mocked repo returns per test.
 const { grantState } = vi.hoisted(() => ({
   grantState: {
-    grant: { granted_packs: [] as string[], granted_tools: [] as string[], denied_tools: [] as string[] },
+    grant: {
+      granted_packs: [] as string[],
+      granted_tools: [] as string[],
+      denied_tools: [] as string[],
+    },
   },
 }));
 

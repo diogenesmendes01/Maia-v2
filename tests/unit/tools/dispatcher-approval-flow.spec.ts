@@ -104,26 +104,44 @@ vi.mock('@/db/repositories.js', () => ({
     findById: vi.fn(async () => null),
   },
   approvalRequestsRepo: {
-    create: vi.fn(async (input: Omit<Row, 'id' | 'tenant_id' | 'agent_id' | 'status' | 'created_at' | 'updated_at' | 'approved_at' | 'denied_at' | 'claimed_at' | 'consumed_at' | 'claim_token' | 'result_ref'>) => {
-      if (store.open(input.fingerprint)) return null;
-      const row: Row = {
-        ...input,
-        id: randomUUID(),
-        tenant_id: 'primary',
-        agent_id: 'primary',
-        status: 'pending',
-        approved_at: null,
-        denied_at: null,
-        claimed_at: null,
-        consumed_at: null,
-        claim_token: null,
-        result_ref: null,
-        created_at: new Date(),
-        updated_at: new Date(),
-      };
-      store.rows.set(row.id, row);
-      return row;
-    }),
+    create: vi.fn(
+      async (
+        input: Omit<
+          Row,
+          | 'id'
+          | 'tenant_id'
+          | 'agent_id'
+          | 'status'
+          | 'created_at'
+          | 'updated_at'
+          | 'approved_at'
+          | 'denied_at'
+          | 'claimed_at'
+          | 'consumed_at'
+          | 'claim_token'
+          | 'result_ref'
+        >,
+      ) => {
+        if (store.open(input.fingerprint)) return null;
+        const row: Row = {
+          ...input,
+          id: randomUUID(),
+          tenant_id: 'primary',
+          agent_id: 'primary',
+          status: 'pending',
+          approved_at: null,
+          denied_at: null,
+          claimed_at: null,
+          consumed_at: null,
+          claim_token: null,
+          result_ref: null,
+          created_at: new Date(),
+          updated_at: new Date(),
+        };
+        store.rows.set(row.id, row);
+        return row;
+      },
+    ),
     byId: vi.fn(async (id: string) => store.rows.get(id) ?? null),
     findOpenByRefPrefix: vi.fn(async (prefix: string) => {
       const hits = [...store.rows.values()].filter(
@@ -175,14 +193,18 @@ vi.mock('@/db/repositories.js', () => ({
     expireDue: vi.fn(async () => []),
   },
   approvalDecisionsRepo: {
-    record: vi.fn(async (input: { request_id: string; principal_pessoa_id: string; decision: string }) => {
-      const dup = store.decisions.find(
-        (d) => d.request_id === input.request_id && d.principal_pessoa_id === input.principal_pessoa_id,
-      );
-      if (dup) return null;
-      store.decisions.push(input);
-      return { ...input, id: randomUUID() };
-    }),
+    record: vi.fn(
+      async (input: { request_id: string; principal_pessoa_id: string; decision: string }) => {
+        const dup = store.decisions.find(
+          (d) =>
+            d.request_id === input.request_id &&
+            d.principal_pessoa_id === input.principal_pessoa_id,
+        );
+        if (dup) return null;
+        store.decisions.push(input);
+        return { ...input, id: randomUUID() };
+      },
+    ),
     byRequest: vi.fn(async (request_id: string) =>
       store.decisions.filter((d) => d.request_id === request_id),
     ),

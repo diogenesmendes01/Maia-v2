@@ -10,11 +10,7 @@ import { forCurrentAgentChannel } from '@/gateway/line-output.js';
 import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js';
 import { audit } from '@/governance/audit.js';
 import { quotedReplyContext } from '@/gateway/presence.js';
-import {
-  runWithTenantContext,
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 
 const SCAN_LIMIT = 50;
 const MAX_REMINDERS = 2;
@@ -104,10 +100,7 @@ export async function runPendingReminder(): Promise<void> {
     }
   }
 
-  logger.info(
-    { tuples: tuples.length, agents_processed, agents_failed },
-    'pending_reminder.done',
-  );
+  logger.info({ tuples: tuples.length, agents_processed, agents_failed }, 'pending_reminder.done');
 }
 
 async function runPendingReminderInner(): Promise<void> {
@@ -262,9 +255,6 @@ async function processOne(row: Row): Promise<void> {
       metadata: { reminder_count: newCount },
     });
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, pq_id: row.id },
-      'pending_reminder.send_failed',
-    );
+    logger.warn({ err: (err as Error).message, pq_id: row.id }, 'pending_reminder.send_failed');
   }
 }

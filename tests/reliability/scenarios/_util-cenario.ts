@@ -30,10 +30,7 @@ import type { SupervisedChild } from '../harness/process-supervisor.js';
 export const CARREGADOR_TSX = '--import tsx';
 
 /** Toda linha estruturada de um prefixo, já parseada. */
-export function linhasDe(
-  filho: SupervisedChild,
-  prefixo: string,
-): Array<Record<string, unknown>> {
+export function linhasDe(filho: SupervisedChild, prefixo: string): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (const linha of filho.stdout.split('\n')) {
     const t = linha.trim();

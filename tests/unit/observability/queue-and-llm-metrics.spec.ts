@@ -96,7 +96,10 @@ describe('issue #514 §5 — queue gauges', () => {
   });
 
   it('a state Redis omitted is NaN, not 0', async () => {
-    registerQueueGauges(fakeQueue({ getJobCounts: vi.fn().mockResolvedValue({ waiting: 5 }) }), 'q');
+    registerQueueGauges(
+      fakeQueue({ getJobCounts: vi.fn().mockResolvedValue({ waiting: 5 }) }),
+      'q',
+    );
     const out = await renderPrometheus();
     expect(out).toContain('maia_queue_depth{queue="q",state="waiting"} 5');
     expect(out).toContain('maia_queue_depth{queue="q",state="active"} NaN');
@@ -104,7 +107,10 @@ describe('issue #514 §5 — queue gauges', () => {
 
   it('keeps queues separated', async () => {
     registerQueueGauges(fakeQueue(), 'agent');
-    registerQueueGauges(fakeQueue({ getJobCounts: vi.fn().mockResolvedValue({ waiting: 99 }) }), 'unrouted-replay');
+    registerQueueGauges(
+      fakeQueue({ getJobCounts: vi.fn().mockResolvedValue({ waiting: 99 }) }),
+      'unrouted-replay',
+    );
     const out = await renderPrometheus();
     expect(out).toContain('maia_queue_depth{queue="agent",state="waiting"} 12');
     expect(out).toContain('maia_queue_depth{queue="unrouted-replay",state="waiting"} 99');

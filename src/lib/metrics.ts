@@ -35,7 +35,10 @@ const bucketsPorMetrica = new Map<string, readonly number[]>();
  * efeito sobre séries JÁ criadas (ver acima).
  */
 export function registerHistogramBuckets(name: string, buckets: readonly number[]): void {
-  bucketsPorMetrica.set(name, [...buckets].sort((a, b) => a - b));
+  bucketsPorMetrica.set(
+    name,
+    [...buckets].sort((a, b) => a - b),
+  );
 }
 
 function key(name: string, labels?: Record<string, string>): string {

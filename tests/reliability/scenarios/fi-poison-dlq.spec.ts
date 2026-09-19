@@ -153,10 +153,11 @@ async function conversaComDoisTurnos(sufixo: string): Promise<Conversa> {
 async function turnoDoBanco(
   turn_id: string,
 ): Promise<{ status: string; outcome: string | null; last_error_code: string | null }> {
-  const r = await pool.query<{ status: string; outcome: string | null; last_error_code: string | null }>(
-    'SELECT status, outcome, last_error_code FROM agent_turns WHERE id = $1',
-    [turn_id],
-  );
+  const r = await pool.query<{
+    status: string;
+    outcome: string | null;
+    last_error_code: string | null;
+  }>('SELECT status, outcome, last_error_code FROM agent_turns WHERE id = $1', [turn_id]);
   const linha = r.rows[0];
   if (!linha) throw new Error(`turno ${turn_id} sumiu do banco`);
   return linha;
@@ -259,111 +260,106 @@ d('#510 FI-14 — poison/DLQ: a política libera ou bloqueia, e as duas são aud
     }
   });
 
-  it(
-    'FI-14 — M1 excede as tentativas: efeito irreversível INTERDITA a conversa; falha de modelo a LIBERA',
-    async () => {
-      const interditada = await conversaComDoisTurnos('1');
-      const liberada = await conversaComDoisTurnos('2');
-      const oracle = new InvariantOracle({
-        pool,
-        escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
-        turnIds: [interditada.m1, interditada.m2, liberada.m1, liberada.m2],
+  it('FI-14 — M1 excede as tentativas: efeito irreversível INTERDITA a conversa; falha de modelo a LIBERA', async () => {
+    const interditada = await conversaComDoisTurnos('1');
+    const liberada = await conversaComDoisTurnos('2');
+    const oracle = new InvariantOracle({
+      pool,
+      escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
+      turnIds: [interditada.m1, interditada.m2, liberada.m1, liberada.m2],
+    });
+
+    // ── AS DUAS PONTAS, mesmo binário, códigos de erro diferentes.
+    const veneno = subirVeneno('veneno-efeito', interditada, 'side_effect_committed');
+    const modelo = subirVeneno('veneno-modelo', liberada, 'llm_timeout');
+    const [pv, pm] = await Promise.all([prontidaoDe(veneno), prontidaoDe(modelo)]);
+    expect(pv.acquired, `a réplica não reivindicou M1: ${JSON.stringify(pv)}`).toBe(true);
+    expect(pm.acquired).toBe(true);
+
+    // A premissa é COBRADA: as duas esgotaram o teto de PRODUÇÃO. Sem isso,
+    // "foi para dead letter" poderia ser qualquer outro caminho terminal.
+    for (const filho of [veneno, modelo]) {
+      expect(linhasDe(filho, '##fi-veneno##').at(-1)).toMatchObject({
+        esgotou: true,
+        teto: MAX_TURN_ATTEMPTS,
+        status_apos: 'dead_letter',
       });
+    }
 
-      // ── AS DUAS PONTAS, mesmo binário, códigos de erro diferentes.
-      const veneno = subirVeneno('veneno-efeito', interditada, 'side_effect_committed');
-      const modelo = subirVeneno('veneno-modelo', liberada, 'llm_timeout');
-      const [pv, pm] = await Promise.all([prontidaoDe(veneno), prontidaoDe(modelo)]);
-      expect(pv.acquired, `a réplica não reivindicou M1: ${JSON.stringify(pv)}`).toBe(true);
-      expect(pm.acquired).toBe(true);
+    // ── O QUE É IGUAL NOS DOIS: o turno acabou, e a trilha registra.
+    for (const alvo of [interditada.m1, liberada.m1]) {
+      const t = await turnoDoBanco(alvo);
+      expect(t.status).toBe('dead_letter');
+      expect(t.outcome).toBe('retry_exhausted');
+      const trilha = await auditorias('turn_dead_lettered', alvo);
+      expect(trilha, 'o dead letter não foi auditado exatamente uma vez').toHaveLength(1);
+      expect(trilha[0]!.metadata).toMatchObject({ to_status: 'dead_letter' });
+    }
 
-      // A premissa é COBRADA: as duas esgotaram o teto de PRODUÇÃO. Sem isso,
-      // "foi para dead letter" poderia ser qualquer outro caminho terminal.
-      for (const filho of [veneno, modelo]) {
-        expect(linhasDe(filho, '##fi-veneno##').at(-1)).toMatchObject({
-          esgotou: true,
-          teto: MAX_TURN_ATTEMPTS,
-          status_apos: 'dead_letter',
-        });
-      }
+    // ── O QUE É DIFERENTE, e é a decisão: a conversa do efeito irreversível
+    //    está INTERDITADA, com a categoria que decidiu registrada.
+    const bloqueios = await bloqueiosAtivos(interditada.stream_key);
+    expect(bloqueios, 'a conversa do efeito irreversível NÃO foi interditada').toHaveLength(1);
+    expect(bloqueios[0]).toMatchObject({
+      category: 'effect_committed',
+      reason: 'poison',
+      blocked_by_turn_id: interditada.m1,
+    });
+    const poisonAudit = await auditorias('stream_poisoned', interditada.m1);
+    expect(poisonAudit, 'a interdição não foi auditada').toHaveLength(1);
+    expect(poisonAudit[0]!.metadata).toMatchObject({
+      disposition: 'block_stream',
+      category: 'effect_committed',
+      reason: 'poison',
+    });
 
-      // ── O QUE É IGUAL NOS DOIS: o turno acabou, e a trilha registra.
-      for (const alvo of [interditada.m1, liberada.m1]) {
-        const t = await turnoDoBanco(alvo);
-        expect(t.status).toBe('dead_letter');
-        expect(t.outcome).toBe('retry_exhausted');
-        const trilha = await auditorias('turn_dead_lettered', alvo);
-        expect(trilha, 'o dead letter não foi auditado exatamente uma vez').toHaveLength(1);
-        expect(trilha[0]!.metadata).toMatchObject({ to_status: 'dead_letter' });
-      }
+    // ── O CONTROLE: a conversa da falha de modelo NÃO foi interditada.
+    expect(
+      await bloqueiosAtivos(liberada.stream_key),
+      'uma falha de modelo interditou a conversa — a política bloqueia SEMPRE',
+    ).toHaveLength(0);
+    expect(await auditorias('stream_poisoned', liberada.m1)).toHaveLength(0);
 
-      // ── O QUE É DIFERENTE, e é a decisão: a conversa do efeito irreversível
-      //    está INTERDITADA, com a categoria que decidiu registrada.
-      const bloqueios = await bloqueiosAtivos(interditada.stream_key);
-      expect(bloqueios, 'a conversa do efeito irreversível NÃO foi interditada').toHaveLength(1);
-      expect(bloqueios[0]).toMatchObject({
-        category: 'effect_committed',
-        reason: 'poison',
-        blocked_by_turn_id: interditada.m1,
-      });
-      const poisonAudit = await auditorias('stream_poisoned', interditada.m1);
-      expect(poisonAudit, 'a interdição não foi auditada').toHaveLength(1);
-      expect(poisonAudit[0]!.metadata).toMatchObject({
-        disposition: 'block_stream',
-        category: 'effect_committed',
-        reason: 'poison',
-      });
+    // ── A CONSEQUÊNCIA OPERACIONAL, que é o que a decisão significa. Duas
+    //    réplicas do MESMO binário tentam reivindicar M2 de cada conversa.
+    const bloqueado = subirClaim('claim-m2-interditada', interditada.m2);
+    const livre = subirClaim('claim-m2-liberada', liberada.m2);
+    const [pb, pl] = await Promise.all([prontidaoDe(bloqueado), prontidaoDe(livre)]);
 
-      // ── O CONTROLE: a conversa da falha de modelo NÃO foi interditada.
-      expect(
-        await bloqueiosAtivos(liberada.stream_key),
-        'uma falha de modelo interditou a conversa — a política bloqueia SEMPRE',
-      ).toHaveLength(0);
-      expect(await auditorias('stream_poisoned', liberada.m1)).toHaveLength(0);
+    expect(pb.acquired, `M2 da conversa INTERDITADA foi reivindicado: ${JSON.stringify(pb)}`).toBe(
+      false,
+    );
+    expect(pb.motivo).toBe('stream_poisoned');
+    // Todas as tentativas foram recusadas pelo MESMO motivo — não é uma
+    // recusa transitória que some sozinha.
+    for (const t of linhasDe(bloqueado, '##fi-claim##')) {
+      expect(t.result).toBe('stream_poisoned');
+    }
 
-      // ── A CONSEQUÊNCIA OPERACIONAL, que é o que a decisão significa. Duas
-      //    réplicas do MESMO binário tentam reivindicar M2 de cada conversa.
-      const bloqueado = subirClaim('claim-m2-interditada', interditada.m2);
-      const livre = subirClaim('claim-m2-liberada', liberada.m2);
-      const [pb, pl] = await Promise.all([prontidaoDe(bloqueado), prontidaoDe(livre)]);
+    expect(
+      pl.acquired,
+      `M2 da conversa LIBERADA não foi reivindicado: ${JSON.stringify(pl)} — ` +
+        'sem este controle, "a conversa parou" também passaria num sistema que para sempre',
+    ).toBe(true);
 
-      expect(
-        pb.acquired,
-        `M2 da conversa INTERDITADA foi reivindicado: ${JSON.stringify(pb)}`,
-      ).toBe(false);
-      expect(pb.motivo).toBe('stream_poisoned');
-      // Todas as tentativas foram recusadas pelo MESMO motivo — não é uma
-      // recusa transitória que some sozinha.
-      for (const t of linhasDe(bloqueado, '##fi-claim##')) {
-        expect(t.result).toBe('stream_poisoned');
-      }
+    // E nada destrava a conversa interditada sozinho: nem o tempo, nem o
+    // varredor, nem a promoção. Só `npm run dlq -- unblock`.
+    await estavelDurante(
+      async () => ({
+        m2: (await turnoDoBanco(interditada.m2)).status,
+        bloqueios: (await bloqueiosAtivos(interditada.stream_key)).length,
+      }),
+      {
+        label: 'a conversa interditada continua interditada',
+        janelaMs: 2_000,
+        intervalMs: 100,
+        justificativa:
+          'a invariante é NEGATIVA ("nada a destrava sozinha"); não existe evento de ' +
+          'desbloqueio que não aconteceu, e o valor da interdição está justamente em ela ' +
+          'não expirar.',
+      },
+    );
 
-      expect(
-        pl.acquired,
-        `M2 da conversa LIBERADA não foi reivindicado: ${JSON.stringify(pl)} — ` +
-          'sem este controle, "a conversa parou" também passaria num sistema que para sempre',
-      ).toBe(true);
-
-      // E nada destrava a conversa interditada sozinho: nem o tempo, nem o
-      // varredor, nem a promoção. Só `npm run dlq -- unblock`.
-      await estavelDurante(
-        async () => ({
-          m2: (await turnoDoBanco(interditada.m2)).status,
-          bloqueios: (await bloqueiosAtivos(interditada.stream_key)).length,
-        }),
-        {
-          label: 'a conversa interditada continua interditada',
-          janelaMs: 2_000,
-          intervalMs: 100,
-          justificativa:
-            'a invariante é NEGATIVA ("nada a destrava sozinha"); não existe evento de ' +
-            'desbloqueio que não aconteceu, e o valor da interdição está justamente em ela ' +
-            'não expirar.',
-        },
-      );
-
-      await oracle.assertInvariantes('FI-14');
-    },
-    240_000,
-  );
+    await oracle.assertInvariantes('FI-14');
+  }, 240_000);
 });

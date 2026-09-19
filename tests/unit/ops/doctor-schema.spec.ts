@@ -31,9 +31,10 @@ interface FakeClient {
 }
 
 /** Pool falso que registra tudo o que o adapter fez com o cliente. */
-function fakePool(
-  onQuery?: (sql: string) => Promise<{ rows: Record<string, unknown>[] }>,
-): { pool: PgPoolLike; client: FakeClient } {
+function fakePool(onQuery?: (sql: string) => Promise<{ rows: Record<string, unknown>[] }>): {
+  pool: PgPoolLike;
+  client: FakeClient;
+} {
   const client: FakeClient = { issued: [], released: 0, destroyed: 0 };
   const pool: PgPoolLike = {
     connect: () =>

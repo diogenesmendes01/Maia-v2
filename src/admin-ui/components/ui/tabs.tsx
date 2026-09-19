@@ -27,10 +27,7 @@ export function Tabs({
   return (
     <div
       role="tablist"
-      className={cn(
-        'scroll-thin flex gap-1 overflow-x-auto border-b border-zinc-200',
-        className,
-      )}
+      className={cn('scroll-thin flex gap-1 overflow-x-auto border-b border-zinc-200', className)}
     >
       {tabs.map((tab) => {
         const active = tab.id === value;

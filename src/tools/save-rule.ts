@@ -13,12 +13,7 @@ import { logger } from '@/lib/logger.js';
 import { proposeRuleTool } from './propose-rule.js';
 
 const inputSchema = z.object({
-  tipo: z.enum([
-    'classificacao',
-    'identificacao_entidade',
-    'tom_resposta',
-    'recorrencia',
-  ]),
+  tipo: z.enum(['classificacao', 'identificacao_entidade', 'tom_resposta', 'recorrencia']),
   contexto: z.string().min(1),
   acao: z.string().min(1),
   contexto_jsonb: z.record(z.unknown()).default({}),

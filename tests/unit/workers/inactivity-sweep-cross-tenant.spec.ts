@@ -180,9 +180,7 @@ describe('Issue #345 — runInactivitySweep is per-tenant scoped (no default/def
     expect(seen).toEqual(new Set(['tenant-A|agent-A', 'tenant-B|agent-B']));
     // tenant-B's audit still fired despite tenant-A blowing up.
     expect(auditMock).toHaveBeenCalledTimes(1);
-    expect(auditMock).toHaveBeenCalledWith(
-      expect.objectContaining({ alvo_id: 'perm-b' }),
-    );
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({ alvo_id: 'perm-b' }));
   });
 
   it('DISPATCHER runs without an ambient tenant context (cron path)', async () => {

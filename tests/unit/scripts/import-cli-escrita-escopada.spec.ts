@@ -164,9 +164,7 @@ describe('#720 — toda escrita das CLIs de importação é escopada por tenant+
       ['import-review.ts', fonteReview],
       ['import-ofx.ts', fonteOfx],
     ] as const) {
-      expect(fonte, `${nome}: não entra em contexto de tenant`).toContain(
-        'runWithTenantContext(',
-      );
+      expect(fonte, `${nome}: não entra em contexto de tenant`).toContain('runWithTenantContext(');
       expect(fonte, `${nome}: não falha fechado por argumento ausente`).toContain(
         'RequiredArgsError',
       );

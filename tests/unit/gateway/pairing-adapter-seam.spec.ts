@@ -167,8 +167,9 @@ describe('[declaração] o adapter de canal NÃO é alcançável por configuraç
 
   it('instalar DEPOIS de o manager existir é erro, não um no-op silencioso', () => {
     getLineSessionManager();
-    expect(() => installPairingChannelAdapter({ open: () => Promise.reject(new Error('x')) }))
-      .toThrow(/installed too late|ANTES do primeiro/i);
+    expect(() =>
+      installPairingChannelAdapter({ open: () => Promise.reject(new Error('x')) }),
+    ).toThrow(/installed too late|ANTES do primeiro/i);
   });
 
   it('instalar duas vezes é erro — nunca "o último vence" em silêncio', () => {

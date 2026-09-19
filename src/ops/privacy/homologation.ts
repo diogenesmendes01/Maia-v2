@@ -171,7 +171,8 @@ export const PERIODIC_POLICIES: readonly PeriodicPolicy[] = Object.freeze([
     id: 'privacy.export.ttl_sweep',
     data_class: 'privacy.export',
     cadence: '50 * * * * (horária) — src/workers/index.ts, `privacy_export_sweep`',
-    destroys: 'o pacote `.enc` com os dados consolidados de um titular, vencido o prazo carimbado na emissão',
+    destroys:
+      'o pacote `.enc` com os dados consolidados de um titular, vencido o prazo carimbado na emissão',
     // ATIVO. `PRIVACY_EXPORT_SWEEP_DRY_RUN` tem default `false` de propósito:
     // aqui a direção segura é EXECUTAR, porque um varredor inerte deixa o
     // pacote cifrado no disco para sempre.
@@ -209,7 +210,8 @@ export const PERIODIC_POLICIES: readonly PeriodicPolicy[] = Object.freeze([
     id: 'retention.class_purge',
     data_class: '*',
     cadence: 'nenhuma — não existe job por classe; `resolveRetention` recusa tudo hoje',
-    destroys: 'linhas de qualquer classe do inventário, por prazo, quando uma RETENTION_POLICY aprovada existir',
+    destroys:
+      'linhas de qualquer classe do inventário, por prazo, quando uma RETENTION_POLICY aprovada existir',
     active_by_default: false,
     dry_run_var: 'RETENTION_DRY_RUN',
     // Dry-run desligado E uma RETENTION_POLICY aprovada nomeando ao menos uma
@@ -307,9 +309,7 @@ function authorises(policy: PeriodicPolicy, grandfathered: readonly string[]): b
  *
  * Puro. Sem relógio, sem IO, sem `process.env`.
  */
-export function auditPeriodicPolicies(
-  input: HomologationAuditInput = {},
-): HomologationViolation[] {
+export function auditPeriodicPolicies(input: HomologationAuditInput = {}): HomologationViolation[] {
   const policies = input.policies ?? PERIODIC_POLICIES;
   const classes = input.classes ?? DATA_CLASSES;
   const retentionPolicy = input.retentionPolicy ?? UNAPPROVED_POLICY;

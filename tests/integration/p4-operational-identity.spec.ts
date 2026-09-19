@@ -201,9 +201,7 @@ Você é a Maia.
  * top level of the fake row (spread via overrides) so the renderer can find them,
  * while also satisfying TypeScript via `as unknown as AgentOperationalProfileVersion`.
  */
-function buildVersion(
-  overrides: Record<string, unknown>,
-): AgentOperationalProfileVersion {
+function buildVersion(overrides: Record<string, unknown>): AgentOperationalProfileVersion {
   return {
     id: 'prof-1',
     tenant_id: 'default',
@@ -275,84 +273,84 @@ describe('P4 operational identity — end-to-end', () => {
     // Default seed-mode for create/transition: use in-memory state.
     // Accepts profile_body (v3.1.1 single JSONB column) — the generator packs
     // legacy 4-layer keys inside profile_body during the migration window.
-    operationalProfileVersionsCreate.mockImplementation(async (input: {
-      profile_body: unknown;
-      proposed_by: string;
-      proposed_reason?: string;
-    }) => {
-      const id = `prof-${Math.random().toString(36).slice(2)}`;
-      const versions = Object.values(profilesState).filter(
-        (r) => r.tenant_id === 'default' && r.agent_id === 'default',
-      );
-      const version = versions.length === 0 ? 1 : Math.max(...versions.map((v) => v.version)) + 1;
-      const row: ProfileRow = {
-        id,
-        tenant_id: 'default',
-        agent_id: 'default',
-        version,
-        status: 'proposed',
-        profile_body: input.profile_body,
-        proposed_by: input.proposed_by,
-        proposed_reason: input.proposed_reason ?? null,
-        approved_by: null,
-        approved_at: null,
-        activated_at: null,
-        frozen_at: null,
-        rolled_back_at: null,
-        rollback_reason: null,
-        created_at: new Date(),
-      };
-      profilesState[id] = row;
-      return row;
-    });
-
-    operationalProfileVersionsTransition.mockImplementation(async (args: {
-      id: string;
-      to: 'proposed' | 'active' | 'frozen' | 'rolled_back';
-      approved_by?: string;
-      rollback_reason?: string;
-    }) => {
-      const row = profilesState[args.id];
-      if (!row) return { ok: false, reason: 'not_found' };
-      const from = row.status;
-      if (from === 'rolled_back') return { ok: false, reason: 'terminal' };
-      if (from === args.to) return { ok: false, reason: 'invalid_transition' };
-      const allowed: Record<string, string[]> = {
-        proposed: ['active', 'frozen', 'rolled_back'],
-        active: ['frozen', 'rolled_back'],
-        frozen: ['active', 'rolled_back'],
-      };
-      if (!allowed[from]?.includes(args.to)) {
-        return { ok: false, reason: 'invalid_transition' };
-      }
-      if (args.to === 'active') {
-        const otherActive = Object.values(profilesState).find(
-          (r) =>
-            r.tenant_id === row.tenant_id &&
-            r.agent_id === row.agent_id &&
-            r.status === 'active' &&
-            r.id !== row.id,
+    operationalProfileVersionsCreate.mockImplementation(
+      async (input: { profile_body: unknown; proposed_by: string; proposed_reason?: string }) => {
+        const id = `prof-${Math.random().toString(36).slice(2)}`;
+        const versions = Object.values(profilesState).filter(
+          (r) => r.tenant_id === 'default' && r.agent_id === 'default',
         );
-        if (otherActive) return { ok: false, reason: 'already_has_active' };
-      }
-      const now = new Date();
-      const patch: Partial<ProfileRow> = { status: args.to };
-      if (args.to === 'active') {
-        if (!row.approved_at) {
-          patch.approved_at = now;
-          patch.approved_by = args.approved_by ?? row.approved_by;
+        const version = versions.length === 0 ? 1 : Math.max(...versions.map((v) => v.version)) + 1;
+        const row: ProfileRow = {
+          id,
+          tenant_id: 'default',
+          agent_id: 'default',
+          version,
+          status: 'proposed',
+          profile_body: input.profile_body,
+          proposed_by: input.proposed_by,
+          proposed_reason: input.proposed_reason ?? null,
+          approved_by: null,
+          approved_at: null,
+          activated_at: null,
+          frozen_at: null,
+          rolled_back_at: null,
+          rollback_reason: null,
+          created_at: new Date(),
+        };
+        profilesState[id] = row;
+        return row;
+      },
+    );
+
+    operationalProfileVersionsTransition.mockImplementation(
+      async (args: {
+        id: string;
+        to: 'proposed' | 'active' | 'frozen' | 'rolled_back';
+        approved_by?: string;
+        rollback_reason?: string;
+      }) => {
+        const row = profilesState[args.id];
+        if (!row) return { ok: false, reason: 'not_found' };
+        const from = row.status;
+        if (from === 'rolled_back') return { ok: false, reason: 'terminal' };
+        if (from === args.to) return { ok: false, reason: 'invalid_transition' };
+        const allowed: Record<string, string[]> = {
+          proposed: ['active', 'frozen', 'rolled_back'],
+          active: ['frozen', 'rolled_back'],
+          frozen: ['active', 'rolled_back'],
+        };
+        if (!allowed[from]?.includes(args.to)) {
+          return { ok: false, reason: 'invalid_transition' };
         }
-        patch.activated_at = now;
-      } else if (args.to === 'frozen') {
-        patch.frozen_at = now;
-      } else if (args.to === 'rolled_back') {
-        patch.rolled_back_at = now;
-        patch.rollback_reason = args.rollback_reason ?? null;
-      }
-      const updated = { ...row, ...patch };
-      profilesState[args.id] = updated;
-      return { ok: true, updated };
-    });
+        if (args.to === 'active') {
+          const otherActive = Object.values(profilesState).find(
+            (r) =>
+              r.tenant_id === row.tenant_id &&
+              r.agent_id === row.agent_id &&
+              r.status === 'active' &&
+              r.id !== row.id,
+          );
+          if (otherActive) return { ok: false, reason: 'already_has_active' };
+        }
+        const now = new Date();
+        const patch: Partial<ProfileRow> = { status: args.to };
+        if (args.to === 'active') {
+          if (!row.approved_at) {
+            patch.approved_at = now;
+            patch.approved_by = args.approved_by ?? row.approved_by;
+          }
+          patch.activated_at = now;
+        } else if (args.to === 'frozen') {
+          patch.frozen_at = now;
+        } else if (args.to === 'rolled_back') {
+          patch.rolled_back_at = now;
+          patch.rollback_reason = args.rollback_reason ?? null;
+        }
+        const updated = { ...row, ...patch };
+        profilesState[args.id] = updated;
+        return { ok: true, updated };
+      },
+    );
 
     driftAlertsCreate.mockImplementation(async (input: { drift_type: string }) => ({
       id: `alert-${input.drift_type}-${Math.random().toString(36).slice(2)}`,
@@ -371,60 +369,52 @@ describe('P4 operational identity — end-to-end', () => {
 
   // ---------- Cenário 1 ----------
   it('cenário 1: seedInitialOperationalProfile cria v1 active e é idempotente', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        // Mock getActive to return null on the first call, then the created
-        // active row on subsequent calls (simulating idempotency check after
-        // the first seed succeeded).
-        operationalProfileVersionsGetActive.mockImplementation(async () => {
-          return (
-            Object.values(profilesState).find(
-              (r) =>
-                r.tenant_id === 'default' &&
-                r.agent_id === 'default' &&
-                r.status === 'active',
-            ) ?? null
-          );
-        });
-
-        const { seedInitialOperationalProfile } = await import(
-          '@/identity/proposal-generator.js'
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      // Mock getActive to return null on the first call, then the created
+      // active row on subsequent calls (simulating idempotency check after
+      // the first seed succeeded).
+      operationalProfileVersionsGetActive.mockImplementation(async () => {
+        return (
+          Object.values(profilesState).find(
+            (r) => r.tenant_id === 'default' && r.agent_id === 'default' && r.status === 'active',
+          ) ?? null
         );
+      });
 
-        // 1st seed: cria v1 active.
-        const first = await seedInitialOperationalProfile();
-        expect(first.created).toBe(true);
-        if (!first.created) throw new Error('expected created=true');
-        const v = first.version;
-        expect(v.status).toBe('active');
-        expect(v.version).toBe(1);
-        expect(v.proposed_by).toBe('system_seed');
-        // The generator packs legacy 4-layer keys inside profile_body during
-        // the v3.1.1 migration window. Read core_immutable from there.
-        const body = v.profile_body as {
-          core_immutable: { identity_block: string; principles: string[] };
-        };
-        expect(body.core_immutable.identity_block).toBeTruthy();
-        expect(body.core_immutable.principles.length).toBeGreaterThanOrEqual(3);
+      const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
 
-        // Spies confirm: create + transition foram invocados.
-        expect(operationalProfileVersionsCreate).toHaveBeenCalledTimes(1);
-        expect(operationalProfileVersionsTransition).toHaveBeenCalledTimes(1);
+      // 1st seed: cria v1 active.
+      const first = await seedInitialOperationalProfile();
+      expect(first.created).toBe(true);
+      if (!first.created) throw new Error('expected created=true');
+      const v = first.version;
+      expect(v.status).toBe('active');
+      expect(v.version).toBe(1);
+      expect(v.proposed_by).toBe('system_seed');
+      // The generator packs legacy 4-layer keys inside profile_body during
+      // the v3.1.1 migration window. Read core_immutable from there.
+      const body = v.profile_body as {
+        core_immutable: { identity_block: string; principles: string[] };
+      };
+      expect(body.core_immutable.identity_block).toBeTruthy();
+      expect(body.core_immutable.principles.length).toBeGreaterThanOrEqual(3);
 
-        // 2nd seed: idempotency — getActive já retorna o row criado.
-        operationalProfileVersionsCreate.mockClear();
-        operationalProfileVersionsTransition.mockClear();
-        const second = await seedInitialOperationalProfile();
-        expect(second.created).toBe(false);
-        if (second.created) throw new Error('expected created=false');
-        expect(second.reason).toBe('already_active');
-        expect(second.existing.id).toBe(v.id);
-        // Crítico: nem create nem transition foram invocados de novo.
-        expect(operationalProfileVersionsCreate).not.toHaveBeenCalled();
-        expect(operationalProfileVersionsTransition).not.toHaveBeenCalled();
-      },
-    );
+      // Spies confirm: create + transition foram invocados.
+      expect(operationalProfileVersionsCreate).toHaveBeenCalledTimes(1);
+      expect(operationalProfileVersionsTransition).toHaveBeenCalledTimes(1);
+
+      // 2nd seed: idempotency — getActive já retorna o row criado.
+      operationalProfileVersionsCreate.mockClear();
+      operationalProfileVersionsTransition.mockClear();
+      const second = await seedInitialOperationalProfile();
+      expect(second.created).toBe(false);
+      if (second.created) throw new Error('expected created=false');
+      expect(second.reason).toBe('already_active');
+      expect(second.existing.id).toBe(v.id);
+      // Crítico: nem create nem transition foram invocados de novo.
+      expect(operationalProfileVersionsCreate).not.toHaveBeenCalled();
+      expect(operationalProfileVersionsTransition).not.toHaveBeenCalled();
+    });
   });
 
   // ---------- Cenário 2 ----------
@@ -555,5 +545,4 @@ describe('P4 operational identity — end-to-end', () => {
       summary: evidenceSummary,
     });
   });
-
 });

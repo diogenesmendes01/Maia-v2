@@ -42,7 +42,7 @@ const CASES: readonly [string, string][] = [
   ['linha em branco entre pares', 'A_ONE=1\n\nA_TWO=2'],
   ['CRLF', 'LOG_LEVEL=info\r\nAPP_PORT=3000\r\n'],
   ['sinal de `=` dentro do valor', 'RUNTIME_TRACE_HMAC_PREV_MASTER_SECRETS=1=abc;2=def'],
-  ['JSON entre aspas simples', "MAIA_STAGING_KEYRING='{\"k1\":\"AAA=\"}'"],
+  ['JSON entre aspas simples', 'MAIA_STAGING_KEYRING=\'{"k1":"AAA="}\''],
   ['sem `=` é ignorado', 'ISTO_NAO_E_UM_PAR\nLOG_LEVEL=info'],
 ];
 

@@ -117,9 +117,7 @@ export async function tryAcquireOpsLock(
   };
 }
 
-export type SingleFlightResult<T> =
-  | { status: 'ran'; result: T }
-  | { status: 'already_running' };
+export type SingleFlightResult<T> = { status: 'ran'; result: T } | { status: 'already_running' };
 
 /**
  * Run `fn` under the named global lock, releasing in `finally` on BOTH the

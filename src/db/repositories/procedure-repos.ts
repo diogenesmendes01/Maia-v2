@@ -44,12 +44,14 @@ export const procedureDefinitionsRepo = {
     const rows = await db
       .select()
       .from(procedure_definitions)
-      .where(and(
-        eq(procedure_definitions.tenant_id, tenant_id),
-        eq(procedure_definitions.agent_id, agent_id),
-        eq(procedure_definitions.nome, nome),
-        eq(procedure_definitions.status, 'active'),
-      ))
+      .where(
+        and(
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+          eq(procedure_definitions.nome, nome),
+          eq(procedure_definitions.status, 'active'),
+        ),
+      )
       .orderBy(desc(procedure_definitions.version_number))
       .limit(1);
     return rows[0] ?? null;
@@ -65,11 +67,13 @@ export const procedureDefinitionsRepo = {
     const rows = await db
       .select()
       .from(procedure_definitions)
-      .where(and(
-        eq(procedure_definitions.id, id),
-        eq(procedure_definitions.tenant_id, tenant_id),
-        eq(procedure_definitions.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(procedure_definitions.id, id),
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -111,11 +115,13 @@ export const procedureDefinitionsRepo = {
     return db
       .select()
       .from(procedure_definitions)
-      .where(and(
-        eq(procedure_definitions.tenant_id, tenant_id),
-        eq(procedure_definitions.agent_id, agent_id),
-        eq(procedure_definitions.status, status),
-      ))
+      .where(
+        and(
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+          eq(procedure_definitions.status, status),
+        ),
+      )
       .orderBy(desc(procedure_definitions.created_at))
       .limit(limit);
   },
@@ -131,11 +137,13 @@ export const procedureDefinitionsRepo = {
     const rows = await db
       .update(procedure_definitions)
       .set({ ...updates, updated_at: new Date() })
-      .where(and(
-        eq(procedure_definitions.id, id),
-        eq(procedure_definitions.tenant_id, tenant_id),
-        eq(procedure_definitions.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(procedure_definitions.id, id),
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+        ),
+      )
       .returning({ id: procedure_definitions.id });
     return rows.length;
   },
@@ -146,11 +154,13 @@ export const procedureDefinitionsRepo = {
     return db
       .select()
       .from(procedure_definitions)
-      .where(and(
-        eq(procedure_definitions.tenant_id, tenant_id),
-        eq(procedure_definitions.agent_id, agent_id),
-        eq(procedure_definitions.nome, nome),
-      ))
+      .where(
+        and(
+          eq(procedure_definitions.tenant_id, tenant_id),
+          eq(procedure_definitions.agent_id, agent_id),
+          eq(procedure_definitions.nome, nome),
+        ),
+      )
       .orderBy(desc(procedure_definitions.version_number));
   },
 
@@ -182,11 +192,13 @@ export const procedureDefinitionsRepo = {
       const targetRows = await tx
         .select()
         .from(procedure_definitions)
-        .where(and(
-          eq(procedure_definitions.id, args.target_id),
-          eq(procedure_definitions.tenant_id, tenant_id),
-          eq(procedure_definitions.agent_id, agent_id),
-        ))
+        .where(
+          and(
+            eq(procedure_definitions.id, args.target_id),
+            eq(procedure_definitions.tenant_id, tenant_id),
+            eq(procedure_definitions.agent_id, agent_id),
+          ),
+        )
         .for('update');
       const target = targetRows[0];
       if (!target) {
@@ -209,13 +221,15 @@ export const procedureDefinitionsRepo = {
       const activeSiblings = await tx
         .select()
         .from(procedure_definitions)
-        .where(and(
-          eq(procedure_definitions.tenant_id, tenant_id),
-          eq(procedure_definitions.agent_id, agent_id),
-          eq(procedure_definitions.nome, target.nome),
-          eq(procedure_definitions.status, 'active'),
-          ne(procedure_definitions.id, target.id),
-        ))
+        .where(
+          and(
+            eq(procedure_definitions.tenant_id, tenant_id),
+            eq(procedure_definitions.agent_id, agent_id),
+            eq(procedure_definitions.nome, target.nome),
+            eq(procedure_definitions.status, 'active'),
+            ne(procedure_definitions.id, target.id),
+          ),
+        )
         .for('update');
 
       let deactivated: ProcedureDefinition | null = null;
@@ -304,11 +318,13 @@ export const procedureStatusEventsRepo = {
     return db
       .select()
       .from(procedure_status_events)
-      .where(and(
-        eq(procedure_status_events.tenant_id, tenant_id),
-        eq(procedure_status_events.agent_id, agent_id),
-        eq(procedure_status_events.definition_id, definition_id),
-      ))
+      .where(
+        and(
+          eq(procedure_status_events.tenant_id, tenant_id),
+          eq(procedure_status_events.agent_id, agent_id),
+          eq(procedure_status_events.definition_id, definition_id),
+        ),
+      )
       .orderBy(desc(procedure_status_events.occurred_at));
   },
 };
@@ -357,12 +373,14 @@ export const procedureAssignmentsRepo = {
     return db
       .select()
       .from(procedure_assignments)
-      .where(and(
-        eq(procedure_assignments.tenant_id, tenant_id),
-        eq(procedure_assignments.target_type, target_type),
-        eq(procedure_assignments.target_id, target_id),
-        eq(procedure_assignments.enabled, true),
-      ));
+      .where(
+        and(
+          eq(procedure_assignments.tenant_id, tenant_id),
+          eq(procedure_assignments.target_type, target_type),
+          eq(procedure_assignments.target_id, target_id),
+          eq(procedure_assignments.enabled, true),
+        ),
+      );
   },
 
   async disable(id: string): Promise<void> {
@@ -388,12 +406,7 @@ export const procedureAssignmentsRepo = {
     const updated = await db
       .update(procedure_assignments)
       .set({ enabled: false, deactivated_at: new Date() })
-      .where(
-        and(
-          eq(procedure_assignments.id, id),
-          eq(procedure_assignments.tenant_id, tenant_id),
-        ),
-      )
+      .where(and(eq(procedure_assignments.id, id), eq(procedure_assignments.tenant_id, tenant_id)))
       .returning({ id: procedure_assignments.id });
     if (updated.length !== 1) {
       throw new Error(
@@ -408,10 +421,16 @@ export const procedureAssignmentsRepo = {
 
 export const procedureExecutionsRepo = {
   async create(
-    input: Omit<ProcedureExecution, 'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'>,
+    input: Omit<
+      ProcedureExecution,
+      'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'
+    >,
   ): Promise<ProcedureExecution> {
     const guarded = applyTenantGuard(input);
-    const [row] = await db.insert(procedure_executions).values(guarded as any).returning();
+    const [row] = await db
+      .insert(procedure_executions)
+      .values(guarded as any)
+      .returning();
     return row!;
   },
 
@@ -421,12 +440,14 @@ export const procedureExecutionsRepo = {
     const rows = await db
       .select()
       .from(procedure_executions)
-      .where(and(
-        eq(procedure_executions.tenant_id, tenant_id),
-        eq(procedure_executions.agent_id, agent_id),
-        eq(procedure_executions.conversa_id, conversa_id),
-        eq(procedure_executions.status, 'in_progress'),
-      ))
+      .where(
+        and(
+          eq(procedure_executions.tenant_id, tenant_id),
+          eq(procedure_executions.agent_id, agent_id),
+          eq(procedure_executions.conversa_id, conversa_id),
+          eq(procedure_executions.status, 'in_progress'),
+        ),
+      )
       .orderBy(desc(procedure_executions.last_activity_at))
       .limit(1);
     return rows[0] ?? null;
@@ -442,11 +463,13 @@ export const procedureExecutionsRepo = {
     const rows = await db
       .select()
       .from(procedure_executions)
-      .where(and(
-        eq(procedure_executions.id, id),
-        eq(procedure_executions.tenant_id, tenant_id),
-        eq(procedure_executions.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(procedure_executions.id, id),
+          eq(procedure_executions.tenant_id, tenant_id),
+          eq(procedure_executions.agent_id, agent_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -458,7 +481,10 @@ export const procedureExecutionsRepo = {
   // rejected by the constraint; we swallow it and return null so the caller
   // re-loads the active row.
   async createOrFindActive(
-    input: Omit<ProcedureExecution, 'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'>,
+    input: Omit<
+      ProcedureExecution,
+      'id' | 'started_at' | 'last_activity_at' | 'tenant_id' | 'agent_id'
+    >,
   ): Promise<{ execution: ProcedureExecution; created: boolean }> {
     const guarded = applyTenantGuard(input);
     const rows = await db
@@ -488,11 +514,17 @@ export const procedureExecutionsRepo = {
     // is guaranteed non-null here because the partial index only applies
     // when conversa_id IS NOT NULL (and a null conversa_id can't conflict).
     if (guarded.conversa_id == null) {
-      throw new Error('procedureExecutionsRepo.createOrFindActive: insert returned no row and conversa_id is null');
+      throw new Error(
+        'procedureExecutionsRepo.createOrFindActive: insert returned no row and conversa_id is null',
+      );
     }
-    const existing = await procedureExecutionsRepo.findActiveForConversa(guarded.conversa_id as string);
+    const existing = await procedureExecutionsRepo.findActiveForConversa(
+      guarded.conversa_id as string,
+    );
     if (!existing) {
-      throw new Error('procedureExecutionsRepo.createOrFindActive: conflict but no active row found');
+      throw new Error(
+        'procedureExecutionsRepo.createOrFindActive: conflict but no active row found',
+      );
     }
     return { execution: existing, created: false };
   },
@@ -551,11 +583,13 @@ export const procedureExecutionsRepo = {
     const updated = await tx
       .update(procedure_executions)
       .set({ ...updates, last_activity_at: new Date() } as any)
-      .where(and(
-        eq(procedure_executions.id, id),
-        eq(procedure_executions.tenant_id, tenant_id),
-        eq(procedure_executions.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(procedure_executions.id, id),
+          eq(procedure_executions.tenant_id, tenant_id),
+          eq(procedure_executions.agent_id, agent_id),
+        ),
+      )
       .returning({ id: procedure_executions.id });
     if (updated.length !== 1) {
       throw new Error(
@@ -642,11 +676,13 @@ export const procedureExecutionEventsRepo = {
     return db
       .select()
       .from(procedure_execution_events)
-      .where(and(
-        eq(procedure_execution_events.execution_id, execution_id),
-        eq(procedure_execution_events.tenant_id, tenant_id),
-        eq(procedure_execution_events.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(procedure_execution_events.execution_id, execution_id),
+          eq(procedure_execution_events.tenant_id, tenant_id),
+          eq(procedure_execution_events.agent_id, agent_id),
+        ),
+      )
       .orderBy(procedure_execution_events.created_at);
   },
 };
@@ -664,10 +700,12 @@ export const procedureSelectorDecisionsRepo = {
     return db
       .select()
       .from(procedure_selector_decisions)
-      .where(and(
-        eq(procedure_selector_decisions.tenant_id, tenant_id),
-        eq(procedure_selector_decisions.conversa_id, conversa_id),
-      ))
+      .where(
+        and(
+          eq(procedure_selector_decisions.tenant_id, tenant_id),
+          eq(procedure_selector_decisions.conversa_id, conversa_id),
+        ),
+      )
       .orderBy(desc(procedure_selector_decisions.decided_at))
       .limit(limit);
   },
@@ -693,7 +731,10 @@ export const procedureTestsRepo = {
       expected_outcome: input.expected_outcome,
       expected_step_path: (input.expected_step_path ?? null) as object | null,
     });
-    const [row] = await db.insert(procedure_tests).values(guarded as any).returning();
+    const [row] = await db
+      .insert(procedure_tests)
+      .values(guarded as any)
+      .returning();
     return row!;
   },
 
@@ -703,11 +744,13 @@ export const procedureTestsRepo = {
     return db
       .select()
       .from(procedure_tests)
-      .where(and(
-        eq(procedure_tests.tenant_id, tenant_id),
-        eq(procedure_tests.agent_id, agent_id),
-        eq(procedure_tests.definition_id, definition_id),
-      ))
+      .where(
+        and(
+          eq(procedure_tests.tenant_id, tenant_id),
+          eq(procedure_tests.agent_id, agent_id),
+          eq(procedure_tests.definition_id, definition_id),
+        ),
+      )
       .orderBy(procedure_tests.created_at);
   },
 
@@ -767,11 +810,13 @@ export const procedureTestsRepo = {
     const rows = await db
       .select({ last_run_status: procedure_tests.last_run_status })
       .from(procedure_tests)
-      .where(and(
-        eq(procedure_tests.tenant_id, tenant_id),
-        eq(procedure_tests.agent_id, agent_id),
-        eq(procedure_tests.definition_id, definition_id),
-      ));
+      .where(
+        and(
+          eq(procedure_tests.tenant_id, tenant_id),
+          eq(procedure_tests.agent_id, agent_id),
+          eq(procedure_tests.definition_id, definition_id),
+        ),
+      );
     if (rows.length === 0) return false;
     return rows.every((r) => r.last_run_status === 'pass');
   },
@@ -819,11 +864,13 @@ export const procedureMetricsRepo = {
     const rows = await db
       .select()
       .from(procedure_metrics)
-      .where(and(
-        eq(procedure_metrics.tenant_id, tenant_id),
-        eq(procedure_metrics.agent_id, agent_id),
-        eq(procedure_metrics.definition_id, definition_id),
-      ))
+      .where(
+        and(
+          eq(procedure_metrics.tenant_id, tenant_id),
+          eq(procedure_metrics.agent_id, agent_id),
+          eq(procedure_metrics.definition_id, definition_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -834,9 +881,8 @@ export const procedureMetricsRepo = {
     return db
       .select()
       .from(procedure_metrics)
-      .where(and(
-        eq(procedure_metrics.tenant_id, tenant_id),
-        eq(procedure_metrics.agent_id, agent_id),
-      ));
+      .where(
+        and(eq(procedure_metrics.tenant_id, tenant_id), eq(procedure_metrics.agent_id, agent_id)),
+      );
   },
 };

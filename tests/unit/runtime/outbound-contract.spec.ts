@@ -212,9 +212,7 @@ describe('#630 — serialização canônica versionada', () => {
       media: { object_key: 'k', kind: 'storage_object', bucket: 'b' },
       type: 'document',
     } as const;
-    expect(computePayloadHash(a as OutboundPayload)).toBe(
-      computePayloadHash(b as OutboundPayload),
-    );
+    expect(computePayloadHash(a as OutboundPayload)).toBe(computePayloadHash(b as OutboundPayload));
   });
 
   it('a ordem das opções da enquete MUDA o hash — ali a ordem é semântica', () => {
@@ -291,9 +289,7 @@ describe('#630 — as duas identidades são estáveis, distintas e não vazam', 
   it('a chave do provedor tem o formato de message id do WhatsApp', () => {
     // `3EB0` + 18 hex maiúsculo: o mesmo formato que a plataforma já usa em
     // produção (deriveProviderDedupKey) e que o Baileys grava verbatim.
-    expect(deriveProviderIdempotencyKey(identidade(), 'whatsapp')).toMatch(
-      /^3EB0[0-9A-F]{18}$/,
-    );
+    expect(deriveProviderIdempotencyKey(identidade(), 'whatsapp')).toMatch(/^3EB0[0-9A-F]{18}$/);
   });
 
   it('a chave lógica é um digest prefixado e versionado', () => {
@@ -365,8 +361,14 @@ describe('#630 — SONDA 1: o enquadramento por comprimento impede colisão por 
 
   it('turn/sequence ambíguos também não colidem', () => {
     // ('...01', 12) vs ('...012', 1) — o mesmo problema, no outro par.
-    const a = deriveOutboundKeys(identidade({ turn_id: 'turno-1', sequence_in_turn: 12 }), 'whatsapp');
-    const b = deriveOutboundKeys(identidade({ turn_id: 'turno-12', sequence_in_turn: 1 }), 'whatsapp');
+    const a = deriveOutboundKeys(
+      identidade({ turn_id: 'turno-1', sequence_in_turn: 12 }),
+      'whatsapp',
+    );
+    const b = deriveOutboundKeys(
+      identidade({ turn_id: 'turno-12', sequence_in_turn: 1 }),
+      'whatsapp',
+    );
     expect(a.logical_dedupe_key).not.toBe(b.logical_dedupe_key);
   });
 });

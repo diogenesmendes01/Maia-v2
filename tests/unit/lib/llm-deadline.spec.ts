@@ -184,9 +184,7 @@ describe('deadline derivado — caller que não declara nada', () => {
       usage: { input_tokens: 1, output_tokens: 1 },
     });
 
-    await withScope(() =>
-      executeLLM({ ...REQ, ctx: { deadline_at: Date.now() + 3_600_000 } }),
-    );
+    await withScope(() => executeLLM({ ...REQ, ctx: { deadline_at: Date.now() + 3_600_000 } }));
 
     const opts = anthropicCreateMock.mock.calls[0]?.[1];
     expect(opts.timeout).toBeLessThanOrEqual(400);

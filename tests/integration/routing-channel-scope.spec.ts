@@ -17,7 +17,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 const T = 'routing-scope-tenant';
@@ -30,7 +31,10 @@ let chA1: string; // canal do agente A, linha 1
 let chA2: string; // canal do agente A, linha 2
 let chB1: string; // canal do tenant B (estrangeiro)
 
-async function q<R extends pg.QueryResultRow>(text: string, params?: unknown[]): Promise<pg.QueryResult<R>> {
+async function q<R extends pg.QueryResultRow>(
+  text: string,
+  params?: unknown[],
+): Promise<pg.QueryResult<R>> {
   const c = await pool.connect();
   try {
     return await c.query<R>(text, params);
@@ -336,9 +340,7 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
 
       // Dados pós-rollout: o MESMO wid em dois canais (dedup por canal) — o
       // cenário que abortava o down antigo na recriação da unique global.
-      await c.query(
-        `INSERT INTO tenants (id, nome) VALUES ('rb-tenant', 'rb-tenant')`,
-      );
+      await c.query(`INSERT INTO tenants (id, nome) VALUES ('rb-tenant', 'rb-tenant')`);
       await c.query(
         `INSERT INTO agents (id, tenant_id, nome) VALUES ('rb-agent', 'rb-tenant', 'rb-agent')`,
       );
@@ -368,10 +370,7 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
         [rbCh],
       );
 
-      const down091 = await readFile(
-        new URL('091_line_ownership_down.sql', migrationsDir),
-        'utf8',
-      );
+      const down091 = await readFile(new URL('091_line_ownership_down.sql', migrationsDir), 'utf8');
       const down090 = await readFile(
         new URL('090_channel_scoped_egress_down.sql', migrationsDir),
         'utf8',
@@ -418,9 +417,7 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
       await c.end().catch(() => undefined);
       const cleanup = new pg.Client({ connectionString: adminUrl });
       await cleanup.connect();
-      await cleanup
-        .query(`DROP DATABASE IF EXISTS ${RB_DB} WITH (FORCE)`)
-        .catch(() => undefined);
+      await cleanup.query(`DROP DATABASE IF EXISTS ${RB_DB} WITH (FORCE)`).catch(() => undefined);
       await cleanup.end();
     }
   }, 120_000);

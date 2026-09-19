@@ -27,10 +27,7 @@ import {
 } from '@/config/compose-env.js';
 import { parseEnvFile } from '@/config/env-file.js';
 import { entriesForService } from '@/config/contract.js';
-import {
-  MIN_NEXTAUTH_SECRET_LEN,
-  MIN_OIDC_CLIENT_SECRET_LEN,
-} from '@/config/admin-boot-gates.js';
+import { MIN_NEXTAUTH_SECRET_LEN, MIN_OIDC_CLIENT_SECRET_LEN } from '@/config/admin-boot-gates.js';
 import type { ConfigProblem } from '@/config/metadata.js';
 
 const REPO_ROOT = resolve(__dirname, '../../..');
@@ -180,7 +177,9 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
     // O slug vai direto para `appUsersRepo.getByEmail(tenant, email)` em
     // src/admin-ui/lib/auth-resolver.ts — ele É o tenant_id (AGENTS.md §4).
     const s = servico(preflightSobreOsExemplos({ OIDC_TENANT_SLUGS: 'default' }), 'admin-ui');
-    expect(errosDeContrato(s).map((e) => e.rule)).toContain('admin-ui/tenant-slugs-default-literal');
+    expect(errosDeContrato(s).map((e) => e.rule)).toContain(
+      'admin-ui/tenant-slugs-default-literal',
+    );
   });
 
   it('um .env.infra sem MAIA_ENV falha ANTES da validação, nos cinco serviços', () => {
@@ -468,7 +467,8 @@ describe('config preflight — os .prod.example não escondem nenhuma chave (iss
       composeLabel: 'compose.prod.yml',
       infraText: INFRA_TEXT,
       readEnvFile: (name) => {
-        if (name === '.env.app') throw new Error(`env_file declarado no compose não existe: ${name}`);
+        if (name === '.env.app')
+          throw new Error(`env_file declarado no compose não existe: ${name}`);
         return readExampleFor(name);
       },
       shellEnv: { MAIA_ENV: 'staging' },

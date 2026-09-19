@@ -22,9 +22,7 @@ export function mcpToolName(serverName: string, tool: string): string {
   return `${MCP_PREFIX}${serverName}:${tool}`;
 }
 
-export function parseMcpToolName(
-  name: string,
-): { serverName: string; tool: string } | null {
+export function parseMcpToolName(name: string): { serverName: string; tool: string } | null {
   if (!isMcpToolName(name)) return null;
   const rest = name.slice(MCP_PREFIX.length);
   const sep = rest.indexOf(':');

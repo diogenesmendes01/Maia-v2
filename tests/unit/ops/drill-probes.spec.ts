@@ -45,9 +45,7 @@ describe('restore drill probes — the suite goes beyond `transacoes`', () => {
     expect(result.passed).toBe(true);
     expect(result.failed_required).toEqual([]);
     expect(result.warned).toEqual([]);
-    expect(Object.keys(result.probes).sort()).toEqual(
-      RESTORE_DRILL_PROBES.map((p) => p.id).sort(),
-    );
+    expect(Object.keys(result.probes).sort()).toEqual(RESTORE_DRILL_PROBES.map((p) => p.id).sort());
   });
 
   it('covers more than the baseline probe: financial rows are ONE of several required probes', () => {
@@ -158,9 +156,12 @@ describe('restore drill probes — the suite goes beyond `transacoes`', () => {
   });
 
   it('does not grade the migration head when the manifest makes no claim', () => {
-    const result = gradeProbeSuite(healthyRows({ migration_head_matches: { head: 'x.sql', applied: 1 } }), {
-      manifest_migration_head: null,
-    });
+    const result = gradeProbeSuite(
+      healthyRows({ migration_head_matches: { head: 'x.sql', applied: 1 } }),
+      {
+        manifest_migration_head: null,
+      },
+    );
     expect(result.warned).not.toContain('migration_head_matches');
   });
 

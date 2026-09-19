@@ -198,9 +198,7 @@ d('#541 finding 2 — the scope block names every entity, past 500', () => {
     // comes back with `state: null` — the same shape an entity that genuinely
     // has no state row has, which is exactly what the renderer already handles.
     const { entidadesRepo } = await import('@/db/repositories.js');
-    const rows = await runWithTenantContext(T, () =>
-      entidadesRepo.byIdsWithState(entityIds, 5),
-    );
+    const rows = await runWithTenantContext(T, () => entidadesRepo.byIdsWithState(entityIds, 5));
 
     expect(rows).toHaveLength(ENTITY_COUNT);
     expect(rows.filter((r) => r.state !== null)).toHaveLength(5);

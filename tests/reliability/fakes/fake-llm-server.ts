@@ -49,9 +49,17 @@ export const respostaRoteirizadaSchema = z.discriminatedUnion('kind', [
   /** JSON estruturalmente inválido para o schema do SUT — exercita o fail-closed. */
   z.object({ kind: z.literal('invalid'), delayMs: z.number().int().min(0).default(0) }),
   /** Erro retryable (5xx). */
-  z.object({ kind: z.literal('error'), status: z.number().int().min(500).max(599).default(503), delayMs: z.number().int().min(0).default(0) }),
+  z.object({
+    kind: z.literal('error'),
+    status: z.number().int().min(500).max(599).default(503),
+    delayMs: z.number().int().min(0).default(0),
+  }),
   /** Erro terminal (4xx que não adianta repetir). */
-  z.object({ kind: z.literal('terminal'), status: z.number().int().min(400).max(499).default(400), delayMs: z.number().int().min(0).default(0) }),
+  z.object({
+    kind: z.literal('terminal'),
+    status: z.number().int().min(400).max(499).default(400),
+    delayMs: z.number().int().min(0).default(0),
+  }),
   /** 429 com `retry-after`. */
   z.object({ kind: z.literal('rate_limit'), retryAfterS: z.number().int().min(0).default(1) }),
   /** Stream que entrega N pedaços e PARA no meio, sem fechar direito. */
@@ -106,7 +114,13 @@ export class FakeLlmServer {
   private readonly chamadas: ChamadaDeLlm[] = [];
   private readonly pendurados = new Set<ServerResponse>();
   /** Padrão quando o roteiro esvazia — evita que o SUT trave por falta de script. */
-  private padrao: RespostaResolvida = { kind: 'ok', texto: 'ok', inputTokens: 10, outputTokens: 5, delayMs: 0 };
+  private padrao: RespostaResolvida = {
+    kind: 'ok',
+    texto: 'ok',
+    inputTokens: 10,
+    outputTokens: 5,
+    delayMs: 0,
+  };
 
   private agora(): number {
     return Math.round((performance.now() - this.t0) * 1000) / 1000;
@@ -214,7 +228,11 @@ export class FakeLlmServer {
       }
     });
 
-    const finalizar = (status: number, corpo: unknown, headers: Record<string, string> = {}): void => {
+    const finalizar = (
+      status: number,
+      corpo: unknown,
+      headers: Record<string, string> = {},
+    ): void => {
       if (res.writableEnded || res.destroyed) return;
       const texto = typeof corpo === 'string' ? corpo : JSON.stringify(corpo);
       res.writeHead(status, { 'content-type': 'application/json', ...headers });
@@ -237,7 +255,10 @@ export class FakeLlmServer {
         depois(roteirizada.delayMs, () =>
           finalizar(200, {
             content: [{ type: 'text', text: roteirizada.texto }],
-            usage: { input_tokens: roteirizada.inputTokens, output_tokens: roteirizada.outputTokens },
+            usage: {
+              input_tokens: roteirizada.inputTokens,
+              output_tokens: roteirizada.outputTokens,
+            },
             stop_reason: 'end_turn',
           }),
         );
@@ -248,13 +269,21 @@ export class FakeLlmServer {
         depois(roteirizada.delayMs, () => finalizar(200, { nao_e_isso: true }));
         return;
       case 'error':
-        depois(roteirizada.delayMs, () => finalizar(roteirizada.status, { error: { type: 'overloaded_error' } }));
+        depois(roteirizada.delayMs, () =>
+          finalizar(roteirizada.status, { error: { type: 'overloaded_error' } }),
+        );
         return;
       case 'terminal':
-        depois(roteirizada.delayMs, () => finalizar(roteirizada.status, { error: { type: 'invalid_request_error' } }));
+        depois(roteirizada.delayMs, () =>
+          finalizar(roteirizada.status, { error: { type: 'invalid_request_error' } }),
+        );
         return;
       case 'rate_limit':
-        finalizar(429, { error: { type: 'rate_limit_error' } }, { 'retry-after': String(roteirizada.retryAfterS) });
+        finalizar(
+          429,
+          { error: { type: 'rate_limit_error' } },
+          { 'retry-after': String(roteirizada.retryAfterS) },
+        );
         return;
       case 'stream_parcial': {
         res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });

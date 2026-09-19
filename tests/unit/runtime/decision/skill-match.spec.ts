@@ -1,8 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  SKILL_MATCH_THRESHOLD,
-  scoreSkillMatch,
-} from '@/runtime/decision/skill-match.ts';
+import { SKILL_MATCH_THRESHOLD, scoreSkillMatch } from '@/runtime/decision/skill-match.ts';
 import type { Skill } from '@/runtime/decision/types.js';
 
 const mkSkill = (overrides: Partial<Skill> & { id: string }): Skill => ({
@@ -42,9 +39,7 @@ describe('F1 Phase 0 — scoreSkillMatch', () => {
       when_to_use: 'Use to transfer money between two accounts.',
     });
     // intent tokens {transfer, money} both present → ratio 1.0
-    expect(
-      scoreSkillMatch(skill, { label: 'transfer_money', confidence: 0.8 }),
-    ).toBe(1);
+    expect(scoreSkillMatch(skill, { label: 'transfer_money', confidence: 0.8 })).toBe(1);
   });
 
   it('damps a single-token partial overlap (anti-hijack) well below threshold', () => {
@@ -104,9 +99,7 @@ describe('F1 Phase 0 — scoreSkillMatch', () => {
       applicable_to_intent: ['weather_lookup'],
       when_to_use: 'Use to fetch the weather forecast.',
     });
-    expect(
-      scoreSkillMatch(skill, { label: 'transfer_money', confidence: 0.9 }),
-    ).toBe(0);
+    expect(scoreSkillMatch(skill, { label: 'transfer_money', confidence: 0.9 })).toBe(0);
   });
 
   // ---------------------------------------------------------------------------
@@ -216,8 +209,6 @@ describe('F1 Phase 0 — scoreSkillMatch', () => {
       id: 's_greet',
       when_to_use: 'Use para uma saudação calorosa ao cliente.',
     });
-    expect(
-      scoreSkillMatch(skill, { label: 'saudacao', confidence: 0.9 }),
-    ).toBe(1);
+    expect(scoreSkillMatch(skill, { label: 'saudacao', confidence: 0.9 })).toBe(1);
   });
 });

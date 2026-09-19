@@ -28,7 +28,8 @@ const PROFILES: CSVProfile[] = [
   },
   {
     name: 'itau',
-    detect: (h) => h.some((c) => /^data$/i.test(c.trim())) && h.some((c) => /hist[óo]rico/i.test(c)),
+    detect: (h) =>
+      h.some((c) => /^data$/i.test(c.trim())) && h.some((c) => /hist[óo]rico/i.test(c)),
     extract: (row, header) => {
       const idx = (re: RegExp) => header.findIndex((c) => re.test(c));
       const data = row[idx(/^data$/i)] ?? '';

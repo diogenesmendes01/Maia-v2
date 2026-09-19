@@ -25,8 +25,8 @@ const EXPECTED_VALUES = [
   'escopo',
   'linguagem',
   'procedimento',
-  'soul_drift',    // P8b — must be preserved for merge-safety
-  'papel_drift',   // P8d — this branch's addition
+  'soul_drift', // P8b — must be preserved for merge-safety
+  'papel_drift', // P8d — this branch's addition
 ];
 
 describe('migration 042 — drift_type CHECK enum superset', () => {

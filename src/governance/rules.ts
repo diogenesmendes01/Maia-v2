@@ -56,7 +56,11 @@ export function constitutionalCheck(input: {
 
   // C-005: strategic decisions
   const meta = intent.args.metadata as Record<string, unknown> | undefined;
-  if (intent.tool === 'register_transaction' && meta && meta['tipo'] === 'investimento_estrategico') {
+  if (
+    intent.tool === 'register_transaction' &&
+    meta &&
+    meta['tipo'] === 'investimento_estrategico'
+  ) {
     return { kind: 'forbidden', rule_id: 'C-005', reason: 'decisão estratégica exige humano' };
   }
 
@@ -66,7 +70,11 @@ export function constitutionalCheck(input: {
   if (intent.tool === 'start_recurring_payment') {
     const valor = intent.args.valor;
     if (typeof valor === 'number' && valor > config.VALOR_LIMITE_DURO) {
-      return { kind: 'forbidden', rule_id: 'C-006', reason: 'pagamento agendado acima do limite duro' };
+      return {
+        kind: 'forbidden',
+        rule_id: 'C-006',
+        reason: 'pagamento agendado acima do limite duro',
+      };
     }
   }
 
@@ -87,7 +95,11 @@ export function constitutionalCheck(input: {
   if (intent.tool === '__occurrence_claim__' && intent.args.tipo === 'recurring_payment') {
     const valor = (intent.args.contexto_snapshot as Record<string, unknown> | undefined)?.['valor'];
     if (typeof valor === 'number' && valor > config.VALOR_LIMITE_DURO) {
-      return { kind: 'forbidden', rule_id: 'C-008', reason: 'ocorrência acima do limite duro atual' };
+      return {
+        kind: 'forbidden',
+        rule_id: 'C-008',
+        reason: 'ocorrência acima do limite duro atual',
+      };
     }
   }
 

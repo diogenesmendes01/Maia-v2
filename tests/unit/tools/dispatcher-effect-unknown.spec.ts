@@ -114,10 +114,9 @@ vi.mock('@/governance/idempotency.js', () => ({
   computePayloadHash: vi.fn(() => 'hash-1'),
 }));
 vi.mock('@/governance/permissions.js', async () => {
-  const actual =
-    await vi.importActual<typeof import('@/governance/permissions.js')>(
-      '@/governance/permissions.js',
-    );
+  const actual = await vi.importActual<typeof import('@/governance/permissions.js')>(
+    '@/governance/permissions.js',
+  );
   return { ...actual, canAct: vi.fn(() => ({ allowed: true })) };
 });
 vi.mock('@/governance/rules.js', () => ({ constitutionalCheck: vi.fn(() => null) }));
@@ -391,14 +390,17 @@ describe('#507 — SHUTDOWN e TAKEOVER produzem o mesmo veredito honesto', () =>
     ['takeover', 'turn.lease_lost:token_mismatch'],
     ['shutdown gracioso', 'turn.lease_lost:released'],
     ['heartbeat morto', 'turn.lease_lost:heartbeat_failed'],
-  ])('%s durante o handler → effect_unknown para tool com efeito possível', async (_nome, reason) => {
-    const controller = new AbortController();
-    recorder.duranteOHandler = () => controller.abort(new Error(reason));
+  ])(
+    '%s durante o handler → effect_unknown para tool com efeito possível',
+    async (_nome, reason) => {
+      const controller = new AbortController();
+      recorder.duranteOHandler = () => controller.abort(new Error(reason));
 
-    const result = await runWithTurnExecution(turnContext(controller, daquiA(60_000)), () =>
-      dispatchTool({ tool: 'writer_tool', args: {}, ctx }),
-    );
+      const result = await runWithTurnExecution(turnContext(controller, daquiA(60_000)), () =>
+        dispatchTool({ tool: 'writer_tool', args: {}, ctx }),
+      );
 
-    expect(result).toMatchObject({ error: 'effect_unknown', details: { retryable: false } });
-  });
+      expect(result).toMatchObject({ error: 'effect_unknown', details: { retryable: false } });
+    },
+  );
 });

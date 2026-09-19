@@ -18,10 +18,7 @@
  * the old code took straight to `return` without ever validating context.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 
 type Call = { op: string; key: string; args: unknown[] };
 const calls: Call[] = [];
@@ -69,9 +66,7 @@ vi.mock('@/lib/redis.js', () => ({
   recordRedisOomDegraded: () => {},
 }));
 
-const { pushMessage, readRecent } = await import(
-  '@/memory/working.js'
-);
+const { pushMessage, readRecent } = await import('@/memory/working.js');
 
 const TENANT_A = '11111111-1111-1111-1111-111111111111';
 const AGENT_A = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
@@ -88,9 +83,7 @@ describe('issue #231 / #241 MAJOR #1 — fail-closed when Redis is down', () => 
       // Regression: previously `pushMessage` returned early on
       // `!isRedisConnected()` before ever calling `getCurrentTenant()`,
       // so a missing-context caller silently no-op'd during a Redis outage.
-      await expect(pushMessage(CONV, 'user', 'no ctx')).rejects.toThrow(
-        MissingTenantContextError,
-      );
+      await expect(pushMessage(CONV, 'user', 'no ctx')).rejects.toThrow(MissingTenantContextError);
       // No Redis ops should have been attempted either way (the atomic
       // data-write EVAL must not fire, #333).
       expect(redisStub.eval).not.toHaveBeenCalled();
@@ -99,14 +92,9 @@ describe('issue #231 / #241 MAJOR #1 — fail-closed when Redis is down', () => 
     it('returns silently when context IS present (Redis-down no-op preserved)', async () => {
       // The Redis-down branch is a legitimate degraded-mode early return
       // when context IS valid — we just shouldn't write anything.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await expect(
-            pushMessage(CONV, 'user', 'with ctx'),
-          ).resolves.toBeUndefined();
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await expect(pushMessage(CONV, 'user', 'with ctx')).resolves.toBeUndefined();
+      });
       expect(redisStub.eval).not.toHaveBeenCalled();
     });
   });

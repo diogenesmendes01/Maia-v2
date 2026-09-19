@@ -364,13 +364,10 @@ d('#507 — perda de lease durante o reasoner: a chamada aborta e a auditoria n�
     expect(llm.abortadas, 'com a lease viva nada é abortado').toEqual([]);
 
     const rows = await reasonerRows(inbound.id);
-    expect(rows.map((r) => r.status), 'cinco iterações, cinco rows de sucesso').toEqual([
-      'success',
-      'success',
-      'success',
-      'success',
-      'success',
-    ]);
+    expect(
+      rows.map((r) => r.status),
+      'cinco iterações, cinco rows de sucesso',
+    ).toEqual(['success', 'success', 'success', 'success', 'success']);
     expect(result, 'e o laço termina normalmente, devolvendo o resultado ao core').not.toBeNull();
     expect((result as { delivery: { exitReason: string } }).delivery.exitReason).toBe(
       'iteration_cap',
@@ -378,9 +375,8 @@ d('#507 — perda de lease durante o reasoner: a chamada aborta e a auditoria n�
   }, 60_000);
 
   it('BARREIRA (dependência cooperativa): a chamada em voo ABORTA e a row diz cancelled', async () => {
-    const { runWithTurnExecution, TurnOwnershipLostError } = await import(
-      '@/runtime/turns/execution-context.js'
-    );
+    const { runWithTurnExecution, TurnOwnershipLostError } =
+      await import('@/runtime/turns/execution-context.js');
     const inbound = await mkInbound();
     resetRoteiro();
 
@@ -406,9 +402,7 @@ d('#507 — perda de lease durante o reasoner: a chamada aborta e a auditoria n�
       llm.abortadas,
       'a chamada em voo tem de receber o abort e parar — não apenas perder o race',
     ).toEqual([PERDA_NA_CHAMADA]);
-    expect(llm.calls, 'e nenhuma iteração nova pode começar depois disso').toBe(
-      PERDA_NA_CHAMADA,
-    );
+    expect(llm.calls, 'e nenhuma iteração nova pode começar depois disso').toBe(PERDA_NA_CHAMADA);
 
     // 2. A AUDITORIA NÃO MENTE. Duas rows legítimas (a lease estava viva) e uma
     //    terceira que diz `cancelled` — nem `success` (a mentira original) nem
@@ -433,9 +427,8 @@ d('#507 — perda de lease durante o reasoner: a chamada aborta e a auditoria n�
   }, 60_000);
 
   it('BARREIRA (dependência NÃO cooperativa): o LLM responde depois da perda e a row AINDA diz cancelled', async () => {
-    const { runWithTurnExecution, TurnOwnershipLostError } = await import(
-      '@/runtime/turns/execution-context.js'
-    );
+    const { runWithTurnExecution, TurnOwnershipLostError } =
+      await import('@/runtime/turns/execution-context.js');
     const inbound = await mkInbound();
     resetRoteiro();
     // O caso literal do achado do dono: "depois que o LLM retorna,

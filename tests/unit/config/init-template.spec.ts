@@ -42,28 +42,27 @@ describe('config init — o template não é uma fixture (#515 / PR #522 [P1])',
   it.each(MAIA_PROFILES)('o template de %s não contém NENHUM valor de fixture', (profile) => {
     const template = parseEnvFile(renderEnvTemplate(profile));
     const leaked = Object.entries(template).filter(([k, v]) => isSyntheticFixtureValue(k, v));
-    expect(
-      leaked,
-      'o template operacional nunca pode carregar um valor sintético de CI',
-    ).toEqual([]);
+    expect(leaked, 'o template operacional nunca pode carregar um valor sintético de CI').toEqual(
+      [],
+    );
   });
 
-  it.each(MAIA_PROFILES)(
-    'o template de %s difere da fixture do mesmo profile',
+  it.each(MAIA_PROFILES)('o template de %s difere da fixture do mesmo profile', (profile) => {
+    expect(renderEnvTemplate(profile)).not.toBe(renderFixture(profile));
+  });
+
+  it.each(STRICT)(
+    'o template de %s FALHA na validação estrita antes de ser preenchido',
     (profile) => {
-      expect(renderEnvTemplate(profile)).not.toBe(renderFixture(profile));
+      const env = parseEnvFile(renderEnvTemplate(profile));
+      const result = validateConfig({ env, profile });
+      expect(result.ok, 'um template não preenchido não pode passar por configuração válida').toBe(
+        false,
+      );
+      // E falha exatamente por causa dos marcadores — não por acidente.
+      expect(result.errors.some((p) => p.rule === 'secret/placeholder')).toBe(true);
     },
   );
-
-  it.each(STRICT)('o template de %s FALHA na validação estrita antes de ser preenchido', (profile) => {
-    const env = parseEnvFile(renderEnvTemplate(profile));
-    const result = validateConfig({ env, profile });
-    expect(result.ok, 'um template não preenchido não pode passar por configuração válida').toBe(
-      false,
-    );
-    // E falha exatamente por causa dos marcadores — não por acidente.
-    expect(result.errors.some((p) => p.rule === 'secret/placeholder')).toBe(true);
-  });
 
   it.each(STRICT)(
     'o template de %s PASSA depois de preenchido — ou seja, está completo',
@@ -250,7 +249,13 @@ describe('secret/synthetic-fixture — rede de segurança (#515 / PR #522 [P1])'
     // POSTGRES_USER=maia e TZ=America/Sao_Paulo SÃO os valores das fixtures, e
     // também exatamente o que um deployment real configura.
     const fixture = buildFixture('production');
-    for (const name of ['POSTGRES_USER', 'POSTGRES_DB', 'TZ', 'EMBEDDING_MODEL', 'ALERT_CHANNELS']) {
+    for (const name of [
+      'POSTGRES_USER',
+      'POSTGRES_DB',
+      'TZ',
+      'EMBEDDING_MODEL',
+      'ALERT_CHANNELS',
+    ]) {
       expect(isSyntheticFixtureValue(name, fixture[name]!), name).toBe(false);
     }
   });

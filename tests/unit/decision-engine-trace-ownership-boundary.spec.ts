@@ -59,9 +59,8 @@ const {
   _resetDecisionEngineSingleton,
   _overrideDecisionEngineSingleton,
 } = await import('@/runtime/decision/integration.js');
-const { runWithTurnExecution, TurnOwnershipLostError } = await import(
-  '@/runtime/turns/execution-context.js'
-);
+const { runWithTurnExecution, TurnOwnershipLostError } =
+  await import('@/runtime/turns/execution-context.js');
 const { MandatoryTraceEnvelopeError } = await import('@/observability/turn-trace.js');
 
 import type { BaseContextPacket, DecisionPacket } from '@/runtime/context-packet/types.js';

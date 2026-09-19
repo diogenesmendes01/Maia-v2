@@ -5,10 +5,10 @@
  * cross-scope `pessoa_id` expose another agent's person row; filtering only the
  * joined person still lets a caller probe a foreign conversation by known id.
  */
-import { beforeEach, describe, expect, it, vi } from "vitest";
-import { PgDialect } from "drizzle-orm/pg-core";
-import type { SQL } from "drizzle-orm";
-import { runWithTenantContext } from "../../src/db/tenant-context.js";
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { PgDialect } from 'drizzle-orm/pg-core';
+import type { SQL } from 'drizzle-orm';
+import { runWithTenantContext } from '../../src/db/tenant-context.js';
 
 const captured = vi.hoisted(() => ({
   joins: [] as SQL[],
@@ -31,7 +31,7 @@ function makeChain(): Record<string, unknown> {
   return chain;
 }
 
-vi.mock("../../src/db/client.js", () => ({
+vi.mock('../../src/db/client.js', () => ({
   db: { select: () => makeChain() },
   withTx: vi.fn(),
   pgErrorCode: () => undefined,
@@ -47,14 +47,12 @@ beforeEach(() => {
   captured.wheres.length = 0;
 });
 
-describe("conversasRepo.byIdWithPessoa — complete ALS scope", () => {
-  it("binds tenant + agent on both the conversation WHERE and the person JOIN", async () => {
-    const { conversasRepo } =
-      await import("../../src/db/repositories/conversation-repos.js");
+describe('conversasRepo.byIdWithPessoa — complete ALS scope', () => {
+  it('binds tenant + agent on both the conversation WHERE and the person JOIN', async () => {
+    const { conversasRepo } = await import('../../src/db/repositories/conversation-repos.js');
 
-    await runWithTenantContext(
-      { tenant_id: "tenant-a", agent_id: "agent-a" },
-      () => conversasRepo.byIdWithPessoa("conversation-known-id"),
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, () =>
+      conversasRepo.byIdWithPessoa('conversation-known-id'),
     );
 
     expect(captured.wheres).toHaveLength(1);
@@ -65,7 +63,7 @@ describe("conversasRepo.byIdWithPessoa — complete ALS scope", () => {
     expect(where.sql).toMatch(/conversas.*tenant_id/i);
     expect(where.sql).toMatch(/conversas.*agent_id/i);
     expect(where.params).toEqual(
-      expect.arrayContaining(["conversation-known-id", "tenant-a", "agent-a"]),
+      expect.arrayContaining(['conversation-known-id', 'tenant-a', 'agent-a']),
     );
 
     const join = compile(captured.joins[0]!);
@@ -73,8 +71,6 @@ describe("conversasRepo.byIdWithPessoa — complete ALS scope", () => {
     expect(join.sql).toMatch(/conversas.*pessoa_id/i);
     expect(join.sql).toMatch(/pessoas.*tenant_id/i);
     expect(join.sql).toMatch(/pessoas.*agent_id/i);
-    expect(join.params).toEqual(
-      expect.arrayContaining(["tenant-a", "agent-a"]),
-    );
+    expect(join.params).toEqual(expect.arrayContaining(['tenant-a', 'agent-a']));
   });
 });

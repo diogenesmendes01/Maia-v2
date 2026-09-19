@@ -211,16 +211,14 @@ export async function transitionProcedureStatus(args: {
     }
 
     // Inline tx.insert for the audit event — same tx, same rollback boundary.
-    await tx
-      .insert(procedure_status_events)
-      .values({
-        tenant_id,
-        agent_id,
-        definition_id: args.definition.id,
-        from_status: owned.status, // persisted, not caller-supplied
-        to_status: args.to,
-        actor: args.actor,
-      });
+    await tx.insert(procedure_status_events).values({
+      tenant_id,
+      agent_id,
+      definition_id: args.definition.id,
+      from_status: owned.status, // persisted, not caller-supplied
+      to_status: args.to,
+      actor: args.actor,
+    });
 
     return {
       ok: true as const,

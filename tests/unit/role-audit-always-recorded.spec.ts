@@ -17,19 +17,14 @@ import {
 } from '@/types/enums.js';
 import type { Role, ChannelPolicy } from '@/db/schema.js';
 
-const {
-  detSuggestMock,
-  llmSuggestMock,
-  decidePolicyMock,
-  recordMock,
-  countSwitchesMock,
-} = vi.hoisted(() => ({
-  detSuggestMock: vi.fn(),
-  llmSuggestMock: vi.fn(),
-  decidePolicyMock: vi.fn(),
-  recordMock: vi.fn(),
-  countSwitchesMock: vi.fn(),
-}));
+const { detSuggestMock, llmSuggestMock, decidePolicyMock, recordMock, countSwitchesMock } =
+  vi.hoisted(() => ({
+    detSuggestMock: vi.fn(),
+    llmSuggestMock: vi.fn(),
+    decidePolicyMock: vi.fn(),
+    recordMock: vi.fn(),
+    countSwitchesMock: vi.fn(),
+  }));
 
 vi.mock('@/cognition/role-selector/deterministic-classifier.js', () => ({
   deterministicSuggester: { suggest: detSuggestMock },

@@ -209,10 +209,10 @@ d('#636 — guardrail: nenhum caminho registra tool automaticamente', () => {
         'DELETE FROM agent_capabilities_domain WHERE tenant_id = $1 AND agent_id = $2',
         [T, AG],
       );
-      await c.query(
-        'DELETE FROM agent_capabilities_skill WHERE tenant_id = $1 AND agent_id = $2',
-        [T, AG],
-      );
+      await c.query('DELETE FROM agent_capabilities_skill WHERE tenant_id = $1 AND agent_id = $2', [
+        T,
+        AG,
+      ]);
     } finally {
       c.release();
     }
@@ -452,8 +452,14 @@ describe('#636 — nenhum arquivo do CAMINHO contém verbo de instalação', () 
     // forma que a sonda do revisor usou, e um padrão ancorado em
     // `REGISTRY\s*\[` não a vê. O `;` fecha o alcance no fim do statement.
     { padrao: /\bREGISTRY\b[^\n;]*\[[^\]\n]*\]\s*=[^=]/, porque: 'escrita no registro de tools' },
-    { padrao: /\bREGISTRY\b[^\n;]*\.[A-Za-z_$][\w$]*\s*=[^=]/, porque: 'escrita no registro de tools' },
-    { padrao: /\bObject\.(assign|defineProperty)\s*\(\s*\(?\s*REGISTRY\b/, porque: 'escrita no registro de tools' },
+    {
+      padrao: /\bREGISTRY\b[^\n;]*\.[A-Za-z_$][\w$]*\s*=[^=]/,
+      porque: 'escrita no registro de tools',
+    },
+    {
+      padrao: /\bObject\.(assign|defineProperty)\s*\(\s*\(?\s*REGISTRY\b/,
+      porque: 'escrita no registro de tools',
+    },
     { padrao: /agentToolGrantsRepo/, porque: 'concessão de tool ao agente' },
     { padrao: /capabilitiesSkillRepo|capabilitiesDomainRepo/, porque: 'criação de capability' },
     { padrao: /\beval\s*\(/, porque: 'execução de código proposto' },
@@ -508,9 +514,10 @@ describe('#636 — nenhum arquivo do CAMINHO contém verbo de instalação', () 
     ];
     for (const forma of formas) {
       const achados = PROIBIDOS.filter((p) => p.padrao.test(semComentarios(forma)));
-      expect(achados.map((a) => a.porque), `nao pegou: ${forma}`).toContain(
-        'escrita no registro de tools',
-      );
+      expect(
+        achados.map((a) => a.porque),
+        `nao pegou: ${forma}`,
+      ).toContain('escrita no registro de tools');
     }
     // E não pode acusar LEITURA: `proposer.ts` lê o registro de propósito.
     for (const leitura of ['return Object.keys(REGISTRY);', 'const t = REGISTRY[nome];']) {
@@ -519,9 +526,9 @@ describe('#636 — nenhum arquivo do CAMINHO contém verbo de instalação', () 
         `falso positivo em: ${leitura}`,
       ).toBe(false);
     }
-    expect(PROIBIDOS.some((p) => p.padrao.test(semComentarios('await agentToolGrantsRepo.x()')))).toBe(
-      true,
-    );
+    expect(
+      PROIBIDOS.some((p) => p.padrao.test(semComentarios('await agentToolGrantsRepo.x()'))),
+    ).toBe(true);
   });
 
   it('o removedor de comentários não engole código (senão a varredura seria cega)', () => {

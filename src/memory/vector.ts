@@ -89,7 +89,12 @@ export async function recall(input: {
   const tiposFilter =
     input.tipos && input.tipos.length > 0 ? sql`AND tipo = ANY(${new Param(input.tipos)})` : sql``;
   try {
-    const result = await db.execute<{ conteudo: string; tipo: string; escopo: string; score: string }>(sql`
+    const result = await db.execute<{
+      conteudo: string;
+      tipo: string;
+      escopo: string;
+      score: string;
+    }>(sql`
       SELECT conteudo, tipo, escopo, 1 - (embedding <=> ${vec}::vector) AS score
       FROM agent_memories
       WHERE tenant_id = ${tenant_id}

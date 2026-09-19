@@ -188,10 +188,7 @@ export function recordCircuitAudit(
   metadata: Record<string, unknown>,
 ): void {
   const p = writeCircuitAudit(acao, metadata).catch((err: unknown) => {
-    logger.error(
-      { err: (err as Error)?.message, acao },
-      'llm_gateway.circuit_audit_failed',
-    );
+    logger.error({ err: (err as Error)?.message, acao }, 'llm_gateway.circuit_audit_failed');
   });
   // O drain de shutdown (#512) aguarda o que estiver registrado aqui.
   void lifecycle.trackBackgroundTask('llm_circuit_audit', p);

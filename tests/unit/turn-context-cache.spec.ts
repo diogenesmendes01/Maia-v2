@@ -46,7 +46,9 @@ import {
 import { runWithTenantContext } from '../../src/db/tenant-context.js';
 import { renderPrometheus, _resetForTests as _resetMetrics } from '../../src/lib/metrics.js';
 
-function mkCache(over: Partial<{ ttl_ms: number; negative_ttl_ms: number; max_entries: number }> = {}) {
+function mkCache(
+  over: Partial<{ ttl_ms: number; negative_ttl_ms: number; max_entries: number }> = {},
+) {
   return new TurnContextCache({
     ttl_ms: over.ttl_ms ?? 300_000,
     negative_ttl_ms: over.negative_ttl_ms ?? 30_000,
@@ -177,9 +179,9 @@ describe('#511 turn-context cache — read path', () => {
     const load = vi.fn(async () => {
       throw new Error('db down');
     });
-    await expect(
-      runWithTenantContext(A, () => cache.getOrLoad('identity', load)),
-    ).rejects.toThrow('db down');
+    await expect(runWithTenantContext(A, () => cache.getOrLoad('identity', load))).rejects.toThrow(
+      'db down',
+    );
 
     const ok = vi.fn(async () => 'recovered');
     const after = await runWithTenantContext(A, () => cache.getOrLoad('identity', ok));
@@ -348,9 +350,7 @@ describe('#511 turn-context cache — subscription gating', () => {
 
   it('refuses to subscribe when the subscriber was never started', async () => {
     _resetTurnContextSubscriberForTests();
-    await expect(_subscribeTenantForTests('acme')).rejects.toThrow(
-      /subscriber_not_started/,
-    );
+    await expect(_subscribeTenantForTests('acme')).rejects.toThrow(/subscriber_not_started/);
   });
 
   it('only resolves after the client connected AND the channel was subscribed', async () => {
@@ -419,9 +419,9 @@ describe('#511 turn-context cache — cross-replica bus', () => {
       replica,
     );
 
-    expect(await runWithTenantContext(A, () => replica.getOrLoad('identity', async () => 'v2'))).toBe(
-      'v2',
-    );
+    expect(
+      await runWithTenantContext(A, () => replica.getOrLoad('identity', async () => 'v2')),
+    ).toBe('v2');
   });
 
   it('drops a payload whose tenant does not match the channel', async () => {
@@ -440,9 +440,9 @@ describe('#511 turn-context cache — cross-replica bus', () => {
       replica,
     );
 
-    expect(await runWithTenantContext(A, () => replica.getOrLoad('identity', async () => 'v2'))).toBe(
-      'v1',
-    );
+    expect(
+      await runWithTenantContext(A, () => replica.getOrLoad('identity', async () => 'v2')),
+    ).toBe('v1');
   });
 
   it('ignores malformed payloads and unknown resources', async () => {
@@ -457,8 +457,8 @@ describe('#511 turn-context cache — cross-replica bus', () => {
       replica,
     );
 
-    expect(await runWithTenantContext(A, () => replica.getOrLoad('identity', async () => 'v2'))).toBe(
-      'v1',
-    );
+    expect(
+      await runWithTenantContext(A, () => replica.getOrLoad('identity', async () => 'v2')),
+    ).toBe('v1');
   });
 });

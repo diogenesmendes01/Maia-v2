@@ -225,12 +225,7 @@ async function seedTurn(comConversa = true): Promise<string> {
       `INSERT INTO mensagens(tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata)
        VALUES ($1, $2, $3, 'in', 'texto', 'me da um resumo do mes', $4::jsonb)
        RETURNING id`,
-      [
-        TENANT,
-        AGENT,
-        comConversa ? conversaId : null,
-        JSON.stringify({ telefone }),
-      ],
+      [TENANT, AGENT, comConversa ? conversaId : null, JSON.stringify({ telefone })],
     );
     mensagemIds.push(m.rows[0]!.id);
     return m.rows[0]!.id;
@@ -263,10 +258,7 @@ async function cleanup(): Promise<void> {
            OR mensagem_id IN (SELECT id FROM mensagens WHERE conversa_id IN ${doPessoa})`,
       [pessoaId, mensagemIds],
     );
-    await c.query(
-      `DELETE FROM outbound_messages WHERE conversa_id IN ${doPessoa}`,
-      [pessoaId],
-    );
+    await c.query(`DELETE FROM outbound_messages WHERE conversa_id IN ${doPessoa}`, [pessoaId]);
     await c.query(`DELETE FROM agent_turns WHERE conversa_id IN ${doPessoa}`, [pessoaId]);
     await c.query(
       `DELETE FROM mensagens WHERE id = ANY($2::uuid[]) OR conversa_id IN ${doPessoa}`,
@@ -474,7 +466,6 @@ d('issue #535 — um turno real abre a árvore de spans declarada', () => {
     const preturn = spansNamed(SPAN.PRETURN_GRAPH)[0]!;
     expect(spansNamed(SPAN.PROCEDURE_SELECT)[0]!.parent_span_id).toBe(preturn.span_id);
     expect(spansNamed(SPAN.ROLE_SELECT)[0]!.parent_span_id).toBe(preturn.span_id);
-
   });
 
   it('a chamada ao modelo acontece DENTRO de react.iteration', async () => {

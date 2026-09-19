@@ -55,8 +55,7 @@ vi.mock('@/control-plane/policy/policy-rules-repo.js', () => ({
   POLICY_LIFECYCLE_CHANNEL: 'policy_rule_lifecycle',
   POLICY_LIFECYCLE_CHANNEL_PREFIX: 'policy_rule_lifecycle',
   POLICY_LIFECYCLE_CHANNEL_PATTERN: 'policy_rule_lifecycle:*',
-  buildPolicyLifecycleChannel: (tenant_id: string) =>
-    `policy_rule_lifecycle:${tenant_id}`,
+  buildPolicyLifecycleChannel: (tenant_id: string) => `policy_rule_lifecycle:${tenant_id}`,
   parsePolicyLifecycleChannel: (channel: string) =>
     channel.startsWith('policy_rule_lifecycle:')
       ? channel.slice('policy_rule_lifecycle:'.length) || null
@@ -146,9 +145,7 @@ vi.mock('@/db/client.js', () => {
 vi.mock('@/db/tenant-context.js', () => ({
   getCurrentTenant: vi.fn().mockReturnValue('tn_test'),
   getCurrentAgent: vi.fn().mockReturnValue('agent_test'),
-  runWithTenantContext: vi.fn(
-    async <T>(_ctx: unknown, fn: () => Promise<T>): Promise<T> => fn(),
-  ),
+  runWithTenantContext: vi.fn(async <T>(_ctx: unknown, fn: () => Promise<T>): Promise<T> => fn()),
 }));
 
 // Mock: LLM client
@@ -209,9 +206,11 @@ describe('Decision Engine — real adapter wiring (mocked DB)', () => {
 
     // Default: resolver returns empty policies (allow-all by default).
     // The P8e resolver returns {resolved, unresolved, failures} not a plain array.
-    vi.mocked(mockResolver.resolveDescriptors).mockResolvedValue(
-      { resolved: [], unresolved: [], failures: [] } as unknown as PolicyDescriptorResolverOutput,
-    );
+    vi.mocked(mockResolver.resolveDescriptors).mockResolvedValue({
+      resolved: [],
+      unresolved: [],
+      failures: [],
+    } as unknown as PolicyDescriptorResolverOutput);
 
     // Default: policy repo returns no rule body.
     vi.mocked(mockPolicyRepo.getById).mockResolvedValue(null);
@@ -249,13 +248,11 @@ describe('Decision Engine — real adapter wiring (mocked DB)', () => {
       version: 1,
       rule_kind: 'hard_limit',
     };
-    vi.mocked(mockResolver.resolveDescriptors).mockResolvedValue(
-      {
-        resolved: [resolvedPolicy],
-        unresolved: [],
-        failures: [],
-      } as unknown as PolicyDescriptorResolverOutput,
-    );
+    vi.mocked(mockResolver.resolveDescriptors).mockResolvedValue({
+      resolved: [resolvedPolicy],
+      unresolved: [],
+      failures: [],
+    } as unknown as PolicyDescriptorResolverOutput);
 
     // Policy repo returns the rule body for that policy_id.
     vi.mocked(mockPolicyRepo.getById).mockImplementation(async (id) => {
@@ -333,9 +330,11 @@ describe('Decision Engine — real adapter wiring (mocked DB)', () => {
   // -------------------------------------------------------------------------
   it('T2: active skill in registry → tool_reductions reflect real skill state', async () => {
     // Resolver returns an empty list (no blocking policies).
-    vi.mocked(mockResolver.resolveDescriptors).mockResolvedValue(
-      { resolved: [], unresolved: [], failures: [] } as unknown as PolicyDescriptorResolverOutput,
-    );
+    vi.mocked(mockResolver.resolveDescriptors).mockResolvedValue({
+      resolved: [],
+      unresolved: [],
+      failures: [],
+    } as unknown as PolicyDescriptorResolverOutput);
 
     // P9a skills repo: list one skill with an allowed_tool.
     const mockSkillRow = {
@@ -370,7 +369,16 @@ describe('Decision Engine — real adapter wiring (mocked DB)', () => {
       updated_at: new Date(),
     };
     vi.mocked(mockSkillsRepo.listByCategory).mockImplementation(async (cat) => {
-      if (cat === 'tool_mediated') return [mockSkillRow as Parameters<typeof mockSkillsRepo.listByCategory>[0] extends Promise<infer T> ? T extends Array<infer U> ? U : never : never];
+      if (cat === 'tool_mediated')
+        return [
+          mockSkillRow as Parameters<typeof mockSkillsRepo.listByCategory>[0] extends Promise<
+            infer T
+          >
+            ? T extends Array<infer U>
+              ? U
+              : never
+            : never,
+        ];
       return [];
     });
 
@@ -387,9 +395,14 @@ describe('Decision Engine — real adapter wiring (mocked DB)', () => {
     expect(packet).toBeDefined();
     // We can't assert exact tool_reductions without triggering a Mid PEP reduce_tool_set
     // verdict. What we CAN assert is that the skill registry was consulted.
-    expect(['respond', 'call_tool', 'ask_clarification', 'escalate', 'continue_workflow', 'decide', 'plan']).toContain(
-      packet.action_mode,
-    );
+    expect([
+      'respond',
+      'call_tool',
+      'ask_clarification',
+      'escalate',
+      'continue_workflow',
+      'decide',
+      'plan',
+    ]).toContain(packet.action_mode);
   });
-
 });

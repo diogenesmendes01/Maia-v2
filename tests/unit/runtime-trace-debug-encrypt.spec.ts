@@ -119,8 +119,6 @@ describe('uploadDebugSnapshot — S3 path (bucket configured)', () => {
     s3SendMock.mockReset();
     s3SendMock.mockRejectedValueOnce(new Error('S3 503 ServiceUnavailable'));
     const cipher = encryptForDebug({ x: 1 })!;
-    await expect(uploadDebugSnapshot('trace-fail', cipher)).rejects.toThrow(
-      /ServiceUnavailable/,
-    );
+    await expect(uploadDebugSnapshot('trace-fail', cipher)).rejects.toThrow(/ServiceUnavailable/);
   });
 });

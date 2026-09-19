@@ -52,10 +52,7 @@ async function cleanupPaceKey(paceKey: string): Promise<void> {
       recordRedisOomDegraded('backpressure.cleanup');
     } else {
       recordRedisError('backpressure.cleanup');
-      logger.warn(
-        { err: (err as Error).message },
-        'backpressure.cleanup_pace_failed',
-      );
+      logger.warn({ err: (err as Error).message }, 'backpressure.cleanup_pace_failed');
     }
   }
 }

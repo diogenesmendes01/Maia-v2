@@ -50,9 +50,7 @@ export interface BuildBaseContextInput {
  * Builds a BaseContextPacket from turn state already available in
  * runAgentForMensagemInner. No async I/O.
  */
-export function buildBaseContextPacketFromTurn(
-  input: BuildBaseContextInput,
-): BaseContextPacket {
+export function buildBaseContextPacketFromTurn(input: BuildBaseContextInput): BaseContextPacket {
   const {
     inbound,
     conversa,
@@ -107,11 +105,16 @@ export function buildBaseContextPacketFromTurn(
         : {}),
     },
     input: {
-      kind: inbound.tipo === 'texto' ? 'text'
-        : inbound.tipo === 'audio' ? 'audio'
-        : inbound.tipo === 'imagem' ? 'image'
-        : inbound.tipo === 'documento' ? 'pdf'
-        : 'text',
+      kind:
+        inbound.tipo === 'texto'
+          ? 'text'
+          : inbound.tipo === 'audio'
+            ? 'audio'
+            : inbound.tipo === 'imagem'
+              ? 'image'
+              : inbound.tipo === 'documento'
+                ? 'pdf'
+                : 'text',
       content_ref: inbound.id,
       content_hmac: '', // HMAC computed by BaseContextBuilder; stub ok for hot path
       received_at: receivedAt,
@@ -141,7 +144,11 @@ export function buildBaseContextPacketFromTurn(
  */
 export function applyToolReductions<T extends { name: string }>(
   toolSet: T[],
-  tool_permissions: { allowed_tools: string[]; blocked_tools: string[]; requires_confirmation: string[] },
+  tool_permissions: {
+    allowed_tools: string[];
+    blocked_tools: string[];
+    requires_confirmation: string[];
+  },
 ): T[] {
   if (!tool_permissions.blocked_tools.length) return toolSet;
   const blocked = new Set(tool_permissions.blocked_tools);

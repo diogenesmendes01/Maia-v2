@@ -49,8 +49,7 @@ export default function ProposalDetailPage({
         onRetry={() => void proposalQuery.refetch()}
       />
     );
-  if (!proposalQuery.data)
-    return <EmptyState title="Proposta não encontrada" />;
+  if (!proposalQuery.data) return <EmptyState title="Proposta não encontrada" />;
 
   const proposal = proposalQuery.data;
   /**
@@ -161,8 +160,7 @@ export default function ProposalDetailPage({
             </ul>
             {userRole !== 'founder' && (
               <p className="mt-2 font-medium">
-                Botões de aprovar/rejeitar desabilitados. Escale para um usuário com papel
-                founder.
+                Botões de aprovar/rejeitar desabilitados. Escale para um usuário com papel founder.
               </p>
             )}
           </Alert>
@@ -215,9 +213,7 @@ export default function ProposalDetailPage({
                 ))}
               </ul>
             ) : (
-              <p className="text-sm text-zinc-500">
-                Nenhuma decisão anterior nesta proposta.
-              </p>
+              <p className="text-sm text-zinc-500">Nenhuma decisão anterior nesta proposta.</p>
             )}
           </CardBody>
         </Card>

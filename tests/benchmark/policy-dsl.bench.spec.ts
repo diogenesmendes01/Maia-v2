@@ -19,9 +19,7 @@ import { describe, it, expect } from 'vitest';
 import { Bench } from 'tinybench';
 import { evaluate } from '@/governance/policy-dsl/evaluator.js';
 import { resetRegexCache } from '@/governance/policy-dsl/regex-cache.js';
-import {
-  TARGET_P99_MICROS,
-} from '@/governance/policy-dsl/constants.js';
+import { TARGET_P99_MICROS } from '@/governance/policy-dsl/constants.js';
 import type { PolicyRuleBody } from '@/governance/policy-dsl/types.js';
 
 const simpleBody: PolicyRuleBody = {
@@ -70,7 +68,10 @@ function makeDeepBody(depth: number): PolicyRuleBody {
     value: '^[A-Z][a-z]+$',
   };
   for (let i = 0; i < depth; i += 1) {
-    pred = { kind: 'and', predicates: [pred, { kind: 'leaf', field: `f${i}`, op: 'eq', value: i }] };
+    pred = {
+      kind: 'and',
+      predicates: [pred, { kind: 'leaf', field: `f${i}`, op: 'eq', value: i }],
+    };
   }
   return { predicate: pred, effect: { action: 'block' } };
 }

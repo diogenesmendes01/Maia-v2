@@ -23,7 +23,8 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 import { DriftType } from '@/types/enums.js';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 const T = 'issue196-tenant';
@@ -200,9 +201,7 @@ d('decideAndApply cross-invocation freeze race (real DB, PR #196 regression)', (
       const v1 = rows.rows[0]!;
       expect(v1.status).toBe('rolled_back');
       expect(v1.rolled_back_at).not.toBeNull();
-      expect(v1.rollback_reason).toBe(
-        'cross-invocation critical: offensive content',
-      );
+      expect(v1.rollback_reason).toBe('cross-invocation critical: offensive content');
     } finally {
       c3.release();
     }
@@ -288,9 +287,7 @@ d('decideAndApply cross-invocation freeze race (real DB, PR #196 regression)', (
     expect(out).toHaveLength(1);
     const r = out[0]!;
     expect(r.applied).toBe(false);
-    expect(r.applied_error).toBe(
-      'stale:expected=active,actual=frozen;active_replaced',
-    );
+    expect(r.applied_error).toBe('stale:expected=active,actual=frozen;active_replaced');
 
     // Final state: v1 stays frozen, v2 stays active.
     const c3 = await pool.connect();

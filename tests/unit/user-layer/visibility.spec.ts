@@ -1,8 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  VISIBLE_LIFECYCLE_STATES,
-  isVisible,
-} from '@/user-layer/internal/visibility.js';
+import { VISIBLE_LIFECYCLE_STATES, isVisible } from '@/user-layer/internal/visibility.js';
 import type { KnowledgeLifecycleStatus } from '@/user-layer/types.js';
 
 describe('user-layer visibility predicates', () => {

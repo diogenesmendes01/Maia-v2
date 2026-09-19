@@ -31,10 +31,7 @@ vi.mock('@/lib/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import {
-  DecisionEngine,
-  type DecisionEngineDeps,
-} from '@/runtime/decision/decision-engine.ts';
+import { DecisionEngine, type DecisionEngineDeps } from '@/runtime/decision/decision-engine.ts';
 import { SkillSelectorImpl } from '@/runtime/decision/skill-selector.ts';
 import type {
   ActionDecider,
@@ -171,9 +168,7 @@ describe('Issue #415/#416 — DecisionEngine threads active_role_key to the Skil
     const engine = new DecisionEngine(deps);
     const r = await engine.run({ base: mkBase({ active_role_key: ROLE }) });
     expect(r.packet.routing.selected_skill_id).toBe('cancel_proposal_billing');
-    expect(r.packet.routing.candidate_skill_ids).toContain(
-      'cancel_proposal_billing',
-    );
+    expect(r.packet.routing.candidate_skill_ids).toContain('cancel_proposal_billing');
   });
 
   it('(b) does NOT select a role-bound skill when base.active_role_key is a different role', async () => {
@@ -183,9 +178,7 @@ describe('Issue #415/#416 — DecisionEngine threads active_role_key to the Skil
       base: mkBase({ active_role_key: 'sales_attendant' }),
     });
     expect(r.packet.routing.selected_skill_id).toBeUndefined();
-    expect(r.packet.routing.candidate_skill_ids).not.toContain(
-      'cancel_proposal_billing',
-    );
+    expect(r.packet.routing.candidate_skill_ids).not.toContain('cancel_proposal_billing');
   });
 
   it('(b) does NOT select a role-bound skill when no role is active (fail-closed)', async () => {
@@ -193,9 +186,7 @@ describe('Issue #415/#416 — DecisionEngine threads active_role_key to the Skil
     const engine = new DecisionEngine(deps);
     const r = await engine.run({ base: mkBase() }); // no active_role_key
     expect(r.packet.routing.selected_skill_id).toBeUndefined();
-    expect(r.packet.routing.candidate_skill_ids).not.toContain(
-      'cancel_proposal_billing',
-    );
+    expect(r.packet.routing.candidate_skill_ids).not.toContain('cancel_proposal_billing');
   });
 
   it('passes base.active_role_key through to skillOptions.active_role_key (exact wiring)', async () => {

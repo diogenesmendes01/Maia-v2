@@ -48,7 +48,10 @@ function getBool(spec: Record<string, unknown> | null | undefined, key: string):
   return v === true || v === 'true' || v === 1 || v === '1';
 }
 
-function hasAny(spec: Record<string, unknown> | null | undefined, keys: readonly string[]): boolean {
+function hasAny(
+  spec: Record<string, unknown> | null | undefined,
+  keys: readonly string[],
+): boolean {
   return keys.some((k) => getBool(spec, k));
 }
 

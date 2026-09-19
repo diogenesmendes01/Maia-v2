@@ -62,9 +62,10 @@ test.describe('Trilha de auditoria', () => {
 
     for (const id of PROPOSTAS_DO_LOTE) {
       const trilha = await auditoriaDaProposta(id);
-      expect(trilha.map((l) => l.action), `trilha da proposta ${id}`).toEqual([
-        'proposal_reject',
-      ]);
+      expect(
+        trilha.map((l) => l.action),
+        `trilha da proposta ${id}`,
+      ).toEqual(['proposal_reject']);
       expect(await statusDaProposta(id), `status da proposta ${id}`).toBe('rejected');
     }
   });

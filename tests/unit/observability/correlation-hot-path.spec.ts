@@ -6,10 +6,7 @@
 import { describe, it, expect } from 'vitest';
 import { withCorrelation } from '../../../src/gateway/job-correlation.js';
 import { buildBaseContextPacketFromTurn } from '../../../src/runtime/decision/build-base-context.js';
-import {
-  deriveTraceId,
-  runWithCorrelation,
-} from '../../../src/observability/correlation.js';
+import { deriveTraceId, runWithCorrelation } from '../../../src/observability/correlation.js';
 import type { Mensagem, Conversa, Pessoa } from '../../../src/db/schema.js';
 
 const MSG_ID = '3f1a9d2e-4c5b-4a7e-9f0d-1b2c3d4e5f60';
@@ -89,11 +86,13 @@ describe('buildBaseContextPacketFromTurn — one trace id per turn', () => {
 
   it('does not leak the trace id across concurrent turns', async () => {
     const [a, b] = await Promise.all([
-      runWithCorrelation({ trace_id: 'root-A' }, async () =>
-        buildBaseContextPacketFromTurn(turnFixture()).trace_id,
+      runWithCorrelation(
+        { trace_id: 'root-A' },
+        async () => buildBaseContextPacketFromTurn(turnFixture()).trace_id,
       ),
-      runWithCorrelation({ trace_id: 'root-B' }, async () =>
-        buildBaseContextPacketFromTurn(turnFixture()).trace_id,
+      runWithCorrelation(
+        { trace_id: 'root-B' },
+        async () => buildBaseContextPacketFromTurn(turnFixture()).trace_id,
       ),
     ]);
     expect(a).toBe('root-A');

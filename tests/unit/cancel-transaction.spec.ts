@@ -166,10 +166,7 @@ describe('cancel_transaction tool', () => {
     auditTxMock.mockRejectedValueOnce(new Error('audit insert failed'));
     const { cancelTransactionTool } = await import('../../src/tools/cancel-transaction.js');
     await expect(
-      cancelTransactionTool.handler(
-        { entidade_id: 'e1', transacao_id: 'tx-doomed' } as never,
-        ctx,
-      ),
+      cancelTransactionTool.handler({ entidade_id: 'e1', transacao_id: 'tx-doomed' } as never, ctx),
     ).rejects.toThrow(/audit insert failed/);
     // Both the cancel UPDATE and the audit write were issued on the SAME tx
     // handle — so the audit failure aborts the transaction the UPDATE is bound to.

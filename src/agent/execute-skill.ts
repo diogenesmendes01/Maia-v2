@@ -27,10 +27,7 @@
  * without the agent's DB + network stack.
  */
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
-import type {
-  SkillExecutionInput,
-  SkillExecutionOutput,
-} from '@/skills/types.js';
+import type { SkillExecutionInput, SkillExecutionOutput } from '@/skills/types.js';
 import { config } from '@/config/env.js';
 import type { OutboundMessageRow } from '@/db/repositories.js';
 import type { DispatchOutputCtx, DispatchOutcome } from './output-dispatch.js';
@@ -89,10 +86,7 @@ export type FindOutboundLedgerForTurn = (args: {
 
 export interface ExecuteSelectedSkillDeps {
   /** Re-resolve the currently-active skill (by descriptor, under routed agent). */
-  resolveActiveSkill: (
-    descriptor: string,
-    agent_id: string,
-  ) => Promise<ActiveSkillIdentity | null>;
+  resolveActiveSkill: (descriptor: string, agent_id: string) => Promise<ActiveSkillIdentity | null>;
   /** Execute the skill (the stable P9a SkillRunner). */
   runSkill: (input: SkillExecutionInput) => Promise<SkillExecutionOutput>;
   /**
@@ -269,9 +263,7 @@ export async function executeSelectedSkill(
     }
     if (
       prior &&
-      (prior.status === 'sent' ||
-        prior.status === 'unknown' ||
-        prior.status === 'pending')
+      (prior.status === 'sent' || prior.status === 'unknown' || prior.status === 'pending')
     ) {
       // BLOCK the skill run. A prior `sent` proves delivery; `unknown` and
       // `pending` prove only that re-execution is unsafe. Core must preserve a
@@ -302,10 +294,7 @@ export async function executeSelectedSkill(
   // Contract 1b: re-resolve the active skill by descriptor under the routed
   // agent and assert id + version still match. This closes the activate/
   // rollback race (Codex HIGH-1) — never execute a divergent row.
-  const active = await deps.resolveActiveSkill(
-    pinned.selected_skill_descriptor,
-    routedAgentId,
-  );
+  const active = await deps.resolveActiveSkill(pinned.selected_skill_descriptor, routedAgentId);
   if (!active) {
     deps.logger.warn(
       {
@@ -318,10 +307,7 @@ export async function executeSelectedSkill(
     );
     return { handled: false, reason: 'skill_not_resolved' };
   }
-  if (
-    active.id !== pinned.selected_skill_id ||
-    active.version !== pinned.selected_skill_version
-  ) {
+  if (active.id !== pinned.selected_skill_id || active.version !== pinned.selected_skill_version) {
     deps.logger.warn(
       {
         conversa_id: conversa.id,

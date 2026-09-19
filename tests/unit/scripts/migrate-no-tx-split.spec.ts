@@ -22,11 +22,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import {
-  NO_TX_MARKER,
-  splitNoTxStatements,
-  isDirectInvocation,
-} from '../../../scripts/migrate.js';
+import { NO_TX_MARKER, splitNoTxStatements, isDirectInvocation } from '../../../scripts/migrate.js';
 import { buildMigrationArtifact } from '@/migrations/discover.js';
 
 const MIG_DIR = join(process.cwd(), 'migrations');
@@ -112,7 +108,10 @@ describe('PR #310 — no-tx migration statement splitter', () => {
 
     // So the file never reaches the splitter: `buildMigrationArtifact` refuses
     // it at discovery, naming the marker, the `$meu_bloco$` and the way out.
-    const artifact = buildMigrationArtifact([{ filename: '001_a.sql', contents: sql }], ['001_a_down.sql']);
+    const artifact = buildMigrationArtifact(
+      [{ filename: '001_a.sql', contents: sql }],
+      ['001_a_down.sql'],
+    );
     expect(artifact.problems.map((p) => p.kind)).toEqual(['no_transaction_unsplittable']);
     expect(artifact.problems[0]!.detail).toContain('$meu_bloco$');
 
@@ -121,7 +120,8 @@ describe('PR #310 — no-tx migration statement splitter', () => {
     const control = sql.split('\n').slice(1).join('\n');
     expect(NO_TX_MARKER.test(control)).toBe(false);
     expect(
-      buildMigrationArtifact([{ filename: '001_a.sql', contents: control }], ['001_a_down.sql']).problems,
+      buildMigrationArtifact([{ filename: '001_a.sql', contents: control }], ['001_a_down.sql'])
+        .problems,
     ).toEqual([]);
   });
 
@@ -130,8 +130,6 @@ describe('PR #310 — no-tx migration statement splitter', () => {
     // open a pg.Pool and the suite would hang/fail. Reaching here means the
     // isDirectInvocation guard held. We also assert the guard logic directly.
     expect(isDirectInvocation(undefined, 'file:///whatever.js')).toBe(false);
-    expect(
-      isDirectInvocation('/some/other/script.ts', 'file:///different.js'),
-    ).toBe(false);
+    expect(isDirectInvocation('/some/other/script.ts', 'file:///different.js')).toBe(false);
   });
 });

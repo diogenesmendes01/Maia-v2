@@ -25,24 +25,39 @@ describe('Calendar v2 — cache tenant isolation (acceptance gate Cenário 5)', 
     _internal_cache.set(cacheKey('tenant-B', 'default', undefined, 2026, 'standard'), setB);
 
     // Hit no tenant correto
-    expect(_internal_cache.get(cacheKey('tenant-A', 'default', undefined, 2026, 'standard'))).toBe(setA);
-    expect(_internal_cache.get(cacheKey('tenant-B', 'default', undefined, 2026, 'standard'))).toBe(setB);
+    expect(_internal_cache.get(cacheKey('tenant-A', 'default', undefined, 2026, 'standard'))).toBe(
+      setA,
+    );
+    expect(_internal_cache.get(cacheKey('tenant-B', 'default', undefined, 2026, 'standard'))).toBe(
+      setB,
+    );
 
     // Invalidation no tenant A NÃO toca tenant B
     invalidateCacheForHolidayChange(
       { tenant_id: 'tenant-A', type: 'entity_custom' },
       { changeKind: 'create' },
     );
-    expect(_internal_cache.get(cacheKey('tenant-A', 'default', undefined, 2026, 'standard'))).toBeUndefined();
-    expect(_internal_cache.get(cacheKey('tenant-B', 'default', undefined, 2026, 'standard'))).toBe(setB);
+    expect(
+      _internal_cache.get(cacheKey('tenant-A', 'default', undefined, 2026, 'standard')),
+    ).toBeUndefined();
+    expect(_internal_cache.get(cacheKey('tenant-B', 'default', undefined, 2026, 'standard'))).toBe(
+      setB,
+    );
   });
 
   it('cache key inclui entidade_id (entidades diferentes não compartilham)', () => {
     const eA = 'entidade-A';
     const eB = 'entidade-B';
-    _internal_cache.set(cacheKey('tenant-A', 'default', eA, 2026, 'standard'), new Set(['2026-12-25']));
-    expect(_internal_cache.get(cacheKey('tenant-A', 'default', eA, 2026, 'standard'))).toBeDefined();
-    expect(_internal_cache.get(cacheKey('tenant-A', 'default', eB, 2026, 'standard'))).toBeUndefined();
+    _internal_cache.set(
+      cacheKey('tenant-A', 'default', eA, 2026, 'standard'),
+      new Set(['2026-12-25']),
+    );
+    expect(
+      _internal_cache.get(cacheKey('tenant-A', 'default', eA, 2026, 'standard')),
+    ).toBeDefined();
+    expect(
+      _internal_cache.get(cacheKey('tenant-A', 'default', eB, 2026, 'standard')),
+    ).toBeUndefined();
   });
 });
 

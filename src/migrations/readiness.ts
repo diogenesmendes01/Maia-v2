@@ -98,9 +98,7 @@ export async function getMigrationStatus(
  * Never throws. Never writes. Returns `state: 'unknown'` (and `ready: false`)
  * when the answer could not be established.
  */
-export async function getSchemaReadiness(
-  deps: SchemaInspectionDeps,
-): Promise<SchemaReadiness> {
+export async function getSchemaReadiness(deps: SchemaInspectionDeps): Promise<SchemaReadiness> {
   const now = deps.now;
   let manifest = deps.manifest;
   try {

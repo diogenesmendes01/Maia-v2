@@ -27,12 +27,9 @@ type RoleRow = {
 const rolesState: Record<string, RoleRow> = {};
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
-  const { getCurrentTenant, getCurrentAgent } = await import(
-    '@/db/tenant-context.js'
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
 
   return {
     ...actual,
@@ -72,8 +69,7 @@ vi.mock('@/db/repositories.js', async () => {
         const agent_id = getCurrentAgent();
         const row = rolesState[id];
         if (!row) return null;
-        if (row.tenant_id !== tenant_id || row.agent_id !== agent_id)
-          return null;
+        if (row.tenant_id !== tenant_id || row.agent_id !== agent_id) return null;
         return row;
       }),
       getByKey: vi.fn(async (role_key: string) => {
@@ -81,10 +77,7 @@ vi.mock('@/db/repositories.js', async () => {
         const agent_id = getCurrentAgent();
         return (
           Object.values(rolesState).find(
-            (r) =>
-              r.tenant_id === tenant_id &&
-              r.agent_id === agent_id &&
-              r.role_key === role_key,
+            (r) => r.tenant_id === tenant_id && r.agent_id === agent_id && r.role_key === role_key,
           ) ?? null
         );
       }),
@@ -93,10 +86,7 @@ vi.mock('@/db/repositories.js', async () => {
         const agent_id = getCurrentAgent();
         return (
           Object.values(rolesState).find(
-            (r) =>
-              r.tenant_id === tenant_id &&
-              r.agent_id === agent_id &&
-              r.is_default === true,
+            (r) => r.tenant_id === tenant_id && r.agent_id === agent_id && r.is_default === true,
           ) ?? null
         );
       }),
@@ -104,10 +94,7 @@ vi.mock('@/db/repositories.js', async () => {
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
         return Object.values(rolesState).filter(
-          (r) =>
-            r.tenant_id === tenant_id &&
-            r.agent_id === agent_id &&
-            r.active === true,
+          (r) => r.tenant_id === tenant_id && r.agent_id === agent_id && r.active === true,
         );
       }),
       deactivate: vi.fn(async (id: string) => {
@@ -128,104 +115,89 @@ describe('rolesRepo', () => {
   });
 
   it('create insere via applyTenantGuard e seta active=true por default', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { rolesRepo } = await import('@/db/repositories.js');
-        const row = await rolesRepo.create({
-          role_key: 'comercial',
-          display_name: 'Comercial',
-          description: 'Modo de atendimento comercial',
-          prompt_addendum: 'Você é um atendente comercial.',
-        });
-        expect(row.id).toBeDefined();
-        expect(row.tenant_id).toBe('default');
-        expect(row.agent_id).toBe('default');
-        expect(row.role_key).toBe('comercial');
-        expect(row.display_name).toBe('Comercial');
-        expect(row.active).toBe(true);
-        expect(row.is_default).toBe(false);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { rolesRepo } = await import('@/db/repositories.js');
+      const row = await rolesRepo.create({
+        role_key: 'comercial',
+        display_name: 'Comercial',
+        description: 'Modo de atendimento comercial',
+        prompt_addendum: 'Você é um atendente comercial.',
+      });
+      expect(row.id).toBeDefined();
+      expect(row.tenant_id).toBe('default');
+      expect(row.agent_id).toBe('default');
+      expect(row.role_key).toBe('comercial');
+      expect(row.display_name).toBe('Comercial');
+      expect(row.active).toBe(true);
+      expect(row.is_default).toBe(false);
+    });
   });
 
   it('getByKey retorna role com chave correta', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { rolesRepo } = await import('@/db/repositories.js');
-        await rolesRepo.create({
-          role_key: 'suporte',
-          display_name: 'Suporte',
-        });
-        await rolesRepo.create({
-          role_key: 'comercial',
-          display_name: 'Comercial',
-        });
-        const found = await rolesRepo.getByKey('suporte');
-        expect(found).not.toBeNull();
-        expect(found!.display_name).toBe('Suporte');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { rolesRepo } = await import('@/db/repositories.js');
+      await rolesRepo.create({
+        role_key: 'suporte',
+        display_name: 'Suporte',
+      });
+      await rolesRepo.create({
+        role_key: 'comercial',
+        display_name: 'Comercial',
+      });
+      const found = await rolesRepo.getByKey('suporte');
+      expect(found).not.toBeNull();
+      expect(found!.display_name).toBe('Suporte');
+    });
   });
 
   it('getDefault retorna apenas a row com is_default=true', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { rolesRepo } = await import('@/db/repositories.js');
-        await rolesRepo.create({
-          role_key: 'default',
-          display_name: 'Default',
-          is_default: true,
-        });
-        await rolesRepo.create({
-          role_key: 'comercial',
-          display_name: 'Comercial',
-        });
-        const def = await rolesRepo.getDefault();
-        expect(def).not.toBeNull();
-        expect(def!.role_key).toBe('default');
-        expect(def!.is_default).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { rolesRepo } = await import('@/db/repositories.js');
+      await rolesRepo.create({
+        role_key: 'default',
+        display_name: 'Default',
+        is_default: true,
+      });
+      await rolesRepo.create({
+        role_key: 'comercial',
+        display_name: 'Comercial',
+      });
+      const def = await rolesRepo.getDefault();
+      expect(def).not.toBeNull();
+      expect(def!.role_key).toBe('default');
+      expect(def!.is_default).toBe(true);
+    });
   });
 
   it('listActive filtra roles desativados', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { rolesRepo } = await import('@/db/repositories.js');
-        const a = await rolesRepo.create({
-          role_key: 'a',
-          display_name: 'A',
-        });
-        await rolesRepo.create({
-          role_key: 'b',
-          display_name: 'B',
-        });
-        await rolesRepo.deactivate(a.id);
-        const active = await rolesRepo.listActive();
-        expect(active.length).toBe(1);
-        expect(active[0]!.role_key).toBe('b');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { rolesRepo } = await import('@/db/repositories.js');
+      const a = await rolesRepo.create({
+        role_key: 'a',
+        display_name: 'A',
+      });
+      await rolesRepo.create({
+        role_key: 'b',
+        display_name: 'B',
+      });
+      await rolesRepo.deactivate(a.id);
+      const active = await rolesRepo.listActive();
+      expect(active.length).toBe(1);
+      expect(active[0]!.role_key).toBe('b');
+    });
   });
 
   it('create com is_default=true cria role default (DB partial unique permite)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { rolesRepo } = await import('@/db/repositories.js');
-        const def = await rolesRepo.create({
-          role_key: 'default',
-          display_name: 'Default',
-          is_default: true,
-        });
-        expect(def.is_default).toBe(true);
-        const fetched = await rolesRepo.getDefault();
-        expect(fetched!.id).toBe(def.id);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { rolesRepo } = await import('@/db/repositories.js');
+      const def = await rolesRepo.create({
+        role_key: 'default',
+        display_name: 'Default',
+        is_default: true,
+      });
+      expect(def.is_default).toBe(true);
+      const fetched = await rolesRepo.getDefault();
+      expect(fetched!.id).toBe(def.id);
+    });
   });
 });

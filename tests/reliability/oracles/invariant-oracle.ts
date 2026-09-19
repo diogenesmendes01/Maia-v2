@@ -111,7 +111,13 @@ export interface FotoDuravel {
 // VIOLAÇÕES
 // ---------------------------------------------------------------------------
 
-export const FAMILIAS_DE_INVARIANTE = ['turno', 'fifo', 'outbound', 'seguranca', 'operacao'] as const;
+export const FAMILIAS_DE_INVARIANTE = [
+  'turno',
+  'fifo',
+  'outbound',
+  'seguranca',
+  'operacao',
+] as const;
 export type FamiliaDeInvariante = (typeof FAMILIAS_DE_INVARIANTE)[number];
 
 /**
@@ -132,7 +138,10 @@ export class InvarianteVioladaError extends Error {
     super(
       `${cenario}: ${violacoes.length} invariante(s) violada(s).\n` +
         violacoes
-          .map((v) => `  · [${v.familia}] ${v.invariante}: ${v.detalhe} ${JSON.stringify(v.evidencia)}`)
+          .map(
+            (v) =>
+              `  · [${v.familia}] ${v.invariante}: ${v.detalhe} ${JSON.stringify(v.evidencia)}`,
+          )
           .join('\n'),
     );
     this.name = 'InvarianteVioladaError';
@@ -179,7 +188,12 @@ function violacao(
   detalhe: string,
   evidencia: Record<string, unknown>,
 ): ViolacaoDeInvariante {
-  return { familia, invariante, detalhe, evidencia: sanitizarValor(evidencia) as Record<string, unknown> };
+  return {
+    familia,
+    invariante,
+    detalhe,
+    evidencia: sanitizarValor(evidencia) as Record<string, unknown>,
+  };
 }
 
 function checarTurno(foto: FotoDuravel): ViolacaoDeInvariante[] {
@@ -264,21 +278,31 @@ function checarTurno(foto: FotoDuravel): ViolacaoDeInvariante[] {
       const presentes = partes.filter((p) => p !== null).length;
       if (presentes !== 0 && presentes !== partes.length) {
         out.push(
-          violacao('turno', 'turno.claim_completo', 'claim gravado pela metade (token/dono/lease)', {
-            turn_id: t.id,
-            claim_token: t.claim_token,
-            claimed_by: t.claimed_by,
-            lease_expires_at: t.lease_expires_at,
-          }),
+          violacao(
+            'turno',
+            'turno.claim_completo',
+            'claim gravado pela metade (token/dono/lease)',
+            {
+              turn_id: t.id,
+              claim_token: t.claim_token,
+              claimed_by: t.claimed_by,
+              lease_expires_at: t.lease_expires_at,
+            },
+          ),
         );
       }
     }
 
     if (t.status === 'superseded' && t.superseded_by_turn_id === null) {
       out.push(
-        violacao('turno', 'turno.superseded_aponta_absorvedor', 'turno `superseded` sem absorvedor', {
-          turn_id: t.id,
-        }),
+        violacao(
+          'turno',
+          'turno.superseded_aponta_absorvedor',
+          'turno `superseded` sem absorvedor',
+          {
+            turn_id: t.id,
+          },
+        ),
       );
     }
   }
@@ -331,11 +355,16 @@ function checarOutbound(foto: FotoDuravel): ViolacaoDeInvariante[] {
   for (const [chave, linhas] of porChave) {
     if (linhas.length > 1) {
       out.push(
-        violacao('outbound', 'outbound.uma_linha_por_saida_logica', 'duas linhas para a MESMA saída lógica', {
-          logical_dedupe_key: chave,
-          ids: linhas.map((l) => l.id),
-          hashes: linhas.map((l) => l.payload_hash),
-        }),
+        violacao(
+          'outbound',
+          'outbound.uma_linha_por_saida_logica',
+          'duas linhas para a MESMA saída lógica',
+          {
+            logical_dedupe_key: chave,
+            ids: linhas.map((l) => l.id),
+            hashes: linhas.map((l) => l.payload_hash),
+          },
+        ),
       );
     }
   }
@@ -352,10 +381,15 @@ function checarOutbound(foto: FotoDuravel): ViolacaoDeInvariante[] {
   for (const [chave, ids] of porPosicao) {
     if (ids.length > 1) {
       out.push(
-        violacao('outbound', 'outbound.sequencia_unica_no_turno', 'duas saídas na mesma posição do turno', {
-          posicao: chave,
-          ids,
-        }),
+        violacao(
+          'outbound',
+          'outbound.sequencia_unica_no_turno',
+          'duas saídas na mesma posição do turno',
+          {
+            posicao: chave,
+            ids,
+          },
+        ),
       );
     }
   }
@@ -364,10 +398,15 @@ function checarOutbound(foto: FotoDuravel): ViolacaoDeInvariante[] {
     if (s.delivery_outcome === null) continue;
     if (!(OUTBOUND_DELIVERY_OUTCOMES as readonly string[]).includes(s.delivery_outcome)) {
       out.push(
-        violacao('outbound', 'outbound.desfecho_conhecido', 'delivery_outcome fora do vocabulário de #506', {
-          outbound_id: s.id,
-          delivery_outcome: s.delivery_outcome,
-        }),
+        violacao(
+          'outbound',
+          'outbound.desfecho_conhecido',
+          'delivery_outcome fora do vocabulário de #506',
+          {
+            outbound_id: s.id,
+            delivery_outcome: s.delivery_outcome,
+          },
+        ),
       );
       continue;
     }
@@ -375,7 +414,11 @@ function checarOutbound(foto: FotoDuravel): ViolacaoDeInvariante[] {
     // é `statusForOutcome` — importada, não copiada: uma cópia continuaria
     // afirmando o mapa antigo depois de a política mudar.
     const esperado = statusForOutcome(s.delivery_outcome as never);
-    if (esperado === 'delivery_unknown' && s.status !== 'delivery_unknown' && s.status !== 'reconciling') {
+    if (
+      esperado === 'delivery_unknown' &&
+      s.status !== 'delivery_unknown' &&
+      s.status !== 'reconciling'
+    ) {
       out.push(
         violacao(
           'outbound',
@@ -406,22 +449,32 @@ function checarSeguranca(foto: FotoDuravel): ViolacaoDeInvariante[] {
     const par = `${tenant_id}/${agent_id}`;
     if (!permitidos.has(par)) {
       out.push(
-        violacao('seguranca', 'seguranca.escopo_declarado', `${tipo} fora do escopo declarado do cenário`, {
-          tipo,
-          id,
-          encontrado: par,
-          esperados: [...permitidos],
-        }),
+        violacao(
+          'seguranca',
+          'seguranca.escopo_declarado',
+          `${tipo} fora do escopo declarado do cenário`,
+          {
+            tipo,
+            id,
+            encontrado: par,
+            esperados: [...permitidos],
+          },
+        ),
       );
     }
     if (tenant_id === 'default' || agent_id === 'default') {
       out.push(
-        violacao('seguranca', 'seguranca.sem_fallback_default', `${tipo} caiu no escopo "default"`, {
-          tipo,
-          id,
-          tenant_id,
-          agent_id,
-        }),
+        violacao(
+          'seguranca',
+          'seguranca.sem_fallback_default',
+          `${tipo} caiu no escopo "default"`,
+          {
+            tipo,
+            id,
+            tenant_id,
+            agent_id,
+          },
+        ),
       );
     }
   };
@@ -506,11 +559,16 @@ export function verificarProgresso(
       !isTerminalTurnStatus(d.status)
     ) {
       out.push(
-        violacao('turno', 'turno.terminal_nao_volta', 'turno TERMINAL voltou a estado não terminal', {
-          turn_id: d.id,
-          antes: a.status,
-          depois: d.status,
-        }),
+        violacao(
+          'turno',
+          'turno.terminal_nao_volta',
+          'turno TERMINAL voltou a estado não terminal',
+          {
+            turn_id: d.id,
+            antes: a.status,
+            depois: d.status,
+          },
+        ),
       );
     }
   }

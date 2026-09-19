@@ -38,7 +38,9 @@ const getRoleById = vi.fn();
 // falha ANTES do canal (pré-envio, fail-closed), que é o comportamento certo em
 // produção e um falso vermelho aqui.
 vi.mock('../../src/gateway/baileys.js', () => ({
-  sendOutboundText, sendOutboundDocument, sendOutboundVoice,
+  sendOutboundText,
+  sendOutboundDocument,
+  sendOutboundVoice,
   isBaileysConnected: () => true,
   MEDIA_ROOT: mkdtempSync(join(tmpdir(), 'maia-media-spec-')),
 }));
@@ -88,15 +90,17 @@ vi.mock('../../src/lib/tts.js', () => ({
 vi.mock('../../src/db/repositories.js', () => ({
   pessoasRepo: { findById },
   mensagensRepo: {
-    create: createMensagem, findById: findMensagem, markProcessed,
-    recentInConversation, setConversaId: vi.fn(), createInbound: vi.fn(),
+    create: createMensagem,
+    findById: findMensagem,
+    markProcessed,
+    recentInConversation,
+    setConversaId: vi.fn(),
+    createInbound: vi.fn(),
   },
   pendingQuestionsRepo: { findActiveSnapshot: vi.fn() },
   conversasRepo: {
     byIdWithPessoa: vi.fn(async () => {
-      const row = dbState.conversaResult[0] as
-        | { conversas: unknown; pessoas: unknown }
-        | undefined;
+      const row = dbState.conversaResult[0] as { conversas: unknown; pessoas: unknown } | undefined;
       return row ? { conversa: row.conversas, pessoa: row.pessoas } : null;
     }),
     touch: vi.fn(),
@@ -113,23 +117,35 @@ vi.mock('../../src/db/repositories.js', () => ({
     record: vi.fn().mockResolvedValue(undefined),
   },
   selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
-  factsRepo: { listForScopes: vi.fn().mockResolvedValue([]), listMentionableForScopes: vi.fn().mockResolvedValue([]) },
+  factsRepo: {
+    listForScopes: vi.fn().mockResolvedValue([]),
+    listMentionableForScopes: vi.fn().mockResolvedValue([]),
+  },
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
   entityStatesRepo: { byId: vi.fn().mockResolvedValue(null), byIds: vi.fn().mockResolvedValue([]) },
   entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },
 }));
 vi.mock('../../src/db/client.js', () => {
   const fakeQuery = {
-    from: () => fakeQuery, innerJoin: () => fakeQuery, where: () => fakeQuery,
+    from: () => fakeQuery,
+    innerJoin: () => fakeQuery,
+    where: () => fakeQuery,
     limit: () => Promise.resolve(dbState.conversaResult),
   };
-  return { db: { select: () => fakeQuery }, withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})) };
+  return {
+    db: { select: () => fakeQuery },
+    withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+  };
 });
 // `mensagens` is needed by the channel-resolution probe in runAgentForMensagem
 // (it reads `mensagens.metadata` via db.select before the resolver). Without it
 // the probe deref throws and, post-#417 fail-closed, that propagates instead of
 // being silently swallowed.
-vi.mock('../../src/db/schema.js', () => ({ conversas: {}, pessoas: {}, mensagens: { metadata: {}, id: {} } }));
+vi.mock('../../src/db/schema.js', () => ({
+  conversas: {},
+  pessoas: {},
+  mensagens: { metadata: {}, id: {} },
+}));
 vi.mock('drizzle-orm', () => ({ eq: () => ({}) }));
 vi.mock('../../src/governance/audit.js', () => ({ audit }));
 vi.mock('../../src/lib/logger.js', () => ({
@@ -151,71 +167,77 @@ vi.mock('../../src/config/env.js', () => ({
 vi.mock('../../src/tools/_dispatcher.js', () => ({ dispatchTool }));
 vi.mock('../../src/lib/claude.js', () => ({ callLLM }));
 vi.mock('../../src/agent/prompt-builder.js', () => ({
-  buildPrompt, PROMPT_TOKEN_BUDGET_INPUT: 11000, PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
+  buildPrompt,
+  PROMPT_TOKEN_BUDGET_INPUT: 11000,
+  PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
 }));
 vi.mock('../../src/agent/pending-gate.js', () => ({
   checkPendingFirst: vi.fn().mockResolvedValue({ kind: 'no_pending' }),
 }));
 vi.mock('../../src/identity/resolver.js', () => ({ resolveIdentity: vi.fn() }));
 vi.mock('../../src/identity/quarantine.js', () => ({
-  handleQuarantineFirstContact: vi.fn(), handleOwnerIdentityReply: vi.fn(),
+  handleQuarantineFirstContact: vi.fn(),
+  handleOwnerIdentityReply: vi.fn(),
 }));
 vi.mock('../../src/governance/permissions.js', () => ({
   resolveScope: vi.fn().mockResolvedValue({ entidades: [], byEntity: new Map() }),
 }));
-vi.mock("../../src/cognitive-graph/orchestrator.js", () => ({
+vi.mock('../../src/cognitive-graph/orchestrator.js', () => ({
   runNodes: vi.fn().mockResolvedValue({ nodes: {} }),
 }));
-vi.mock("../../src/gateway/rate-limit.js", () => ({
-  checkRateLimit: vi.fn().mockResolvedValue({ kind: "allow" }),
+vi.mock('../../src/gateway/rate-limit.js', () => ({
+  checkRateLimit: vi.fn().mockResolvedValue({ kind: 'allow' }),
   formatPoliteReply: vi.fn(),
 }));
 vi.mock('../../src/gateway/presence.js', () => ({
   startTyping: vi.fn(() => ({ stop: vi.fn() })),
-  sendReaction: vi.fn(), quotedReplyContext: vi.fn(), sendPoll: vi.fn(),
+  sendReaction: vi.fn(),
+  quotedReplyContext: vi.fn(),
+  sendPoll: vi.fn(),
 }));
 vi.mock('../../src/workflows/pending-questions.js', () => ({
   getActivePending: vi.fn().mockReturnValue(null),
 }));
 vi.mock('../../src/agent/reflection.js', () => ({
   detectCorrection: vi.fn().mockReturnValue(false),
-  reflectOnCorrection: vi.fn(), findPreviousAssistantMessage: vi.fn(),
+  reflectOnCorrection: vi.fn(),
+  findPreviousAssistantMessage: vi.fn(),
 }));
 
 const PESSOA = {
-  id: "p1",
-  telefone_whatsapp: "+5511888888888",
-  nome: "Owner",
-  tenant_id: "primary",
-  agent_id: "primary",
-  tipo: "owner",
-  status: "ativa",
+  id: 'p1',
+  telefone_whatsapp: '+5511888888888',
+  nome: 'Owner',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  tipo: 'owner',
+  status: 'ativa',
   preferencias: {},
 } as never;
 const CONVERSA = {
-  id: "c1",
-  pessoa_id: "p1",
-  status: "ativa",
-  channel_id: "ch-1",
+  id: 'c1',
+  pessoa_id: 'p1',
+  status: 'ativa',
+  channel_id: 'ch-1',
 } as never;
 const AUDIENCE_PROFILE = {
-  id: "aud-1",
-  tenant_id: "primary",
-  agent_id: "primary",
-  pessoa_id: "p1",
-  audience_type: "owner",
-  trust_level: "trusted_internal",
-  status: "active",
+  id: 'aud-1',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  pessoa_id: 'p1',
+  audience_type: 'owner',
+  trust_level: 'trusted_internal',
+  status: 'active',
   permission_profile_ids: [],
   labels: [],
   metadata: {},
 } as never;
 const DEFAULT_ROLE = {
-  id: "role-default",
-  tenant_id: "primary",
-  agent_id: "primary",
-  role_key: "default",
-  display_name: "Default",
+  id: 'role-default',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  role_key: 'default',
+  display_name: 'Default',
   description: null,
   prompt_addendum: null,
   granted_packs: [],
@@ -224,24 +246,32 @@ const DEFAULT_ROLE = {
   metadata: {},
 } as never;
 const CHANNEL_POLICY = {
-  id: "policy-1",
-  tenant_id: "primary",
-  agent_id: "primary",
-  channel_id: "ch-1",
-  default_role_id: "role-default",
-  switch_behavior: "fixed",
-  announce_mode: "never",
+  id: 'policy-1',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  channel_id: 'ch-1',
+  default_role_id: 'role-default',
+  switch_behavior: 'fixed',
+  announce_mode: 'never',
   by_context_guards: {},
   allowed_role_ids: [],
 } as never;
 const VOICE_INBOUND = {
-  id: 'in1', conversa_id: 'c1', direcao: 'in' as const, tipo: 'audio' as const,
+  id: 'in1',
+  conversa_id: 'c1',
+  direcao: 'in' as const,
+  tipo: 'audio' as const,
   conteudo: '[transcribed: registra cinco reais do café]',
-  metadata: { whatsapp_id: 'WAID-IN' }, processada_em: null,
+  metadata: { whatsapp_id: 'WAID-IN' },
+  processada_em: null,
 };
 const TEXT_INBOUND = {
-  id: 'in1', conversa_id: 'c1', direcao: 'in' as const, tipo: 'texto' as const,
-  conteudo: 'registra cinco reais', metadata: { whatsapp_id: 'WAID-IN' },
+  id: 'in1',
+  conversa_id: 'c1',
+  direcao: 'in' as const,
+  tipo: 'texto' as const,
+  conteudo: 'registra cinco reais',
+  metadata: { whatsapp_id: 'WAID-IN' },
   processada_em: null,
 };
 
@@ -271,7 +301,7 @@ describe('agent loop — B4 voice flow', () => {
     getChannelPolicy.mockReset().mockResolvedValue(CHANNEL_POLICY);
     listActiveRoles.mockReset().mockResolvedValue([DEFAULT_ROLE]);
     getRoleById.mockReset().mockResolvedValue(DEFAULT_ROLE);
-    buildPrompt.mockResolvedValue({ system: "s", messages: [] });
+    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
     findById.mockResolvedValue(PESSOA);
     sendOutboundVoice.mockResolvedValue('WAID-OUT-VOICE');
     sendOutboundText.mockResolvedValue('WAID-OUT-TEXT');
@@ -282,10 +312,11 @@ describe('agent loop — B4 voice flow', () => {
   it('voice-in + flag on + reply ≤400 chars → calls sendOutboundVoice + audit + mensagens row', async () => {
     findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
     callLLM.mockResolvedValueOnce({
-      content: '✅ R$ 5 registrado em transporte.', tool_uses: [],
+      content: '✅ R$ 5 registrado em transporte.',
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 10 },
     });
-    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67, 0x67, 0x53, 0x00]));
+    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4f, 0x67, 0x67, 0x53, 0x00]));
     const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
 
@@ -296,11 +327,13 @@ describe('agent loop — B4 voice flow', () => {
     const auditAcoes = audit.mock.calls.map((c) => c[0].acao);
     expect(auditAcoes).toContain('outbound_sent_voice');
     const voiceAudit = audit.mock.calls.find((c) => c[0].acao === 'outbound_sent_voice')![0];
-    expect(voiceAudit.metadata).toEqual(expect.objectContaining({
-      whatsapp_id: 'WAID-OUT-VOICE',
-      char_count: '✅ R$ 5 registrado em transporte.'.length,
-      byte_size: 5,
-    }));
+    expect(voiceAudit.metadata).toEqual(
+      expect.objectContaining({
+        whatsapp_id: 'WAID-OUT-VOICE',
+        char_count: '✅ R$ 5 registrado em transporte.'.length,
+        byte_size: 5,
+      }),
+    );
 
     const audioRow = createMensagem.mock.calls.find((c) => c[0].tipo === 'audio')?.[0];
     expect(audioRow).toBeDefined();
@@ -312,7 +345,8 @@ describe('agent loop — B4 voice flow', () => {
     findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
     const longText = 'a'.repeat(500);
     callLLM.mockResolvedValueOnce({
-      content: longText, tool_uses: [],
+      content: longText,
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 100 },
     });
     const { runAgentForMensagem } = core();
@@ -327,7 +361,8 @@ describe('agent loop — B4 voice flow', () => {
   it('text-in + flag on + reply short → text path; no voice call', async () => {
     findMensagem.mockResolvedValue({ ...TEXT_INBOUND });
     callLLM.mockResolvedValueOnce({
-      content: 'reply curto', tool_uses: [],
+      content: 'reply curto',
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 10 },
     });
     const { runAgentForMensagem } = core();
@@ -341,7 +376,8 @@ describe('agent loop — B4 voice flow', () => {
     flagState.FEATURE_OUTBOUND_VOICE = false;
     findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
     callLLM.mockResolvedValueOnce({
-      content: 'reply', tool_uses: [],
+      content: 'reply',
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 5 },
     });
     const { runAgentForMensagem } = core();
@@ -354,7 +390,8 @@ describe('agent loop — B4 voice flow', () => {
   it('TTS failure → text fallback; no voice audit; warn log', async () => {
     findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
     callLLM.mockResolvedValueOnce({
-      content: 'reply curto', tool_uses: [],
+      content: 'reply curto',
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 10 },
     });
     synthesizeSpeech.mockRejectedValueOnce(new Error('tts_failed: 500 boom'));
@@ -370,7 +407,8 @@ describe('agent loop — B4 voice flow', () => {
   it('Baileys disconnected (null wid) → no audit, no mensagens row', async () => {
     findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
     callLLM.mockResolvedValueOnce({
-      content: 'reply curto', tool_uses: [],
+      content: 'reply curto',
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 10 },
     });
     synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0]));
@@ -396,7 +434,8 @@ describe('agent loop — B4 voice flow', () => {
       usage: { input_tokens: 100, output_tokens: 10 },
     });
     callLLM.mockResolvedValueOnce({
-      content: 'Saldo R$ 1.234,56', tool_uses: [],
+      content: 'Saldo R$ 1.234,56',
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 20 },
     });
     dispatchTool.mockResolvedValue({ ok: true });
@@ -422,11 +461,12 @@ describe('agent loop — B4 voice flow', () => {
       usage: { input_tokens: 100, output_tokens: 10 },
     });
     callLLM.mockResolvedValueOnce({
-      content: 'Saldo R$ 1.234,56', tool_uses: [],
+      content: 'Saldo R$ 1.234,56',
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 20 },
     });
     dispatchTool.mockResolvedValue({ ok: true });
-    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
+    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4f, 0x67]));
     const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
 
@@ -439,10 +479,11 @@ describe('agent loop — B4 voice flow', () => {
     findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
     const exact400 = 'a'.repeat(400);
     callLLM.mockResolvedValueOnce({
-      content: exact400, tool_uses: [],
+      content: exact400,
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 80 },
     });
-    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
+    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4f, 0x67]));
     const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(synthesizeSpeech).toHaveBeenCalledTimes(1);
@@ -458,10 +499,11 @@ describe('agent loop — B4 voice flow', () => {
     (quotedReplyContext as ReturnType<typeof vi.fn>).mockReturnValueOnce(fakeQuoted);
     findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
     callLLM.mockResolvedValueOnce({
-      content: 'corrigido', tool_uses: [],
+      content: 'corrigido',
+      tool_uses: [],
       usage: { input_tokens: 50, output_tokens: 10 },
     });
-    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4F, 0x67]));
+    synthesizeSpeech.mockResolvedValueOnce(Buffer.from([0x4f, 0x67]));
     const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');
     expect(sendOutboundVoice).toHaveBeenCalledTimes(1);

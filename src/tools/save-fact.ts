@@ -12,14 +12,10 @@ import { logger } from '@/lib/logger.js';
 import { proposeFactTool } from './propose-fact.js';
 
 const inputSchema = z.object({
-  escopo: z
-    .string()
-    .regex(/^(global|pessoa:[0-9a-f-]+|entidade:[0-9a-f-]+)$/),
+  escopo: z.string().regex(/^(global|pessoa:[0-9a-f-]+|entidade:[0-9a-f-]+)$/),
   chave: z.string().min(1).max(120),
   valor: z.unknown(),
-  fonte: z
-    .enum(['configurado', 'aprendido', 'inferido'])
-    .default('aprendido'),
+  fonte: z.enum(['configurado', 'aprendido', 'inferido']).default('aprendido'),
   confianca: z.number().min(0).max(1).optional(),
 });
 

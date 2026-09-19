@@ -28,9 +28,7 @@ const rule = (
   ...overrides,
 });
 
-const mkResolver = (
-  rules: PolicyRuleRecord[],
-): PolicyDescriptorResolverPort => ({
+const mkResolver = (rules: PolicyRuleRecord[]): PolicyDescriptorResolverPort => ({
   async resolveDescriptors() {
     return { resolved: rules, unresolved: [] };
   },
@@ -61,9 +59,7 @@ describe('PolicySliceBuilder', () => {
       signal: AbortSignal.timeout(600),
     });
     // 5 hard_limits + 1 soft = 6 total, but ALL 5 hard_limits must be there
-    const hards = r.slice.applicable_rules.filter(
-      (rr) => rr.rule_kind === 'hard_limit',
-    );
+    const hards = r.slice.applicable_rules.filter((rr) => rr.rule_kind === 'hard_limit');
     expect(hards).toHaveLength(5);
     expect(r.slice.applicable_rules).toHaveLength(6);
     expect(r.slice.truncated).toBe(true);
@@ -86,11 +82,11 @@ describe('PolicySliceBuilder', () => {
       signal: AbortSignal.timeout(600),
     });
     // Even when max=3, hard_limits override budget — all 5 stay.
-    expect(
-      r.slice.applicable_rules.filter((rr) => rr.rule_kind === 'hard_limit'),
-    ).toHaveLength(5);
+    expect(r.slice.applicable_rules.filter((rr) => rr.rule_kind === 'hard_limit')).toHaveLength(5);
     // No room for soft, so soft is excluded
-    expect(r.slice.applicable_rules.filter((rr) => rr.rule_kind === 'soft_guidance')).toHaveLength(0);
+    expect(r.slice.applicable_rules.filter((rr) => rr.rule_kind === 'soft_guidance')).toHaveLength(
+      0,
+    );
   });
 
   it('returns empty slice when resolver has no rules', async () => {
@@ -106,10 +102,7 @@ describe('PolicySliceBuilder', () => {
   });
 
   it('cache hit on second call', async () => {
-    const builder = new PolicySliceBuilder(
-      mkResolver([rule('p1', 'hard_limit')]),
-      cache,
-    );
+    const builder = new PolicySliceBuilder(mkResolver([rule('p1', 'hard_limit')]), cache);
     const a = await builder.build({
       base: mockBase(),
       requirements: { depth: 'basic', max_rules: 5 },
@@ -147,10 +140,7 @@ describe('PolicySliceBuilder', () => {
   });
 
   it('resolver_cache_key matches the cache key used to store the slice', async () => {
-    const builder = new PolicySliceBuilder(
-      mkResolver([rule('p1', 'hard_limit')]),
-      cache,
-    );
+    const builder = new PolicySliceBuilder(mkResolver([rule('p1', 'hard_limit')]), cache);
     const r = await builder.build({
       base: mockBase(),
       requirements: { depth: 'basic', max_rules: 5 },

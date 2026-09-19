@@ -1,0 +1,13 @@
+# Fim de linha LF no repositório e na cópia de trabalho, qualquer que seja o
+# `core.autocrlf` da máquina (o Git for Windows instala `true` no gitconfig do
+# sistema, e um checkout assim grava CRLF que depois vaza para os commits).
+*.ts   text eol=lf
+*.tsx  text eol=lf
+*.mts  text eol=lf
+*.js   text eol=lf
+*.mjs  text eol=lf
+*.cjs  text eol=lf
+*.py   text eol=lf
+*.sql  text eol=lf
+*.json text eol=lf
+*.md   text eol=lf

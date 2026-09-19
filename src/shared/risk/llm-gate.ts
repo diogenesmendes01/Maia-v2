@@ -31,12 +31,7 @@ import type { LLMGate } from './types.js';
  * throw `LLMGateParseError` para o runCognitiveModule registrar como erro.
  */
 const HaikuResponseSchema = z.object({
-  suggested_level: z.enum([
-    RiskLevel.LOW,
-    RiskLevel.MEDIUM,
-    RiskLevel.HIGH,
-    RiskLevel.CRITICAL,
-  ]),
+  suggested_level: z.enum([RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL]),
   reason: z.string().optional().default(''),
 });
 

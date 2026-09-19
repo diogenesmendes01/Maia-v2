@@ -6,19 +6,8 @@ import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
 import { PageHeader } from '../../components/ui/page-header.js';
 import { Badge, StatusBadge } from '../../components/ui/badge.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../components/ui/table.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState } from '../../components/ui/states.js';
 import { IconActivity } from '../../components/ui/icons.js';
 
 export default function TracesPage() {

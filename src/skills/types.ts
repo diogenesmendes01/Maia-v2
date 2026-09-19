@@ -190,10 +190,10 @@ export interface ResolvedPolicyDescriptor {
    * `matched: true` → BLOCK execution. Stays optional so P9a/P8e can keep
    * shape-only stubs while the real PolicyDescriptorResolver lands.
    */
-  evaluator?: (args: {
-    skill: SkillRow;
-    input: Record<string, unknown>;
-  }) => { matched: boolean; reason?: string };
+  evaluator?: (args: { skill: SkillRow; input: Record<string, unknown> }) => {
+    matched: boolean;
+    reason?: string;
+  };
 }
 
 export interface UnresolvedPolicyDescriptor {

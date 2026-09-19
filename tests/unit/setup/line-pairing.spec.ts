@@ -14,21 +14,21 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 const { auditMock, auditCalls, channelsRepoMock, managerMock, rmMock, readinessMock } = vi.hoisted(
   () => ({
-  readinessMock: vi.fn(async () => ({ ready: true })),
-  auditMock: vi.fn(async () => undefined),
-  auditCalls: [] as Array<{
-    acao: string;
-    ctx: { tenant_id: string; agent_id: string } | null;
-  }>,
-  channelsRepoMock: {
-    getByIdCrossTenant: vi.fn(),
-    activateVerified: vi.fn(),
-  },
-  managerMock: {
-    startPairingSession: vi.fn(),
-    abortPairing: vi.fn(async () => undefined),
-  },
-  rmMock: vi.fn(async () => undefined),
+    readinessMock: vi.fn(async () => ({ ready: true })),
+    auditMock: vi.fn(async () => undefined),
+    auditCalls: [] as Array<{
+      acao: string;
+      ctx: { tenant_id: string; agent_id: string } | null;
+    }>,
+    channelsRepoMock: {
+      getByIdCrossTenant: vi.fn(),
+      activateVerified: vi.fn(),
+    },
+    managerMock: {
+      startPairingSession: vi.fn(),
+      abortPairing: vi.fn(async () => undefined),
+    },
+    rmMock: vi.fn(async () => undefined),
   }),
 );
 

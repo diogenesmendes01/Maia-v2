@@ -30,11 +30,17 @@ export * from './repositories/runtime-trace-repos.js';
 
 // Calendar v2 — re-export of holidaysRepo + holidayEntidadesRepo from dedicated modules.
 export { holidaysRepo } from './repositories/holidays-repo.js';
-export { holidayEntidadesRepo, CrossTenantIntegrityError } from './repositories/holiday-entidades-repo.js';
+export {
+  holidayEntidadesRepo,
+  CrossTenantIntegrityError,
+} from './repositories/holiday-entidades-repo.js';
 
 // P9a — re-export skillsRepo from control-plane/skill-registry. Convention:
 // `repositories.ts` é o ponto único de import para callers; `control-plane/`
 // hospeda a implementação propriamente dita (Source of Truth + Admin UI).
 // Ver `src/control-plane/skill-registry/skills-repo.ts`.
 export { skillsRepo } from '@/control-plane/skill-registry/index.js';
-export type { SkillsRepo, ProposeInput as SkillProposeInput } from '@/control-plane/skill-registry/index.js';
+export type {
+  SkillsRepo,
+  ProposeInput as SkillProposeInput,
+} from '@/control-plane/skill-registry/index.js';

@@ -237,7 +237,11 @@ describe('#506 — dono, prazo e condição de remoção: as guardas', () => {
     // não a conta. É a modelagem honesta que a decisão pediu: quem vence pelo
     // calendário são as temporárias; o carve-out atrasa REVISÃO, e isso é a
     // guarda seguinte.
-    expect(expiredExceptions(OUTBOUND_SEND_PATHS, '2099-12-31').map((e) => e.id).sort()).toEqual([
+    expect(
+      expiredExceptions(OUTBOUND_SEND_PATHS, '2099-12-31')
+        .map((e) => e.id)
+        .sort(),
+    ).toEqual([
       'agent.message_update_owner_review',
       'identity.quarantine',
       'scheduling.outbox_drain',
@@ -260,9 +264,9 @@ describe('#506 — dono, prazo e condição de remoção: as guardas', () => {
     // E as duas funções não se contaminam: o carve-out nunca aparece em
     // `expiredExceptions`, e as temporárias nunca aparecem em
     // `carveOutReviewsDue` — cada vermelho pede a ação certa.
-    expect(
-      expiredExceptions(OUTBOUND_SEND_PATHS, '2099-12-31').map((e) => e.id),
-    ).not.toContain('agent.react_loop_tool_reaction');
+    expect(expiredExceptions(OUTBOUND_SEND_PATHS, '2099-12-31').map((e) => e.id)).not.toContain(
+      'agent.react_loop_tool_reaction',
+    );
     expect(carveOutReviewsDue(OUTBOUND_SEND_PATHS, '2099-12-31').map((e) => e.id)).toEqual([
       'agent.react_loop_tool_reaction',
     ]);
@@ -370,7 +374,8 @@ describe('#506 — o inventário de PRODUÇÃO, linha a linha', () => {
       if (e.containment.trim() === '') faltando.push(`${e.id}: controle fail-closed (containment)`);
       if (!OUTBOUND_EXCEPTION_OWNERS.includes(e.owner)) faltando.push(`${e.id}: owner`);
       if (e.removal.when.trim() === '') faltando.push(`${e.id}: condição de remoção`);
-      if (e.removal.why_sufficient.trim() === '') faltando.push(`${e.id}: por que a condição basta`);
+      if (e.removal.why_sufficient.trim() === '')
+        faltando.push(`${e.id}: por que a condição basta`);
       if (e.removal.probes.length === 0) faltando.push(`${e.id}: sonda da condição`);
     }
     expect(faltando).toEqual([]);
@@ -381,9 +386,11 @@ describe('#506 — o inventário de PRODUÇÃO, linha a linha', () => {
     // guarda viva: uma exceção que volte a ficar pendente sem declaração, ou
     // um id que fique listado depois de ganhar dono e prazo, quebram este
     // caso — a lista não vira depósito nem a lacuna entra em silêncio.
-    expect(pendingOwnerDecisions().map((e) => e.id).sort()).toEqual(
-      [...PENDING_OWNER_DECISION_IDS].sort(),
-    );
+    expect(
+      pendingOwnerDecisions()
+        .map((e) => e.id)
+        .sort(),
+    ).toEqual([...PENDING_OWNER_DECISION_IDS].sort());
     expect(pendingOwnerDecisions()).toEqual([]);
     const orfaos = PENDING_OWNER_DECISION_IDS.filter(
       (id) => !declaredExceptions().some((e) => e.id === id && isPendingOwnerDecision(e)),
@@ -508,7 +515,11 @@ describe('#506 — o inventário de PRODUÇÃO, linha a linha', () => {
         semAncora.push(`${exc.id} (callsite ${exc.module})`);
       }
       for (const pr of probes) {
-        if (pr.symbol === 'commitStandaloneOutbound' && pr.kind === 'surge' && pr.module !== exc.module) {
+        if (
+          pr.symbol === 'commitStandaloneOutbound' &&
+          pr.kind === 'surge' &&
+          pr.module !== exc.module
+        ) {
           surgeForaDoCallsite.push(`${exc.id}: surge de commitStandaloneOutbound em ${pr.module}`);
         }
       }

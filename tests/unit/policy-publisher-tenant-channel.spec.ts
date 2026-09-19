@@ -58,9 +58,7 @@ vi.mock('@/db/tenant-guard.js', () => ({
 }));
 
 // Re-import the repo AFTER mocks are wired so it picks up the stubs.
-const { policyRulesRepo } = await import(
-  '@/control-plane/policy/policy-rules-repo.js'
-);
+const { policyRulesRepo } = await import('@/control-plane/policy/policy-rules-repo.js');
 
 function makeRow(overrides: Partial<PolicyRule> = {}): PolicyRule {
   return {
@@ -107,16 +105,13 @@ describe('issue #249 — repo publishes on per-tenant channel via activate', () 
       }),
     );
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'default' },
-      async () => {
-        const res = await policyRulesRepo.activate({
-          id: 'pol-1',
-          approved_by: 'admin',
-        });
-        expect(res.ok).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
+      const res = await policyRulesRepo.activate({
+        id: 'pol-1',
+        approved_by: 'admin',
+      });
+      expect(res.ok).toBe(true);
+    });
 
     expect(publishCalls).toHaveLength(1);
     expect(publishCalls[0]?.channel).toBe('policy_rule_lifecycle:tenant-a');
@@ -137,16 +132,13 @@ describe('issue #249 — repo publishes on per-tenant channel via activate', () 
       }),
     );
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'default' },
-      async () => {
-        const res = await policyRulesRepo.activate({
-          id: 'pol-1',
-          approved_by: 'admin',
-        });
-        expect(res.ok).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'default' }, async () => {
+      const res = await policyRulesRepo.activate({
+        id: 'pol-1',
+        approved_by: 'admin',
+      });
+      expect(res.ok).toBe(true);
+    });
 
     expect(publishCalls).toHaveLength(1);
     expect(publishCalls[0]?.channel).toBe('policy_rule_lifecycle:tenant-b');
@@ -166,16 +158,13 @@ describe('issue #249 — repo publishes on per-tenant channel via activate', () 
       }),
     );
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'default' },
-      async () => {
-        const res = await policyRulesRepo.deprecate({
-          id: 'pol-1',
-          deprecated_by: 'admin',
-        });
-        expect(res.ok).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
+      const res = await policyRulesRepo.deprecate({
+        id: 'pol-1',
+        deprecated_by: 'admin',
+      });
+      expect(res.ok).toBe(true);
+    });
 
     expect(publishCalls[0]?.channel).toBe('policy_rule_lifecycle:tenant-a');
     const payload = JSON.parse(publishCalls[0]?.payload ?? '{}');
@@ -193,17 +182,14 @@ describe('issue #249 — repo publishes on per-tenant channel via activate', () 
       }),
     );
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'default' },
-      async () => {
-        const res = await policyRulesRepo.rollback({
-          id: 'pol-1',
-          rolled_back_by: 'admin',
-          rollback_reason: 'incident',
-        });
-        expect(res.ok).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
+      const res = await policyRulesRepo.rollback({
+        id: 'pol-1',
+        rolled_back_by: 'admin',
+        rollback_reason: 'incident',
+      });
+      expect(res.ok).toBe(true);
+    });
 
     expect(publishCalls[0]?.channel).toBe('policy_rule_lifecycle:tenant-a');
     const payload = JSON.parse(publishCalls[0]?.payload ?? '{}');
@@ -214,9 +200,9 @@ describe('issue #249 — repo publishes on per-tenant channel via activate', () 
     // Note: getCurrentTenant() at the *start* of activate() already
     // throws when called outside runWithTenantContext. We assert that
     // (a) the call throws, (b) redis.publish was never reached.
-    await expect(
-      policyRulesRepo.activate({ id: 'pol-1', approved_by: 'admin' }),
-    ).rejects.toThrow(/Tenant context/i);
+    await expect(policyRulesRepo.activate({ id: 'pol-1', approved_by: 'admin' })).rejects.toThrow(
+      /Tenant context/i,
+    );
     expect(publishCalls).toHaveLength(0);
   });
 });

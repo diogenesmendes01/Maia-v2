@@ -168,8 +168,12 @@ describe('routeMessageUpdate — side-effect detected', () => {
         },
       }),
     );
-    expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_edited_after_side_effect')).toBe(true);
-    expect(auditMock.mock.calls.some((c) => c[0].acao === 'pending_substituted_by_edit_review')).toBe(true);
+    expect(
+      auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_edited_after_side_effect'),
+    ).toBe(true);
+    expect(
+      auditMock.mock.calls.some((c) => c[0].acao === 'pending_substituted_by_edit_review'),
+    ).toBe(true);
   });
 
   it('skips pending creation when owner is not configured', async () => {
@@ -185,7 +189,9 @@ describe('routeMessageUpdate — side-effect detected', () => {
     } as never);
     expect(pendingCreateTxMock).not.toHaveBeenCalled();
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
-    expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_edited_after_side_effect')).toBe(true);
+    expect(
+      auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_edited_after_side_effect'),
+    ).toBe(true);
   });
 
   it('skips pending creation when audit row lacks entidade_alvo (e.g. legacy audit pre-fix)', async () => {
@@ -206,7 +212,11 @@ describe('routeMessageUpdate — side-effect detected', () => {
   });
 
   it('revoke side-effect path also creates edit_review pending', async () => {
-    findByWhatsappIdMock.mockResolvedValueOnce({ id: 'm-orig', conteudo: 'x', conversa_id: 'c-user' });
+    findByWhatsappIdMock.mockResolvedValueOnce({
+      id: 'm-orig',
+      conteudo: 'x',
+      conversa_id: 'c-user',
+    });
     auditLogQueryMock.mockResolvedValueOnce([
       { acao: 'transaction_created', alvo_id: 'tx-2', entidade_alvo: 'e-2' },
     ]);
@@ -237,7 +247,9 @@ describe('routeMessageUpdate — side-effect detected', () => {
         }),
       }),
     );
-    expect(auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_revoked_after_side_effect')).toBe(true);
+    expect(
+      auditMock.mock.calls.some((c) => c[0].acao === 'mensagem_revoked_after_side_effect'),
+    ).toBe(true);
   });
 
   it('notifies owner via outbound WhatsApp message after creating edit_review pending', async () => {

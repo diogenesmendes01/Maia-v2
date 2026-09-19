@@ -82,49 +82,41 @@ async function runMigrate(env: Record<string, string>): Promise<RunResult> {
 }
 
 describe('scripts/migrate.ts — erro de configuração é acionável', () => {
-  it(
-    'nomeia as variáveis faltantes e a remediação, em vez de só a classe do erro',
-    async () => {
-      const { code, stderr, started } = await runMigrate({
-        // Só a URL: o serviço `migrator` também exige POSTGRES_USER/PASSWORD/DB.
-        DATABASE_URL: 'postgres://u:p@localhost:5432/d',
-      });
+  it('nomeia as variáveis faltantes e a remediação, em vez de só a classe do erro', async () => {
+    const { code, stderr, started } = await runMigrate({
+      // Só a URL: o serviço `migrator` também exige POSTGRES_USER/PASSWORD/DB.
+      DATABASE_URL: 'postgres://u:p@localhost:5432/d',
+    });
 
-      expect(started, 'a CLI não chegou a executar').toBe(true);
-      // A regressão exata: a mensagem inteira reduzida à classe.
-      expect(stderr).not.toMatch(/unexpected failure \(ConfigValidationError\)/);
+    expect(started, 'a CLI não chegou a executar').toBe(true);
+    // A regressão exata: a mensagem inteira reduzida à classe.
+    expect(stderr).not.toMatch(/unexpected failure \(ConfigValidationError\)/);
 
-      expect(stderr).toContain('POSTGRES_USER');
-      expect(stderr).toContain('POSTGRES_PASSWORD');
-      expect(stderr).toContain('POSTGRES_DB');
-      // Remediação, não só o diagnóstico.
-      expect(stderr).toMatch(/→/);
-      // Exit 2 = uso/configuração inválida, distinto de 1 (falha do runner).
-      expect(code).toBe(2);
-    },
-    180_000,
-  );
+    expect(stderr).toContain('POSTGRES_USER');
+    expect(stderr).toContain('POSTGRES_PASSWORD');
+    expect(stderr).toContain('POSTGRES_DB');
+    // Remediação, não só o diagnóstico.
+    expect(stderr).toMatch(/→/);
+    // Exit 2 = uso/configuração inválida, distinto de 1 (falha do runner).
+    expect(code).toBe(2);
+  }, 180_000);
 
-  it(
-    'não imprime o VALOR de nenhuma variável — nem a senha da connection string',
-    async () => {
-      const secret = 'senha-canario-nao-deve-vazar';
-      const { stderr, stdout, started } = await runMigrate({
-        DATABASE_URL: `postgres://u:${secret}@localhost:5432/d`,
-      });
+  it('não imprime o VALOR de nenhuma variável — nem a senha da connection string', async () => {
+    const secret = 'senha-canario-nao-deve-vazar';
+    const { stderr, stdout, started } = await runMigrate({
+      DATABASE_URL: `postgres://u:${secret}@localhost:5432/d`,
+    });
 
-      // Sem estas duas asserções o caso é VACUOSO: um processo que nunca
-      // executou produz stderr vazio, e "vazio" satisfaz `not.toContain`
-      // trivialmente. Exigir que a CLI tenha rodado E produzido o diagnóstico
-      // é o que faz o canário significar alguma coisa.
-      expect(started, 'a CLI não chegou a executar').toBe(true);
-      expect(stderr, 'sem diagnóstico não há o que auditar').toContain('POSTGRES_USER');
+    // Sem estas duas asserções o caso é VACUOSO: um processo que nunca
+    // executou produz stderr vazio, e "vazio" satisfaz `not.toContain`
+    // trivialmente. Exigir que a CLI tenha rodado E produzido o diagnóstico
+    // é o que faz o canário significar alguma coisa.
+    expect(started, 'a CLI não chegou a executar').toBe(true);
+    expect(stderr, 'sem diagnóstico não há o que auditar').toContain('POSTGRES_USER');
 
-      // O canário prova a propriedade que justifica abrir a exceção: a
-      // mensagem do ConfigValidationError é feita de METADADO, não de valor.
-      expect(stderr).not.toContain(secret);
-      expect(stdout).not.toContain(secret);
-    },
-    180_000,
-  );
+    // O canário prova a propriedade que justifica abrir a exceção: a
+    // mensagem do ConfigValidationError é feita de METADADO, não de valor.
+    expect(stderr).not.toContain(secret);
+    expect(stdout).not.toContain(secret);
+  }, 180_000);
 });

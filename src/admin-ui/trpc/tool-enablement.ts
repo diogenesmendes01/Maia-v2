@@ -72,9 +72,7 @@ function envFlagValue(name: string): boolean | undefined {
 }
 
 /** The set of valid `FeatureFlagName` VALUES, for the runtime-vs-env decision. */
-const FEATURE_FLAG_VALUES: ReadonlySet<string> = new Set(
-  Object.values(FeatureFlagName),
-);
+const FEATURE_FLAG_VALUES: ReadonlySet<string> = new Set(Object.values(FeatureFlagName));
 
 /**
  * Whether a catalog tool is currently enabled, given its gating flag NAME.

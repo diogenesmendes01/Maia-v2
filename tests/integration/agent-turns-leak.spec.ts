@@ -190,13 +190,21 @@ d('agent turns — leak suite cross-tenant', () => {
 
     // A não consegue reivindicar o turno de B.
     const alienClaim = await inA(() =>
-      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turnB.id, worker_id: 'wA', lease_ms: 60_000 }),
+      agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: turnB.id,
+        worker_id: 'wA',
+        lease_ms: 60_000,
+      }),
     );
     expect(alienClaim).toMatchObject({ ok: false, reason: 'not_found' });
 
     // O dono reivindica...
     const owned = await inB(() =>
-      agentTurnsRepo.claimNextEligibleTurn({ turn_id: turnB.id, worker_id: 'wB', lease_ms: 60_000 }),
+      agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: turnB.id,
+        worker_id: 'wB',
+        lease_ms: 60_000,
+      }),
     );
     expect(owned.ok).toBe(true);
     if (!owned.ok) return;

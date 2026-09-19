@@ -119,9 +119,7 @@ const {
       where: () => self,
       limit: () =>
         Promise.resolve(
-          [...persisted.entries()]
-            .filter(([k]) => k.startsWith(`${table}:`))
-            .map(([, v]) => v),
+          [...persisted.entries()].filter(([k]) => k.startsWith(`${table}:`)).map(([, v]) => v),
         ),
     };
     return self;
@@ -189,12 +187,8 @@ vi.mock('@/config/contract-env.js', () => ({
   },
 }));
 
-const {
-  traceTurnDecision,
-  toContextStub,
-  MandatoryTraceEnvelopeError,
-  envelopeTraceIdForAttempt,
-} = await import('@/observability/turn-trace.js');
+const { traceTurnDecision, toContextStub, MandatoryTraceEnvelopeError, envelopeTraceIdForAttempt } =
+  await import('@/observability/turn-trace.js');
 const { redactPacket } = await import('@/control-plane/runtime-trace/lib/redaction.js');
 const { verifyHmac, canonicalJson } = await import('@/control-plane/runtime-trace/lib/hmac.js');
 const { runWithCorrelation, deriveTraceId } = await import('@/observability/correlation.js');
@@ -360,9 +354,7 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
     const serialized = JSON.stringify(redacted);
 
     // Nothing outside the allowlist ⇒ the evidence trail loses no field.
-    expect(
-      (redacted as Record<string, unknown>)._redaction_dropped_unknown_count ?? 0,
-    ).toBe(0);
+    expect((redacted as Record<string, unknown>)._redaction_dropped_unknown_count ?? 0).toBe(0);
     expect(bytes_redacted).toBe(0);
 
     // The operator-authored policy reason quoted a phone number and the
@@ -407,7 +399,9 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
         base: baseFixture('acme', trace_id),
         packet: packetFixture(),
       });
-      expect(txRows.filter((r) => r.table === 'runtime_trace_envelopes')[0]!.row.trace_id).toBe(trace_id);
+      expect(txRows.filter((r) => r.table === 'runtime_trace_envelopes')[0]!.row.trace_id).toBe(
+        trace_id,
+      );
     });
   });
 
@@ -417,13 +411,11 @@ describe('issue #514 — hot-path runtime trace, real writers', () => {
 
     /** Drive one attempt of the same turn, exactly as the worker would. */
     async function attemptTurn(attempt: number) {
-      return runWithCorrelation(
-        { seed: TURN, turn_id: TURN, attempt, origin: 'recovery' },
-        () =>
-          traceTurnDecision({
-            base: baseFixture('acme', root),
-            packet: packetFixture(),
-          }),
+      return runWithCorrelation({ seed: TURN, turn_id: TURN, attempt, origin: 'recovery' }, () =>
+        traceTurnDecision({
+          base: baseFixture('acme', root),
+          packet: packetFixture(),
+        }),
       );
     }
 

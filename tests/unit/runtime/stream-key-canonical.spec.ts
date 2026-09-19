@@ -54,11 +54,26 @@ describe('#505 — encoding canônico é injetivo (sem ambiguidade)', () => {
   // Cada par tem a MESMA concatenação sob `join(':')` e componentes DIFERENTES.
   // Sob o encoding comprimento-prefixado, os materiais têm de divergir.
   const colisoesSobSeparador: ReadonlyArray<readonly [string[], string[]]> = [
-    [['a:b', 'c'], ['a', 'b:c']],
-    [['t', 'a:g'], ['t:a', 'g']],
-    [[':', 'x'], ['', ':x']],
-    [['primary:primary', 'whatsapp'], ['primary', 'primary:whatsapp']],
-    [['1', '2:3'], ['1:2', '3']],
+    [
+      ['a:b', 'c'],
+      ['a', 'b:c'],
+    ],
+    [
+      ['t', 'a:g'],
+      ['t:a', 'g'],
+    ],
+    [
+      [':', 'x'],
+      ['', ':x'],
+    ],
+    [
+      ['primary:primary', 'whatsapp'],
+      ['primary', 'primary:whatsapp'],
+    ],
+    [
+      ['1', '2:3'],
+      ['1:2', '3'],
+    ],
   ];
 
   it.each(colisoesSobSeparador)(
@@ -81,9 +96,7 @@ describe('#505 — encoding canônico é injetivo (sem ambiguidade)', () => {
 
   it('componentes trocados de posição produzem chaves diferentes', () => {
     // tenant/agent invertidos são um par DIFERENTE, não o mesmo escopo.
-    expect(key({ tenant_id: 'x', agent_id: 'y' })).not.toBe(
-      key({ tenant_id: 'y', agent_id: 'x' }),
-    );
+    expect(key({ tenant_id: 'x', agent_id: 'y' })).not.toBe(key({ tenant_id: 'y', agent_id: 'x' }));
   });
 
   it('a derivação é determinística', () => {
@@ -210,8 +223,8 @@ describe('#505 — versão do algoritmo', () => {
     // deixaria de ser detectável.
     const componentes = ['primary', 'primary', 'whatsapp', BASE.channel_id!, '+5511999998888'];
     const material = canonicalStreamMaterial(componentes);
-    expect(material.startsWith(`${`maia.stream.v${STREAM_KEY_VERSION}`.length}:maia.stream.v`)).toBe(
-      true,
-    );
+    expect(
+      material.startsWith(`${`maia.stream.v${STREAM_KEY_VERSION}`.length}:maia.stream.v`),
+    ).toBe(true);
   });
 });

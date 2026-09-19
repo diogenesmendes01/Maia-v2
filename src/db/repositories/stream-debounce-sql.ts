@@ -106,11 +106,7 @@ function terminaisLiterais(): SQL {
  * então não há contenção a evitar: `FOR UPDATE` puro é seguro e é o único
  * correto.
  */
-export function lockStreamForDebounce(input: {
-  tenant: SQL;
-  agent: SQL;
-  stream_key: SQL;
-}): SQL {
+export function lockStreamForDebounce(input: { tenant: SQL; agent: SQL; stream_key: SQL }): SQL {
   return sql`
     SELECT s.stream_key
       FROM ${agent_stream_sequences} AS s
@@ -215,11 +211,7 @@ export function openDebounceWindowMembers(input: {
  * AQUISIÇÃO, pela mesma razão da CTE `ativos` de `recoverExpiredStreamClaims`:
  * duas transações que travem o mesmo conjunto na mesma ordem não fecham ciclo.
  */
-export function debounceBatchPrefix(input: {
-  tenant: SQL;
-  agent: SQL;
-  stream_key: SQL;
-}): SQL {
+export function debounceBatchPrefix(input: { tenant: SQL; agent: SQL; stream_key: SQL }): SQL {
   return sql`
     WITH travados AS MATERIALIZED (
       SELECT t.id

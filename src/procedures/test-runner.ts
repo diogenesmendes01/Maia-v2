@@ -22,13 +22,21 @@ import { logger } from '@/lib/logger.js';
 
 export type ScenarioTurn =
   | { role: 'user'; message: string }
-  | { role: 'agent'; response_text: string; tools_called?: Array<{ name: string; result: unknown }> };
+  | {
+      role: 'agent';
+      response_text: string;
+      tools_called?: Array<{ name: string; result: unknown }>;
+    };
 
 export type Scenario = {
   turns: ScenarioTurn[];
   /** Inject human confirmations at scripted step transitions. Applied when
    *  current_step_id === at_step (after the agent turn that landed there). */
-  human_confirmations?: Array<{ at_step: string; decision: 'approved' | 'rejected'; operator_id: string }>;
+  human_confirmations?: Array<{
+    at_step: string;
+    decision: 'approved' | 'rejected';
+    operator_id: string;
+  }>;
 };
 
 export type TestRunResult = {
@@ -61,8 +69,10 @@ export async function runProcedureTest(args: {
     let executionId: string | null = null;
 
     try {
-      const steps = (args.definition.steps as unknown as Array<{ id: string; depends_on?: string[] }>) ?? [];
-      const firstStep = steps.find((s) => !s.depends_on || s.depends_on.length === 0) ?? steps[0] ?? null;
+      const steps =
+        (args.definition.steps as unknown as Array<{ id: string; depends_on?: string[] }>) ?? [];
+      const firstStep =
+        steps.find((s) => !s.depends_on || s.depends_on.length === 0) ?? steps[0] ?? null;
       const firstStepId = firstStep?.id ?? null;
 
       const startResult = await engine.startExecution({
@@ -154,7 +164,9 @@ export async function runProcedureTest(args: {
 
       // Observe final state. If still in_progress, the scenario ran out of
       // turns mid-procedure → outcome is `partial`.
-      const finalExec = (await procedureExecutionsRepo.findById(exec.id)) as ProcedureExecution | null;
+      const finalExec = (await procedureExecutionsRepo.findById(
+        exec.id,
+      )) as ProcedureExecution | null;
       if (finalExec) {
         final_status = finalExec.status;
         if (finalExec.outcome) {
@@ -186,7 +198,9 @@ export async function runProcedureTest(args: {
       // tenant isolation keeps these rows from leaking into production reads.
       // If a delete method is added later this block becomes the natural hook.
       if (executionId) {
-        const repoAny = procedureExecutionsRepo as unknown as { delete?: (id: string) => Promise<void> };
+        const repoAny = procedureExecutionsRepo as unknown as {
+          delete?: (id: string) => Promise<void>;
+        };
         if (typeof repoAny.delete === 'function') {
           try {
             await repoAny.delete(executionId);

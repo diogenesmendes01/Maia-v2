@@ -137,7 +137,11 @@ export async function resolveAndDispatch(
         inbound_mensagem_id?: string;
         response_text?: string;
       };
-      if (acao.candidates && acao.inbound_mensagem_id !== undefined && acao.response_text !== undefined) {
+      if (
+        acao.candidates &&
+        acao.inbound_mensagem_id !== undefined &&
+        acao.response_text !== undefined
+      ) {
         const result = await applyDisambiguationDecision({
           pending_question_id: input.expected_pending_id,
           chosen_key: input.option_chosen,

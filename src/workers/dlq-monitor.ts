@@ -63,14 +63,15 @@ async function runDlqMonitorInner(): Promise<void> {
     return;
   }
 
-  logger.error({ count, threshold, tag: 'dlq.threshold_exceeded' }, 'dlq_monitor.threshold_exceeded');
+  logger.error(
+    { count, threshold, tag: 'dlq.threshold_exceeded' },
+    'dlq_monitor.threshold_exceeded',
+  );
 
   await sendAlert({
     subject: `DLQ size ${count} above threshold ${threshold}`,
     body: `Dead-letter queue has ${count} unresolved jobs (threshold: ${threshold}).\n\nUse \`tsx scripts/dlq.ts list\` to inspect, then \`retry <id>\` or \`resolve <id>\`.`,
-  }).catch((err) =>
-    logger.warn({ err: (err as Error).message }, 'dlq_monitor.alert_send_failed'),
-  );
+  }).catch((err) => logger.warn({ err: (err as Error).message }, 'dlq_monitor.alert_send_failed'));
 
   await audit({
     acao: 'dlq_alert_emitted',

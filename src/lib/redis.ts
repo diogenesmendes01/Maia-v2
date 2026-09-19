@@ -178,10 +178,7 @@ export type RedisErrorCaller =
  * `extra` carries per-tenant attribution (tenant_id/agent_id) into the LOG
  * only — it is never used as a metric label.
  */
-export function recordRedisError(
-  caller: RedisErrorCaller,
-  extra?: Record<string, unknown>,
-): void {
+export function recordRedisError(caller: RedisErrorCaller, extra?: Record<string, unknown>): void {
   incCounter('redis_error_total', { operation: caller });
   logger.warn({ redis_error: true, caller, ...extra }, 'redis.error');
 }
@@ -273,7 +270,11 @@ export async function ensureRedisConnect(opts?: { timeoutMs?: number }): Promise
     // `connect()` throws "Redis is already connecting/connected" if a connect
     // is already in flight (e.g. two boot paths racing) — in that case we only
     // need to WAIT for readiness, not to initiate.
-    if (redis.status !== 'connecting' && redis.status !== 'connect' && redis.status !== 'reconnecting') {
+    if (
+      redis.status !== 'connecting' &&
+      redis.status !== 'connect' &&
+      redis.status !== 'reconnecting'
+    ) {
       await redis.connect();
     }
     await waitForReady(timeoutMs);

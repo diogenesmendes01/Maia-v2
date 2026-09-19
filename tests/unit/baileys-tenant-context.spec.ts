@@ -34,12 +34,8 @@ const {
   handlerState,
 } = vi.hoisted(() => {
   const state: {
-    upsertHandler:
-      | ((args: { messages: unknown[] }) => Promise<void>)
-      | null;
-    updateHandler:
-      | ((updates: unknown[]) => Promise<void>)
-      | null;
+    upsertHandler: ((args: { messages: unknown[] }) => Promise<void>) | null;
+    updateHandler: ((updates: unknown[]) => Promise<void>) | null;
   } = { upsertHandler: null, updateHandler: null };
   return {
     createInboundMock: vi.fn(),

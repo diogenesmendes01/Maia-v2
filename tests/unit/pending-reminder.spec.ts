@@ -30,9 +30,7 @@ vi.mock('../../src/db/client.js', () => ({
 //     scoped JOIN + scoped UPDATE bind them — see worker).
 // Net effect: `dbExecuteMock` is consumed ONCE by the inner JOIN exactly as
 // before this change (the enumeration uses the repo mock, not `db.execute`).
-const listRemindablePairsMock = vi.fn(async () => [
-  { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-]);
+const listRemindablePairsMock = vi.fn(async () => [{ tenant_id: 'tenant-A', agent_id: 'agent-A' }]);
 vi.mock('../../src/db/repositories.js', () => ({
   pendingQuestionsRepo: {
     listTenantAgentPairsWithRemindableQuestions: listRemindablePairsMock,
@@ -56,8 +54,7 @@ vi.mock('../../src/gateway/baileys.js', () => ({
 // `sendText` delega para o MESMO spy de antes, então as asserções existentes
 // sobre (jid, texto, quoted) continuam provando o contrato de envio.
 const forCurrentAgentChannelMock = vi.fn(async () => ({
-  sendText: (jid: string, text: string, opts?: unknown) =>
-    sendOutboundTextMock(jid, text, opts),
+  sendText: (jid: string, text: string, opts?: unknown) => sendOutboundTextMock(jid, text, opts),
 }));
 vi.mock('../../src/gateway/line-output.js', () => ({
   forCurrentAgentChannel: forCurrentAgentChannelMock,

@@ -48,7 +48,14 @@ function readyFacts(overrides: Partial<ReadinessFacts> = {}): ReadinessFacts {
       denied_tools: [],
     },
     roles: [
-      { id: ROLE_ID, tenant_id: T, agent_id: A, role_key: 'suporte', active: true, is_default: true },
+      {
+        id: ROLE_ID,
+        tenant_id: T,
+        agent_id: A,
+        role_key: 'suporte',
+        active: true,
+        is_default: true,
+      },
     ],
     channels: [
       {
@@ -62,7 +69,13 @@ function readyFacts(overrides: Partial<ReadinessFacts> = {}): ReadinessFacts {
       },
     ],
     policies: [
-      { id: POLICY_ID, tenant_id: T, agent_id: A, channel_id: CHANNEL_ID, default_role_id: ROLE_ID },
+      {
+        id: POLICY_ID,
+        tenant_id: T,
+        agent_id: A,
+        channel_id: CHANNEL_ID,
+        default_role_id: ROLE_ID,
+      },
     ],
     required_packs: ['baseline.core', 'domain.calendar'],
     schema: readySchema(),
@@ -149,7 +162,14 @@ describe('composição INTRA-agente — dois canais dividindo papel válido e po
   function splitFacts(): ReadinessFacts {
     return readyFacts({
       roles: [
-        { id: ROLE_ID, tenant_id: T, agent_id: A, role_key: 'suporte', active: true, is_default: true },
+        {
+          id: ROLE_ID,
+          tenant_id: T,
+          agent_id: A,
+          role_key: 'suporte',
+          active: true,
+          is_default: true,
+        },
         {
           id: INACTIVE_ROLE,
           tenant_id: T,
@@ -180,7 +200,13 @@ describe('composição INTRA-agente — dois canais dividindo papel válido e po
         },
       ],
       policies: [
-        { id: POLICY_ID, tenant_id: T, agent_id: A, channel_id: CHANNEL_ID, default_role_id: ROLE_ID },
+        {
+          id: POLICY_ID,
+          tenant_id: T,
+          agent_id: A,
+          channel_id: CHANNEL_ID,
+          default_role_id: ROLE_ID,
+        },
         {
           id: POLICY_B,
           tenant_id: T,
@@ -443,7 +469,14 @@ describe('checks individuais', () => {
       failedCodes(
         readyFacts({
           roles: [
-            { id: ROLE_ID, tenant_id: T, agent_id: A, role_key: 'a', active: true, is_default: true },
+            {
+              id: ROLE_ID,
+              tenant_id: T,
+              agent_id: A,
+              role_key: 'a',
+              active: true,
+              is_default: true,
+            },
             { id: 'r2', tenant_id: T, agent_id: A, role_key: 'b', active: true, is_default: true },
           ],
         }),
@@ -605,7 +638,9 @@ describe('checks individuais', () => {
       }),
     );
     expect(r.ready).toBe(false);
-    expect(r.checks.find((c) => c.code === 'schema_ready')!.message).toContain('não pôde ser apurado');
+    expect(r.checks.find((c) => c.code === 'schema_ready')!.message).toContain(
+      'não pôde ser apurado',
+    );
   });
 
   it('pendência de governança bloqueante reprova', () => {
@@ -672,7 +707,7 @@ describe('fingerprints', () => {
   it('schemaFingerprint é estável sob reordenação e sensível ao conjunto de migrations', () => {
     const a = { id: 'a.sql', state: 'applied', checksum: 'a'.repeat(64) };
     const b = { id: 'b.sql', state: 'applied', checksum: 'b'.repeat(64) };
-    const fp = (verified: typeof a[]) =>
+    const fp = (verified: (typeof a)[]) =>
       schemaFingerprint(readySchema({ verified, expected_head: null, applied_head: null }));
     expect(fp([b, a])).toBe(fp([a, b]));
     expect(fp([a])).not.toBe(fp([a, b]));

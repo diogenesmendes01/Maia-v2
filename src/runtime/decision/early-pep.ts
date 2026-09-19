@@ -27,11 +27,7 @@ export interface EarlyPepDeps {
 export class EarlyPepImpl implements EarlyPep {
   constructor(private deps: EarlyPepDeps) {}
 
-  async evaluate({
-    base,
-    resolved_policies,
-    signal,
-  }: EarlyPepInput): Promise<EarlyPepOutput> {
+  async evaluate({ base, resolved_policies, signal }: EarlyPepInput): Promise<EarlyPepOutput> {
     const opts: { signal?: AbortSignal } = {};
     if (signal) opts.signal = signal;
     // 1. Hardcoded short-circuits (rules first, master §0.4 principle 1).

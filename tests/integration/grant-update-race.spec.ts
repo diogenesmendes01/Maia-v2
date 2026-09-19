@@ -42,7 +42,9 @@ async function wipe(): Promise<void> {
 }
 
 function addPackCompute(pack: string) {
-  return (current: { granted_packs: string[]; granted_tools: string[]; denied_tools: string[] } | null) => ({
+  return (
+    current: { granted_packs: string[]; granted_tools: string[]; denied_tools: string[] } | null,
+  ) => ({
     ok: true as const,
     granted_packs: [...new Set([...(current?.granted_packs ?? ['baseline.core']), pack])],
     granted_tools: current?.granted_tools ?? [],
@@ -143,12 +145,12 @@ d('agentToolGrantsRepo.updateWithAudit (concurrent writers, real DB)', () => {
       previous: { granted_packs: string[] };
       next: { granted_packs: string[] };
     };
-    const firstNext = (audits.rows[0]!.change_summary as {
-      next: { granted_packs: string[] };
-    }).next.granted_packs;
-    const firstAdded = firstNext.includes('domain.finance')
-      ? 'domain.finance'
-      : 'domain.support';
+    const firstNext = (
+      audits.rows[0]!.change_summary as {
+        next: { granted_packs: string[] };
+      }
+    ).next.granted_packs;
+    const firstAdded = firstNext.includes('domain.finance') ? 'domain.finance' : 'domain.support';
     expect(second.previous.granted_packs).toContain(firstAdded);
   });
 
@@ -185,10 +187,7 @@ d('agentToolGrantsRepo.updateWithAudit (concurrent writers, real DB)', () => {
     expect(packs).toContain('domain.finance');
     expect(packs).toContain('domain.support');
 
-    const audits = await pool.query(
-      `SELECT id FROM admin_audit_log WHERE tenant_id = $1`,
-      [T],
-    );
+    const audits = await pool.query(`SELECT id FROM admin_audit_log WHERE tenant_id = $1`, [T]);
     expect(audits.rows.length).toBe(2);
   });
 });

@@ -45,10 +45,7 @@ import { inArray } from 'drizzle-orm';
 import { logger } from '@/lib/logger.js';
 import { db } from '@/db/client.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
-import {
-  capabilityGapsRepo,
-  gapEscalationRulesRepo,
-} from '@/db/repositories.js';
+import { capabilityGapsRepo, gapEscalationRulesRepo } from '@/db/repositories.js';
 import { decideEscalation } from '@/cognition/gap-escalation/engine.js';
 import { DEFAULT_RULES } from '@/cognition/gap-escalation/types.js';
 import { proposeCapabilityForGap } from '@/cognition/capability-proposer.js';
@@ -139,10 +136,7 @@ async function proporParaGapNoTopo(gap: AgentCapabilityGap): Promise<void> {
 
   const r = await proposeCapabilityForGap({ gap });
   if (r.ok) {
-    logger.info(
-      { proposal_id: r.proposal_id, gap_id: gap.id },
-      'gap_escalation.proposal_created',
-    );
+    logger.info({ proposal_id: r.proposal_id, gap_id: gap.id }, 'gap_escalation.proposal_created');
   } else {
     logger.warn({ gap_id: gap.id, reason: r.reason }, 'gap_escalation.proposal_failed');
   }
@@ -181,8 +175,7 @@ export async function runGapEscalationMonitor(): Promise<void> {
           // P5 simplification: distinct_contexts_count proxy = 2 if contexto present, else 1.
           // O engine usa esse valor apenas na transição mentionable -> proposed; antes
           // disso (silent/dashboard) o valor é irrelevante.
-          const distinct_contexts_count =
-            gap.contexto && gap.contexto.length > 0 ? 2 : 1;
+          const distinct_contexts_count = gap.contexto && gap.contexto.length > 0 ? 2 : 1;
 
           const decision = decideEscalation({
             gap,
@@ -229,10 +222,9 @@ export async function runGapEscalationMonitor(): Promise<void> {
             //
             // Continua fire-and-forget: o `capability-proposer` chama Sonnet e
             // pode levar 15s; o worker não bloqueia por isso.
-            void proporParaGapNoTopo({ ...gap, current_level: decision.new_level })
-              .catch((err) => {
-                logger.error({ gap_id: gap.id, err }, 'gap_escalation.proposer_threw');
-              });
+            void proporParaGapNoTopo({ ...gap, current_level: decision.new_level }).catch((err) => {
+              logger.error({ gap_id: gap.id, err }, 'gap_escalation.proposer_threw');
+            });
             total_proposed_triggered++;
           }
         }

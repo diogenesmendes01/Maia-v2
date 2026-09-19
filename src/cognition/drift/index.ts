@@ -53,9 +53,7 @@ export function buildDetectors(): DriftDetector[] {
 /** @deprecated Use buildDetectors() to get the flag-aware list. */
 export const DETECTORS: DriftDetector[] = BASE_DETECTORS;
 
-export async function runAllDriftDetectors(
-  input: DriftDetectionInput,
-): Promise<DriftEvidence[]> {
+export async function runAllDriftDetectors(input: DriftDetectionInput): Promise<DriftEvidence[]> {
   const activeDetectors = buildDetectors();
   const results = await Promise.all(
     activeDetectors.map((d) =>
@@ -70,9 +68,7 @@ export async function runAllDriftDetectors(
       ),
     ),
   );
-  return results
-    .map((r) => r.output)
-    .filter((o): o is DriftEvidence => o !== null);
+  return results.map((r) => r.output).filter((o): o is DriftEvidence => o !== null);
 }
 
 export type {

@@ -41,9 +41,7 @@ const inputSchema = z
   })
   .refine(
     (v) =>
-      Boolean(
-        v.company_id || v.cnpj || v.legal_name || v.trade_name || v.partner_or_owner_name,
-      ),
+      Boolean(v.company_id || v.cnpj || v.legal_name || v.trade_name || v.partner_or_owner_name),
     { message: 'at least one search field is required' },
   )
   // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.

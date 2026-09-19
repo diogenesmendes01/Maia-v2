@@ -249,7 +249,10 @@ export async function completeExecution(args: {
   });
 }
 
-export async function abortExecution(args: { execution_id: string; reason: string }): Promise<void> {
+export async function abortExecution(args: {
+  execution_id: string;
+  reason: string;
+}): Promise<void> {
   // P84-C5: atomicity. Same rationale as completeExecution.
   await withTx(async (tx) => {
     await procedureExecutionEventsRepo.recordTx(tx, {

@@ -79,11 +79,7 @@ function scriptKey(kind: KnowledgeKind, id: string): string {
   return `${kind}:${id}`;
 }
 
-function scriptConflicts(
-  kind: KnowledgeKind,
-  id: string,
-  script: ConflictScript,
-): void {
+function scriptConflicts(kind: KnowledgeKind, id: string, script: ConflictScript): void {
   conflictScriptByKindId.set(scriptKey(kind, id), script);
   updateCallCountByKindId.set(scriptKey(kind, id), 0);
 }
@@ -95,9 +91,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
       public readonly id: string,
       public readonly expected_previous_status: KnowledgeLifecycleStatus,
     ) {
-      super(
-        `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
-      );
+      super(`knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`);
       this.name = 'KnowledgeConflictError';
     }
   }
@@ -105,10 +99,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
   return {
     KnowledgeConflictError,
     knowledgeRepos: {
-      async findById(
-        kind: KnowledgeKind,
-        id: string,
-      ): Promise<KnowledgeRow | null> {
+      async findById(kind: KnowledgeKind, id: string): Promise<KnowledgeRow | null> {
         return storeByKind.get(kind)?.get(id) ?? null;
       },
       async update(
@@ -129,12 +120,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
         const step = script[callIdx];
         const row = storeByKind.get(kind)?.get(id);
 
-        if (
-          step &&
-          typeof step === 'object' &&
-          'conflict' in step &&
-          step.conflict
-        ) {
+        if (step && typeof step === 'object' && 'conflict' in step && step.conflict) {
           // Simulate the conflict (production raises this when the
           // conditional UPDATE affects 0 rows). If the script asked us
           // to mutate the row's status before the next re-read, do so —
@@ -159,11 +145,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
         ) {
           // No script step, but the state has drifted out from under us.
           // Production would raise KnowledgeConflictError here too.
-          throw new KnowledgeConflictError(
-            kind,
-            id,
-            updates.expected_previous_status,
-          );
+          throw new KnowledgeConflictError(kind, id, updates.expected_previous_status);
         }
         if (updates.lifecycle_status !== undefined) {
           row.lifecycle_status = updates.lifecycle_status;
@@ -183,9 +165,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
 // Bypass the cognitive_module_log DB write — tenant context is missing
 // in these unit tests and the runner swallows the audit failure.
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -210,9 +191,7 @@ vi.mock('@/lib/logger.js', () => ({
 // Blocker [3] [audit log on idempotent paths]).
 const incCounterMock = vi.fn();
 vi.mock('@/lib/metrics.js', async () => {
-  const actual = await vi.importActual<typeof import('@/lib/metrics.js')>(
-    '@/lib/metrics.js',
-  );
+  const actual = await vi.importActual<typeof import('@/lib/metrics.js')>('@/lib/metrics.js');
   return {
     ...actual,
     incCounter: (name: string, labels?: Record<string, string>, by?: number) => {
@@ -435,9 +414,7 @@ describe('Issue #256 — KSM.revoke() bounded retry under optimistic-conflict', 
     // update to throw a plain Error on first call.
     seedRule('rule-generic-err', 'pending_review');
 
-    const { knowledgeRepos } = await import(
-      '@/control-plane/knowledge-state-machine/repos.js'
-    );
+    const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
     const updateSpy = vi.spyOn(knowledgeRepos, 'update');
     updateSpy.mockRejectedValueOnce(new Error('db_unreachable'));
 
@@ -565,9 +542,7 @@ describe('PR #279 Codex review — Blocker [2] AbortSignal cancellation', () => 
     const controller = new AbortController();
     controller.abort(new Error('caller_cancelled'));
 
-    const { knowledgeRepos } = await import(
-      '@/control-plane/knowledge-state-machine/repos.js'
-    );
+    const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
     const findSpy = vi.spyOn(knowledgeRepos, 'findById');
     const updateSpy = vi.spyOn(knowledgeRepos, 'update');
 
@@ -612,17 +587,18 @@ describe('PR #279 Codex review — Blocker [2] AbortSignal cancellation', () => 
     // any scheduled timer in the backoff bands gets us a fresh chance
     // to abort.
     const originalSetTimeout = globalThis.setTimeout;
-    const setTimeoutSpy = vi
-      .spyOn(globalThis, 'setTimeout')
-      .mockImplementation(((cb: (...a: unknown[]) => void, ms?: number) => {
-        if (ms !== undefined && ms >= 10 && ms < 20) {
-          // First backoff slot — abort the signal while the timer is
-          // still pending. The sleep() helper's abort listener will
-          // clear this timer.
-          queueMicrotask(() => controller.abort(new Error('mid_sleep')));
-        }
-        return originalSetTimeout(cb, ms);
-      }) as typeof setTimeout);
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(((
+      cb: (...a: unknown[]) => void,
+      ms?: number,
+    ) => {
+      if (ms !== undefined && ms >= 10 && ms < 20) {
+        // First backoff slot — abort the signal while the timer is
+        // still pending. The sleep() helper's abort listener will
+        // clear this timer.
+        queueMicrotask(() => controller.abort(new Error('mid_sleep')));
+      }
+      return originalSetTimeout(cb, ms);
+    }) as typeof setTimeout);
 
     await expect(
       KnowledgeStateMachine.revoke({
@@ -686,9 +662,7 @@ describe('PR #279 Codex review — Blocker [3] audit + counter on idempotent pat
 
   it('concurrent-revoke-won (re-read shows revoked) emits log + counter', async () => {
     seedRule('rule-concurrent-won', 'pending_review');
-    scriptConflicts('rule', 'rule-concurrent-won', [
-      { conflict: true, postReadStatus: 'revoked' },
-    ]);
+    scriptConflicts('rule', 'rule-concurrent-won', [{ conflict: true, postReadStatus: 'revoked' }]);
 
     await KnowledgeStateMachine.revoke({
       kind: 'rule',

@@ -54,42 +54,40 @@ async function assertAgentInTenant(
 }
 
 export const playgroundRouter = router({
-  createSession: protectedProcedure
-    .input(CreateSessionInput)
-    .mutation(async ({ input, ctx }) => {
-      ctx.assertRole('owner', 'founder');
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      await assertAgentInTenant(ctx, tenantId, input.agentId);
+  createSession: protectedProcedure.input(CreateSessionInput).mutation(async ({ input, ctx }) => {
+    ctx.assertRole('owner', 'founder');
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    await assertAgentInTenant(ctx, tenantId, input.agentId);
 
-      const profileVersionId = input.profileVersionId ?? null;
-      if (profileVersionId) {
-        const version = await runWithTenantContext(
-          { tenant_id: tenantId, agent_id: input.agentId },
-          async () => ctx.repos.operationalProfileVersionsRepo.getById(profileVersionId),
-        );
-        if (!version) {
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Profile version not found' });
-        }
-        if (version.status !== 'proposed' && version.status !== 'active') {
-          throw new TRPCError({
-            code: 'PRECONDITION_FAILED',
-            message: `Cannot test a '${version.status}' profile version — only proposed or active.`,
-          });
-        }
+    const profileVersionId = input.profileVersionId ?? null;
+    if (profileVersionId) {
+      const version = await runWithTenantContext(
+        { tenant_id: tenantId, agent_id: input.agentId },
+        async () => ctx.repos.operationalProfileVersionsRepo.getById(profileVersionId),
+      );
+      if (!version) {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Profile version not found' });
       }
+      if (version.status !== 'proposed' && version.status !== 'active') {
+        throw new TRPCError({
+          code: 'PRECONDITION_FAILED',
+          message: `Cannot test a '${version.status}' profile version — only proposed or active.`,
+        });
+      }
+    }
 
-      const session = await ctx.repos.playgroundRepo.createSession({
-        tenant_id: tenantId,
-        agent_id: input.agentId,
-        profile_version_id: profileVersionId,
-        created_by: ctx.userId,
-      });
-      return {
-        id: session.id,
-        profile_version_id: session.profile_version_id,
-        expires_at: session.expires_at,
-      };
-    }),
+    const session = await ctx.repos.playgroundRepo.createSession({
+      tenant_id: tenantId,
+      agent_id: input.agentId,
+      profile_version_id: profileVersionId,
+      created_by: ctx.userId,
+    });
+    return {
+      id: session.id,
+      profile_version_id: session.profile_version_id,
+      expires_at: session.expires_at,
+    };
+  }),
 
   sendTurn: protectedProcedure.input(SendTurnInput).mutation(async ({ input, ctx }) => {
     ctx.assertRole('owner', 'founder');

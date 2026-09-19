@@ -9,21 +9,11 @@ vi.mock('@/lib/logger.js', () => ({
   logger: { debug: vi.fn(), info: vi.fn(), warn: vi.fn(), error: vi.fn() },
 }));
 
-import {
-  SkillSelectorImpl,
-  type SkillSelectorDeps,
-} from '@/runtime/decision/skill-selector.ts';
+import { SkillSelectorImpl, type SkillSelectorDeps } from '@/runtime/decision/skill-selector.ts';
 import { SKILL_MATCH_THRESHOLD } from '@/runtime/decision/skill-match.ts';
-import type {
-  SkillsRepo,
-  Skill,
-  SkillSelectorAudience,
-} from '@/runtime/decision/types.js';
+import type { SkillsRepo, Skill, SkillSelectorAudience } from '@/runtime/decision/types.js';
 import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
-import {
-  allowedDataScopesForAudience,
-  type SkillUsagePolicy,
-} from '@/skills/usage-policy.js';
+import { allowedDataScopesForAudience, type SkillUsagePolicy } from '@/skills/usage-policy.js';
 
 function mkBase(overrides?: Partial<BaseContextPacket>): BaseContextPacket {
   return {
@@ -146,8 +136,7 @@ describe('P9b — SkillSelector', () => {
       { label: 'transfer_intent', confidence: 0.8 },
       { agent_id_override: 'routed_agent_Y' },
     );
-    const call = (deps.skillsRepo.findActive as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0];
+    const call = (deps.skillsRepo.findActive as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(call?.agent_id).toBe('routed_agent_Y');
     expect(call?.agent_id).not.toBe('base_agent_X');
   });
@@ -155,12 +144,8 @@ describe('P9b — SkillSelector', () => {
   it('Codex #103 — falls back to base.agent_id when no override given', async () => {
     const deps = mkDeps([mkSkill({ id: 's_x' })]);
     const selector = new SkillSelectorImpl(deps);
-    await selector.select(
-      mkBase({ agent_id: 'base_only' }),
-      { label: 'greet', confidence: 0.95 },
-    );
-    const call = (deps.skillsRepo.findActive as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0];
+    await selector.select(mkBase({ agent_id: 'base_only' }), { label: 'greet', confidence: 0.95 });
+    const call = (deps.skillsRepo.findActive as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(call?.agent_id).toBe('base_only');
   });
 
@@ -168,8 +153,7 @@ describe('P9b — SkillSelector', () => {
     const deps = mkDeps([mkSkill({ id: 's_x' })]);
     const selector = new SkillSelectorImpl(deps);
     await selector.select(mkBase(), { label: 'greet', confidence: 0.95 });
-    const call = (deps.skillsRepo.findActive as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0];
+    const call = (deps.skillsRepo.findActive as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(call).toEqual({
       tenant_id: 'tn1',
       agent_id: 'ag1',
@@ -491,9 +475,7 @@ describe('P9b — SkillSelector', () => {
       confidence: 0.85,
     });
     expect(r.selected_skill_id).toBe('s_top');
-    expect(
-      r.candidate_skill_ids.filter((id) => id === 's_top'),
-    ).toHaveLength(1);
+    expect(r.candidate_skill_ids.filter((id) => id === 's_top')).toHaveLength(1);
   });
 
   // ---------------------------------------------------------------------------
@@ -569,9 +551,7 @@ describe('P9b — SkillSelector', () => {
     // No safe skill → empty selection (fail-closed) → ActionDecider responds.
     expect(r.selected_skill_id).toBeUndefined();
     expect(r.candidate_skill_ids).toEqual([]);
-    const blocked = auditMock.mock.calls.find(
-      (c) => c[0].acao === 'skill_blocked_by_audience',
-    );
+    const blocked = auditMock.mock.calls.find((c) => c[0].acao === 'skill_blocked_by_audience');
     expect(blocked).toBeTruthy();
     expect(blocked?.[0].metadata.skill_id).toBe('daily_business_summary');
     expect(blocked?.[0].metadata.audience_type).toBe('customer');
@@ -603,9 +583,7 @@ describe('P9b — SkillSelector', () => {
     expect(r.selected_skill_id).toBeUndefined();
     expect(r.candidate_skill_ids).toEqual([]);
     // Conservative default blocks an unknown audience (not in internal allow-list).
-    expect(
-      auditMock.mock.calls.some((c) => c[0].acao === 'skill_blocked_by_audience'),
-    ).toBe(true);
+    expect(auditMock.mock.calls.some((c) => c[0].acao === 'skill_blocked_by_audience')).toBe(true);
   });
 
   it('#409 — an unauthorized channel removes the candidate (channel_blocked)', async () => {
@@ -641,9 +619,7 @@ describe('P9b — SkillSelector', () => {
       },
     );
     expect(r.selected_skill_id).toBeUndefined();
-    expect(
-      auditMock.mock.calls.some((c) => c[0].acao === 'skill_blocked_by_channel'),
-    ).toBe(true);
+    expect(auditMock.mock.calls.some((c) => c[0].acao === 'skill_blocked_by_channel')).toBe(true);
   });
 
   it('#409 — keeps the SAFE candidate and drops the unsafe one for a customer', async () => {
@@ -723,10 +699,6 @@ describe('P9b — SkillSelector', () => {
     // No audience → no early filter → selection proceeds (runner gate 4.6 is the
     // fail-closed backstop). No usage-policy audit emitted.
     expect(r.selected_skill_id).toBe('daily_business_summary');
-    expect(
-      auditMock.mock.calls.some((c) =>
-        String(c[0].acao).startsWith('skill_'),
-      ),
-    ).toBe(false);
+    expect(auditMock.mock.calls.some((c) => String(c[0].acao).startsWith('skill_'))).toBe(false);
   });
 });

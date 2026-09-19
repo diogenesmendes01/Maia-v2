@@ -179,60 +179,58 @@ d('#541 finding 1 — a turn cannot monopolise the shared Postgres pool', () => 
     expect(TURN_CONTEXT_MAX_CONCURRENT_READS).toBeLessThan(pool.options.max!);
   });
 
-  it(
-    'two simultaneous turns each stay under the ceiling, and neither is starved',
-    async () => {
-      const started = performance.now();
-      await Promise.all([runTurn('A', ['ent-a']), runTurn('B', ['ent-b'])]);
-      const elapsed = performance.now() - started;
+  it('two simultaneous turns each stay under the ceiling, and neither is starved', async () => {
+    const started = performance.now();
+    await Promise.all([runTurn('A', ['ent-a']), runTurn('B', ['ent-b'])]);
+    const elapsed = performance.now() - started;
 
-      // Both turns did the full read set — a "fix" that skipped work would
-      // lower the peak too, so the work itself is asserted first. 11 reads:
-      // profile + self_state + history + entities⋈states + facts + rules +
-      // memories + hints + capabilities + gaps + procedure.
-      expect(h.reads['A']).toBe(11);
-      expect(h.reads['B']).toBe(11);
-      expect(h.reads['unattributed']).toBeUndefined();
+    // Both turns did the full read set — a "fix" that skipped work would
+    // lower the peak too, so the work itself is asserted first. 11 reads:
+    // profile + self_state + history + entities⋈states + facts + rules +
+    // memories + hints + capabilities + gaps + procedure.
+    expect(h.reads['A']).toBe(11);
+    expect(h.reads['B']).toBe(11);
+    expect(h.reads['unattributed']).toBeUndefined();
 
-      // (1) THE CEILING. This is the assertion the finding is about: before the
-      //     shared gate, a cold-cache turn with an unresolved procedure issued
-      //     all ten of its tasks in one tick and the peak here was 10 — the
-      //     entire pool, held by one turn, with two of them competing for it.
-      expect(h.peak['A']).toBeLessThanOrEqual(TURN_CONTEXT_MAX_CONCURRENT_READS);
-      expect(h.peak['B']).toBeLessThanOrEqual(TURN_CONTEXT_MAX_CONCURRENT_READS);
+    // (1) THE CEILING. This is the assertion the finding is about: before the
+    //     shared gate, a cold-cache turn with an unresolved procedure issued
+    //     all ten of its tasks in one tick and the peak here was 10 — the
+    //     entire pool, held by one turn, with two of them competing for it.
+    expect(h.peak['A']).toBeLessThanOrEqual(TURN_CONTEXT_MAX_CONCURRENT_READS);
+    expect(h.peak['B']).toBeLessThanOrEqual(TURN_CONTEXT_MAX_CONCURRENT_READS);
 
-      // (2) NO WATERFALL. Bounding concurrency by serialising would pass (1)
-      //     and throw away everything #525 bought. The gate must actually
-      //     saturate: 10 tasks against 6 permits means 6 in flight from the
-      //     first tick.
-      expect(h.peak['A']).toBe(TURN_CONTEXT_MAX_CONCURRENT_READS);
-      expect(h.peak['B']).toBe(TURN_CONTEXT_MAX_CONCURRENT_READS);
+    // (2) NO WATERFALL. Bounding concurrency by serialising would pass (1)
+    //     and throw away everything #525 bought. The gate must actually
+    //     saturate: 10 tasks against 6 permits means 6 in flight from the
+    //     first tick.
+    expect(h.peak['A']).toBe(TURN_CONTEXT_MAX_CONCURRENT_READS);
+    expect(h.peak['B']).toBe(TURN_CONTEXT_MAX_CONCURRENT_READS);
 
-      // (3) CAPACITY LEFT FOR OTHERS, stated in pool terms rather than in the
-      //     gate's own units — the property an operator cares about.
-      const reservedForEveryoneElse = pool.options.max! - Math.max(h.peak['A']!, h.peak['B']!);
-      expect(reservedForEveryoneElse).toBeGreaterThanOrEqual(4);
+    // (3) CAPACITY LEFT FOR OTHERS, stated in pool terms rather than in the
+    //     gate's own units — the property an operator cares about.
+    const reservedForEveryoneElse = pool.options.max! - Math.max(h.peak['A']!, h.peak['B']!);
+    expect(reservedForEveryoneElse).toBeGreaterThanOrEqual(4);
 
-      // (4) FAIRNESS — the two turns genuinely interleave. Not just "both
-      //     finished", which a serial execution would also satisfy: there is a
-      //     moment where both had reads open at once.
-      const overlapping = h.samples.filter((s) => (s.inFlight['A'] ?? 0) > 0 && (s.inFlight['B'] ?? 0) > 0);
-      expect(overlapping.length).toBeGreaterThan(0);
+    // (4) FAIRNESS — the two turns genuinely interleave. Not just "both
+    //     finished", which a serial execution would also satisfy: there is a
+    //     moment where both had reads open at once.
+    const overlapping = h.samples.filter(
+      (s) => (s.inFlight['A'] ?? 0) > 0 && (s.inFlight['B'] ?? 0) > 0,
+    );
+    expect(overlapping.length).toBeGreaterThan(0);
 
-      // (5) FAIRNESS, the sharper form: while both turns are active, neither
-      //     ever holds more than half the pool. This is what "one turn's
-      //     latency win became everyone else's queue" looks like as a number.
-      const worstShareWhileContending = Math.max(
-        ...overlapping.map((s) => Math.max(s.inFlight['A'] ?? 0, s.inFlight['B'] ?? 0)),
-      );
-      expect(worstShareWhileContending).toBeLessThanOrEqual(pool.options.max! / 2 + 1);
+    // (5) FAIRNESS, the sharper form: while both turns are active, neither
+    //     ever holds more than half the pool. This is what "one turn's
+    //     latency win became everyone else's queue" looks like as a number.
+    const worstShareWhileContending = Math.max(
+      ...overlapping.map((s) => Math.max(s.inFlight['A'] ?? 0, s.inFlight['B'] ?? 0)),
+    );
+    expect(worstShareWhileContending).toBeLessThanOrEqual(pool.options.max! / 2 + 1);
 
-      // Sanity: the whole thing still ran concurrently rather than as 22
-      // sequential holds. 22 reads × 50ms serial would be ≥ 1.1s.
-      expect(elapsed).toBeLessThan(1_000);
-    },
-    30_000,
-  );
+    // Sanity: the whole thing still ran concurrently rather than as 22
+    // sequential holds. 22 reads × 50ms serial would be ≥ 1.1s.
+    expect(elapsed).toBeLessThan(1_000);
+  }, 30_000);
 
   it('the gate does not change the failure contract of either group', async () => {
     // A gated CRITICAL rejection must still fail the turn, and a gated OPTIONAL

@@ -193,9 +193,9 @@ describe('backup/drill-interval-feasible (issue #536)', () => {
   it('refuses the value that motivated the rule — a 1h interval', () => {
     // An hourly evidence budget with an hourly tick cannot work at all, and
     // used to boot happily and merely flap the gate red.
-    expect(
-      errorRules(check('production', { BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '1' })),
-    ).toContain('backup/drill-interval-feasible');
+    expect(errorRules(check('production', { BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '1' }))).toContain(
+      'backup/drill-interval-feasible',
+    );
   });
 
   it('accepts exactly the floor', () => {
@@ -226,19 +226,15 @@ describe('backup/drill-interval-feasible (issue #536)', () => {
     };
     // (1h + 15min + 30min) / 0.25 = 1.75h / 0.25 = 7h
     expect(
-      errorRules(
-        check('production', { ...faster, BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '7' }),
-      ),
+      errorRules(check('production', { ...faster, BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '7' })),
     ).not.toContain('backup/drill-interval-feasible');
     expect(
-      errorRules(
-        check('production', { ...faster, BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '6' }),
-      ),
+      errorRules(check('production', { ...faster, BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '6' })),
     ).toContain('backup/drill-interval-feasible');
     // …and the same 7h is refused under the SHIPPED budgets.
-    expect(
-      errorRules(check('production', { BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '7' })),
-    ).toContain('backup/drill-interval-feasible');
+    expect(errorRules(check('production', { BACKUP_RESTORE_DRILL_INTERVAL_HOURS: '7' }))).toContain(
+      'backup/drill-interval-feasible',
+    );
   });
 
   it('does not fire when backups are disabled', () => {

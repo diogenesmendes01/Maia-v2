@@ -30,8 +30,12 @@ const outputSchema = z.object({
       }),
     )
     .default([]),
-  complaints: z.array(z.object({ date: z.string().optional(), summary: z.string().optional() })).default([]),
-  refunds: z.array(z.object({ protocol: z.string().optional(), status: z.string().optional() })).default([]),
+  complaints: z
+    .array(z.object({ date: z.string().optional(), summary: z.string().optional() }))
+    .default([]),
+  refunds: z
+    .array(z.object({ protocol: z.string().optional(), status: z.string().optional() }))
+    .default([]),
   operational_notes: z.array(z.string()).default([]),
 });
 

@@ -131,38 +131,36 @@ export const tenantsRouter = router({
    * founders racing to suspend the same tenant now serialize on the
    * SELECT FOR UPDATE — only one wins, the other returns `already_in_status`.)
    */
-  updateStatus: founderProcedure
-    .input(UpdateStatusInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      const result = await ctx.repos.tenantsRepo.updateStatusAtomic({
-        id: input.id,
-        status: input.status,
-        audit: {
-          tenant_id: ctx.tenantId,
-          actor_id: ctx.userId,
-          actor_role: ctx.userRole,
-          comment: input.comment,
-        },
-      });
+  updateStatus: founderProcedure.input(UpdateStatusInputSchema).mutation(async ({ input, ctx }) => {
+    const result = await ctx.repos.tenantsRepo.updateStatusAtomic({
+      id: input.id,
+      status: input.status,
+      audit: {
+        tenant_id: ctx.tenantId,
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+        comment: input.comment,
+      },
+    });
 
-      if (!result.ok) {
-        if (result.reason === 'not_found') {
-          throw new TRPCError({ code: 'NOT_FOUND', message: 'Tenant not found' });
-        }
-        if (result.reason === 'already_in_status') {
-          throw new TRPCError({
-            code: 'BAD_REQUEST',
-            message: `Tenant is already ${input.status}`,
-          });
-        }
-        // Exhaustiveness check — any future reason must be handled above.
-        const _exhaustive: never = result.reason;
+    if (!result.ok) {
+      if (result.reason === 'not_found') {
+        throw new TRPCError({ code: 'NOT_FOUND', message: 'Tenant not found' });
+      }
+      if (result.reason === 'already_in_status') {
         throw new TRPCError({
-          code: 'INTERNAL_SERVER_ERROR',
-          message: `updateStatusAtomic failed: ${String(_exhaustive)}`,
+          code: 'BAD_REQUEST',
+          message: `Tenant is already ${input.status}`,
         });
       }
+      // Exhaustiveness check — any future reason must be handled above.
+      const _exhaustive: never = result.reason;
+      throw new TRPCError({
+        code: 'INTERNAL_SERVER_ERROR',
+        message: `updateStatusAtomic failed: ${String(_exhaustive)}`,
+      });
+    }
 
-      return result.after;
-    }),
+    return result.after;
+  }),
 });

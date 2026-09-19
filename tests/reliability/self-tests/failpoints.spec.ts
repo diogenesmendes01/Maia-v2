@@ -69,7 +69,9 @@ describe('#510 harness — catálogo de failpoints', () => {
     // Este é o self-test nominal "failpoint inexistente falha cedo". O ponto do
     // "cedo" é que a reprovação acontece no `arm`, quando o cenário é escrito —
     // não trinta segundos depois, num `eventually` que nunca observa `reached`.
-    expect(() => parseFailpointName('after_turn_claim_before_runing')).toThrow(UnknownFailpointError);
+    expect(() => parseFailpointName('after_turn_claim_before_runing')).toThrow(
+      UnknownFailpointError,
+    );
     try {
       parseFailpointName('nao_existe');
       throw new Error('deveria ter jogado');

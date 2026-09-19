@@ -67,15 +67,9 @@ import {
   reconciliationDisposition,
   type ReconciliationResult,
 } from '@/runtime/outbound/recovery-contract.js';
-import {
-  parseOutboundPayload,
-  type OutboundProviderChannel,
-} from '@/runtime/outbound/contract.js';
+import { parseOutboundPayload, type OutboundProviderChannel } from '@/runtime/outbound/contract.js';
 import { buildHistoricoFromArtifact } from '@/runtime/outbound/historico.js';
-import {
-  noteNoSuccessor,
-  signalStreamPromotion,
-} from '@/runtime/turns/stream-promotion.js';
+import { noteNoSuccessor, signalStreamPromotion } from '@/runtime/turns/stream-promotion.js';
 
 /** O canal de egresso desta fatia — fechado, como em `delivery.ts`. */
 const EGRESS_CHANNEL: OutboundProviderChannel = 'whatsapp';
@@ -125,14 +119,10 @@ function publishPendingAge(scope: RecoveryScope, seconds: number): void {
   lastPendingAge.set(key, seconds);
   if (registeredGauges.has(key)) return;
   registeredGauges.add(key);
-  gauge(
-    METRIC.OUTBOUND_PENDING_AGE_SECONDS,
-    () => lastPendingAge.get(key) ?? 0,
-    {
-      tenant_id: scope.tenant_id,
-      agent_id: scope.agent_id,
-    },
-  );
+  gauge(METRIC.OUTBOUND_PENDING_AGE_SECONDS, () => lastPendingAge.get(key) ?? 0, {
+    tenant_id: scope.tenant_id,
+    agent_id: scope.agent_id,
+  });
 }
 
 function publishNoSuccessPending(scope: RecoveryScope, pending: number): void {
@@ -140,14 +130,10 @@ function publishNoSuccessPending(scope: RecoveryScope, pending: number): void {
   lastNoSuccessPending.set(key, pending);
   if (registeredNoSuccessGauges.has(key)) return;
   registeredNoSuccessGauges.add(key);
-  gauge(
-    METRIC.OUTBOUND_TURN_NO_SUCCESS_PENDING,
-    () => lastNoSuccessPending.get(key) ?? 0,
-    {
-      tenant_id: scope.tenant_id,
-      agent_id: scope.agent_id,
-    },
-  );
+  gauge(METRIC.OUTBOUND_TURN_NO_SUCCESS_PENDING, () => lastNoSuccessPending.get(key) ?? 0, {
+    tenant_id: scope.tenant_id,
+    agent_id: scope.agent_id,
+  });
 }
 
 /** Só para teste: esquece as séries registradas entre casos. */
@@ -178,10 +164,7 @@ function emptyReconciled(): Record<ReconciliationResult, number> {
   };
 }
 
-function recordReconciliation(
-  stats: SweepStats,
-  result: ReconciliationResult,
-): void {
+function recordReconciliation(stats: SweepStats, result: ReconciliationResult): void {
   stats.reconciled[result] += 1;
   counter(METRIC.OUTBOUND_RECONCILIATION, { result });
 }
@@ -209,9 +192,7 @@ function recordReconciliation(
  * chega à DLQ dizendo a verdade sobre si.
  */
 async function sweepDeliverable(stats: SweepStats): Promise<void> {
-  const candidates = await outboundRecoveryRepo.listDeliverable(
-    SWEEP_LIMIT_PER_SCOPE,
-  );
+  const candidates = await outboundRecoveryRepo.listDeliverable(SWEEP_LIMIT_PER_SCOPE);
   for (const row of candidates) {
     if (attemptBudgetExhausted(row.attempt) && row.status !== 'sending') {
       await deadLetter(row, 'attempt_limit', stats);
@@ -241,9 +222,7 @@ async function sweepDeliverable(stats: SweepStats): Promise<void> {
  * histórico, e recuperá-lo é uma leitura + uma transição, sem tocar o provedor.
  */
 async function sweepReconciliation(stats: SweepStats): Promise<void> {
-  const candidates = await outboundRecoveryRepo.listReconciliation(
-    SWEEP_LIMIT_PER_SCOPE,
-  );
+  const candidates = await outboundRecoveryRepo.listReconciliation(SWEEP_LIMIT_PER_SCOPE);
   for (const row of candidates) {
     if (row.status === 'delivered') {
       await reconcileDelivered(row, stats);
@@ -328,9 +307,7 @@ async function sweepReconciliation(stats: SweepStats): Promise<void> {
         // "ficou incerta por 24h" (olhe o provedor).
         await deadLetter(
           row,
-          attemptBudgetExhausted(row.attempt)
-            ? 'attempt_limit'
-            : 'reconciliation_timeout',
+          attemptBudgetExhausted(row.attempt) ? 'attempt_limit' : 'reconciliation_timeout',
           stats,
         );
         break;
@@ -352,13 +329,9 @@ async function sweepReconciliation(stats: SweepStats): Promise<void> {
  * relê todas as partes antes de terminalizar.
  */
 async function sweepTurnFinalization(stats: SweepStats): Promise<void> {
-  const candidates = await outboundRecoveryRepo.listFinalizableTurns(
-    SWEEP_LIMIT_PER_SCOPE,
-  );
+  const candidates = await outboundRecoveryRepo.listFinalizableTurns(SWEEP_LIMIT_PER_SCOPE);
   for (const candidate of candidates) {
-    const finalized = await outboundRecoveryRepo.finalizeResolvedTurnTx(
-      candidate.turn_id,
-    );
+    const finalized = await outboundRecoveryRepo.finalizeResolvedTurnTx(candidate.turn_id);
     if (!finalized.finalized) continue;
 
     recordReconciliation(stats, 'turn_finalized');
@@ -372,8 +345,7 @@ async function sweepTurnFinalization(stats: SweepStats): Promise<void> {
     });
   }
 
-  stats.no_success_pending =
-    await outboundRecoveryRepo.countFinalTurnsWithoutSuccess();
+  stats.no_success_pending = await outboundRecoveryRepo.countFinalTurnsWithoutSuccess();
   if (stats.no_success_pending > 0) {
     logger.warn(
       { pending_turns: stats.no_success_pending },
@@ -423,17 +395,12 @@ async function sweepTurnFinalization(stats: SweepStats): Promise<void> {
  * `delivered` — a mensagem chegou, e reenviar continua fora de questão — com
  * `ops_alert`.
  */
-async function reconcileDelivered(
-  row: RecoveryCandidate,
-  stats: SweepStats,
-): Promise<void> {
+async function reconcileDelivered(row: RecoveryCandidate, stats: SweepStats): Promise<void> {
   if (row.age_ms < DELIVERED_WITHOUT_HISTORY_GRACE_MS) {
     recordReconciliation(stats, 'await_grace');
     return;
   }
-  const artefato = await outboundRecoveryRepo.artifactForHistoryRecovery(
-    row.outbound_id,
-  );
+  const artefato = await outboundRecoveryRepo.artifactForHistoryRecovery(row.outbound_id);
   if (!artefato) {
     recordReconciliation(stats, 'noop');
     return;
@@ -449,16 +416,11 @@ async function reconcileDelivered(
   if (hasHistory) {
     // O histórico está lá (caminho síncrono, ou uma tentativa anterior desta
     // mesma reconciliação). Só o ESTADO ficou para trás.
-    const completed = await outboundRecoveryRepo.completeDeliveredWithHistoryTx(
-      {
-        outbound_id: row.outbound_id,
-        ...correlation,
-      },
-    );
-    recordReconciliation(
-      stats,
-      completed.completed ? 'history_recovered' : 'noop',
-    );
+    const completed = await outboundRecoveryRepo.completeDeliveredWithHistoryTx({
+      outbound_id: row.outbound_id,
+      ...correlation,
+    });
+    recordReconciliation(stats, completed.completed ? 'history_recovered' : 'noop');
     return;
   }
 
@@ -548,11 +510,7 @@ async function deadLetter(
     // `attempt_limit` nasce nos dois (na varredura entregável e na
     // reconciliação), e `sending` não está em nenhuma das duas — ver a exceção
     // documentada em `sweepDeliverable`.
-    from_statuses: DEAD_LETTER_SOURCES[row.status] ?? [
-      'pending',
-      'retryable',
-      'claimed',
-    ],
+    from_statuses: DEAD_LETTER_SOURCES[row.status] ?? ['pending', 'retryable', 'claimed'],
     reason,
     attempt: row.attempt,
     delivery_outcome: row.delivery_outcome,
@@ -612,10 +570,7 @@ async function sweepDivergence(scope: RecoveryScope): Promise<void> {
       d.outbound_without_live_turn,
     );
   }
-  logger.error(
-    { ...scope, ...d, ops_alert: true },
-    'outbound_recovery.turn_outbound_divergence',
-  );
+  logger.error({ ...scope, ...d, ops_alert: true }, 'outbound_recovery.turn_outbound_divergence');
   await audit({
     acao: 'outbound_turn_inconsistency_detected',
     metadata: {
@@ -629,9 +584,7 @@ async function sweepDivergence(scope: RecoveryScope): Promise<void> {
  * A varredura de UM escopo. Exportada para que o teste de integração entre pelo
  * MESMO caminho da produção, com o contexto de tenant já aberto pelo chamador.
  */
-export async function runOutboundRecoveryForScope(
-  scope: RecoveryScope,
-): Promise<SweepStats> {
+export async function runOutboundRecoveryForScope(scope: RecoveryScope): Promise<SweepStats> {
   const stats: SweepStats = {
     rearmed: 0,
     reconciled: emptyReconciled(),
@@ -643,10 +596,7 @@ export async function runOutboundRecoveryForScope(
   await sweepTurnFinalization(stats);
   publishNoSuccessPending(scope, stats.no_success_pending);
   await sweepDivergence(scope);
-  publishPendingAge(
-    scope,
-    await outboundRecoveryRepo.oldestPendingAgeSeconds(),
-  );
+  publishPendingAge(scope, await outboundRecoveryRepo.oldestPendingAgeSeconds());
   return stats;
 }
 
@@ -679,9 +629,7 @@ export async function runOutboundRecovery(): Promise<void> {
 
   for (const scope of scopes) {
     try {
-      const stats = await runWithTenantContext(scope, () =>
-        runOutboundRecoveryForScope(scope),
-      );
+      const stats = await runWithTenantContext(scope, () => runOutboundRecoveryForScope(scope));
       rearmed += stats.rearmed;
       deadLettered += stats.dead_lettered;
       noSuccessPending += stats.no_success_pending;
@@ -691,10 +639,7 @@ export async function runOutboundRecovery(): Promise<void> {
       scopesProcessed++;
     } catch (err) {
       scopesFailed++;
-      logger.warn(
-        { ...scope, err: (err as Error).message },
-        'outbound_recovery.scope_failed',
-      );
+      logger.warn({ ...scope, err: (err as Error).message }, 'outbound_recovery.scope_failed');
     }
   }
 

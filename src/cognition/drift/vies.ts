@@ -94,7 +94,9 @@ export const viesDetector: DriftDetector = {
           severity_hint: parsed.severity_hint ?? 'medio',
           reasoning: parsed.reasoning ?? '',
         },
-        evidence_summary: (parsed.reasoning ?? `${matches.length} possíveis vieses detectados`).slice(0, 200),
+        evidence_summary: (
+          parsed.reasoning ?? `${matches.length} possíveis vieses detectados`
+        ).slice(0, 200),
       };
     } catch {
       // Defensive — but DO surface regex matches at baixo severity, even when LLM is down.

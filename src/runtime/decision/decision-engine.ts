@@ -49,10 +49,7 @@ import {
   type SubBudgetName,
   type WorkflowSelector,
 } from './types.js';
-import type {
-  BaseContextPacket,
-  DecisionPacket,
-} from '../context-packet/types.js';
+import type { BaseContextPacket, DecisionPacket } from '../context-packet/types.js';
 import { DEFAULT_CONTEXT_REQUIREMENTS } from '../context-packet/types.js';
 import { allowedDataScopesForAudience } from '@/skills/usage-policy.js';
 import { config } from '@/config/env.js';
@@ -222,10 +219,7 @@ export class DecisionEngine {
     }
     const signal = controller.signal;
 
-    const runStep = async <T>(
-      name: SubBudgetName,
-      fn: () => Promise<T>,
-    ): Promise<T> => {
+    const runStep = async <T>(name: SubBudgetName, fn: () => Promise<T>): Promise<T> => {
       this.checkBudget(tracker, name);
       if (signal.aborted) {
         throw new BudgetExhaustedError(name, tracker.elapsed());
@@ -265,12 +259,7 @@ export class DecisionEngine {
       if ('decision' in earlyResult) {
         audit.recordFromBlock(earlyResult);
         this.recordPepMetrics('early', earlyResult.decision);
-        const packet = this.buildMinimalPacket(
-          input.base,
-          'escalate',
-          audit,
-          earlyResult,
-        );
+        const packet = this.buildMinimalPacket(input.base, 'escalate', audit, earlyResult);
         this.emitTotalMetrics(tracker, packet);
         return { packet, block: earlyResult };
       }
@@ -290,9 +279,7 @@ export class DecisionEngine {
       // exatamente dois nodes (`procedure-selector`, `role-selector`), e risco
       // é pontuado AQUI. Ver a nota de parentesco em `taxonomy.ts`.
       const risk = await instrumentRiskClassify(() =>
-        runStep('risk', () =>
-          this.deps.riskScorer.score({ intent, base: input.base }, { signal }),
-        ),
+        runStep('risk', () => this.deps.riskScorer.score({ intent, base: input.base }, { signal })),
       );
 
       // --- Step 4: workflow selector. ---
@@ -311,9 +298,10 @@ export class DecisionEngine {
       // policy routes to a different agent than the one that built the
       // BaseContextPacket, base.agent_id would leak a different agent's
       // skills/tool permissions into the packet.
-      const skillOptions: NonNullable<
-        Parameters<SkillSelector['select']>[2]
-      > = { agent_id_override: agent.agent_id, signal };
+      const skillOptions: NonNullable<Parameters<SkillSelector['select']>[2]> = {
+        agent_id_override: agent.agent_id,
+        signal,
+      };
       if (workflow.workflow_id !== undefined) {
         skillOptions.workflow_id = workflow.workflow_id;
       }
@@ -367,9 +355,7 @@ export class DecisionEngine {
             ? { selected_skill_id: skill.selected_skill_id }
             : {}),
           candidate_skill_ids: skill.candidate_skill_ids,
-          ...(workflow.workflow_id !== undefined
-            ? { workflow_id: workflow.workflow_id }
-            : {}),
+          ...(workflow.workflow_id !== undefined ? { workflow_id: workflow.workflow_id } : {}),
           ...(selectedSkill ? { selected_skill: selectedSkill } : {}),
           tool_permissions_preview: toolPermsPreview,
           resolved_policies,
@@ -393,9 +379,7 @@ export class DecisionEngine {
           return { packet, block: midResult as BlockDecision };
         }
         if (midResult.decision === 'require_dual_approval') {
-          audit.recordFromDualApproval(
-            midResult as RequireDualApprovalDecision,
-          );
+          audit.recordFromDualApproval(midResult as RequireDualApprovalDecision);
           this.recordPepMetrics('mid', 'require_dual_approval');
           const packet = this.buildMinimalPacket(
             input.base,
@@ -430,9 +414,7 @@ export class DecisionEngine {
         intent,
         risk_profile: risk,
         routing: {
-          ...(workflow.workflow_id !== undefined
-            ? { workflow_id: workflow.workflow_id }
-            : {}),
+          ...(workflow.workflow_id !== undefined ? { workflow_id: workflow.workflow_id } : {}),
           agent_id: agent.agent_id,
           ...(skill.selected_skill_id !== undefined
             ? { selected_skill_id: skill.selected_skill_id }
@@ -486,8 +468,7 @@ export class DecisionEngine {
     audit: PepAudit,
     err: unknown,
   ): Promise<DecisionEngineResult> {
-    const failedStep =
-      err instanceof BudgetExhaustedError ? err.step : 'unknown';
+    const failedStep = err instanceof BudgetExhaustedError ? err.step : 'unknown';
     const sensitive = await this.safeSensitiveCheck(base.tenant_id);
     const action_mode: ActionMode = sensitive ? 'escalate' : 'ask_clarification';
 
@@ -554,21 +535,11 @@ export class DecisionEngine {
     };
   }
 
-  private emitTotalMetrics(
-    tracker: BudgetTracker,
-    packet: DecisionPacket,
-  ): void {
+  private emitTotalMetrics(tracker: BudgetTracker, packet: DecisionPacket): void {
     if (!this.deps.metrics) return;
-    this.deps.metrics.recordHistogram(
-      'decision_engine.duration_ms',
-      tracker.elapsed(),
-    );
+    this.deps.metrics.recordHistogram('decision_engine.duration_ms', tracker.elapsed());
     for (const [step, duration] of Object.entries(tracker.snapshot())) {
-      this.deps.metrics.recordHistogram(
-        'decision_engine.sub_duration_ms',
-        duration,
-        { step },
-      );
+      this.deps.metrics.recordHistogram('decision_engine.sub_duration_ms', duration, { step });
     }
     this.deps.metrics.increment('decision_engine.packet_emitted', {
       action_mode: packet.action_mode,

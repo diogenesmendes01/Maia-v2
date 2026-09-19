@@ -124,7 +124,9 @@ describe('#638 — o corpo da issue', () => {
       agregado: agregado({
         contract_state: 'divergent',
         merged_contract_draft: null,
-        contract_conflicts: [{ lado: 'input', campo: 'competencia', zods: ['z.string()', 'z.number()'] }],
+        contract_conflicts: [
+          { lado: 'input', campo: 'competencia', zods: ['z.string()', 'z.number()'] },
+        ],
       }),
       pedido,
     });

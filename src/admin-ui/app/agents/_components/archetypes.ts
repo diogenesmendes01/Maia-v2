@@ -130,8 +130,7 @@ export const ARCHETYPES: Archetype[] = [
       'Marca, confirma e remaneja compromissos respeitando a disponibilidade real da agenda.',
     icon: 'bot',
     profile: {
-      role_descriptor:
-        'Assistente de agendamento que marca, confirma e remaneja compromissos',
+      role_descriptor: 'Assistente de agendamento que marca, confirma e remaneja compromissos',
       tone: 'cordial e objetivo',
       formality: 'medium',
       verbosity: 'concise',

@@ -23,11 +23,7 @@ import { eq } from 'drizzle-orm';
 import { db } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
-import {
-  pessoasRepo,
-  conversasRepo,
-  pendingQuestionsRepo,
-} from '@/db/repositories.js';
+import { pessoasRepo, conversasRepo, pendingQuestionsRepo } from '@/db/repositories.js';
 import { occurrencesRepo, tasksRepo, outboxRepo } from './repos.js';
 import { extractCorrelationToken } from './correlation.js';
 import { tasks as tasksTable } from '@/db/schema.js';
@@ -62,10 +58,7 @@ export async function captureInboundForOutreach(input: {
       }
     }
     // Token in text but mismatched series — fall through (treat as no token).
-    logger.info(
-      { token, sender_id: sender.id, inbound_id: inbound.id },
-      'outreach.token_mismatch',
-    );
+    logger.info({ token, sender_id: sender.id, inbound_id: inbound.id }, 'outreach.token_mismatch');
   }
 
   // 2. Single-candidate fallback.
@@ -143,7 +136,11 @@ export async function captureInboundForOutreach(input: {
   return { kind: 'disambiguation_requested', pending_question_id: pq.id };
 }
 
-async function attachResponse(occ: Occurrence, text: string, inbound_mensagem_id: string): Promise<void> {
+async function attachResponse(
+  occ: Occurrence,
+  text: string,
+  inbound_mensagem_id: string,
+): Promise<void> {
   const tasksList = await tasksRepo.byOccurrence(occ.id);
   const awaitTask = tasksList.find((t) => t.kind === 'await_response');
   if (awaitTask) {
@@ -178,7 +175,11 @@ export async function applyDisambiguationDecision(input: {
   if (!chosen) return { routed_to: null };
   const occ = await occurrencesRepo.byId(chosen.occurrence_id);
   if (!occ) return { routed_to: null };
-  await attachResponse(occ, input.acao_proposta.response_text, input.acao_proposta.inbound_mensagem_id);
+  await attachResponse(
+    occ,
+    input.acao_proposta.response_text,
+    input.acao_proposta.inbound_mensagem_id,
+  );
   return { routed_to: chosen.occurrence_id };
 }
 

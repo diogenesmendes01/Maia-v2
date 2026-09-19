@@ -21,12 +21,15 @@ import type { DriftDetector, DriftDetectionInput, DriftEvidence } from './types.
 
 type SkillRow = { skill_name?: string; confidence?: number; evidence_count?: number };
 
-const CONFIDENT_REGEX = /\b(tenho certeza|com certeza|sem d[úu]vida|garanto|100%|absolutamente|definitivamente)\b/i;
+const CONFIDENT_REGEX =
+  /\b(tenho certeza|com certeza|sem d[úu]vida|garanto|100%|absolutamente|definitivamente)\b/i;
 
 export const confiancaDetector: DriftDetector = {
   type: DriftType.CONFIANCA,
   async detect(input: DriftDetectionInput): Promise<DriftEvidence | null> {
-    const skills = Array.isArray(input.self_model_skills) ? (input.self_model_skills as SkillRow[]) : [];
+    const skills = Array.isArray(input.self_model_skills)
+      ? (input.self_model_skills as SkillRow[])
+      : [];
     if (skills.length === 0) return null;
 
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');

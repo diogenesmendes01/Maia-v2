@@ -49,8 +49,7 @@ const migracaoDown = readFileSync(
 const repoFonte = readFileSync(resolve(raiz, 'src/db/repositories/turn-repos.ts'), 'utf8');
 
 const dialeto = new PgDialect();
-const compilar = (fragmento: ReturnType<typeof sql>): string =>
-  dialeto.sqlToQuery(fragmento).sql;
+const compilar = (fragmento: ReturnType<typeof sql>): string => dialeto.sqlToQuery(fragmento).sql;
 
 const escopo = {
   tenant: sql`${'t-1'}`,
@@ -197,7 +196,12 @@ describe('#626 — contrato do head-of-line', () => {
     // Se `CLAIM_REJECTIONS` puder carregar um código que não está no
     // vocabulário, o label de métrica e o motivo tipado voltam a poder divergir
     // — que é a duplicação que a issue manda eliminar, na outra dimensão.
-    for (const reason of ['not_head', 'stream_blocked', 'stream_busy', 'stream_poisoned'] as const) {
+    for (const reason of [
+      'not_head',
+      'stream_blocked',
+      'stream_busy',
+      'stream_poisoned',
+    ] as const) {
       expect(CLAIM_REJECTIONS).toContain(reason);
       expect(STREAM_SCHEDULING_RESULTS).toContain(reason);
     }

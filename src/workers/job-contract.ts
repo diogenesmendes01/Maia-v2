@@ -138,7 +138,8 @@ export const JOB_GROUP_SPECS: readonly JobGroupSpec[] = [
   },
   {
     group: 'console',
-    description: 'filas Postgres do console (playground, work loop) — inertes desde sempre sob startWorkers(1)',
+    description:
+      'filas Postgres do console (playground, work loop) — inertes desde sempre sob startWorkers(1)',
     defaultEnabled: false,
   },
   {
@@ -411,10 +412,7 @@ export function validateJobRegistry(jobs: readonly JobContract[]): JobContractVi
           detail:
             'job com efeito externo não idempotente precisa de row-claim, global-singleton ou per-tenant-singleton (issue #513 §9) — ou de uma lacuna DECLARADA em `unguarded`, e o conjunto de jobs que a carregam está congelado no teste de arquitetura',
         });
-      } else if (
-        job.unguarded.tracked_in.trim() === '' ||
-        job.unguarded.duplicates.trim() === ''
-      ) {
+      } else if (job.unguarded.tracked_in.trim() === '' || job.unguarded.duplicates.trim() === '') {
         violations.push({
           job: job.name,
           rule: 'unguarded-gap-is-specific',
@@ -423,7 +421,10 @@ export function validateJobRegistry(jobs: readonly JobContract[]): JobContractVi
       }
     }
 
-    if (job.unguarded !== undefined && !(job.effect === 'side-effectful' && job.guard.kind === 'none')) {
+    if (
+      job.unguarded !== undefined &&
+      !(job.effect === 'side-effectful' && job.guard.kind === 'none')
+    ) {
       violations.push({
         job: job.name,
         rule: 'unguarded-gap-only-when-unguarded',

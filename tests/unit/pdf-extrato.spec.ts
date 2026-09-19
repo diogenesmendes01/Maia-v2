@@ -55,8 +55,20 @@ describe('generateExtratoPdf', () => {
       date_from: '2026-04-01',
       date_to: '2026-04-30',
       transactions: [
-        { data_competencia: '2026-04-05', natureza: 'receita', valor: 1000, descricao: 'Cliente A', categoriaNome: 'Vendas' },
-        { data_competencia: '2026-04-10', natureza: 'despesa', valor: 250, descricao: 'Aluguel', categoriaNome: 'Operacional' },
+        {
+          data_competencia: '2026-04-05',
+          natureza: 'receita',
+          valor: 1000,
+          descricao: 'Cliente A',
+          categoriaNome: 'Vendas',
+        },
+        {
+          data_competencia: '2026-04-10',
+          natureza: 'despesa',
+          valor: 250,
+          descricao: 'Aluguel',
+          categoriaNome: 'Operacional',
+        },
       ],
     });
     expect(result.path).toMatch(/[/\\]tmp[/\\][a-f0-9-]+\.pdf$/);
@@ -79,8 +91,11 @@ describe('generateExtratoPdf', () => {
       categoriaNome: 'Vendas',
     }));
     const result = await generateExtratoPdf({
-      ownerName: 'Owner', entidadeName: 'Empresa Y',
-      date_from: '2026-04-01', date_to: '2026-04-30', transactions: txns,
+      ownerName: 'Owner',
+      entidadeName: 'Empresa Y',
+      date_from: '2026-04-01',
+      date_to: '2026-04-30',
+      transactions: txns,
     });
     expect(result.summary.rowCount).toBe(500);
     await unlink(result.path);
@@ -89,8 +104,11 @@ describe('generateExtratoPdf', () => {
   it('handles empty transaction list (header + empty table + zero totals)', async () => {
     const { generateExtratoPdf } = await import('../../src/lib/pdf/extrato.js');
     const result = await generateExtratoPdf({
-      ownerName: 'Owner', entidadeName: 'Empresa Z',
-      date_from: '2026-04-01', date_to: '2026-04-30', transactions: [],
+      ownerName: 'Owner',
+      entidadeName: 'Empresa Z',
+      date_from: '2026-04-01',
+      date_to: '2026-04-30',
+      transactions: [],
     });
     expect(result.summary.rowCount).toBe(0);
     expect(result.summary.totals).toEqual({ receita: 0, despesa: 0, lucro: 0 });

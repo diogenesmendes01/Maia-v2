@@ -1,9 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PepAudit } from '@/runtime/decision/pep-audit.ts';
-import type {
-  BlockDecision,
-  RequireDualApprovalDecision,
-} from '@/runtime/decision/types.js';
+import type { BlockDecision, RequireDualApprovalDecision } from '@/runtime/decision/types.js';
 
 describe('P9b — PepAudit', () => {
   it('starts empty', () => {

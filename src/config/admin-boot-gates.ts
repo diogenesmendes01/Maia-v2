@@ -144,8 +144,10 @@ export function adminBootGateProblems(
     problems.push({
       variable: 'OIDC_ISSUER',
       rule: 'admin-boot/oidc-issuer-unparseable',
-      message: 'está definido mas não é uma URL parseável; o boot em production LANÇA (issue #167).',
-      remediation: 'Use uma URL https:// completa, ou deixe OIDC_ISSUER vazio para desligar o provider.',
+      message:
+        'está definido mas não é uma URL parseável; o boot em production LANÇA (issue #167).',
+      remediation:
+        'Use uma URL https:// completa, ou deixe OIDC_ISSUER vazio para desligar o provider.',
     });
   }
   if (url !== null && url.protocol !== 'https:') {

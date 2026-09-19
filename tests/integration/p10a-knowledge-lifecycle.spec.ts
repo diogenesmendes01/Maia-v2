@@ -17,14 +17,7 @@
  *   7. save_fact deprecated wrapper continues to work + emits warn log.
  */
 
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type {
   KnowledgeKind,
   KnowledgeLifecycleStatus,
@@ -40,10 +33,7 @@ function seedRow(kind: KnowledgeKind, row: KnowledgeRow): void {
   storeByKind.get(kind)!.set(row.id, row);
 }
 
-function listByStatus(
-  kind: KnowledgeKind,
-  status: KnowledgeLifecycleStatus,
-): KnowledgeRow[] {
+function listByStatus(kind: KnowledgeKind, status: KnowledgeLifecycleStatus): KnowledgeRow[] {
   const rows = storeByKind.get(kind);
   if (!rows) return [];
   return [...rows.values()].filter((r) => r.lifecycle_status === status);
@@ -75,9 +65,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
       public readonly id: string,
       public readonly expected_previous_status: KnowledgeLifecycleStatus,
     ) {
-      super(
-        `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
-      );
+      super(`knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`);
       this.name = 'KnowledgeConflictError';
     }
   }
@@ -106,10 +94,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
         });
         return id;
       },
-      async findById(
-        kind: KnowledgeKind,
-        id: string,
-      ): Promise<KnowledgeRow | null> {
+      async findById(kind: KnowledgeKind, id: string): Promise<KnowledgeRow | null> {
         return storeByKind.get(kind)?.get(id) ?? null;
       },
       async update(
@@ -128,18 +113,12 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
           updates.expected_previous_status !== undefined &&
           row.lifecycle_status !== updates.expected_previous_status
         ) {
-          throw new KnowledgeConflictError(
-            kind,
-            id,
-            updates.expected_previous_status,
-          );
+          throw new KnowledgeConflictError(kind, id, updates.expected_previous_status);
         }
-        if (updates.lifecycle_status !== undefined)
-          row.lifecycle_status = updates.lifecycle_status;
+        if (updates.lifecycle_status !== undefined) row.lifecycle_status = updates.lifecycle_status;
         if (updates.lifecycle_transitions !== undefined)
           row.lifecycle_transitions = updates.lifecycle_transitions;
-        if (updates.evidence_count !== undefined)
-          row.evidence_count = updates.evidence_count;
+        if (updates.evidence_count !== undefined) row.evidence_count = updates.evidence_count;
         row.updated_at = new Date();
       },
       async listEligible(args: {
@@ -202,9 +181,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
 
 // Silence the audit_missing_tenant_context warn from runner.
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -235,9 +213,9 @@ vi.mock('@/lib/logger.js', () => {
 // short-circuit on `disabled` because the test env doesn't set
 // FEATURE_KNOWLEDGE_STATE_MACHINE_V1=true.
 vi.mock('@/config/feature-flags.js', async () => {
-  const actual = await vi.importActual<
-    typeof import('@/config/feature-flags.js')
-  >('@/config/feature-flags.js');
+  const actual = await vi.importActual<typeof import('@/config/feature-flags.js')>(
+    '@/config/feature-flags.js',
+  );
   return {
     ...actual,
     FEATURE_KNOWLEDGE_STATE_MACHINE_V1: true,
@@ -298,9 +276,7 @@ describe('P10a integration: cenário 1 — happy path ephemeral→…→verified
       reason: 'evidence_threshold:1_in_24h',
       decided_by: 'auto_promoter:evidence_threshold',
     });
-    expect(
-      storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_status,
-    ).toBe('observed');
+    expect(storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_status).toBe('observed');
 
     row.evidence_count = 3;
     await KnowledgeStateMachine.transition({
@@ -310,9 +286,7 @@ describe('P10a integration: cenário 1 — happy path ephemeral→…→verified
       reason: 'evidence_threshold:3_in_30d',
       decided_by: 'auto_promoter:evidence_threshold',
     });
-    expect(
-      storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_status,
-    ).toBe('reinforced');
+    expect(storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_status).toBe('reinforced');
 
     row.evidence_count = 7;
     await KnowledgeStateMachine.transition({
@@ -322,9 +296,7 @@ describe('P10a integration: cenário 1 — happy path ephemeral→…→verified
       reason: 'evidence_threshold:7_in_90d',
       decided_by: 'auto_promoter:evidence_threshold',
     });
-    expect(
-      storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_status,
-    ).toBe('verified');
+    expect(storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_status).toBe('verified');
 
     // The lifecycle_transitions array now has 4 records (initial + 3
     // promotions). All append-only.
@@ -367,9 +339,7 @@ describe('P10a integration: cenário 3 — revocation is terminal', () => {
       reason: 'test_revoke',
       decided_by: 'incident_response',
     });
-    expect(
-      storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_status,
-    ).toBe('revoked');
+    expect(storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_status).toBe('revoked');
 
     await expect(
       KnowledgeStateMachine.transition({
@@ -396,8 +366,7 @@ describe('P10a integration: cenário 3 — revocation is terminal', () => {
       decided_by: 'incident_response',
     });
     const transitionsAfterFirst = [
-      ...storeByKind.get('fact')!.get(proposal.proposal_id)!
-        .lifecycle_transitions,
+      ...storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_transitions,
     ];
     await KnowledgeStateMachine.revoke({
       kind: 'fact',
@@ -405,9 +374,9 @@ describe('P10a integration: cenário 3 — revocation is terminal', () => {
       reason: 'second',
       decided_by: 'incident_response',
     });
-    expect(
-      storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_transitions,
-    ).toEqual(transitionsAfterFirst);
+    expect(storeByKind.get('fact')!.get(proposal.proposal_id)!.lifecycle_transitions).toEqual(
+      transitionsAfterFirst,
+    );
   });
 });
 
@@ -472,9 +441,7 @@ describe('P10a integration: cenário 5 — TTL expiration → deprecated', () =>
       reason: 'ttl_expired:30d_no_update',
       decided_by: 'auto_promoter:ttl_expired',
     });
-    expect(storeByKind.get('fact')!.get('fact-stale')!.lifecycle_status).toBe(
-      'deprecated',
-    );
+    expect(storeByKind.get('fact')!.get('fact-stale')!.lifecycle_status).toBe('deprecated');
   });
 });
 

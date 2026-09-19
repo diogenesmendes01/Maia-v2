@@ -20,9 +20,7 @@ const h = vi.hoisted(() => {
     fakeRedis,
     redisConnected: { value: true },
     queueAdd: vi.fn(async () => undefined),
-    queueGetJob: vi.fn(
-      async (_id: string) => null as { remove: () => Promise<void> } | null,
-    ),
+    queueGetJob: vi.fn(async (_id: string) => null as { remove: () => Promise<void> } | null),
   };
 });
 
@@ -116,10 +114,7 @@ describe('debouncer.scheduleDebouncedAgent', () => {
   it('second message within window: removes old job, adds new with reset flag, preserves first_enqueued_at', async () => {
     // Stage prior state — pretend M1 was enqueued 1.5s ago.
     const firstAt = Date.now() - 1500;
-    h.store.set(
-      _internal.STATE_KEY(SCOPED),
-      JSON.stringify({ first_enqueued_at: firstAt }),
-    );
+    h.store.set(_internal.STATE_KEY(SCOPED), JSON.stringify({ first_enqueued_at: firstAt }));
     const remove = vi.fn(async () => undefined);
     h.queueGetJob.mockResolvedValueOnce({ remove });
 
@@ -147,10 +142,7 @@ describe('debouncer.scheduleDebouncedAgent', () => {
 
   it('past max_hold_ms: leaves existing job alone, returns max_hold_passthrough', async () => {
     const firstAt = Date.now() - 31000; // 31s, > 30s ceiling
-    h.store.set(
-      _internal.STATE_KEY(SCOPED),
-      JSON.stringify({ first_enqueued_at: firstAt }),
-    );
+    h.store.set(_internal.STATE_KEY(SCOPED), JSON.stringify({ first_enqueued_at: firstAt }));
 
     const result = await withCtx(() =>
       scheduleDebouncedAgent({
@@ -200,9 +192,7 @@ describe('debouncer.scheduleDebouncedAgent', () => {
   it('redis disconnected during clearDebounceState: throws DebouncerRedisUnavailableError', async () => {
     h.redisConnected.value = false;
 
-    await expect(
-      withCtx(() => clearDebounceState(PHONE)),
-    ).rejects.toMatchObject({
+    await expect(withCtx(() => clearDebounceState(PHONE))).rejects.toMatchObject({
       name: 'DebouncerRedisUnavailableError',
       code: 'DEBOUNCER_REDIS_UNAVAILABLE',
     });

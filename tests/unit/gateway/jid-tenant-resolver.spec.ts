@@ -62,9 +62,7 @@ function makeChannel(overrides: Partial<Channel> = {}): Channel {
 
 describe('extractPhoneFromJid — pure JID parser', () => {
   it('parses standard `@s.whatsapp.net` JID → {phone_e164: "+<digits>", via_lid_fallback: false}', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     const out = extractPhoneFromJid('5511999999999@s.whatsapp.net');
     expect(out).toEqual({
       phone_e164: '+5511999999999',
@@ -73,9 +71,7 @@ describe('extractPhoneFromJid — pure JID parser', () => {
   });
 
   it('parses legacy `@c.us` JID → {phone_e164: "+<digits>", via_lid_fallback: false}', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     const out = extractPhoneFromJid('5511888888888@c.us');
     expect(out).toEqual({
       phone_e164: '+5511888888888',
@@ -84,9 +80,7 @@ describe('extractPhoneFromJid — pure JID parser', () => {
   });
 
   it('@lid + senderPn (bare digits) → fallback resolves via senderPn', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     const out = extractPhoneFromJid('12345@lid', {
       senderPn: '5511777777777',
     });
@@ -97,9 +91,7 @@ describe('extractPhoneFromJid — pure JID parser', () => {
   });
 
   it('@lid + senderPn (JID-shaped) → strips domain and resolves', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     const out = extractPhoneFromJid('12345@lid', {
       senderPn: '5511777777777@s.whatsapp.net',
     });
@@ -108,9 +100,7 @@ describe('extractPhoneFromJid — pure JID parser', () => {
   });
 
   it('@lid + participantPn fallback (senderPn missing)', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     const out = extractPhoneFromJid('12345@lid', {
       participantPn: '5511666666666',
     });
@@ -119,9 +109,7 @@ describe('extractPhoneFromJid — pure JID parser', () => {
   });
 
   it('@lid with neither senderPn nor participantPn → null (caller treats as unresolvable)', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     expect(extractPhoneFromJid('12345@lid')).toBeNull();
     expect(extractPhoneFromJid('12345@lid', {})).toBeNull();
     expect(
@@ -133,56 +121,38 @@ describe('extractPhoneFromJid — pure JID parser', () => {
   });
 
   it('group JID (@g.us) → null (defense in depth: groups must not route through tenant resolver)', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     expect(extractPhoneFromJid('120363025111111111@g.us')).toBeNull();
   });
 
   it('unknown domain → null', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     expect(extractPhoneFromJid('5511999999999@example.com')).toBeNull();
     expect(extractPhoneFromJid('5511999999999@broadcast')).toBeNull();
   });
 
   it('malformed JID (no @) → null', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     expect(extractPhoneFromJid('5511999999999')).toBeNull();
     expect(extractPhoneFromJid('@s.whatsapp.net')).toBeNull();
   });
 
   it('non-digit local part on standard JID → null (cannot invent a phone)', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
-    expect(
-      extractPhoneFromJid('abc-not-a-phone@s.whatsapp.net'),
-    ).toBeNull();
-    expect(
-      extractPhoneFromJid('5511-999-999@s.whatsapp.net'),
-    ).toBeNull();
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
+    expect(extractPhoneFromJid('abc-not-a-phone@s.whatsapp.net')).toBeNull();
+    expect(extractPhoneFromJid('5511-999-999@s.whatsapp.net')).toBeNull();
   });
 
   it('empty / null / undefined JID → null', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
     expect(extractPhoneFromJid('')).toBeNull();
     expect(extractPhoneFromJid(null)).toBeNull();
     expect(extractPhoneFromJid(undefined)).toBeNull();
   });
 
   it('@lid senderPn with non-digit local part → null (rejects malformed fallback)', async () => {
-    const { extractPhoneFromJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
-    expect(
-      extractPhoneFromJid('12345@lid', { senderPn: 'not-a-phone' }),
-    ).toBeNull();
+    const { extractPhoneFromJid } = await import('@/gateway/jid-tenant-resolver.js');
+    expect(extractPhoneFromJid('12345@lid', { senderPn: 'not-a-phone' })).toBeNull();
   });
 });
 
@@ -205,12 +175,8 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
         external_id: '+5511999999999',
       }),
     );
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
-    const { scope, jid_context } = await resolveScopeForJid(
-      '5511999999999@s.whatsapp.net',
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
+    const { scope, jid_context } = await resolveScopeForJid('5511999999999@s.whatsapp.net');
     expect(scope).toEqual({
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
@@ -244,9 +210,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
           external_id: '+5511222222222',
         }),
       );
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     const a = await resolveScopeForJid('5511111111111@s.whatsapp.net');
     const b = await resolveScopeForJid('5511222222222@s.whatsapp.net');
 
@@ -257,9 +221,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
 
   it('unknown JID (channel miss) → throws TypedError("channel_resolution_failed")', async () => {
     findByExternalCrossTenantMock.mockResolvedValueOnce(null);
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     const p = resolveScopeForJid('5511999999999@s.whatsapp.net');
     await expect(p).rejects.toBeInstanceOf(TypedError);
     await expect(p).rejects.toMatchObject({
@@ -273,12 +235,8 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
   });
 
   it('channel inactive → throws with resolver_path=unknown_or_inactive_channel and active:false', async () => {
-    findByExternalCrossTenantMock.mockResolvedValueOnce(
-      makeChannel({ active: false }),
-    );
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    findByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel({ active: false }));
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     const p = resolveScopeForJid('5511999999999@s.whatsapp.net');
     await expect(p).rejects.toMatchObject({
       code: 'channel_resolution_failed',
@@ -287,9 +245,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
   });
 
   it('malformed JID → throws with resolver_path=jid_unparseable WITHOUT hitting the repo', async () => {
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     const p = resolveScopeForJid('not-a-jid');
     await expect(p).rejects.toBeInstanceOf(TypedError);
     await expect(p).rejects.toMatchObject({
@@ -300,12 +256,8 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
   });
 
   it('group JID → throws jid_unparseable WITHOUT hitting the repo (defense in depth)', async () => {
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
-    await expect(
-      resolveScopeForJid('120363025111111111@g.us'),
-    ).rejects.toMatchObject({
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
+    await expect(resolveScopeForJid('120363025111111111@g.us')).rejects.toMatchObject({
       code: 'channel_resolution_failed',
       details: { resolver_path: 'jid_unparseable' },
     });
@@ -313,12 +265,8 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
   });
 
   it('@lid without senderPn AND no LID resolver → throws lid_unmapped (split from jid_unparseable)', async () => {
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
-    await expect(
-      resolveScopeForJid('12345@lid'),
-    ).rejects.toMatchObject({
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
+    await expect(resolveScopeForJid('12345@lid')).rejects.toMatchObject({
       code: 'channel_resolution_failed',
       details: { resolver_path: 'lid_unmapped', raw_jid: '12345@lid' },
     });
@@ -335,14 +283,10 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
       }),
     );
     const lidPhoneResolver = vi.fn().mockResolvedValue('5511777777777@s.whatsapp.net');
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
-    const { scope, jid_context } = await resolveScopeForJid(
-      '168813890908183@lid',
-      undefined,
-      { lidPhoneResolver },
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
+    const { scope, jid_context } = await resolveScopeForJid('168813890908183@lid', undefined, {
+      lidPhoneResolver,
+    });
     expect(scope.tenant_id).toBe('tenant-store');
     expect(jid_context.via_lid_fallback).toBe(true);
     expect(jid_context.lid_recovery_source).toBe('lid_store');
@@ -360,9 +304,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
       makeChannel({ external_id: '+5511777777777' }),
     );
     const lidPhoneResolver = vi.fn().mockResolvedValue('5511000000000');
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     const { jid_context } = await resolveScopeForJid(
       '999@lid',
       { senderPn: '5511777777777' },
@@ -374,9 +316,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
 
   it('@lid: lidPhoneResolver returns null → still throws lid_unmapped (fail-closed)', async () => {
     const lidPhoneResolver = vi.fn().mockResolvedValue(null);
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     await expect(
       resolveScopeForJid('12345@lid', undefined, { lidPhoneResolver }),
     ).rejects.toMatchObject({
@@ -390,9 +330,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
   it('lidPhoneResolver is NEVER consulted for a non-@lid JID', async () => {
     findByExternalCrossTenantMock.mockResolvedValueOnce(makeChannel({}));
     const lidPhoneResolver = vi.fn().mockResolvedValue('5511000000000');
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     await resolveScopeForJid('5511999999999@s.whatsapp.net', undefined, {
       lidPhoneResolver,
     });
@@ -401,9 +339,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
 
   it('malformed (non-@lid) JID still throws jid_unparseable, never lid_unmapped', async () => {
     const lidPhoneResolver = vi.fn().mockResolvedValue('5511000000000');
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     await expect(
       resolveScopeForJid('120363025111111111@g.us', undefined, { lidPhoneResolver }),
     ).rejects.toMatchObject({
@@ -421,9 +357,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
         external_id: '+5511777777777',
       }),
     );
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     const { scope, jid_context } = await resolveScopeForJid('999@lid', {
       senderPn: '5511777777777',
     });
@@ -437,9 +371,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
   });
 
   it('null JID → throws jid_unparseable', async () => {
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     await expect(resolveScopeForJid(null)).rejects.toMatchObject({
       code: 'channel_resolution_failed',
       details: { resolver_path: 'jid_unparseable' },
@@ -447,15 +379,11 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
   });
 
   it('DB-layer throw propagates as-is (caller audits + drops)', async () => {
-    findByExternalCrossTenantMock.mockRejectedValueOnce(
-      new Error('connection refused'),
+    findByExternalCrossTenantMock.mockRejectedValueOnce(new Error('connection refused'));
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
+    await expect(resolveScopeForJid('5511999999999@s.whatsapp.net')).rejects.toThrow(
+      'connection refused',
     );
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
-    await expect(
-      resolveScopeForJid('5511999999999@s.whatsapp.net'),
-    ).rejects.toThrow('connection refused');
   });
 
   it('#411 single-tenant: unknown JID (no real tenant) → resolves to (primary, primary) via catch-all (NOT a throw)', async () => {
@@ -471,9 +399,7 @@ describe('resolveScopeForJid — JID + channel delegation', () => {
         external_id: 'default-channel',
       }),
     });
-    const { resolveScopeForJid } = await import(
-      '@/gateway/jid-tenant-resolver.js'
-    );
+    const { resolveScopeForJid } = await import('@/gateway/jid-tenant-resolver.js');
     const { scope } = await resolveScopeForJid('5511999999999@s.whatsapp.net');
     expect(scope).toEqual({
       tenant_id: 'primary',

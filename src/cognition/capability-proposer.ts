@@ -107,9 +107,13 @@ export async function proposeCapabilityForGap(args: {
         'IMPORTANTE: NÃO inclua julgamento de prioridade. Apenas a spec técnica.',
       ].join('\n');
 
-      const evidenceBlock = args.recent_evidence && args.recent_evidence.length > 0
-        ? `EVIDÊNCIAS RECENTES:\n${args.recent_evidence.slice(0, 5).map((e) => `- ${e.context}`).join('\n')}`
-        : '';
+      const evidenceBlock =
+        args.recent_evidence && args.recent_evidence.length > 0
+          ? `EVIDÊNCIAS RECENTES:\n${args.recent_evidence
+              .slice(0, 5)
+              .map((e) => `- ${e.context}`)
+              .join('\n')}`
+          : '';
 
       const userParts = [
         `LACUNA: ${args.gap.capability_description}`,
@@ -144,12 +148,7 @@ export async function proposeCapabilityForGap(args: {
       }
 
       // Light validation: required keys present.
-      if (
-        !parsed.title ||
-        !parsed.description ||
-        !parsed.motivation ||
-        !parsed.capability_type
-      ) {
+      if (!parsed.title || !parsed.description || !parsed.motivation || !parsed.capability_type) {
         return null;
       }
       return parsed;
@@ -207,26 +206,23 @@ export async function proposeSoulBiasFromDriftAlert(args: {
   motivation: string;
   expected_impact?: string;
 }): Promise<
-  | { ok: true; proposal_id: string }
-  | { ok: false; reason: 'repo_failed'; message: string }
+  { ok: true; proposal_id: string } | { ok: false; reason: 'repo_failed'; message: string }
 > {
   try {
     // CAST: existing `capabilityProposalsRepo.create` is typed against the
     // pre-P8b union. After migration 038c the DB CHECK includes 'soul_bias';
     // we cast at the boundary until the repo signature is widened in a
     // follow-up.
-    const repoCreate = capabilityProposalsRepo.create as unknown as (
-      input: {
-        capability_type: string;
-        title: string;
-        description: string;
-        proposed_spec: Record<string, unknown>;
-        motivation: string;
-        expected_impact?: string;
-        test_scenarios: Array<{ name: string; given: string; when: string; then: string }>;
-        gap_id?: string;
-      },
-    ) => Promise<{ id: string }>;
+    const repoCreate = capabilityProposalsRepo.create as unknown as (input: {
+      capability_type: string;
+      title: string;
+      description: string;
+      proposed_spec: Record<string, unknown>;
+      motivation: string;
+      expected_impact?: string;
+      test_scenarios: Array<{ name: string; given: string; when: string; then: string }>;
+      gap_id?: string;
+    }) => Promise<{ id: string }>;
 
     const proposal = await repoCreate({
       capability_type: 'soul_bias',

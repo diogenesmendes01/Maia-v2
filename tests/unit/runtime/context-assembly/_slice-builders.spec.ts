@@ -73,16 +73,7 @@ describe('SliceBuilder interface contract', () => {
   });
 
   it('builder.name returns one of the SliceName union values', () => {
-    const allowed = [
-      'identity',
-      'user',
-      'knowledge',
-      'soul',
-      'policy',
-      'skill',
-      'tool',
-      'history',
-    ];
+    const allowed = ['identity', 'user', 'knowledge', 'soul', 'policy', 'skill', 'tool', 'history'];
     const builder: SliceBuilder<unknown, IdentitySlice> = {
       name: 'identity',
       build: async () => ({

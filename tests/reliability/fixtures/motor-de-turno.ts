@@ -169,9 +169,7 @@ async function ingressar(): Promise<Record<string, unknown>> {
 /** `enqueueAgent` REAL, `repeticoes` vezes. O jobId sai da produção. */
 async function enfileirar(mensagem_id: string, turn_id: string | null): Promise<void> {
   for (let i = 0; i < repeticoes; i += 1) {
-    await noEscopo(() =>
-      enqueueAgent({ mensagem_id, ...(turn_id ? { turn_id } : {}) }),
-    );
+    await noEscopo(() => enqueueAgent({ mensagem_id, ...(turn_id ? { turn_id } : {}) }));
     emitir('##fi-enqueue##', {
       tentativa: i + 1,
       mensagem_id,
@@ -260,7 +258,8 @@ main().catch((erro: unknown) => {
   // ela o vermelho mostra a query inteira mas não a CONSTRAINT que a recusou —
   // que é justamente o que se precisa saber. Mesma lição de
   // `replica-de-entrega.ts` (fatia C).
-  const causa = erro instanceof Error ? (erro.cause as { message?: string } | undefined) : undefined;
+  const causa =
+    erro instanceof Error ? (erro.cause as { message?: string } | undefined) : undefined;
   const detalhe = [
     erro instanceof Error ? erro.name : 'desconhecido',
     causa?.message ?? (erro instanceof Error ? erro.message : String(erro)),

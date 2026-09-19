@@ -7,12 +7,7 @@ import { Card, CardHeader, CardBody } from '../../../../components/ui/card.js';
 import { Field, Input, Select, Textarea } from '../../../../components/ui/field.js';
 import { Badge, StatusBadge } from '../../../../components/ui/badge.js';
 import { Modal } from '../../../../components/ui/modal.js';
-import {
-  Alert,
-  EmptyState,
-  ErrorState,
-  LoadingState,
-} from '../../../../components/ui/states.js';
+import { Alert, EmptyState, ErrorState, LoadingState } from '../../../../components/ui/states.js';
 import { IconPlus } from '../../../../components/ui/icons.js';
 
 /**
@@ -68,17 +63,14 @@ export default function ObjectivesTab({
   return (
     <div className="space-y-4">
       <Alert tone="info">
-        Objetivos são as <strong>responsabilidades</strong> do agente: o work loop
-        percebe trabalho pendente e executa tarefas sem ninguém pedir; exceções
-        param aqui esperando sua decisão. Nesta v1, o kind <code>manual</code>{' '}
-        valida o ciclo — kinds com percepção automática (ex.: cobrança de
-        inadimplentes) chegam na v2.
+        Objetivos são as <strong>responsabilidades</strong> do agente: o work loop percebe trabalho
+        pendente e executa tarefas sem ninguém pedir; exceções param aqui esperando sua decisão.
+        Nesta v1, o kind <code>manual</code> valida o ciclo — kinds com percepção automática (ex.:
+        cobrança de inadimplentes) chegam na v2.
       </Alert>
 
       <div className="flex items-center justify-between gap-3">
-        <h3 className="text-sm font-semibold text-zinc-900">
-          Objetivos ({objectives.length})
-        </h3>
+        <h3 className="text-sm font-semibold text-zinc-900">Objetivos ({objectives.length})</h3>
         {canManage && (
           <Button size="sm" onClick={() => setShowCreate(true)}>
             <IconPlus size={14} />
@@ -97,9 +89,7 @@ export default function ObjectivesTab({
           {objectives.map((o) => (
             <button
               key={o.id}
-              onClick={() =>
-                setSelectedObjective(selectedObjective === o.id ? null : o.id)
-              }
+              onClick={() => setSelectedObjective(selectedObjective === o.id ? null : o.id)}
               className={`rounded-xl border bg-white p-4 text-left shadow-card transition-all hover:shadow-md ${
                 selectedObjective === o.id
                   ? 'border-brand-500 ring-2 ring-brand-500/20'
@@ -232,9 +222,7 @@ export default function ObjectivesTab({
         />
         <CardBody className="p-0">
           {tasks.length === 0 ? (
-            <p className="px-5 py-8 text-center text-sm text-zinc-400">
-              Nenhuma tarefa ainda.
-            </p>
+            <p className="px-5 py-8 text-center text-sm text-zinc-400">Nenhuma tarefa ainda.</p>
           ) : (
             <ul className="divide-y divide-zinc-100">
               {tasks.map((t) => (
@@ -334,13 +322,12 @@ function CreateObjectiveModal({
     >
       <div className="space-y-4">
         <Field label="Título" required hint="Ex.: “Validar o ciclo do work loop”.">
-          <Input
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            maxLength={200}
-          />
+          <Input value={title} onChange={(e) => setTitle(e.target.value)} maxLength={200} />
         </Field>
-        <Field label="Tipo" hint="v1: apenas o kind manual (tarefas criadas por você). Kinds com percepção automática chegam na v2.">
+        <Field
+          label="Tipo"
+          hint="v1: apenas o kind manual (tarefas criadas por você). Kinds com percepção automática chegam na v2."
+        >
           <Select value="manual" disabled>
             <option value="manual">manual</option>
           </Select>

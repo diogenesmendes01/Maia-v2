@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
-import { putWithDeadline, type DeadlineUploadDeps } from '../../../src/ops/backup/upload-deadline.js';
+import {
+  putWithDeadline,
+  type DeadlineUploadDeps,
+} from '../../../src/ops/backup/upload-deadline.js';
 
 /**
  * Issue #520 §6 — round-1 review finding (P2): the upload timeout rejected the
@@ -133,16 +136,16 @@ describe('an upload that NEVER settles (round-2 finding)', () => {
     // Without the cancellation grace this await never resolves and the run
     // stays active — which the single-active index turns into a permanent
     // block on every future backup.
-    await expect(
-      putWithDeadline(p.deps, 5, { cancelGraceMs: 10 }),
-    ).rejects.toMatchObject({ code: 'upload_cancel_timeout' });
+    await expect(putWithDeadline(p.deps, 5, { cancelGraceMs: 10 })).rejects.toMatchObject({
+      code: 'upload_cancel_timeout',
+    });
   });
 
   it('DECLARES the orphan as unknown instead of claiming a cleanup', async () => {
     const p = provider({ durationMs: 0, honoursAbort: false, neverSettles: true });
-    await expect(
-      putWithDeadline(p.deps, 5, { cancelGraceMs: 10 }),
-    ).rejects.toMatchObject({ details: { orphan: 'unknown' } });
+    await expect(putWithDeadline(p.deps, 5, { cancelGraceMs: 10 })).rejects.toMatchObject({
+      details: { orphan: 'unknown' },
+    });
   });
 
   it('does NOT touch the key — a delete would race a write still in flight', async () => {

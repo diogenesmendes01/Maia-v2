@@ -55,7 +55,10 @@ describe('#519 — a fronteira do bootstrap global não pode ser contornada', ()
     // reintroduziria a leitura de que basta implementar para liberar o caminho
     // genérico — quando o ponto é que o caminho genérico NUNCA libera.
     expect(s).toMatch(/'bootstrap_not_allowed'/);
-    const trecho = s.slice(s.indexOf('async function openRun('), s.indexOf('async function openRunChecked('));
+    const trecho = s.slice(
+      s.indexOf('async function openRun('),
+      s.indexOf('async function openRunChecked('),
+    );
     expect(
       trecho.includes("'kind_not_implemented'"),
       'openRun voltou a recusar bootstrap global como "não implementado". A ' +

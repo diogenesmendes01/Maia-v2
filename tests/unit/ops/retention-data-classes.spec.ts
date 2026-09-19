@@ -126,9 +126,7 @@ describe('the remaining decisions are split by owner (issue #536)', () => {
     // probatório da redação (Security). Separar seria editá-la. Então ela fica
     // visível como "dono a definir" — que é diferente de estar escondida na
     // lista do DPO.
-    expect(openDecisionsByOwner().unassigned.map((d) => d.data_class)).toEqual([
-      'postgres.audit',
-    ]);
+    expect(openDecisionsByOwner().unassigned.map((d) => d.data_class)).toEqual(['postgres.audit']);
   });
 
   it('every class appears in exactly one bucket', () => {
@@ -195,9 +193,9 @@ describe('parseRetentionPolicy', () => {
   });
 
   it('returns the unapproved policy when the approver or version is missing', () => {
-    expect(
-      parseRetentionPolicy(JSON.stringify({ classes: {}, version: 'v1' })).approved,
-    ).toBe(false);
+    expect(parseRetentionPolicy(JSON.stringify({ classes: {}, version: 'v1' })).approved).toBe(
+      false,
+    );
   });
 
   it('accepts a well-formed, approved policy', () => {

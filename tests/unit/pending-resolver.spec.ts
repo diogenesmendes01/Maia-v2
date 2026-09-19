@@ -42,7 +42,9 @@ describe('resolveAndDispatch', () => {
     resolveTx.mockResolvedValueOnce(undefined);
     const { resolveAndDispatch } = await import('../../src/agent/pending-resolver.js');
     const out = await resolveAndDispatch({
-      pessoa, conversa, mensagem_id: 'm1',
+      pessoa,
+      conversa,
+      mensagem_id: 'm1',
       expected_pending_id: 'pq-1',
       option_chosen: 'sim',
       confidence: 1.0,
@@ -57,14 +59,19 @@ describe('resolveAndDispatch', () => {
     expect(audit.mock.calls.some((c) => c[0].acao === 'pending_resolved_by_reaction')).toBe(true);
     expect(audit.mock.calls.some((c) => c[0].acao === 'pending_action_dispatched')).toBe(true);
     expect(dispatchTool).toHaveBeenCalledTimes(1);
-    expect(dispatchTool.mock.calls[0]![0].args).toMatchObject({ valor: 50, _pending_choice: 'sim' });
+    expect(dispatchTool.mock.calls[0]![0].args).toMatchObject({
+      valor: 50,
+      _pending_choice: 'sim',
+    });
   });
 
   it('race-loss: re-check id mismatch → audit pending_race_lost, no dispatch', async () => {
     findActiveForUpdate.mockResolvedValueOnce({ id: 'pq-different', acao_proposta: {} });
     const { resolveAndDispatch } = await import('../../src/agent/pending-resolver.js');
     const out = await resolveAndDispatch({
-      pessoa, conversa, mensagem_id: 'm1',
+      pessoa,
+      conversa,
+      mensagem_id: 'm1',
       expected_pending_id: 'pq-1',
       option_chosen: 'sim',
       confidence: 1.0,
@@ -95,7 +102,9 @@ describe('resolveAndDispatch', () => {
     });
     const { resolveAndDispatch } = await import('../../src/agent/pending-resolver.js');
     await resolveAndDispatch({
-      pessoa, conversa, mensagem_id: 'm1',
+      pessoa,
+      conversa,
+      mensagem_id: 'm1',
       expected_pending_id: 'pq-1',
       option_chosen: 'sim',
       confidence: 0.8,
@@ -108,7 +117,9 @@ describe('resolveAndDispatch', () => {
     findActiveForUpdate.mockResolvedValueOnce({ id: 'pq-1', acao_proposta: {} });
     const { resolveAndDispatch } = await import('../../src/agent/pending-resolver.js');
     const out = await resolveAndDispatch({
-      pessoa, conversa, mensagem_id: 'm1',
+      pessoa,
+      conversa,
+      mensagem_id: 'm1',
       expected_pending_id: 'pq-1',
       option_chosen: 'sim',
       confidence: 1.0,

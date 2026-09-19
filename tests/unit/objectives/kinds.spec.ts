@@ -2,11 +2,7 @@
  * Issue #469 — registry de kinds do work loop (v1).
  */
 import { describe, it, expect } from 'vitest';
-import {
-  OBJECTIVE_KINDS,
-  OBJECTIVE_KIND_IDS,
-  getObjectiveKind,
-} from '@/objectives/kinds.js';
+import { OBJECTIVE_KINDS, OBJECTIVE_KIND_IDS, getObjectiveKind } from '@/objectives/kinds.js';
 import type { AgentObjective, ObjectiveTask } from '@/db/schema.js';
 
 const objective = {

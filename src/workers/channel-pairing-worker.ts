@@ -30,10 +30,7 @@ import {
   type PairingMethod,
   type LineState,
 } from '@/db/repositories/channel-line-state-repos.js';
-import {
-  sealPairingMaterial,
-  PAIRING_MATERIAL_TTL_MS,
-} from '@/setup/pairing-material.js';
+import { sealPairingMaterial, PAIRING_MATERIAL_TTL_MS } from '@/setup/pairing-material.js';
 import { qrToPngBuffer } from '@/setup/qr-png.js';
 import { startChannelPairing, abortChannelPairing } from '@/setup/line-pairing.js';
 import { evaluateLineReadiness } from '@/setup/line-readiness.js';
@@ -322,9 +319,7 @@ async function executeStopLine(row: {
  */
 async function publishLocalSessionOwnership(): Promise<void> {
   try {
-    const { listLocalLineSessions, stopLineSession } = await import(
-      '@/gateway/line-sessions.js'
-    );
+    const { listLocalLineSessions, stopLineSession } = await import('@/gateway/line-sessions.js');
     const { heartbeatChannelLease } = await import('@/gateway/channel-lease.js');
     const lines = listLocalLineSessions();
     if (lines.length === 0) return;
@@ -384,10 +379,7 @@ async function promoteReadyVerifiedLines(): Promise<void> {
         // bug que o CAS fecha (review PR #528 rodada 2).
         if (act.reason === 'already_active') {
           incCounter('maia_channel_pairing_total', { outcome: 'activation_lost_race' });
-          logger.info(
-            { channel_id: line.channel_id },
-            'channel_pairing.activation_lost_race',
-          );
+          logger.info({ channel_id: line.channel_id }, 'channel_pairing.activation_lost_race');
           continue;
         }
         // `line_owned_elsewhere` (23505 do índice global) é fail-closed: a
@@ -400,17 +392,15 @@ async function promoteReadyVerifiedLines(): Promise<void> {
         continue;
       }
 
-      await runWithTenantContext(
-        { tenant_id: line.tenant_id, agent_id: line.agent_id },
-        () =>
-          audit({
-            acao: 'channel_activated',
-            metadata: {
-              channel_id: line.channel_id,
-              line: line.external_id,
-              trigger: 'readiness_revalidated',
-            },
-          }),
+      await runWithTenantContext({ tenant_id: line.tenant_id, agent_id: line.agent_id }, () =>
+        audit({
+          acao: 'channel_activated',
+          metadata: {
+            channel_id: line.channel_id,
+            line: line.external_id,
+            trigger: 'readiness_revalidated',
+          },
+        }),
       );
       incCounter('maia_channel_pairing_total', { outcome: 'activated' });
 

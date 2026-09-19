@@ -22,9 +22,7 @@ export default function TenantCreateModal({ onClose }: Props) {
   const handleSubmit = async () => {
     setError(null);
     if (!ID_REGEX.test(id)) {
-      setError(
-        'O ID deve ter apenas letras minúsculas/dígitos/_/- e começar com letra ou dígito.',
-      );
+      setError('O ID deve ter apenas letras minúsculas/dígitos/_/- e começar com letra ou dígito.');
       return;
     }
     if (id.length > 64) {
@@ -74,11 +72,7 @@ export default function TenantCreateModal({ onClose }: Props) {
           />
         </Field>
         <Field label="Nome de exibição" required>
-          <Input
-            value={nome}
-            onChange={(e) => setNome(e.target.value)}
-            placeholder="Acme Corp"
-          />
+          <Input value={nome} onChange={(e) => setNome(e.target.value)} placeholder="Acme Corp" />
         </Field>
         {error && <Alert tone="danger">{error}</Alert>}
       </div>

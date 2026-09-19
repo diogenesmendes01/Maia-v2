@@ -23,14 +23,9 @@ import { isValidIanaTimeZone } from '@/lib/timezone.js';
  * travels with the same agents that can schedule.
  */
 const inputSchema = z.object({
-  timezone: z
-    .string()
-    .min(1)
-    .max(64)
-    .refine(isValidIanaTimeZone, {
-      message:
-        'timezone precisa ser um nome IANA válido (ex.: America/Sao_Paulo, Europe/Lisbon)',
-    }),
+  timezone: z.string().min(1).max(64).refine(isValidIanaTimeZone, {
+    message: 'timezone precisa ser um nome IANA válido (ex.: America/Sao_Paulo, Europe/Lisbon)',
+  }),
 });
 
 const outputSchema = z.object({

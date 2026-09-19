@@ -89,10 +89,9 @@ d('agent_turns — DB real (migrations 096/097)', () => {
     if (createdMensagens.length > 0) {
       // agent_turn_inputs cai por CASCADE do turno; a FK para mensagens exige
       // apagar inputs antes das mensagens.
-      await pool.query(
-        `DELETE FROM agent_turn_inputs WHERE mensagem_id = ANY($1::uuid[])`,
-        [createdMensagens],
-      );
+      await pool.query(`DELETE FROM agent_turn_inputs WHERE mensagem_id = ANY($1::uuid[])`, [
+        createdMensagens,
+      ]);
       await pool.query(
         `DELETE FROM agent_turns WHERE representative_message_id = ANY($1::uuid[])`,
         [createdMensagens],
@@ -367,9 +366,7 @@ d('agent_turns — DB real (migrations 096/097)', () => {
         /agent_turns_status_chk/,
       );
       // Outcome desconhecido não casa nenhuma lista fechada.
-      await expect(insertTurn(rejectMsg, 'completed', 'done')).rejects.toThrow(
-        OUTCOME_CONSTRAINTS,
-      );
+      await expect(insertTurn(rejectMsg, 'completed', 'done')).rejects.toThrow(OUTCOME_CONSTRAINTS);
     });
 
     // Divergência consciente nº 1 da PR, verificada NO BANCO e não só no
@@ -465,10 +462,9 @@ d('agent_turns — DB real (migrations 096/097)', () => {
         expected_version: Number(turn.state_version),
       }),
     );
-    res = await pool.query(
-      `SELECT id, processada_em FROM mensagens WHERE id = ANY($1::uuid[])`,
-      [[repMsg, siblingMsg]],
-    );
+    res = await pool.query(`SELECT id, processada_em FROM mensagens WHERE id = ANY($1::uuid[])`, [
+      [repMsg, siblingMsg],
+    ]);
     expect(res.rows).toHaveLength(2);
     for (const row of res.rows) expect(row.processada_em).not.toBeNull();
   });
@@ -619,9 +615,7 @@ d('agent_turns — DB real (migrations 096/097)', () => {
    *    desfaz nada no `release()`: um client devolvido ainda em transação, e com
    *    `enable_seqscan=off` local, contamina o próximo teste que pegar o slot.
    */
-  async function explainWithoutSeqScan<T>(
-    fn: (client: pg.PoolClient) => Promise<T>,
-  ): Promise<T> {
+  async function explainWithoutSeqScan<T>(fn: (client: pg.PoolClient) => Promise<T>): Promise<T> {
     const client = await pool.connect();
     try {
       await client.query('BEGIN');

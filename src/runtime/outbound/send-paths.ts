@@ -597,7 +597,11 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
         'depender do valor de retorno do envio e a perda que `reason` teme (a pergunta ' +
         'sumir do histórico do dono) deixa de ser possível.',
       probes: [
-        { module: 'src/agent/message-update.ts', symbol: 'commitStandaloneOutbound', kind: 'surge' },
+        {
+          module: 'src/agent/message-update.ts',
+          symbol: 'commitStandaloneOutbound',
+          kind: 'surge',
+        },
         { module: 'src/agent/message-update.ts', symbol: 'sendText(', kind: 'some' },
       ],
     },
@@ -764,7 +768,11 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
         'coisa que a §Rollback exige. `outbox_messages` continua existindo como ' +
         'AGENDADOR; o que some é o segundo sender.',
       probes: [
-        { module: 'src/scheduling/outbox-drain.ts', symbol: 'commitStandaloneOutbound', kind: 'surge' },
+        {
+          module: 'src/scheduling/outbox-drain.ts',
+          symbol: 'commitStandaloneOutbound',
+          kind: 'surge',
+        },
         { module: 'src/scheduling/outbox-drain.ts', symbol: 'sendText(', kind: 'some' },
       ],
     },
@@ -785,8 +793,7 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
       'emissor. Perder aqui o `messageId` determinístico durante uma migração ' +
       'parcial seria trocar uma garantia forte por uma mais fraca.',
     containment:
-      'Chave de dedupe do provedor derivada da identidade da row; retry e DLQ ' +
-      'próprios.',
+      'Chave de dedupe do provedor derivada da identidade da row; retry e DLQ ' + 'próprios.',
     blocked_by: 'competing_durable_ledger',
     remediation:
       'Mesma fusão de ledgers do `scheduling.outbox_drain`. É a rota com MENOS a ganhar ' +
@@ -866,7 +873,11 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
         'estar no artefato durável, e é a CHAVE da mensagem, nunca o conteúdo: o ' +
         'payload é persistido e logado.',
       probes: [
-        { module: 'src/workers/pending-reminder.ts', symbol: 'commitStandaloneOutbound', kind: 'surge' },
+        {
+          module: 'src/workers/pending-reminder.ts',
+          symbol: 'commitStandaloneOutbound',
+          kind: 'surge',
+        },
         { module: 'src/workers/pending-reminder.ts', symbol: 'sendText(', kind: 'some' },
         { module: 'src/runtime/outbound/contract.ts', symbol: 'quoted', kind: 'surge' },
       ],

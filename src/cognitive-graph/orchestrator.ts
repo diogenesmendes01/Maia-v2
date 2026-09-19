@@ -47,7 +47,9 @@ export async function runNodes<TCtx extends GraphContext>(
   const serials = conditional.filter((n) => n.parallelizable !== true);
   if (parallels.length > 0) {
     const ps = await Promise.all(parallels.map((n) => runOne(n, context)));
-    parallels.forEach((n, i) => { results[n.name] = ps[i]!; });
+    parallels.forEach((n, i) => {
+      results[n.name] = ps[i]!;
+    });
   }
   for (const n of serials) {
     results[n.name] = await runOne(n, context);

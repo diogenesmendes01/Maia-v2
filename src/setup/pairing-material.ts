@@ -29,9 +29,7 @@ import {
 } from '../gateway/staging-crypto.js';
 import { TypedError } from '../lib/utils.js';
 
-export type PairingMaterial =
-  | { kind: 'qr'; png_data_uri: string }
-  | { kind: 'code'; code: string };
+export type PairingMaterial = { kind: 'qr'; png_data_uri: string } | { kind: 'code'; code: string };
 
 /**
  * TTL do material apresentado ao operador. Deliberadamente MENOR que o TTL da

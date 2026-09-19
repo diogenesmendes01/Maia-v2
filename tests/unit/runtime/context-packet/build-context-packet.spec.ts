@@ -9,7 +9,10 @@ import { buildContextPacket } from '@/runtime/context-packet/build-context-packe
 import { IdentitySliceBuilder } from '@/runtime/context-assembly/slice-builders/identity-slice-builder.js';
 import { UserSliceBuilder } from '@/runtime/context-assembly/slice-builders/user-slice-builder.js';
 import { KnowledgeSliceBuilder } from '@/runtime/context-assembly/slice-builders/knowledge-slice-builder.js';
-import { SoulSliceBuilder, stubSoulPort } from '@/runtime/context-assembly/slice-builders/soul-slice-builder.js';
+import {
+  SoulSliceBuilder,
+  stubSoulPort,
+} from '@/runtime/context-assembly/slice-builders/soul-slice-builder.js';
 import {
   PolicySliceBuilder,
   stubPolicyDescriptorResolver,
@@ -22,10 +25,7 @@ import type {
   SliceBuilder,
   SliceBuilderResult,
 } from '@/runtime/context-assembly/slice-builders/_types.js';
-import type {
-  HistorySlice,
-  PolicySlice,
-} from '@/runtime/context-packet/types.js';
+import type { HistorySlice, PolicySlice } from '@/runtime/context-packet/types.js';
 import { mockBase, mockDecision } from '../context-assembly/_fixture.js';
 
 function makeStandardBuilders(): {
@@ -54,7 +54,14 @@ function makeStandardBuilders(): {
       },
     },
     cache,
-  ) as unknown as SliceBuilder<unknown, ReturnType<IdentitySliceBuilder['build']> extends Promise<infer R> ? (R extends SliceBuilderResult<infer S> ? S : never) : never>;
+  ) as unknown as SliceBuilder<
+    unknown,
+    ReturnType<IdentitySliceBuilder['build']> extends Promise<infer R>
+      ? R extends SliceBuilderResult<infer S>
+        ? S
+        : never
+      : never
+  >;
 
   const user = new UserSliceBuilder(
     {
@@ -317,9 +324,7 @@ describe('buildContextPacket orchestrator', () => {
     it('history loader hang also bounded by per-slice timeout', async () => {
       const { builders } = makeStandardBuilders();
       const hangingHistory = () =>
-        new Promise<import('@/runtime/context-packet/types.js').HistorySlice>(
-          () => undefined,
-        );
+        new Promise<import('@/runtime/context-packet/types.js').HistorySlice>(() => undefined);
       const start = performance.now();
       const packet = await buildContextPacket(
         { base: mockBase(), decision: mockDecision() },
@@ -333,9 +338,7 @@ describe('buildContextPacket orchestrator', () => {
       const elapsed = performance.now() - start;
       expect(elapsed).toBeLessThan(300);
       expect(packet.history.turns).toEqual([]);
-      expect(packet.assembly_meta.fallback_depths_applied.history).toBe(
-        'timeout',
-      );
+      expect(packet.assembly_meta.fallback_depths_applied.history).toBe('timeout');
     });
 
     it('policy hang → throws (fail closed, budget cannot rescue)', async () => {
@@ -394,9 +397,7 @@ describe('buildContextPacket orchestrator', () => {
       // The cached value's `preferences` survived; fallback would have been
       // an empty object.
       expect(packet.user.preferences).toEqual({ foo: 'bar' });
-      expect(packet.assembly_meta.fallback_depths_applied.user).toBe(
-        'timeout_cache',
-      );
+      expect(packet.assembly_meta.fallback_depths_applied.user).toBe('timeout_cache');
     });
 
     it('emits metric counter on timeout', async () => {
@@ -426,17 +427,14 @@ describe('buildContextPacket orchestrator', () => {
         },
       );
       const fallbackCounters = counters.filter(
-        (c) =>
-          c.name === 'context_packet.fallback_applied' && c.labels?.slice === 'soul',
+        (c) => c.name === 'context_packet.fallback_applied' && c.labels?.slice === 'soul',
       );
       expect(fallbackCounters.length).toBeGreaterThanOrEqual(1);
       expect(fallbackCounters[0]?.labels?.reason).toMatch(/timeout/);
     });
 
     it('exposes DEFAULT_TOTAL_BUDGET_MS and DEFAULT_TIMEOUT_PER_SLICE_MS', async () => {
-      const mod = await import(
-        '@/runtime/context-packet/build-context-packet.js'
-      );
+      const mod = await import('@/runtime/context-packet/build-context-packet.js');
       expect(mod.DEFAULT_TOTAL_BUDGET_MS).toBe(600);
       expect(mod.DEFAULT_TIMEOUT_PER_SLICE_MS).toBe(100);
     });
@@ -508,4 +506,3 @@ describe('buildContextPacket orchestrator', () => {
     });
   });
 });
-

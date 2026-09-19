@@ -130,13 +130,11 @@ vi.mock('@/config/contract-env.js', () => ({
   },
 }));
 
-const { traceTurnDecision, envelopeTraceIdForAttempt } = await import(
-  '@/observability/turn-trace.js'
-);
+const { traceTurnDecision, envelopeTraceIdForAttempt } =
+  await import('@/observability/turn-trace.js');
 const { runWithCorrelation, deriveTraceId } = await import('@/observability/correlation.js');
-const { verifyEnvelopeIntegrity } = await import(
-  '@/control-plane/runtime-trace/verify-envelope.js'
-);
+const { verifyEnvelopeIntegrity } =
+  await import('@/control-plane/runtime-trace/verify-envelope.js');
 const { tracesRouter } = await import('@/admin-ui/trpc/routers/traces.js');
 const { runtimeTraceRepo } = await import('@/db/repositories/runtime-trace-repos.js');
 
@@ -192,9 +190,7 @@ async function attemptTurn(attempt: number) {
 }
 
 function envelopeRows() {
-  return txRows
-    .filter((r) => r.table === 'runtime_trace_envelopes')
-    .map((r) => r.row);
+  return txRows.filter((r) => r.table === 'runtime_trace_envelopes').map((r) => r.row);
 }
 
 /** Every admin audit row the router wrote during a test. */
@@ -249,7 +245,11 @@ function makeCtx() {
           return runtimeTraceRepo.listAttempts(args);
         },
       },
-      debugSnapshotGrantsRepo: { async findActive() { return null; } },
+      debugSnapshotGrantsRepo: {
+        async findActive() {
+          return null;
+        },
+      },
       adminAuditLogRepo: {
         async append(r: Record<string, unknown>) {
           auditRows.push(r);
@@ -352,9 +352,7 @@ describe('issue #514 [P1] — attempt grouping, writer → repo → Explorer', (
       for (const id of envelopeRows().map((r) => r.trace_id as string)) {
         const res = await tracesRouter.createCaller(makeCtx()).getTrace({ traceId: id });
         expect(res.attempt_count).toBe(3);
-        expect(res.attempts.map((a) => a.trace_id)).toEqual(
-          envelopeRows().map((r) => r.trace_id),
-        );
+        expect(res.attempts.map((a) => a.trace_id)).toEqual(envelopeRows().map((r) => r.trace_id));
       }
     });
 

@@ -96,7 +96,7 @@ export function renderOperationalProfile({
   const items: unknown[] = Array.isArray(bk)
     ? bk
     : Array.isArray((bk as { items?: unknown[] }).items)
-      ? ((bk as { items: unknown[] }).items)
+      ? (bk as { items: unknown[] }).items
       : [];
 
   const growthLines: string[] = [];
@@ -137,9 +137,7 @@ export function renderOperationalProfile({
   return { system_prompt_block, growth_hints_block, episodic_summary_block };
 }
 
-function formatThresholds(
-  t: Record<string, unknown> | undefined,
-): string | null {
+function formatThresholds(t: Record<string, unknown> | undefined): string | null {
   if (!t || typeof t !== 'object') return null;
   const keys = Object.keys(t);
   if (keys.length === 0) return null;

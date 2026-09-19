@@ -11,50 +11,52 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  *   5. Latency tracked (sync_latency_ms populated).
  *   6. With outbox_body option: writes envelope + outbox in one tx.
  */
-const { dbInsertMock, txInsertOnConflictMock, txInsertValuesMock, dbTransactionMock } = vi.hoisted(() => {
-  const txInsertOnConflictMock = vi.fn().mockResolvedValue(undefined);
-  const txInsertValuesMock = vi.fn();
-  return {
-    dbInsertMock: vi.fn().mockResolvedValue(undefined),
-    txInsertOnConflictMock,
-    txInsertValuesMock,
-    dbTransactionMock: vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
-      // Drizzle's tx.insert(table).values(...) returns a thenable that
-      // also has .onConflictDoNothing(). Our mock returns a chain that
-      // supports both terminal awaits (envelope) and the on-conflict
-      // chain (outbox). The values mock is called for each insert so
-      // tests can inspect it.
-      let inserts = 0;
-      const tx = {
-        insert: vi.fn(() => ({
-          values: vi.fn((row: unknown) => {
-            inserts += 1;
-            txInsertValuesMock(row);
-            // Return a chain object that:
-            //  - awaits to undefined (envelope path),
-            //  - has .onConflictDoNothing() that returns a promise (outbox path).
-            const chain = {
-              then: (resolve: (v: unknown) => void) => resolve(undefined),
-              onConflictDoNothing: () => {
-                txInsertOnConflictMock();
-                // Non-empty RETURNING ⇒ the row was inserted, no replay.
-                const rows = [{ trace_id: 'inserted' }];
-                return {
-                  then: (res: (v: unknown) => void) => res(rows),
-                  returning: () => Promise.resolve(rows),
-                };
-              },
-            } as unknown;
-            return chain;
-          }),
-        })),
-      };
-      await fn(tx);
-      // Sanity: tx didn't run? Push to make tests fail clearly.
-      if (inserts === 0) throw new Error('test mock: no inserts ran in tx');
-    }),
-  };
-});
+const { dbInsertMock, txInsertOnConflictMock, txInsertValuesMock, dbTransactionMock } = vi.hoisted(
+  () => {
+    const txInsertOnConflictMock = vi.fn().mockResolvedValue(undefined);
+    const txInsertValuesMock = vi.fn();
+    return {
+      dbInsertMock: vi.fn().mockResolvedValue(undefined),
+      txInsertOnConflictMock,
+      txInsertValuesMock,
+      dbTransactionMock: vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
+        // Drizzle's tx.insert(table).values(...) returns a thenable that
+        // also has .onConflictDoNothing(). Our mock returns a chain that
+        // supports both terminal awaits (envelope) and the on-conflict
+        // chain (outbox). The values mock is called for each insert so
+        // tests can inspect it.
+        let inserts = 0;
+        const tx = {
+          insert: vi.fn(() => ({
+            values: vi.fn((row: unknown) => {
+              inserts += 1;
+              txInsertValuesMock(row);
+              // Return a chain object that:
+              //  - awaits to undefined (envelope path),
+              //  - has .onConflictDoNothing() that returns a promise (outbox path).
+              const chain = {
+                then: (resolve: (v: unknown) => void) => resolve(undefined),
+                onConflictDoNothing: () => {
+                  txInsertOnConflictMock();
+                  // Non-empty RETURNING ⇒ the row was inserted, no replay.
+                  const rows = [{ trace_id: 'inserted' }];
+                  return {
+                    then: (res: (v: unknown) => void) => res(rows),
+                    returning: () => Promise.resolve(rows),
+                  };
+                },
+              } as unknown;
+              return chain;
+            }),
+          })),
+        };
+        await fn(tx);
+        // Sanity: tx didn't run? Push to make tests fail clearly.
+        if (inserts === 0) throw new Error('test mock: no inserts ran in tx');
+      }),
+    };
+  },
+);
 
 // Mock drizzle db.insert(...).values(...) chain + db.transaction.
 vi.mock('../../src/db/client.js', () => ({
@@ -196,17 +198,17 @@ describe('writeEnvelope', () => {
       ...v2MaterialLiteral(out.hmac_key_version),
       root_trace_id: 'eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee',
     };
-    expect(
-      verifyHmac(RETRY_INPUT.tenant_id, out.hmac_key_version, forged, out.envelope_hmac),
-    ).toBe(false);
+    expect(verifyHmac(RETRY_INPUT.tenant_id, out.hmac_key_version, forged, out.envelope_hmac)).toBe(
+      false,
+    );
   });
 
   it('a forged attempt does not verify against what production signed', async () => {
     const out = await writeEnvelope(RETRY_INPUT);
     const forged = { ...v2MaterialLiteral(out.hmac_key_version), attempt: 99 };
-    expect(
-      verifyHmac(RETRY_INPUT.tenant_id, out.hmac_key_version, forged, out.envelope_hmac),
-    ).toBe(false);
+    expect(verifyHmac(RETRY_INPUT.tenant_id, out.hmac_key_version, forged, out.envelope_hmac)).toBe(
+      false,
+    );
   });
 
   it('production writes signature_version=2 on the ROW, and never v1', async () => {
@@ -277,7 +279,11 @@ describe('writeEnvelope', () => {
       trace_id: baseInput.trace_id,
       tenant_id: baseInput.tenant_id,
       agent_id: baseInput.agent_id,
-      packet: { trace_id: baseInput.trace_id, tenant_id: baseInput.tenant_id, agent_id: baseInput.agent_id },
+      packet: {
+        trace_id: baseInput.trace_id,
+        tenant_id: baseInput.tenant_id,
+        agent_id: baseInput.agent_id,
+      },
       decision: baseInput.decision,
       redaction_class: 'standard',
     };

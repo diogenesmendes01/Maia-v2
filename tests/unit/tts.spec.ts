@@ -22,10 +22,11 @@ describe('synthesizeSpeech', () => {
   });
 
   it('POSTs the right payload and returns a Buffer on success', async () => {
-    const fakeBytes = Buffer.from([0x4F, 0x67, 0x67, 0x53]); // 'OggS' magic for OGG
+    const fakeBytes = Buffer.from([0x4f, 0x67, 0x67, 0x53]); // 'OggS' magic for OGG
     fetchMock.mockResolvedValueOnce({
       ok: true,
-      arrayBuffer: async () => fakeBytes.buffer.slice(fakeBytes.byteOffset, fakeBytes.byteOffset + fakeBytes.byteLength),
+      arrayBuffer: async () =>
+        fakeBytes.buffer.slice(fakeBytes.byteOffset, fakeBytes.byteOffset + fakeBytes.byteLength),
     });
     const { synthesizeSpeech } = await import('../../src/lib/tts.js');
     const buf = await synthesizeSpeech('Olá mundo');
@@ -40,7 +41,9 @@ describe('synthesizeSpeech', () => {
       input: 'Olá mundo',
       response_format: 'opus',
     });
-    expect((init as { headers: Record<string, string> }).headers.authorization).toBe('Bearer sk-test-key');
+    expect((init as { headers: Record<string, string> }).headers.authorization).toBe(
+      'Bearer sk-test-key',
+    );
     expect(Buffer.isBuffer(buf)).toBe(true);
     expect(buf.length).toBe(4);
   });

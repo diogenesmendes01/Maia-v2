@@ -51,7 +51,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { TestContext } from 'vitest';
 import pg from 'pg';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // Precisa estar setado ANTES do primeiro import de `@/config/env.js`: o schema
@@ -275,7 +276,10 @@ d('perna perdedora de race de pendência — desfecho terminal', () => {
         [PRIMARY_CTX.tenant_id, PRIMARY_CTX.agent_id, TELEFONE],
       );
       ids.channel = channel.rows[0]!.id;
-      await c.query(`UPDATE conversas SET channel_id = $2 WHERE id = $1`, [ids.conversa, ids.channel]);
+      await c.query(`UPDATE conversas SET channel_id = $2 WHERE id = $1`, [
+        ids.conversa,
+        ids.channel,
+      ]);
 
       const role = await c.query<{ id: string }>(
         `SELECT id FROM roles WHERE tenant_id = $1 AND agent_id = $2 AND active LIMIT 1`,
@@ -558,7 +562,9 @@ d('perna perdedora de race de pendência — desfecho terminal', () => {
     // o carimbo faria a mensagem voltar para sempre.
     expect(
       ev.inbound_processado,
-      `[semântica] o inbound ficou sem `+ '`processada_em`' + `: o worker de recovery ` +
+      `[semântica] o inbound ficou sem ` +
+        '`processada_em`' +
+        `: o worker de recovery ` +
         `reenfileiraria a mensagem em laço. Evidência: ${fmt(ev)}`,
     ).toBe(true);
   });

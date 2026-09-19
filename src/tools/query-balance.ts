@@ -56,7 +56,10 @@ export const queryBalanceTool: Tool<typeof inputSchema, typeof outputSchema> = {
       }
       contas = await contasRepo.byEntity(args.entidade_id);
     } else {
-      contas = await contasRepo.byEntities({ pessoa_id: ctx.pessoa.id, entidades: ctx.scope.entidades });
+      contas = await contasRepo.byEntities({
+        pessoa_id: ctx.pessoa.id,
+        entidades: ctx.scope.entidades,
+      });
     }
     // saldo_atual vem como string (numeric driver pg). Soma é feita em
     // Decimal pra preservar precisão; convertemos pra number SOMENTE

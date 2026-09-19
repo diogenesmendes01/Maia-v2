@@ -112,7 +112,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import type { TestContext } from 'vitest';
 import pg from 'pg';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // Precisa estar setado ANTES do primeiro import de `@/config/env.js` (que vem
@@ -444,9 +445,8 @@ d('pending-gate concurrency', () => {
       // Isto é custo de transformação ESM, não é o que o teste afere.
       fase = 'import';
       const t0 = Date.now();
-      const { checkPendingFirst, setClassifierForTesting } = await import(
-        '../../src/agent/pending-gate.js'
-      );
+      const { checkPendingFirst, setClassifierForTesting } =
+        await import('../../src/agent/pending-gate.js');
       const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
       const { config } = await import('../../src/config/env.js');
       ev.import_ms = Date.now() - t0;
@@ -463,10 +463,9 @@ d('pending-gate concurrency', () => {
       // invalida só o caso `[escopo]`, nunca o veredito da race.
       fase = 'canário';
       try {
-        await c.query(
-          `INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`,
-          [CANARY_CTX.tenant_id],
-        );
+        await c.query(`INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, [
+          CANARY_CTX.tenant_id,
+        ]);
         await c.query(
           `INSERT INTO agents(id, tenant_id, nome) VALUES ($1, $2, $1)
              ON CONFLICT (id) DO NOTHING`,

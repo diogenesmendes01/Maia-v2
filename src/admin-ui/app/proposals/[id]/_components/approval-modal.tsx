@@ -85,8 +85,8 @@ export default function ApprovalModal({ proposal, decision, tenantId, onClose }:
       <div className="space-y-3">
         {isApprove && proposal.requires_dual && (
           <Alert tone="info" title="Aprovação dupla obrigatória">
-            Após a sua aprovação, mais {proposal.required_roles.length - 1}{' '}
-            aprovador(es) distinto(s) precisam assinar antes da ativação.
+            Após a sua aprovação, mais {proposal.required_roles.length - 1} aprovador(es)
+            distinto(s) precisam assinar antes da ativação.
           </Alert>
         )}
         <Field

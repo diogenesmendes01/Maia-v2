@@ -21,10 +21,7 @@ vi.mock('@/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-import {
-  summarizeTranscript,
-  renderTranscript,
-} from '@/shared/summary/summarize-transcript.js';
+import { summarizeTranscript, renderTranscript } from '@/shared/summary/summarize-transcript.js';
 import type { LLMResponse } from '@/lib/claude.js';
 
 const llmResp = (content: string | null): LLMResponse =>

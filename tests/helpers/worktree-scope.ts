@@ -171,7 +171,10 @@ function resolveLinkedWorktree(root: string): { commonGitDir: string } | null {
 
 /** `[a-z0-9_]` apenas, para caber num identificador de banco sem aspas. */
 function sanitize(name: string): string {
-  return name.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+  return name
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '');
 }
 
 /** O diretório de posse dos slots, dentro do `.git` COMUM às worktrees. */

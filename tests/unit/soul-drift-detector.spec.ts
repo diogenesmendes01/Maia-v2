@@ -164,9 +164,7 @@ describe('soulDriftDetector (P8b)', () => {
   });
 
   it('payload inclui violations[] com bias_id, principle, confidence, examples', async () => {
-    mockActiveBiases = [
-      makeBias({ id: 'bias-humility', principle: 'humildade_epistemica' }),
-    ];
+    mockActiveBiases = [makeBias({ id: 'bias-humility', principle: 'humildade_epistemica' })];
     const { soulDriftDetector } = await import('@/cognition/drift/soul.js');
     const r = await soulDriftDetector.detect({
       profile_active: {} as never,

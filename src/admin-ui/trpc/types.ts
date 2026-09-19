@@ -14,13 +14,7 @@ import type {
   ProposalUnifiedStatus,
 } from '../../db/schema.js';
 
-export type {
-  AdminUserRole,
-  ApprovalClassId,
-  ProposalTypeId,
-  RiskLevelId,
-  ProposalUnifiedStatus,
-};
+export type { AdminUserRole, ApprovalClassId, ProposalTypeId, RiskLevelId, ProposalUnifiedStatus };
 
 // Zod schemas — kept in admin-ui (not at db layer) to keep db layer
 // dependency-free. Values mirror the literal-union types above.
@@ -33,7 +27,12 @@ export const ProposalTypeSchema = z.enum([
   'operational_profile',
 ]) satisfies z.ZodType<ProposalTypeId>;
 
-export const RiskLevelSchema = z.enum(['low', 'medium', 'high', 'critical']) satisfies z.ZodType<RiskLevelId>;
+export const RiskLevelSchema = z.enum([
+  'low',
+  'medium',
+  'high',
+  'critical',
+]) satisfies z.ZodType<RiskLevelId>;
 
 export const ApprovalClassSchema = z.enum([
   'policy_rule_soft_guidance',

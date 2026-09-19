@@ -82,20 +82,14 @@ describe('isFieldPathTooDeep', () => {
     expect(isFieldPathTooDeep('a.b.c')).toBe(false);
   });
   it('returns true for paths exceeding the bound', () => {
-    const segments = Array.from(
-      { length: MAX_FIELD_PATH_DEPTH + 1 },
-      (_, i) => `s${i}`,
-    );
+    const segments = Array.from({ length: MAX_FIELD_PATH_DEPTH + 1 }, (_, i) => `s${i}`);
     expect(isFieldPathTooDeep(segments.join('.'))).toBe(true);
   });
   it('returns false for an empty path', () => {
     expect(isFieldPathTooDeep('')).toBe(false);
   });
   it('treats too-deep paths as unresolvable in resolveFieldPath', () => {
-    const segments = Array.from(
-      { length: MAX_FIELD_PATH_DEPTH + 1 },
-      () => 'a',
-    );
+    const segments = Array.from({ length: MAX_FIELD_PATH_DEPTH + 1 }, () => 'a');
     expect(resolveFieldPath({ a: 1 }, segments.join('.'))).toBeUndefined();
   });
 });

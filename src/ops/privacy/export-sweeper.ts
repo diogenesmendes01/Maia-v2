@@ -95,11 +95,7 @@ export interface ExpiredExportCandidate {
   purged_at: Date | null;
 }
 
-export type ExportKeepReason =
-  | 'not_expired'
-  | 'no_expiry_set'
-  | 'already_purged'
-  | 'legal_hold';
+export type ExportKeepReason = 'not_expired' | 'no_expiry_set' | 'already_purged' | 'legal_hold';
 
 export type ExportSweepDecision =
   | { action: 'delete'; reason: 'expired' }
@@ -129,11 +125,7 @@ export function planExportSweep(
   }));
 }
 
-function decide(
-  c: ExpiredExportCandidate,
-  now: Date,
-  held: boolean,
-): ExportSweepDecision {
+function decide(c: ExpiredExportCandidate, now: Date, held: boolean): ExportSweepDecision {
   // Já varrido. Não é erro: é a segunda execução encontrando o próprio
   // trabalho, e é ela que não pode duplicar auditoria.
   if (c.purged_at !== null) return { action: 'keep', reason: 'already_purged' };
@@ -412,11 +404,7 @@ async function sweepOne(
     fresh,
   );
 
-  const proven = await proveExportArtifact(
-    ports.exportRoot(),
-    candidate.locator,
-    ports.probe,
-  );
+  const proven = await proveExportArtifact(ports.exportRoot(), candidate.locator, ports.probe);
 
   // O claim vem DEPOIS do guarda, e isso importa para o diagnóstico. Ele
   // significa "estávamos prestes a remover", não "olhamos para este pedido".

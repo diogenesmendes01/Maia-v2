@@ -29,11 +29,7 @@
  *      migration (migrations/075_*) — governed/auditable, NOT a self-approval.
  */
 import { REGISTRY, buildToolCatalog, type AnyTool } from './_registry.js';
-import {
-  BASELINE_CORE_PACK,
-  DOMAIN_PACKS,
-  type ToolPack,
-} from './grant-math.js';
+import { BASELINE_CORE_PACK, DOMAIN_PACKS, type ToolPack } from './grant-math.js';
 
 // Re-export the full definitions + grant-math surface so existing importers
 // (`@/tools/packs.js`) keep working unchanged.
@@ -157,10 +153,7 @@ function assertConservative(pack: ToolPack): void {
         `baseline_unexpected_write_tool: '${name}' has side_effect=write but is not an allowlisted baseline write`,
       );
     }
-    if (
-      tool.side_effect === 'communication' &&
-      !BASELINE_COMMUNICATION_ALLOWLIST.has(name)
-    ) {
+    if (tool.side_effect === 'communication' && !BASELINE_COMMUNICATION_ALLOWLIST.has(name)) {
       throw new Error(
         `baseline_unexpected_communication_tool: '${name}' has side_effect=communication but is not an allowlisted baseline escalation`,
       );
@@ -174,9 +167,7 @@ function assertConservative(pack: ToolPack): void {
  * them). Domain packs are validated against this so listing a disabled tool is
  * not a module-load crash. Computed once at load.
  */
-const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set(
-  buildToolCatalog().map((e) => e.tool.name),
-);
+const KNOWN_TOOL_NAMES: ReadonlySet<string> = new Set(buildToolCatalog().map((e) => e.tool.name));
 
 /**
  * Fail loud at module load if a DOMAIN pack references a tool name that is not

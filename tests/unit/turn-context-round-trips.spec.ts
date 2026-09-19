@@ -1,6 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { readFile } from 'node:fs/promises';
-import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '../../src/db/schema.js';
+import type {
+  Mensagem,
+  Pessoa,
+  Conversa,
+  Permissao,
+  PermissionProfile,
+} from '../../src/db/schema.js';
 
 /**
  * Issue #525 — THE ROUND-TRIP BUDGET, and its enforcement.
@@ -107,7 +113,9 @@ vi.mock('../../src/db/repositories.js', () => ({
       ids.map((id) => ({ entidade_id: id, saldo_consolidado: '100', proximo_vencimento: null })),
     ),
   },
-  factsRepo: { listMentionableForScopes: failable('factsRepo.listMentionableForScopes', async () => []) },
+  factsRepo: {
+    listMentionableForScopes: failable('factsRepo.listMentionableForScopes', async () => []),
+  },
   rulesRepo: { listActive: failable('rulesRepo.listActive', async () => []) },
   memoryEntryRepo: { findRelevant: failable('memoryEntryRepo.findRelevant', async () => []) },
   behavioralHintRepo: {
@@ -119,10 +127,17 @@ vi.mock('../../src/db/repositories.js', () => ({
     listParaOTurno: failable('capabilityGapsRepo.listParaOTurno', async () => []),
   },
   procedureExecutionsRepo: {
-    findActiveForConversa: failable('procedureExecutionsRepo.findActiveForConversa', async () => null),
+    findActiveForConversa: failable(
+      'procedureExecutionsRepo.findActiveForConversa',
+      async () => null,
+    ),
   },
-  procedureDefinitionsRepo: { findById: failable('procedureDefinitionsRepo.findById', async () => null) },
-  permissoesRepo: { forPessoa: failable('permissoesRepo.forPessoa', async () => permissoesFixture) },
+  procedureDefinitionsRepo: {
+    findById: failable('procedureDefinitionsRepo.findById', async () => null),
+  },
+  permissoesRepo: {
+    forPessoa: failable('permissoesRepo.forPessoa', async () => permissoesFixture),
+  },
   profilesRepo: {
     byId: failable('profilesRepo.byId', async (id: string) => mkProfile(id)),
     forAuthorization: failable('profilesRepo.forAuthorization', async (ids: string[]) =>
@@ -137,7 +152,11 @@ vi.mock('../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },
 }));
 
-import { buildPrompt, renderTurnPrompt, type PromptContext } from '../../src/agent/prompt-builder.js';
+import {
+  buildPrompt,
+  renderTurnPrompt,
+  type PromptContext,
+} from '../../src/agent/prompt-builder.js';
 import { loadTurnContext } from '../../src/agent/turn-context/loader.js';
 import { TURN_ROUND_TRIP_BUDGET } from '../../src/agent/turn-context/types.js';
 import { resolveScope, type ResolvedPermission } from '../../src/governance/permissions.js';

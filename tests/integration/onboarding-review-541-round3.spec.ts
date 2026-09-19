@@ -148,9 +148,8 @@ function nextScope(tag: string): { suffix: string; line: string } {
 }
 
 async function driveToChannelDeclared(tag: string): Promise<SagaState> {
-  const { startOnboardingRun, executeOnboardingStep } = await import(
-    '../../src/onboarding/wizard.js'
-  );
+  const { startOnboardingRun, executeOnboardingStep } =
+    await import('../../src/onboarding/wizard.js');
   const { suffix, line } = nextScope(tag);
   const tenant = `${PREFIX}-${suffix}`;
   const agent = `${PREFIX}-${suffix}-bot`;
@@ -284,9 +283,8 @@ d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e n
 
     // CAMINHO REAL: é esta função que o worker `channel_pairing` chama ao
     // consumir o `start_pairing` que a saga acabou de enfileirar.
-    const { startChannelPairing, _resetChannelPairingsForTests } = await import(
-      '../../src/setup/line-pairing.js'
-    );
+    const { startChannelPairing, _resetChannelPairingsForTests } =
+      await import('../../src/setup/line-pairing.js');
     _resetChannelPairingsForTests();
     matchedPairing();
     expect(await startChannelPairing({ channel_id: s.channel_id, method: 'qr' })).toEqual({
@@ -345,9 +343,8 @@ d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e n
     await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
     await query(`UPDATE onboarding_runs SET state='active' WHERE id=$1`, [s.run_id]);
 
-    const { startChannelPairing, _resetChannelPairingsForTests } = await import(
-      '../../src/setup/line-pairing.js'
-    );
+    const { startChannelPairing, _resetChannelPairingsForTests } =
+      await import('../../src/setup/line-pairing.js');
     _resetChannelPairingsForTests();
     matchedPairing();
     expect(await startChannelPairing({ channel_id: s.channel_id, method: 'qr' })).toEqual({
@@ -392,211 +389,215 @@ d('achado 1 [High] — o pareamento do onboarding VERIFICA posse; não ativa e n
   });
 });
 
-d('achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e desliga os excluídos', () => {
-  it('canal governado que ficou inválido e ESTAVA ativo é DESATIVADO na mesma transação, e a desativação é auditada', async () => {
-    const s = await driveToChannelDeclared('a3set');
-    await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
-    await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
-      s.channel_id,
-    ]);
-    await s.step('confirm_channel_ready', { channel_id: s.channel_id });
+d(
+  'achado 3 [High] — a ativação aplica o CONJUNTO EXATO: liga os válidos e desliga os excluídos',
+  () => {
+    it('canal governado que ficou inválido e ESTAVA ativo é DESATIVADO na mesma transação, e a desativação é auditada', async () => {
+      const s = await driveToChannelDeclared('a3set');
+      await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
+      await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
+        s.channel_id,
+      ]);
+      await s.step('confirm_channel_ready', { channel_id: s.channel_id });
 
-    // Segundo canal do MESMO agente: governado (tem política do escopo), com
-    // posse provada, mas apontando para um papel DESATIVADO. É o canal que o
-    // readiness exclui — e que, por já estar ATIVO, seguia roteando.
-    const badRole = await query<{ id: string }>(
-      `INSERT INTO roles (tenant_id, agent_id, role_key, display_name, active, is_default)
+      // Segundo canal do MESMO agente: governado (tem política do escopo), com
+      // posse provada, mas apontando para um papel DESATIVADO. É o canal que o
+      // readiness exclui — e que, por já estar ATIVO, seguia roteando.
+      const badRole = await query<{ id: string }>(
+        `INSERT INTO roles (tenant_id, agent_id, role_key, display_name, active, is_default)
        VALUES ($1,$2,'desligado','Desligado', false, false) RETURNING id`,
-      [s.tenant, s.agent],
-    );
-    const broken = await query<{ id: string }>(
-      `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+        [s.tenant, s.agent],
+      );
+      const broken = await query<{ id: string }>(
+        `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
        VALUES ($1,$2,'whatsapp',$3,'Linha quebrada', true, false) RETURNING id`,
-      [s.tenant, s.agent, nextScope('extra').line],
-    );
-    const brokenId = broken[0]!.id;
-    await query(
-      `INSERT INTO channel_policies (tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
+        [s.tenant, s.agent, nextScope('extra').line],
+      );
+      const brokenId = broken[0]!.id;
+      await query(
+        `INSERT INTO channel_policies (tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
        VALUES ($1,$2,$3,$4,'locked')`,
-      [s.tenant, s.agent, brokenId, badRole[0]!.id],
-    );
-    await query(
-      `INSERT INTO channel_line_state (channel_id, tenant_id, agent_id, state)
+        [s.tenant, s.agent, brokenId, badRole[0]!.id],
+      );
+      await query(
+        `INSERT INTO channel_line_state (channel_id, tenant_id, agent_id, state)
        VALUES ($1,$2,$3,'connected')`,
-      [brokenId, s.tenant, s.agent],
-    );
+        [brokenId, s.tenant, s.agent],
+      );
 
-    // Pré-condição: ele ESTÁ roteando agora.
-    const before = await query<{ active: boolean }>('SELECT active FROM channels WHERE id=$1', [
-      brokenId,
-    ]);
-    expect(before[0]!.active).toBe(true);
+      // Pré-condição: ele ESTÁ roteando agora.
+      const before = await query<{ active: boolean }>('SELECT active FROM channels WHERE id=$1', [
+        brokenId,
+      ]);
+      expect(before[0]!.active).toBe(true);
 
-    await s.step('evaluate_readiness', {});
-    const out = await s.step('activate', {
-      confirm_tenant_id: s.tenant,
-      confirm_agent_id: s.agent,
-    });
+      await s.step('evaluate_readiness', {});
+      const out = await s.step('activate', {
+        confirm_tenant_id: s.tenant,
+        confirm_agent_id: s.agent,
+      });
 
-    // A PROVA está no BANCO, e é a primeira asserção de propósito: o defeito
-    // reintroduzido tem que falhar em `active`, não num campo de resultado que
-    // a própria correção criou.
-    const after = await query<{ id: string; active: boolean }>(
-      'SELECT id, active FROM channels WHERE tenant_id=$1 AND agent_id=$2 ORDER BY id',
-      [s.tenant, s.agent],
-    );
-    const byId = new Map(after.map((r) => [r.id, r.active]));
-    // Cada canal é FAIL-CLOSED INDIVIDUALMENTE...
-    expect(byId.get(brokenId), 'o canal excluído continuou roteando').toBe(false);
-    // ...e readiness é EXISTENCIAL: o canal bom sozinho basta para o agente
-    // subir, e ele NÃO foi derrubado junto.
-    expect(byId.get(s.channel_id)).toBe(true);
+      // A PROVA está no BANCO, e é a primeira asserção de propósito: o defeito
+      // reintroduzido tem que falhar em `active`, não num campo de resultado que
+      // a própria correção criou.
+      const after = await query<{ id: string; active: boolean }>(
+        'SELECT id, active FROM channels WHERE tenant_id=$1 AND agent_id=$2 ORDER BY id',
+        [s.tenant, s.agent],
+      );
+      const byId = new Map(after.map((r) => [r.id, r.active]));
+      // Cada canal é FAIL-CLOSED INDIVIDUALMENTE...
+      expect(byId.get(brokenId), 'o canal excluído continuou roteando').toBe(false);
+      // ...e readiness é EXISTENCIAL: o canal bom sozinho basta para o agente
+      // subir, e ele NÃO foi derrubado junto.
+      expect(byId.get(s.channel_id)).toBe(true);
 
-    expect(out.result.activated_channel_ids).toEqual([s.channel_id]);
-    expect(out.result.deactivated_channel_ids).toEqual([brokenId]);
+      expect(out.result.activated_channel_ids).toEqual([s.channel_id]);
+      expect(out.result.deactivated_channel_ids).toEqual([brokenId]);
 
-    // Um canal que roteava e deixou de rotear é decisão de GOVERNANÇA: tem que
-    // estar na trilha, com o motivo tipado.
-    const trail = await query<{
-      action: string;
-      resource_id: string;
-      change_summary: Record<string, unknown>;
-    }>(
-      `SELECT action, resource_id, change_summary FROM admin_audit_log
+      // Um canal que roteava e deixou de rotear é decisão de GOVERNANÇA: tem que
+      // estar na trilha, com o motivo tipado.
+      const trail = await query<{
+        action: string;
+        resource_id: string;
+        change_summary: Record<string, unknown>;
+      }>(
+        `SELECT action, resource_id, change_summary FROM admin_audit_log
         WHERE tenant_id=$1 AND action='onboarding_channel_deactivated'`,
-      [s.tenant],
-    );
-    expect(trail).toHaveLength(1);
-    expect(trail[0]!.resource_id).toBe(brokenId);
-    expect(trail[0]!.change_summary).toMatchObject({
-      agent_id: s.agent,
-      failed_checks: ['channel_policy_role_active'],
-      was_active: true,
+        [s.tenant],
+      );
+      expect(trail).toHaveLength(1);
+      expect(trail[0]!.resource_id).toBe(brokenId);
+      expect(trail[0]!.change_summary).toMatchObject({
+        agent_id: s.agent,
+        failed_checks: ['channel_policy_role_active'],
+        was_active: true,
+      });
     });
-  });
 
-  it('canal SEM policy nenhuma também é desativado — ausência de política é estado inválido, não exceção', async () => {
-    // Decisão do owner na rodada 3: o complemento alcança TODO canal
-    // não-sintético do par, tenha política ou não. Um canal sem policy não tem
-    // papel padrão resolvível, logo não pode rotear; deixá-lo de fora faria da
-    // falha de configuração mais grosseira a única que escapa — fail-OPEN
-    // exatamente onde o desenho é fail-closed.
-    const s = await driveToChannelDeclared('a3nopol');
-    await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
-    await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
-      s.channel_id,
-    ]);
-    await s.step('confirm_channel_ready', { channel_id: s.channel_id });
+    it('canal SEM policy nenhuma também é desativado — ausência de política é estado inválido, não exceção', async () => {
+      // Decisão do owner na rodada 3: o complemento alcança TODO canal
+      // não-sintético do par, tenha política ou não. Um canal sem policy não tem
+      // papel padrão resolvível, logo não pode rotear; deixá-lo de fora faria da
+      // falha de configuração mais grosseira a única que escapa — fail-OPEN
+      // exatamente onde o desenho é fail-closed.
+      const s = await driveToChannelDeclared('a3nopol');
+      await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
+      await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
+        s.channel_id,
+      ]);
+      await s.step('confirm_channel_ready', { channel_id: s.channel_id });
 
-    // (a) órfão: MESMO par, ativo, SEM `channel_policies`.
-    const orphan = await query<{ id: string }>(
-      `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+      // (a) órfão: MESMO par, ativo, SEM `channel_policies`.
+      const orphan = await query<{ id: string }>(
+        `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
        VALUES ($1,$2,'whatsapp',$3,'Sem policy', true, false) RETURNING id`,
-      [s.tenant, s.agent, nextScope('extra').line],
-    );
-    const orphanId = orphan[0]!.id;
+        [s.tenant, s.agent, nextScope('extra').line],
+      );
+      const orphanId = orphan[0]!.id;
 
-    // (b) sintético: a sonda (#502) tem ciclo de vida próprio e NÃO pode ser
-    // desligada como efeito colateral de um onboarding.
-    const synthetic = await query<{ id: string }>(
-      `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+      // (b) sintético: a sonda (#502) tem ciclo de vida próprio e NÃO pode ser
+      // desligada como efeito colateral de um onboarding.
+      const synthetic = await query<{ id: string }>(
+        `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
        VALUES ($1,$2,'whatsapp',$3,'Sonda', true, true) RETURNING id`,
-      [s.tenant, s.agent, nextScope('extra').line],
-    );
-    const syntheticId = synthetic[0]!.id;
+        [s.tenant, s.agent, nextScope('extra').line],
+      );
+      const syntheticId = synthetic[0]!.id;
 
-    // (c) OUTRO escopo: um agente ativar-se não desliga canal de ninguém.
-    // Id ÚNICO por execução, não derivado do contador de escopo: este teste tem
-    // `retry`, e uma segunda tentativa reinserindo o mesmo tenant colide em
-    // `tenants_pkey` — mascarando a asserção real com um erro de fixture.
-    const other = nextScope('a3other');
-    const otherTenant = `${PREFIX}-${other.suffix}-${randomUUID().slice(0, 8)}`;
-    const otherAgent = `${otherTenant}-bot`;
-    await query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$2,'active')`, [
-      otherTenant,
-      otherTenant,
-    ]);
-    await query(`INSERT INTO agents (id, tenant_id, nome, status) VALUES ($1,$2,$3,'active')`, [
-      otherAgent,
-      otherTenant,
-      otherAgent,
-    ]);
-    const foreign = await query<{ id: string }>(
-      `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+      // (c) OUTRO escopo: um agente ativar-se não desliga canal de ninguém.
+      // Id ÚNICO por execução, não derivado do contador de escopo: este teste tem
+      // `retry`, e uma segunda tentativa reinserindo o mesmo tenant colide em
+      // `tenants_pkey` — mascarando a asserção real com um erro de fixture.
+      const other = nextScope('a3other');
+      const otherTenant = `${PREFIX}-${other.suffix}-${randomUUID().slice(0, 8)}`;
+      const otherAgent = `${otherTenant}-bot`;
+      await query(`INSERT INTO tenants (id, nome, status) VALUES ($1,$2,'active')`, [
+        otherTenant,
+        otherTenant,
+      ]);
+      await query(`INSERT INTO agents (id, tenant_id, nome, status) VALUES ($1,$2,$3,'active')`, [
+        otherAgent,
+        otherTenant,
+        otherAgent,
+      ]);
+      const foreign = await query<{ id: string }>(
+        `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
        VALUES ($1,$2,'whatsapp',$3,'De outro escopo', true, false) RETURNING id`,
-      [otherTenant, otherAgent, other.line],
-    );
-    const foreignId = foreign[0]!.id;
+        [otherTenant, otherAgent, other.line],
+      );
+      const foreignId = foreign[0]!.id;
 
-    await s.step('evaluate_readiness', {});
-    const out = await s.step('activate', {
-      confirm_tenant_id: s.tenant,
-      confirm_agent_id: s.agent,
-    });
+      await s.step('evaluate_readiness', {});
+      const out = await s.step('activate', {
+        confirm_tenant_id: s.tenant,
+        confirm_agent_id: s.agent,
+      });
 
-    const row = async (id: string): Promise<boolean> =>
-      (await query<{ active: boolean }>('SELECT active FROM channels WHERE id=$1', [id]))[0]!.active;
+      const row = async (id: string): Promise<boolean> =>
+        (await query<{ active: boolean }>('SELECT active FROM channels WHERE id=$1', [id]))[0]!
+          .active;
 
-    expect(await row(orphanId), 'canal sem policy continuou roteando').toBe(false);
-    expect(await row(syntheticId), 'a sonda sintética foi desligada').toBe(true);
-    expect(await row(foreignId), 'canal de OUTRO escopo foi tocado').toBe(true);
-    expect(await row(s.channel_id)).toBe(true);
+      expect(await row(orphanId), 'canal sem policy continuou roteando').toBe(false);
+      expect(await row(syntheticId), 'a sonda sintética foi desligada').toBe(true);
+      expect(await row(foreignId), 'canal de OUTRO escopo foi tocado').toBe(true);
+      expect(await row(s.channel_id)).toBe(true);
 
-    expect(out.result.deactivated_channel_ids).toEqual([orphanId]);
+      expect(out.result.deactivated_channel_ids).toEqual([orphanId]);
 
-    // O órfão estava ativo, então a desativação é decisão de governança e vai
-    // para a trilha. `failed_checks` nomeia a política ausente.
-    const trail = await query<{ resource_id: string; change_summary: Record<string, unknown> }>(
-      `SELECT resource_id, change_summary FROM admin_audit_log
+      // O órfão estava ativo, então a desativação é decisão de governança e vai
+      // para a trilha. `failed_checks` nomeia a política ausente.
+      const trail = await query<{ resource_id: string; change_summary: Record<string, unknown> }>(
+        `SELECT resource_id, change_summary FROM admin_audit_log
         WHERE tenant_id=$1 AND action='onboarding_channel_deactivated'`,
-      [s.tenant],
-    );
-    expect(trail).toHaveLength(1);
-    expect(trail[0]!.resource_id).toBe(orphanId);
-    expect(trail[0]!.change_summary).toMatchObject({ was_active: true });
-  });
-
-  it('o agente sobe com as linhas prontas — um canal quebrado NÃO derruba os válidos', async () => {
-    const s = await driveToChannelDeclared('a3keep');
-    await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
-    await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
-      s.channel_id,
-    ]);
-    await s.step('confirm_channel_ready', { channel_id: s.channel_id });
-
-    // Governado, papel ATIVO, mas SEM posse provada — excluído por outro
-    // predicado, e nunca esteve ativo.
-    const noOwnership = await query<{ id: string }>(
-      `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
-       VALUES ($1,$2,'whatsapp',$3,'Sem posse', false, false) RETURNING id`,
-      [s.tenant, s.agent, nextScope('extra').line],
-    );
-    await query(
-      `INSERT INTO channel_policies (tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
-       VALUES ($1,$2,$3,$4,'locked')`,
-      [s.tenant, s.agent, noOwnership[0]!.id, s.role_id],
-    );
-
-    await s.step('evaluate_readiness', {});
-    const out = await s.step('activate', {
-      confirm_tenant_id: s.tenant,
-      confirm_agent_id: s.agent,
+        [s.tenant],
+      );
+      expect(trail).toHaveLength(1);
+      expect(trail[0]!.resource_id).toBe(orphanId);
+      expect(trail[0]!.change_summary).toMatchObject({ was_active: true });
     });
 
-    expect(out.result.activated_channel_ids).toEqual([s.channel_id]);
-    // Já estava inativo: nada mudou, nada a auditar.
-    expect(out.result.deactivated_channel_ids).toEqual([]);
-    const rows = await query<{ id: string; active: boolean }>(
-      'SELECT id, active FROM channels WHERE tenant_id=$1 AND agent_id=$2',
-      [s.tenant, s.agent],
-    );
-    const byId = new Map(rows.map((r) => [r.id, r.active]));
-    expect(byId.get(s.channel_id)).toBe(true);
-    expect(byId.get(noOwnership[0]!.id)).toBe(false);
-    const trail = await query(
-      `SELECT 1 FROM admin_audit_log WHERE tenant_id=$1 AND action='onboarding_channel_deactivated'`,
-      [s.tenant],
-    );
-    expect(trail).toHaveLength(0);
-  });
-});
+    it('o agente sobe com as linhas prontas — um canal quebrado NÃO derruba os válidos', async () => {
+      const s = await driveToChannelDeclared('a3keep');
+      await s.step('start_pairing', { channel_id: s.channel_id, method: 'qr' });
+      await query(`UPDATE channel_line_state SET state='connected' WHERE channel_id=$1`, [
+        s.channel_id,
+      ]);
+      await s.step('confirm_channel_ready', { channel_id: s.channel_id });
+
+      // Governado, papel ATIVO, mas SEM posse provada — excluído por outro
+      // predicado, e nunca esteve ativo.
+      const noOwnership = await query<{ id: string }>(
+        `INSERT INTO channels (tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+       VALUES ($1,$2,'whatsapp',$3,'Sem posse', false, false) RETURNING id`,
+        [s.tenant, s.agent, nextScope('extra').line],
+      );
+      await query(
+        `INSERT INTO channel_policies (tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
+       VALUES ($1,$2,$3,$4,'locked')`,
+        [s.tenant, s.agent, noOwnership[0]!.id, s.role_id],
+      );
+
+      await s.step('evaluate_readiness', {});
+      const out = await s.step('activate', {
+        confirm_tenant_id: s.tenant,
+        confirm_agent_id: s.agent,
+      });
+
+      expect(out.result.activated_channel_ids).toEqual([s.channel_id]);
+      // Já estava inativo: nada mudou, nada a auditar.
+      expect(out.result.deactivated_channel_ids).toEqual([]);
+      const rows = await query<{ id: string; active: boolean }>(
+        'SELECT id, active FROM channels WHERE tenant_id=$1 AND agent_id=$2',
+        [s.tenant, s.agent],
+      );
+      const byId = new Map(rows.map((r) => [r.id, r.active]));
+      expect(byId.get(s.channel_id)).toBe(true);
+      expect(byId.get(noOwnership[0]!.id)).toBe(false);
+      const trail = await query(
+        `SELECT 1 FROM admin_audit_log WHERE tenant_id=$1 AND action='onboarding_channel_deactivated'`,
+        [s.tenant],
+      );
+      expect(trail).toHaveLength(0);
+    });
+  },
+);

@@ -178,10 +178,7 @@ function registerGauges(): void {
   // which is the right primary signal for "no cap configured".)
   setGaugeProvider('redis_memory_used_ratio', () => getMemoryUsedRatio());
   setGaugeProvider('redis_evicted_keys_total', () => snapshot.evicted_keys);
-  setGaugeProvider(
-    'redis_rejected_connections_total',
-    () => snapshot.rejected_connections,
-  );
+  setGaugeProvider('redis_rejected_connections_total', () => snapshot.rejected_connections);
   gaugesRegistered = true;
 }
 
@@ -196,10 +193,7 @@ function registerGauges(): void {
  */
 export async function collectOnce(): Promise<void> {
   try {
-    const [memInfo, statsInfo] = await Promise.all([
-      redis.info('memory'),
-      redis.info('stats'),
-    ]);
+    const [memInfo, statsInfo] = await Promise.all([redis.info('memory'), redis.info('stats')]);
 
     const used = parseInfoField(memInfo, 'used_memory');
     const max = parseInfoField(memInfo, 'maxmemory');

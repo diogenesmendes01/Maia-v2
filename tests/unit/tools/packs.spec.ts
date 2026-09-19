@@ -97,17 +97,13 @@ describe('baseline.core tool pack (issue #410)', () => {
     const { BASELINE_CORE_PACK } = await import('../../../src/tools/packs.js');
     const { REGISTRY } = await import('../../../src/tools/_registry.js');
 
-    const writes = BASELINE_CORE_PACK.tools.filter(
-      (n) => REGISTRY[n]!.side_effect === 'write',
-    );
+    const writes = BASELINE_CORE_PACK.tools.filter((n) => REGISTRY[n]!.side_effect === 'write');
     const comms = BASELINE_CORE_PACK.tools.filter(
       (n) => REGISTRY[n]!.side_effect === 'communication',
     );
     // The ONLY baseline writes are the two self-scoped ones: remember_safe_fact
     // (own pessoa) and conversation_state_update (own conversation, #433).
-    expect([...writes].sort()).toEqual(
-      ['conversation_state_update', 'remember_safe_fact'].sort(),
-    );
+    expect([...writes].sort()).toEqual(['conversation_state_update', 'remember_safe_fact'].sort());
     // The ONLY baseline communication is handoff_to_owner (internal escalation,
     // NOT send_proactive_message).
     expect(comms).toEqual(['handoff_to_owner']);
@@ -115,9 +111,7 @@ describe('baseline.core tool pack (issue #410)', () => {
   });
 
   it('resolvePackTools resolves baseline.core to its tool set and skips unknown packs', async () => {
-    const { resolvePackTools, BASELINE_CORE_PACK } = await import(
-      '../../../src/tools/packs.js'
-    );
+    const { resolvePackTools, BASELINE_CORE_PACK } = await import('../../../src/tools/packs.js');
     const resolved = resolvePackTools(['baseline.core', 'domain.nonexistent']).sort();
     expect(resolved).toEqual([...BASELINE_CORE_PACK.tools].sort());
   });
@@ -132,7 +126,14 @@ describe('baseline.core tool pack (issue #410)', () => {
 describe('domain.* tool packs (issue #408)', () => {
   it('TOOL_PACKS exposes the 6 domain packs by id, each with name/domain/risk_level', async () => {
     const { TOOL_PACKS } = await import('../../../src/tools/packs.js');
-    const ids = ['domain.finance', 'domain.sales', 'domain.support', 'domain.calendar', 'domain.calendar.admin', 'domain.operations'];
+    const ids = [
+      'domain.finance',
+      'domain.sales',
+      'domain.support',
+      'domain.calendar',
+      'domain.calendar.admin',
+      'domain.operations',
+    ];
     for (const id of ids) {
       const pack = TOOL_PACKS[id];
       expect(pack, `${id} must be registered`).toBeDefined();

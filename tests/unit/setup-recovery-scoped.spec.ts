@@ -129,7 +129,12 @@ describe('recovery da PRIMÁRIA — escopo primary/ apenas', () => {
     const shutdownBaileys = vi.fn().mockResolvedValue(undefined);
     const startBaileys = vi.fn().mockResolvedValue(undefined);
 
-    await triggerRecovery({ target: 'primary', line: '+5511900001111', shutdownBaileys, startBaileys });
+    await triggerRecovery({
+      target: 'primary',
+      line: '+5511900001111',
+      shutdownBaileys,
+      startBaileys,
+    });
 
     expect(await exists(join(ROOT, 'primary'))).toBe(false);
     await expectSharedSurvivors();

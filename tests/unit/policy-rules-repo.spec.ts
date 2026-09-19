@@ -65,9 +65,7 @@ vi.mock('@/control-plane/policy/policy-rules-repo.js', async () => {
     },
     async listActiveForTenant() {
       const tenant_id = getCurrentTenant();
-      return Object.values(state).filter(
-        (r) => r.tenant_id === tenant_id && r.status === 'active',
-      );
+      return Object.values(state).filter((r) => r.tenant_id === tenant_id && r.status === 'active');
     },
     async listVersions(args) {
       const tenant_id = getCurrentTenant();
@@ -140,8 +138,7 @@ vi.mock('@/control-plane/policy/policy-rules-repo.js', async () => {
       if (row.status !== 'proposed') {
         return { ok: false, reason: 'invalid_transition' };
       }
-      const requiresDual =
-        row.rule_kind === 'hard_limit' || row.rule_kind === 'lockdown_trigger';
+      const requiresDual = row.rule_kind === 'hard_limit' || row.rule_kind === 'lockdown_trigger';
       if (requiresDual) {
         if (!args.dual_approval_evidence) {
           return { ok: false, reason: 'hard_limit_requires_dual_approval' };
@@ -154,11 +151,7 @@ vi.mock('@/control-plane/policy/policy-rules-repo.js', async () => {
         }
       }
       // Simulate one-active partial unique index.
-      const existingActive = findActive(
-        row.tenant_id,
-        row.agent_id,
-        row.rule_descriptor,
-      );
+      const existingActive = findActive(row.tenant_id, row.agent_id, row.rule_descriptor);
       if (existingActive) {
         return { ok: false, reason: 'already_has_active' };
       }
@@ -217,16 +210,14 @@ vi.mock('@/control-plane/policy/policy-rules-repo.js', async () => {
 });
 
 // Import AFTER the mock so the resolved module is the mocked one.
-const { policyRulesRepo } = await import(
-  '@/control-plane/policy/policy-rules-repo.js'
-);
+const { policyRulesRepo } = await import('@/control-plane/policy/policy-rules-repo.js');
 
-const ctx = (tenant: string = 'default', agent: string = 'default') =>
-  ({ tenant_id: tenant, agent_id: agent });
+const ctx = (tenant: string = 'default', agent: string = 'default') => ({
+  tenant_id: tenant,
+  agent_id: agent,
+});
 
-const baseProposeInput = (
-  overrides: Partial<ProposeInput> = {},
-): ProposeInput => ({
+const baseProposeInput = (overrides: Partial<ProposeInput> = {}): ProposeInput => ({
   rule_kind: 'soft_guidance',
   rule_descriptor: 'test_descriptor',
   rule_body: {},
@@ -263,12 +254,8 @@ describe('policyRulesRepo.propose', () => {
 
   it('keeps independent version counters per (agent_id_or_wide, descriptor)', async () => {
     await runWithTenantContext(ctx(), async () => {
-      const wideA = await policyRulesRepo.propose(
-        baseProposeInput({ rule_descriptor: 'a' }),
-      );
-      const wideB = await policyRulesRepo.propose(
-        baseProposeInput({ rule_descriptor: 'b' }),
-      );
+      const wideA = await policyRulesRepo.propose(baseProposeInput({ rule_descriptor: 'a' }));
+      const wideB = await policyRulesRepo.propose(baseProposeInput({ rule_descriptor: 'b' }));
       const agentA = await policyRulesRepo.propose(
         baseProposeInput({ rule_descriptor: 'a', agent_id: 'agent-1' }),
       );
@@ -297,9 +284,7 @@ describe('policyRulesRepo.activate', () => {
 
   it('hard_limit without dual_approval_evidence → reason=hard_limit_requires_dual_approval', async () => {
     await runWithTenantContext(ctx(), async () => {
-      const p = await policyRulesRepo.propose(
-        baseProposeInput({ rule_kind: 'hard_limit' }),
-      );
+      const p = await policyRulesRepo.propose(baseProposeInput({ rule_kind: 'hard_limit' }));
       const res = await policyRulesRepo.activate({
         id: p.id,
         approved_by: 'admin',
@@ -312,18 +297,13 @@ describe('policyRulesRepo.activate', () => {
 
   it('hard_limit with VALID structured dual_approval_evidence activates', async () => {
     await runWithTenantContext(ctx(), async () => {
-      const p = await policyRulesRepo.propose(
-        baseProposeInput({ rule_kind: 'hard_limit' }),
-      );
+      const p = await policyRulesRepo.propose(baseProposeInput({ rule_kind: 'hard_limit' }));
       const res = await policyRulesRepo.activate({
         id: p.id,
         approved_by: 'executor',
         dual_approval_evidence: {
           approvers: ['owner-alice', 'compliance-bob'],
-          approved_at: [
-            '2026-05-01T10:00:00.000Z',
-            '2026-05-01T10:05:00.000Z',
-          ],
+          approved_at: ['2026-05-01T10:00:00.000Z', '2026-05-01T10:05:00.000Z'],
         },
       });
       expect(res.ok).toBe(true);
@@ -332,9 +312,7 @@ describe('policyRulesRepo.activate', () => {
 
   it('hard_limit REJECTS old-style truthy-object evidence (Codex #93 closed loophole)', async () => {
     await runWithTenantContext(ctx(), async () => {
-      const p = await policyRulesRepo.propose(
-        baseProposeInput({ rule_kind: 'hard_limit' }),
-      );
+      const p = await policyRulesRepo.propose(baseProposeInput({ rule_kind: 'hard_limit' }));
       // Pre-fix: this used to pass. Post-fix: rejected with the new reason.
       const res = await policyRulesRepo.activate({
         id: p.id,
@@ -349,9 +327,7 @@ describe('policyRulesRepo.activate', () => {
 
   it('hard_limit REJECTS evidence with only ONE approver', async () => {
     await runWithTenantContext(ctx(), async () => {
-      const p = await policyRulesRepo.propose(
-        baseProposeInput({ rule_kind: 'hard_limit' }),
-      );
+      const p = await policyRulesRepo.propose(baseProposeInput({ rule_kind: 'hard_limit' }));
       const res = await policyRulesRepo.activate({
         id: p.id,
         approved_by: 'executor',
@@ -368,18 +344,13 @@ describe('policyRulesRepo.activate', () => {
 
   it('hard_limit REJECTS evidence with two NON-DISTINCT approvers', async () => {
     await runWithTenantContext(ctx(), async () => {
-      const p = await policyRulesRepo.propose(
-        baseProposeInput({ rule_kind: 'hard_limit' }),
-      );
+      const p = await policyRulesRepo.propose(baseProposeInput({ rule_kind: 'hard_limit' }));
       const res = await policyRulesRepo.activate({
         id: p.id,
         approved_by: 'executor',
         dual_approval_evidence: {
           approvers: ['same-user', 'same-user'],
-          approved_at: [
-            '2026-05-01T10:00:00.000Z',
-            '2026-05-01T10:05:00.000Z',
-          ],
+          approved_at: ['2026-05-01T10:00:00.000Z', '2026-05-01T10:05:00.000Z'],
         },
       });
       expect(res.ok).toBe(false);
@@ -390,18 +361,13 @@ describe('policyRulesRepo.activate', () => {
 
   it('hard_limit REJECTS when executor is also one of the approvers (separation of duties)', async () => {
     await runWithTenantContext(ctx(), async () => {
-      const p = await policyRulesRepo.propose(
-        baseProposeInput({ rule_kind: 'hard_limit' }),
-      );
+      const p = await policyRulesRepo.propose(baseProposeInput({ rule_kind: 'hard_limit' }));
       const res = await policyRulesRepo.activate({
         id: p.id,
         approved_by: 'alice',
         dual_approval_evidence: {
           approvers: ['alice', 'bob'],
-          approved_at: [
-            '2026-05-01T10:00:00.000Z',
-            '2026-05-01T10:05:00.000Z',
-          ],
+          approved_at: ['2026-05-01T10:00:00.000Z', '2026-05-01T10:05:00.000Z'],
         },
       });
       expect(res.ok).toBe(false);
@@ -433,10 +399,7 @@ describe('policyRulesRepo.activate', () => {
         approved_by: 'executor',
         dual_approval_evidence: {
           approvers: ['owner', 'compliance'],
-          approved_at: [
-            '2026-05-01T10:00:00.000Z',
-            '2026-05-01T10:05:00.000Z',
-          ],
+          approved_at: ['2026-05-01T10:00:00.000Z', '2026-05-01T10:05:00.000Z'],
         },
       });
       expect(r2.ok).toBe(true);
@@ -582,9 +545,7 @@ describe('policyRulesRepo.findActiveByDescriptor', () => {
   it('returns agent-specific row before tenant-wide for same descriptor', async () => {
     await runWithTenantContext(ctx(), async () => {
       // Tenant-wide rule
-      const wide = await policyRulesRepo.propose(
-        baseProposeInput({ rule_descriptor: 'overlap' }),
-      );
+      const wide = await policyRulesRepo.propose(baseProposeInput({ rule_descriptor: 'overlap' }));
       await policyRulesRepo.activate({ id: wide.id, approved_by: 'admin' });
       // Agent-specific rule for the same descriptor
       const specific = await policyRulesRepo.propose(
@@ -639,9 +600,7 @@ describe('policyRulesRepo.findActiveByDescriptor', () => {
 describe('policyRulesRepo tenant isolation', () => {
   it('tenant A cannot see active policies of tenant B', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
-      const p = await policyRulesRepo.propose(
-        baseProposeInput({ rule_descriptor: 'a_only' }),
-      );
+      const p = await policyRulesRepo.propose(baseProposeInput({ rule_descriptor: 'a_only' }));
       await policyRulesRepo.activate({ id: p.id, approved_by: 'admin' });
     });
     await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'default' }, async () => {
@@ -690,9 +649,7 @@ describe('isValidDualApprovalEvidence (Codex #93)', () => {
   });
 
   it('rejects fewer than 2 approvers', () => {
-    expect(
-      isValidDualApprovalEvidence({ approvers: [], approved_at: [] }),
-    ).toBe(false);
+    expect(isValidDualApprovalEvidence({ approvers: [], approved_at: [] })).toBe(false);
     expect(
       isValidDualApprovalEvidence({
         approvers: ['solo'],

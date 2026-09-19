@@ -194,7 +194,9 @@ d('#510 harness — ciclo de vida do ambiente (exige Postgres + Redis)', () => {
           [ambiente.estado.tenants.map((t) => t.tenantId)],
         );
         expect(rows).toHaveLength(2);
-        const { rows: migrations } = await cliente.query('SELECT count(*)::int AS n FROM schema_migrations');
+        const { rows: migrations } = await cliente.query(
+          'SELECT count(*)::int AS n FROM schema_migrations',
+        );
         expect(migrations[0].n).toBeGreaterThan(50);
       } finally {
         await cliente.end();

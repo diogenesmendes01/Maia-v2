@@ -671,9 +671,10 @@ d('line readiness — perfil operacional ativo é precondição', () => {
     const { evaluateLineReadiness } = await import('../../src/setup/line-readiness.js');
     await seedPolicyAndRole();
 
-    expect(
-      await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A }),
-    ).toEqual({ ready: false, reason_code: 'missing_active_profile' });
+    expect(await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A })).toEqual({
+      ready: false,
+      reason_code: 'missing_active_profile',
+    });
   });
 
   it('perfil apenas PROPOSTO não conta', async () => {
@@ -691,9 +692,10 @@ d('line readiness — perfil operacional ativo é precondição', () => {
       c.release();
     }
 
-    expect(
-      await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A }),
-    ).toEqual({ ready: false, reason_code: 'missing_active_profile' });
+    expect(await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A })).toEqual({
+      ready: false,
+      reason_code: 'missing_active_profile',
+    });
   });
 
   it('perfil ativo + policy + role ativo ⇒ pronta', async () => {
@@ -701,9 +703,9 @@ d('line readiness — perfil operacional ativo é precondição', () => {
     await seedActiveProfile();
     await seedPolicyAndRole();
 
-    expect(
-      await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A }),
-    ).toEqual({ ready: true });
+    expect(await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A })).toEqual({
+      ready: true,
+    });
   });
 
   it('o perfil de OUTRO tenant não satisfaz a precondição (escopo)', async () => {
@@ -721,16 +723,16 @@ d('line readiness — perfil operacional ativo é precondição', () => {
       c.release();
     }
 
-    expect(
-      await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A }),
-    ).toEqual({ ready: false, reason_code: 'missing_active_profile' });
+    expect(await evaluateLineReadiness({ id: channelId, tenant_id: T, agent_id: A })).toEqual({
+      ready: false,
+      reason_code: 'missing_active_profile',
+    });
 
     const cleanup = await pool.connect();
     try {
-      await cleanup.query(
-        `DELETE FROM agent_operational_profile_versions WHERE tenant_id = $1`,
-        [T2],
-      );
+      await cleanup.query(`DELETE FROM agent_operational_profile_versions WHERE tenant_id = $1`, [
+        T2,
+      ]);
     } finally {
       cleanup.release();
     }
@@ -831,10 +833,9 @@ d('channel_line_state — comando e auditoria no MESMO commit (review PR #528, P
 
     const c = await pool.connect();
     try {
-      const chan = await c.query<{ active: boolean }>(
-        `SELECT active FROM channels WHERE id = $1`,
-        [activeId],
-      );
+      const chan = await c.query<{ active: boolean }>(`SELECT active FROM channels WHERE id = $1`, [
+        activeId,
+      ]);
       expect(chan.rows[0]!.active).toBe(false);
       const audit = await c.query<{ n: string }>(
         `SELECT count(*)::text AS n FROM admin_audit_log
@@ -860,10 +861,9 @@ d('channel_line_state — comando e auditoria no MESMO commit (review PR #528, P
 
     const c = await pool.connect();
     try {
-      const chan = await c.query<{ active: boolean }>(
-        `SELECT active FROM channels WHERE id = $1`,
-        [foreignChannelId],
-      );
+      const chan = await c.query<{ active: boolean }>(`SELECT active FROM channels WHERE id = $1`, [
+        foreignChannelId,
+      ]);
       expect(chan.rows[0]!.active).toBe(false); // seed nasce inativo; segue intacto
       const audit = await c.query<{ n: string }>(
         `SELECT count(*)::text AS n FROM admin_audit_log WHERE resource_id = $1`,
@@ -1360,9 +1360,7 @@ d('channel_line_state — material cifrado e restart', () => {
     // Com o dono morto o comando nasce SEM destino — o socket morreu junto.
     const state = await channelLineStateRepo.getStateForScope(scope);
     expect(state?.target_instance).toBeNull();
-    expect((await channelLineStateRepo.claimNextCommand('replica-B'))?.command).toBe(
-      'stop_line',
-    );
+    expect((await channelLineStateRepo.claimNextCommand('replica-B'))?.command).toBe('stop_line');
   });
 
   it('comando endereçado a um dono que morreu DEPOIS não fica pendurado', async () => {
@@ -1384,16 +1382,12 @@ d('channel_line_state — material cifrado e restart', () => {
       ...ACTOR,
       address_to_session_owner: true,
     });
-    expect((await channelLineStateRepo.getStateForScope(scope))?.target_instance).toBe(
-      'replica-A',
-    );
+    expect((await channelLineStateRepo.getStateForScope(scope))?.target_instance).toBe('replica-A');
 
     // ...e só DEPOIS a réplica dona morre. Sem o escape de lease vencida no
     // claim, o comando ficaria endereçado a um processo que não existe mais.
     await expireSessionLease(channelId);
-    expect((await channelLineStateRepo.claimNextCommand('replica-B'))?.command).toBe(
-      'stop_line',
-    );
+    expect((await channelLineStateRepo.claimNextCommand('replica-B'))?.command).toBe('stop_line');
   });
 
   it('a conclusão do stop apaga o registro de posse da sessão', async () => {
@@ -1474,9 +1468,7 @@ d('channel_line_state — material cifrado e restart', () => {
       },
     });
 
-    expect((await channelLineStateRepo.getStateForScope(scope))?.target_instance).toBe(
-      'replica-A',
-    );
+    expect((await channelLineStateRepo.getStateForScope(scope))?.target_instance).toBe('replica-A');
     expect(await channelLineStateRepo.claimNextCommand('replica-B')).toBeNull();
   });
 
@@ -1504,9 +1496,7 @@ d('channel_line_state — material cifrado e restart', () => {
       'replica-A',
     );
     expect(await channelLineStateRepo.releaseSessionOwnership('replica-A', [channelId])).toBe(1);
-    expect(
-      (await channelLineStateRepo.getStateForScope(scope))?.session_owner_instance,
-    ).toBeNull();
+    expect((await channelLineStateRepo.getStateForScope(scope))?.session_owner_instance).toBeNull();
   });
 
   it('uma linha DESABILITADA não é ressuscitada por callback atrasado da sessão', async () => {

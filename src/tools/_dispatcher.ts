@@ -415,8 +415,7 @@ async function dispatchToolInner(input: {
         resolved: resolved ?? null,
         scope: { entidades: input.ctx.scope.entidades },
       }),
-    (v) =>
-      v === null ? 'ok' : v.kind === 'forbidden' ? 'forbidden' : 'requires_approval',
+    (v) => (v === null ? 'ok' : v.kind === 'forbidden' ? 'forbidden' : 'requires_approval'),
   );
   if (violation && violation.kind === 'forbidden') {
     await audit({
@@ -426,7 +425,10 @@ async function dispatchToolInner(input: {
       mensagem_id: input.ctx.mensagem_id,
       metadata: { tool: tool.name, violation },
     });
-    return { error: 'forbidden', details: { rule_id: violation.rule_id, reason: violation.reason } };
+    return {
+      error: 'forbidden',
+      details: { rule_id: violation.rule_id, reason: violation.reason },
+    };
   }
 
   // Issue #535 — span `permission.check`, o segundo portão. UM span para o laço
@@ -472,7 +474,9 @@ async function dispatchToolInner(input: {
     return { error: 'redis_unavailable_blocked' };
   }
 
-  const file_sha256 = pickToolField<'string'>(args, 'file_sha256', 'string') ?? pickToolField<'string'>(args, 'attachment_id', 'string');
+  const file_sha256 =
+    pickToolField<'string'>(args, 'file_sha256', 'string') ??
+    pickToolField<'string'>(args, 'attachment_id', 'string');
   const idempotency_key = computeIdempotencyKey({
     pessoa_id: input.ctx.pessoa.id,
     entity_id,
@@ -569,9 +573,7 @@ async function dispatchToolInner(input: {
   let claimedApproval: { request: ApprovalRequest; claim_token: string } | null = null;
   if (approvalRequirement !== 'none') {
     const approval_class: ApprovalClass =
-      approvalRequirement === 'single'
-        ? 'single_confirmation'
-        : dualClassFor(input.ctx.pessoa);
+      approvalRequirement === 'single' ? 'single_confirmation' : dualClassFor(input.ctx.pessoa);
     const intent_hash = computeIntentHash({
       tenant_id: getCurrentTenant(),
       agent_id: getCurrentAgent(),
@@ -616,9 +618,7 @@ async function dispatchToolInner(input: {
       // o dispatcher só o resolve quando um request precisa de fato notificar
       // humanos.
       const notify: ApprovalNotify = async (input) => {
-        const { enqueueProactiveNotice } = await import(
-          '@/runtime/outbound/proactive-notice.js'
-        );
+        const { enqueueProactiveNotice } = await import('@/runtime/outbound/proactive-notice.js');
         return enqueueProactiveNotice(input);
       };
       const ensured = await ensureApprovalRequest({
@@ -637,7 +637,8 @@ async function dispatchToolInner(input: {
         notify,
       });
       return {
-        error: approvalRequirement === 'single' ? 'requires_confirmation' : 'requires_dual_approval',
+        error:
+          approvalRequirement === 'single' ? 'requires_confirmation' : 'requires_dual_approval',
         details: {
           ref: ensured.ref,
           approval_class,
@@ -726,10 +727,7 @@ async function dispatchToolInner(input: {
     // cached result); a true collision signals a derivation bug / hash
     // truncation that must be loud, not silently papered over. The
     // collision is logged + metered inside `tryReserve`.
-    logger.warn(
-      { tool: tool.name, idempotency_key },
-      'tool.idempotency_payload_hash_collision',
-    );
+    logger.warn({ tool: tool.name, idempotency_key }, 'tool.idempotency_payload_hash_collision');
     return {
       error: 'idempotency_payload_hash_collision',
       details: { tool: tool.name, idempotency_key },
@@ -753,10 +751,7 @@ async function dispatchToolInner(input: {
     // explicit, higher-level decision (which would compute the same
     // idempotency_key and re-enter here — still fenced by the 'failed' row
     // until it ages out of the cache).
-    logger.warn(
-      { tool: tool.name, idempotency_key },
-      'tool.idempotency_prior_failed',
-    );
+    logger.warn({ tool: tool.name, idempotency_key }, 'tool.idempotency_prior_failed');
     return {
       error: 'idempotency_prior_failed',
       details: { tool: tool.name, idempotency_key },
@@ -768,10 +763,7 @@ async function dispatchToolInner(input: {
     // return their result — preserves the exact-once contract (we do NOT
     // execute the handler again).
     await releaseClaimIfHeld();
-    logger.debug(
-      { tool: tool.name, idempotency_key },
-      'tool.idempotency_wait_start',
-    );
+    logger.debug({ tool: tool.name, idempotency_key }, 'tool.idempotency_wait_start');
     const waited = await idempotencyRepo.waitForCompletion(
       idempotency_key,
       WAIT_TIMEOUT_MS,
@@ -785,20 +777,14 @@ async function dispatchToolInner(input: {
     if (waited.status === 'collision') {
       // The settled row carries a different payload_hash than ours.
       // Surface the same typed collision error as the direct-hit path.
-      logger.warn(
-        { tool: tool.name, idempotency_key },
-        'tool.idempotency_payload_hash_collision',
-      );
+      logger.warn({ tool: tool.name, idempotency_key }, 'tool.idempotency_payload_hash_collision');
       return {
         error: 'idempotency_payload_hash_collision',
         details: { tool: tool.name, idempotency_key },
       };
     }
     if (waited.status === 'completed') {
-      logger.debug(
-        { tool: tool.name, idempotency_key },
-        'tool.idempotency_wait_hit',
-      );
+      logger.debug({ tool: tool.name, idempotency_key }, 'tool.idempotency_wait_hit');
       return waited.resultado;
     }
     if (waited.status === 'failed' || waited.status === 'released') {
@@ -820,10 +806,7 @@ async function dispatchToolInner(input: {
     }
     // status === 'timeout': owner is still working (or hung). Surface a
     // retry-friendly error rather than block the caller indefinitely.
-    logger.warn(
-      { tool: tool.name, idempotency_key },
-      'tool.idempotency_wait_timeout',
-    );
+    logger.warn({ tool: tool.name, idempotency_key }, 'tool.idempotency_wait_timeout');
     return {
       error: 'idempotency_wait_timeout',
       details: { tool: tool.name, idempotency_key, waited_ms: WAIT_TIMEOUT_MS },
@@ -1007,20 +990,20 @@ async function dispatchToolInner(input: {
     // esperou", e as duas têm correções opostas.
     result = await instrumentHandlerExecute(tool.name, () =>
       tool.handler(args, {
-      pessoa: input.ctx.pessoa,
-      scope: input.ctx.scope,
-      conversa: input.ctx.conversa,
-      mensagem_id: input.ctx.mensagem_id,
-      request_id: input.ctx.request_id,
-      idempotency_key,
-      // Issue #504 §Fencing — o handler recebe a TENTATIVA, não só o pedido.
-      // Sem isto, uma mutação interna longa (várias queries, uma chamada
-      // externa) não tem como cooperar com o cancelamento nem como validar a
-      // tentativa contra o banco: o `claim_token` é o mesmo fence que
-      // `agent_turns` exige em toda gravação da tentativa. `null` fora de um
-      // turno reivindicado (flag OFF, worker de agenda, playground), que é o
-      // mesmo regime no-op dos guards.
-      turn: turnHandlerContext(),
+        pessoa: input.ctx.pessoa,
+        scope: input.ctx.scope,
+        conversa: input.ctx.conversa,
+        mensagem_id: input.ctx.mensagem_id,
+        request_id: input.ctx.request_id,
+        idempotency_key,
+        // Issue #504 §Fencing — o handler recebe a TENTATIVA, não só o pedido.
+        // Sem isto, uma mutação interna longa (várias queries, uma chamada
+        // externa) não tem como cooperar com o cancelamento nem como validar a
+        // tentativa contra o banco: o `claim_token` é o mesmo fence que
+        // `agent_turns` exige em toda gravação da tentativa. `null` fora de um
+        // turno reivindicado (flag OFF, worker de agenda, playground), que é o
+        // mesmo regime no-op dos guards.
+        turn: turnHandlerContext(),
       }),
     );
   } catch (err) {
@@ -1136,10 +1119,7 @@ async function dispatchToolInner(input: {
     // produce the authoritative cached result; concurrent callers wait on IT.
     // Either way: surface a retry-friendly error rather than returning a result
     // that won't match the cache.
-    logger.warn(
-      { tool: tool.name, idempotency_key },
-      'tool.idempotency_completion_fenced',
-    );
+    logger.warn({ tool: tool.name, idempotency_key }, 'tool.idempotency_completion_fenced');
     // Issue #507 — este caminho TAMBÉM é efeito incerto, e a diferença com o
     // cancelamento cooperativo é só quem descobriu primeiro: aqui o handler
     // rodou inteiro e a reserva foi tomada por outro dono no meio, então

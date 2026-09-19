@@ -41,10 +41,7 @@
  *     execution).
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 import { buildCacheKey } from '@/lib/cache-key.js';
 
 // ---------------------------------------------------------------------------
@@ -118,9 +115,7 @@ vi.mock('@/config/env.js', () => ({
 // ---------------------------------------------------------------------------
 type QueueAdd = { name: string; data: unknown; opts: { jobId: string } & Record<string, unknown> };
 const queueAdds: QueueAdd[] = [];
-const queueGetJob = vi.fn(
-  async (_id: string) => null as { remove: () => Promise<void> } | null,
-);
+const queueGetJob = vi.fn(async (_id: string) => null as { remove: () => Promise<void> } | null);
 const queueAdd = vi.fn(
   async (name: string, data: unknown, opts: { jobId: string } & Record<string, unknown>) => {
     queueAdds.push({ name, data, opts });
@@ -194,10 +189,12 @@ function reset(): void {
   queueGetJob.mockClear();
   queueGetJob.mockResolvedValue(null);
   queueAdd.mockClear();
-  queueAdd.mockImplementation(async (name: string, data: unknown, opts: { jobId: string } & Record<string, unknown>) => {
-    queueAdds.push({ name, data, opts });
-    return undefined;
-  });
+  queueAdd.mockImplementation(
+    async (name: string, data: unknown, opts: { jobId: string } & Record<string, unknown>) => {
+      queueAdds.push({ name, data, opts });
+      return undefined;
+    },
+  );
   // Restore Redis "connected" default — Redis-down tests flip this and
   // beforeEach must reset it for sibling tests.
   redisConnected.value = true;
@@ -217,18 +214,12 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
   // -------------------------------------------------------------------------
   describe('same phone, different tenants', () => {
     it('emits DIFFERENT Redis state keys for tenant A vs tenant B', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mA' });
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mB' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mA' });
+      });
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mB' });
+      });
 
       // Each scheduleDebouncedAgent emits one `get` (readState) + one
       // `set` (writeState). With independent keys we expect the SET-key
@@ -257,18 +248,12 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       // jobId, the second tenant's `add` either silently no-ops or wins
       // over the first — depending on the order of getJob/remove. Either
       // way, ONE of the tenants loses its message.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mA' });
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mB' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mA' });
+      });
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mB' });
+      });
 
       const jobIds = jobIdsAdded();
       expect(jobIds).toHaveLength(2);
@@ -288,23 +273,21 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
   // -------------------------------------------------------------------------
   describe('symmetry: B → A direction', () => {
     it('B-then-A yields the same isolation as A-then-B', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mB1' });
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mA1' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mB1' });
+      });
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mA1' });
+      });
 
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(2);
-      expect(setKeys[0]).toBe(`agent-debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`);
-      expect(setKeys[1]).toBe(`agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`);
+      expect(setKeys[0]).toBe(
+        `agent-debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`,
+      );
+      expect(setKeys[1]).toBe(
+        `agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`,
+      );
       expect(setKeys[0]).not.toBe(setKeys[1]);
 
       const jobIds = jobIdsAdded();
@@ -320,18 +303,12 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       // and an executor agent in a multi-agent setup) must NOT share
       // debounce windows — they buffer message chunks for different
       // pipelines.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mAa' });
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_B },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mAb' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mAa' });
+      });
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_B }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'mAb' });
+      });
 
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(2);
@@ -366,9 +343,7 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
     });
 
     it('clearDebounceState throws MissingTenantContextError and emits zero ops', async () => {
-      await expect(clearDebounceState(SHARED_PHONE)).rejects.toThrow(
-        MissingTenantContextError,
-      );
+      await expect(clearDebounceState(SHARED_PHONE)).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.del).not.toHaveBeenCalled();
     });
 
@@ -409,24 +384,18 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       // If keys collided, B's read would see A's prior state (false
       // reset / wrong heldMs) and B's write would clobber A's stamp.
       // With proper scoping, the two flows are perfectly disjoint.
-      const flowA = runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await scheduleDebouncedAgent({
-            phone: SHARED_PHONE,
-            mensagem_id: 'mA',
-          });
-        },
-      );
-      const flowB = runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await scheduleDebouncedAgent({
-            phone: SHARED_PHONE,
-            mensagem_id: 'mB',
-          });
-        },
-      );
+      const flowA = runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await scheduleDebouncedAgent({
+          phone: SHARED_PHONE,
+          mensagem_id: 'mA',
+        });
+      });
+      const flowB = runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await scheduleDebouncedAgent({
+          phone: SHARED_PHONE,
+          mensagem_id: 'mB',
+        });
+      });
 
       // Promise.all in either order — both flows must succeed and
       // each must observe its own scope, regardless of interleaving.
@@ -446,14 +415,22 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
 
       // (b) mensagem_id is preserved per tenant — no cross-pollination.
       const addByJobId = new Map(queueAdds.map((a) => [a.opts.jobId, a]));
-      expect((addByJobId.get(expectedAJob)?.data as { mensagem_id: string }).mensagem_id).toBe('mA');
-      expect((addByJobId.get(expectedBJob)?.data as { mensagem_id: string }).mensagem_id).toBe('mB');
+      expect((addByJobId.get(expectedAJob)?.data as { mensagem_id: string }).mensagem_id).toBe(
+        'mA',
+      );
+      expect((addByJobId.get(expectedBJob)?.data as { mensagem_id: string }).mensagem_id).toBe(
+        'mB',
+      );
 
       // (c) The Redis state keys also diverge — independent debounce
       // windows that won't suppress each other on the next message.
       const setKeys = new Set(keysOf('set'));
-      expect(setKeys.has(`agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`)).toBe(true);
-      expect(setKeys.has(`agent-debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`)).toBe(true);
+      expect(
+        setKeys.has(`agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(SHARED_PHONE)}`),
+      ).toBe(true);
+      expect(
+        setKeys.has(`agent-debounce:${enc(TENANT_B)}:${enc(AGENT_B)}:${enc(SHARED_PHONE)}`),
+      ).toBe(true);
     });
 
     it('a stale tenant-B state is UNREACHABLE from a tenant-A read (post-fix)', async () => {
@@ -540,12 +517,9 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       // two distinct tenant/agent buckets into one. `tenants.id` is
       // TEXT PRIMARY KEY (free-form slug; see migration
       // 007_p0_tenants_agents.sql).
-      await runWithTenantContext(
-        { tenant_id: 'acme:dev', agent_id: 'prod' },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm1' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme:dev', agent_id: 'prod' }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm1' });
+      });
       const keyA = keysOf('set')[0];
 
       // Reset between the two scenarios so we can compare cleanly.
@@ -556,12 +530,9 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       redisStub.set.mockClear();
       queueAdd.mockClear();
 
-      await runWithTenantContext(
-        { tenant_id: 'acme', agent_id: 'dev:prod' },
-        async () => {
-          await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm2' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'dev:prod' }, async () => {
+        await scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm2' });
+      });
       const keyB = keysOf('set')[0];
 
       expect(keyA).toBeDefined();
@@ -579,12 +550,9 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       // encoding the phone segment makes the rule "every segment is
       // encoded" uniform.
       const weirdPhone = 'lid:12345@whatsapp';
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await scheduleDebouncedAgent({ phone: weirdPhone, mensagem_id: 'm1' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await scheduleDebouncedAgent({ phone: weirdPhone, mensagem_id: 'm1' });
+      });
       const key = keysOf('set')[0];
       expect(key).toBe(`agent-debounce:${enc(TENANT_A)}:${enc(AGENT_A)}:${enc(weirdPhone)}`);
       // `:` inside the phone is encoded, so the key has exactly the right
@@ -605,9 +573,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
   describe('malformed context (empty / whitespace tenant or agent segment)', () => {
     it('empty tenant_id throws MissingTenantContextError and emits zero side-effects', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: '', agent_id: AGENT_A },
-          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        runWithTenantContext({ tenant_id: '', agent_id: AGENT_A }, async () =>
+          scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
         ),
       ).rejects.toThrow(MissingTenantContextError);
 
@@ -618,9 +585,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
 
     it('whitespace-only agent_id throws MissingTenantContextError', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: TENANT_A, agent_id: '   ' },
-          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        runWithTenantContext({ tenant_id: TENANT_A, agent_id: '   ' }, async () =>
+          scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
         ),
       ).rejects.toThrow(MissingTenantContextError);
 
@@ -633,9 +599,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       // codepaths but not others, hiding the upstream bug. Same rule as
       // the project-wide `assertTruthyContext` in `tenant-context.ts`.
       await expect(
-        runWithTenantContext(
-          { tenant_id: ' acme ', agent_id: AGENT_A },
-          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        runWithTenantContext({ tenant_id: ' acme ', agent_id: AGENT_A }, async () =>
+          scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
         ),
       ).rejects.toThrow(MissingTenantContextError);
     });
@@ -656,9 +621,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
 
     it('clearDebounceState also enforces the malformed-context guard', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: '', agent_id: AGENT_A },
-          async () => clearDebounceState(SHARED_PHONE),
+        runWithTenantContext({ tenant_id: '', agent_id: AGENT_A }, async () =>
+          clearDebounceState(SHARED_PHONE),
         ),
       ).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.del).not.toHaveBeenCalled();
@@ -684,9 +648,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       redisConnected.value = false;
 
       await expect(
-        runWithTenantContext(
-          { tenant_id: TENANT_A, agent_id: AGENT_A },
-          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () =>
+          scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
         ),
       ).rejects.toMatchObject({
         name: 'DebouncerRedisUnavailableError',
@@ -706,9 +669,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       redisConnected.value = false;
 
       await expect(
-        runWithTenantContext(
-          { tenant_id: TENANT_A, agent_id: AGENT_A },
-          async () => clearDebounceState(SHARED_PHONE),
+        runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () =>
+          clearDebounceState(SHARED_PHONE),
         ),
       ).rejects.toMatchObject({
         name: 'DebouncerRedisUnavailableError',
@@ -729,9 +691,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       });
 
       await expect(
-        runWithTenantContext(
-          { tenant_id: TENANT_A, agent_id: AGENT_A },
-          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () =>
+          scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
         ),
       ).rejects.toThrow('bullmq blip');
 
@@ -754,9 +715,8 @@ describe('issue #248 — debouncer keys are tenant+agent scoped', () => {
       });
 
       await expect(
-        runWithTenantContext(
-          { tenant_id: TENANT_A, agent_id: AGENT_A },
-          async () => scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
+        runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () =>
+          scheduleDebouncedAgent({ phone: SHARED_PHONE, mensagem_id: 'm' }),
         ),
       ).rejects.toThrow('redis set blip');
 

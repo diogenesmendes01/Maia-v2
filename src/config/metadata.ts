@@ -31,12 +31,7 @@ export const MAIA_PROFILES: readonly MaiaProfile[] = [
  * services allowed to read it, which is what makes "minimum configuration per
  * service" (and the secret blast radius) computable.
  */
-export type MaiaService =
-  | 'runtime'
-  | 'admin-ui'
-  | 'migrator'
-  | 'backup'
-  | 'maintenance';
+export type MaiaService = 'runtime' | 'admin-ui' | 'migrator' | 'backup' | 'maintenance';
 
 export const MAIA_SERVICES: readonly MaiaService[] = [
   'runtime',

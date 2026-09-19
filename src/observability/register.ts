@@ -65,11 +65,13 @@ async function schedulerLagSnapshot(): Promise<SchedulerLagEntry[]> {
       FROM outbox_messages
      WHERE status = 'pending' AND next_attempt_at <= now()
   `);
-  return Array.from(result.rows as unknown as Array<{
-    queue: string;
-    backlog: string;
-    lag_ms: string;
-  }>).map((r) => ({
+  return Array.from(
+    result.rows as unknown as Array<{
+      queue: string;
+      backlog: string;
+      lag_ms: string;
+    }>,
+  ).map((r) => ({
     queue: r.queue,
     backlog: Number(r.backlog),
     lag_ms: Math.max(0, Math.round(Number(r.lag_ms))),

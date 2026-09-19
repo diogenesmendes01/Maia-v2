@@ -53,13 +53,7 @@ function BodyPre({ body }: { body: unknown }) {
   );
 }
 
-export default function DiffRenderer({
-  type,
-  body,
-}: {
-  type: ProposalTypeId;
-  body: unknown;
-}) {
+export default function DiffRenderer({ type, body }: { type: ProposalTypeId; body: unknown }) {
   const section = SECTIONS[type] as { title: string; description: string } | undefined;
 
   if (!section) {

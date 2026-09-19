@@ -41,9 +41,7 @@ const ListTasksInput = z.object({
   tenantId: z.string().optional(),
   agentId: AgentIdSchema,
   objectiveId: z.string().uuid().optional(),
-  status: z
-    .enum(['pending', 'running', 'waiting_human', 'done', 'failed', 'cancelled'])
-    .optional(),
+  status: z.enum(['pending', 'running', 'waiting_human', 'done', 'failed', 'cancelled']).optional(),
   limit: z.number().int().min(1).max(200).default(100),
 });
 
@@ -248,13 +246,11 @@ export const objectivesRouter = router({
     return { ok: true };
   }),
 
-  listExceptions: protectedProcedure
-    .input(ListExceptionsInput)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      const items = await ctx.repos.objectivesRepo.listExceptionsByTenant({
-        tenant_id: tenantId,
-      });
-      return { items };
-    }),
+  listExceptions: protectedProcedure.input(ListExceptionsInput).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const items = await ctx.repos.objectivesRepo.listExceptionsByTenant({
+      tenant_id: tenantId,
+    });
+    return { items };
+  }),
 });

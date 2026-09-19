@@ -25,14 +25,11 @@ type ChannelRow = {
 const channelsState: Record<string, ChannelRow> = {};
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
 
   // Helper to capture tenant context at call time
-  const { getCurrentTenant, getCurrentAgent } = await import(
-    '@/db/tenant-context.js'
-  );
+  const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
 
   return {
     ...actual,
@@ -40,14 +37,7 @@ vi.mock('@/db/repositories.js', async () => {
       create: vi.fn(
         async (input: {
           external_id: string;
-          channel_type:
-            | 'whatsapp'
-            | 'telegram'
-            | 'email'
-            | 'sms'
-            | 'web'
-            | 'api'
-            | 'other';
+          channel_type: 'whatsapp' | 'telegram' | 'email' | 'sms' | 'web' | 'api' | 'other';
           display_name?: string;
           metadata?: unknown;
         }) => {
@@ -77,34 +67,29 @@ vi.mock('@/db/repositories.js', async () => {
         const agent_id = getCurrentAgent();
         const row = channelsState[id];
         if (!row) return null;
-        if (row.tenant_id !== tenant_id || row.agent_id !== agent_id)
-          return null;
+        if (row.tenant_id !== tenant_id || row.agent_id !== agent_id) return null;
         return row;
       }),
-      findByExternal: vi.fn(
-        async (channel_type: string, external_id: string) => {
-          const tenant_id = getCurrentTenant();
-          const agent_id = getCurrentAgent();
-          return (
-            Object.values(channelsState).find(
-              (r) =>
-                r.tenant_id === tenant_id &&
-                r.agent_id === agent_id &&
-                r.channel_type === channel_type &&
-                r.external_id === external_id,
-            ) ?? null
-          );
-        },
-      ),
+      findByExternal: vi.fn(async (channel_type: string, external_id: string) => {
+        const tenant_id = getCurrentTenant();
+        const agent_id = getCurrentAgent();
+        return (
+          Object.values(channelsState).find(
+            (r) =>
+              r.tenant_id === tenant_id &&
+              r.agent_id === agent_id &&
+              r.channel_type === channel_type &&
+              r.external_id === external_id,
+          ) ?? null
+        );
+      }),
       // [Codex review #277] Mock reflects the post-review contract: iterate
       // all matches, prefer active, throw ambiguous_active_channels when 2+
       // active rows exist. Keeps behavioral parity with the real repo.
       findByExternalCrossTenant: vi.fn(
         async (args: { channel_type: string; external_id: string }) => {
           const matches = Object.values(channelsState).filter(
-            (r) =>
-              r.channel_type === args.channel_type &&
-              r.external_id === args.external_id,
+            (r) => r.channel_type === args.channel_type && r.external_id === args.external_id,
           );
           if (matches.length === 0) return null;
           const activeMatches = matches.filter((r) => r.active);
@@ -129,10 +114,7 @@ vi.mock('@/db/repositories.js', async () => {
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
         return Object.values(channelsState).filter(
-          (r) =>
-            r.tenant_id === tenant_id &&
-            r.agent_id === agent_id &&
-            r.active === true,
+          (r) => r.tenant_id === tenant_id && r.agent_id === agent_id && r.active === true,
         );
       }),
       deactivate: vi.fn(async (id: string) => {
@@ -153,81 +135,60 @@ describe('channelsRepo', () => {
   });
 
   it('create insere via applyTenantGuard com active=true por default', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const row = await channelsRepo.create({
-          external_id: 'wa-12345',
-          channel_type: 'whatsapp',
-          display_name: 'Vendas WhatsApp',
-        });
-        expect(row.id).toBeDefined();
-        expect(row.tenant_id).toBe('default');
-        expect(row.agent_id).toBe('default');
-        expect(row.external_id).toBe('wa-12345');
-        expect(row.channel_type).toBe('whatsapp');
-        expect(row.display_name).toBe('Vendas WhatsApp');
-        expect(row.active).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const row = await channelsRepo.create({
+        external_id: 'wa-12345',
+        channel_type: 'whatsapp',
+        display_name: 'Vendas WhatsApp',
+      });
+      expect(row.id).toBeDefined();
+      expect(row.tenant_id).toBe('default');
+      expect(row.agent_id).toBe('default');
+      expect(row.external_id).toBe('wa-12345');
+      expect(row.channel_type).toBe('whatsapp');
+      expect(row.display_name).toBe('Vendas WhatsApp');
+      expect(row.active).toBe(true);
+    });
   });
 
   it('findByExternal é tenant-scoped (não vaza entre tenants)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        await channelsRepo.create({
-          external_id: 'shared-ext-id',
-          channel_type: 'whatsapp',
-        });
-        const found = await channelsRepo.findByExternal(
-          'whatsapp',
-          'shared-ext-id',
-        );
-        expect(found).not.toBeNull();
-        expect(found!.tenant_id).toBe('tenant-a');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      await channelsRepo.create({
+        external_id: 'shared-ext-id',
+        channel_type: 'whatsapp',
+      });
+      const found = await channelsRepo.findByExternal('whatsapp', 'shared-ext-id');
+      expect(found).not.toBeNull();
+      expect(found!.tenant_id).toBe('tenant-a');
+    });
     // De outro tenant, mesmo external_id não deve aparecer
-    await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const found = await channelsRepo.findByExternal(
-          'whatsapp',
-          'shared-ext-id',
-        );
-        expect(found).toBeNull();
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const found = await channelsRepo.findByExternal('whatsapp', 'shared-ext-id');
+      expect(found).toBeNull();
+    });
   });
 
   it('findByExternalCrossTenant retorna row mesmo de outro tenant (bypassa guard)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        await channelsRepo.create({
-          external_id: 'cross-ext-id',
-          channel_type: 'whatsapp',
-        });
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      await channelsRepo.create({
+        external_id: 'cross-ext-id',
+        channel_type: 'whatsapp',
+      });
+    });
     // De outro tenant, ainda encontra (resolver pattern)
-    await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const found = await channelsRepo.findByExternalCrossTenant({
-          channel_type: 'whatsapp',
-          external_id: 'cross-ext-id',
-        });
-        expect(found).not.toBeNull();
-        expect(found!.tenant_id).toBe('tenant-a'); // não filtrou
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const found = await channelsRepo.findByExternalCrossTenant({
+        channel_type: 'whatsapp',
+        external_id: 'cross-ext-id',
+      });
+      expect(found).not.toBeNull();
+      expect(found!.tenant_id).toBe('tenant-a'); // não filtrou
+    });
   });
 
   // [Codex review #277] HIGH: lookup deterministicamente prefere ACTIVE quando
@@ -236,155 +197,125 @@ describe('channelsRepo', () => {
   // podia retornar o inactive → resolver rejeita mensagem do tenant ativo.
   it('findByExternalCrossTenant prefere row active quando há 2 tenants com mesmo (channel_type, external_id) — um active, um inactive', async () => {
     // tenant-a: cria, depois desativa o canal (tenant antigo).
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const row = await channelsRepo.create({
-          external_id: 'reclaimed-num',
-          channel_type: 'whatsapp',
-        });
-        await channelsRepo.deactivate(row.id);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const row = await channelsRepo.create({
+        external_id: 'reclaimed-num',
+        channel_type: 'whatsapp',
+      });
+      await channelsRepo.deactivate(row.id);
+    });
     // tenant-b: claim do mesmo external_id (tenant novo, active=true).
-    await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        await channelsRepo.create({
-          external_id: 'reclaimed-num',
-          channel_type: 'whatsapp',
-        });
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      await channelsRepo.create({
+        external_id: 'reclaimed-num',
+        channel_type: 'whatsapp',
+      });
+    });
 
     // Resolver consulta: deve retornar tenant-b (active), não tenant-a (inactive).
-    await runWithTenantContext(
-      { tenant_id: 'tenant-c', agent_id: 'agent-c' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const found = await channelsRepo.findByExternalCrossTenant({
-          channel_type: 'whatsapp',
-          external_id: 'reclaimed-num',
-        });
-        expect(found).not.toBeNull();
-        expect(found!.tenant_id).toBe('tenant-b');
-        expect(found!.active).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-c', agent_id: 'agent-c' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const found = await channelsRepo.findByExternalCrossTenant({
+        channel_type: 'whatsapp',
+        external_id: 'reclaimed-num',
+      });
+      expect(found).not.toBeNull();
+      expect(found!.tenant_id).toBe('tenant-b');
+      expect(found!.active).toBe(true);
+    });
   });
 
   // [Codex review #277] HIGH: 2+ active rows com mesmo (channel_type,
   // external_id) é ambíguo → fail-loud. Operador deve desativar um lado.
   it('findByExternalCrossTenant lança ambiguous_active_channels com 2 actives no mesmo (channel_type, external_id)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        await channelsRepo.create({
-          external_id: 'ambiguous-num',
-          channel_type: 'whatsapp',
-        });
-      },
-    );
-    await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        await channelsRepo.create({
-          external_id: 'ambiguous-num',
-          channel_type: 'whatsapp',
-        });
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      await channelsRepo.create({
+        external_id: 'ambiguous-num',
+        channel_type: 'whatsapp',
+      });
+    });
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      await channelsRepo.create({
+        external_id: 'ambiguous-num',
+        channel_type: 'whatsapp',
+      });
+    });
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-c', agent_id: 'agent-c' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const { TypedError } = await import('@/lib/utils.js');
-        const promise = channelsRepo.findByExternalCrossTenant({
-          channel_type: 'whatsapp',
-          external_id: 'ambiguous-num',
-        });
-        await expect(promise).rejects.toBeInstanceOf(TypedError);
-        await expect(promise).rejects.toMatchObject({
-          code: 'channel_resolution_failed',
-          details: {
-            resolver_path: 'ambiguous_active_channels',
-            conflicting_tenant_ids: expect.arrayContaining(['tenant-a', 'tenant-b']),
-          },
-        });
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-c', agent_id: 'agent-c' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const { TypedError } = await import('@/lib/utils.js');
+      const promise = channelsRepo.findByExternalCrossTenant({
+        channel_type: 'whatsapp',
+        external_id: 'ambiguous-num',
+      });
+      await expect(promise).rejects.toBeInstanceOf(TypedError);
+      await expect(promise).rejects.toMatchObject({
+        code: 'channel_resolution_failed',
+        details: {
+          resolver_path: 'ambiguous_active_channels',
+          conflicting_tenant_ids: expect.arrayContaining(['tenant-a', 'tenant-b']),
+        },
+      });
+    });
   });
 
   // [Codex review #277] Quando nenhum match é active, retorna um inactive
   // (preserva o signature found:true, active:false esperado pelo resolver).
   it('findByExternalCrossTenant retorna row inactive quando nenhum match é active', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'agent-a' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const row = await channelsRepo.create({
-          external_id: 'all-inactive',
-          channel_type: 'whatsapp',
-        });
-        await channelsRepo.deactivate(row.id);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'agent-a' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const row = await channelsRepo.create({
+        external_id: 'all-inactive',
+        channel_type: 'whatsapp',
+      });
+      await channelsRepo.deactivate(row.id);
+    });
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'agent-b' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const found = await channelsRepo.findByExternalCrossTenant({
-          channel_type: 'whatsapp',
-          external_id: 'all-inactive',
-        });
-        expect(found).not.toBeNull();
-        expect(found!.active).toBe(false);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'agent-b' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const found = await channelsRepo.findByExternalCrossTenant({
+        channel_type: 'whatsapp',
+        external_id: 'all-inactive',
+      });
+      expect(found).not.toBeNull();
+      expect(found!.active).toBe(false);
+    });
   });
 
   it('listActive filtra channels com active=false', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const a = await channelsRepo.create({
-          external_id: 'a',
-          channel_type: 'whatsapp',
-        });
-        await channelsRepo.create({
-          external_id: 'b',
-          channel_type: 'telegram',
-        });
-        await channelsRepo.deactivate(a.id);
-        const active = await channelsRepo.listActive();
-        expect(active.length).toBe(1);
-        expect(active[0]!.external_id).toBe('b');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const a = await channelsRepo.create({
+        external_id: 'a',
+        channel_type: 'whatsapp',
+      });
+      await channelsRepo.create({
+        external_id: 'b',
+        channel_type: 'telegram',
+      });
+      await channelsRepo.deactivate(a.id);
+      const active = await channelsRepo.listActive();
+      expect(active.length).toBe(1);
+      expect(active[0]!.external_id).toBe('b');
+    });
   });
 
   it('deactivate seta active=false', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { channelsRepo } = await import('@/db/repositories.js');
-        const row = await channelsRepo.create({
-          external_id: 'to-deactivate',
-          channel_type: 'whatsapp',
-        });
-        expect(row.active).toBe(true);
-        await channelsRepo.deactivate(row.id);
-        const after = await channelsRepo.getById(row.id);
-        expect(after).not.toBeNull();
-        expect(after!.active).toBe(false);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { channelsRepo } = await import('@/db/repositories.js');
+      const row = await channelsRepo.create({
+        external_id: 'to-deactivate',
+        channel_type: 'whatsapp',
+      });
+      expect(row.active).toBe(true);
+      await channelsRepo.deactivate(row.id);
+      const after = await channelsRepo.getById(row.id);
+      expect(after).not.toBeNull();
+      expect(after!.active).toBe(false);
+    });
   });
 });

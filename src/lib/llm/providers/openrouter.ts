@@ -60,7 +60,9 @@ export function toOpenAIMessages(system: string, messages: LLMMessage[]): OAIMes
     } else {
       // user role: tool_results viram role='tool'; texto puro segue role='user'.
       const tool_results = m.content.filter(
-        (b): b is { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean } =>
+        (
+          b,
+        ): b is { type: 'tool_result'; tool_use_id: string; content: string; is_error?: boolean } =>
           b.type === 'tool_result',
       );
       const text = m.content

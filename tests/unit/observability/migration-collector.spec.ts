@@ -18,10 +18,7 @@ import {
   type MigrationCollectorDeps,
 } from '../../../src/observability/migration-collector.js';
 import { renderPrometheus, _resetForTests as resetMetrics } from '../../../src/lib/metrics.js';
-import type {
-  MigrationEntryStatus,
-  SchemaReadiness,
-} from '../../../src/migrations/types.js';
+import type { MigrationEntryStatus, SchemaReadiness } from '../../../src/migrations/types.js';
 
 const MANIFEST = {
   schema_manifest_version: 1,
@@ -135,7 +132,9 @@ describe('head esperado vs. aplicado', () => {
     // `missing_file`: fingir uma posição para esse id seria inventar ordem onde
     // não há. O bloqueio de readiness já cobre o caso; a série não mente sobre
     // ele.
-    const g = await migrationGaugeSnapshot(deps(healthy({ applied_head: '099_de_outra_build.sql' })));
+    const g = await migrationGaugeSnapshot(
+      deps(healthy({ applied_head: '099_de_outra_build.sql' })),
+    );
     expect(g[HEAD_SERIES.applied]).toBeNaN();
   });
 });
@@ -225,7 +224,15 @@ describe('as séries chegam ao /metrics', () => {
     resetMetrics();
     _resetMigrationCollectorForTests();
     registerMigrationGauges(
-      deps(healthy({ ready: false, state: 'blocked', applied_head: '001_a.sql', pending_count: 2, dirty_count: 1 })),
+      deps(
+        healthy({
+          ready: false,
+          state: 'blocked',
+          applied_head: '001_a.sql',
+          pending_count: 2,
+          dirty_count: 1,
+        }),
+      ),
     );
     const body = await renderPrometheus();
     expect(body).toMatch(/^maia_schema_migration_head\{kind="expected"\} 3$/m);
@@ -248,9 +255,7 @@ describe('as séries chegam ao /metrics', () => {
   it('é fiado a partir de registerRuntimeObservability, o ponto de registro do boot', async () => {
     resetMetrics();
     _resetMigrationCollectorForTests();
-    const { registerRuntimeObservability } = await import(
-      '../../../src/observability/register.js'
-    );
+    const { registerRuntimeObservability } = await import('../../../src/observability/register.js');
     await registerRuntimeObservability();
     const body = await renderPrometheus();
     expect(body).toMatch(/^maia_schema_migrations_pending (NaN|\d+)$/m);

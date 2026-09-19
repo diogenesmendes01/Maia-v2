@@ -70,11 +70,7 @@ export class OnboardingError extends Error {
   readonly code: OnboardingErrorCode;
   readonly details: Record<string, unknown>;
 
-  constructor(
-    code: OnboardingErrorCode,
-    message: string,
-    details: Record<string, unknown> = {},
-  ) {
+  constructor(code: OnboardingErrorCode, message: string, details: Record<string, unknown> = {}) {
     super(message);
     this.name = 'OnboardingError';
     this.code = code;

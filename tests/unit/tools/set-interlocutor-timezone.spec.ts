@@ -34,9 +34,8 @@ function mkCtx(preferencias: Record<string, unknown> = {}) {
 
 describe('set_interlocutor_timezone tool', () => {
   it('persists a valid IANA zone into preferencias.timezone and audits', async () => {
-    const { setInterlocutorTimezoneTool } = await import(
-      '../../../src/tools/set-interlocutor-timezone.js'
-    );
+    const { setInterlocutorTimezoneTool } =
+      await import('../../../src/tools/set-interlocutor-timezone.js');
     const result = await setInterlocutorTimezoneTool.handler(
       { timezone: 'Europe/Lisbon' },
       mkCtx({ idioma: 'pt' }),
@@ -54,9 +53,8 @@ describe('set_interlocutor_timezone tool', () => {
   });
 
   it('rejects an invalid timezone at the schema boundary (no write, no audit)', async () => {
-    const { setInterlocutorTimezoneTool } = await import(
-      '../../../src/tools/set-interlocutor-timezone.js'
-    );
+    const { setInterlocutorTimezoneTool } =
+      await import('../../../src/tools/set-interlocutor-timezone.js');
     const parsed = setInterlocutorTimezoneTool.input_schema.safeParse({
       timezone: 'Mars/Phobos',
     });
@@ -66,9 +64,8 @@ describe('set_interlocutor_timezone tool', () => {
   });
 
   it('is gated by the schedule_reminder action and is a self-scoped write', async () => {
-    const { setInterlocutorTimezoneTool } = await import(
-      '../../../src/tools/set-interlocutor-timezone.js'
-    );
+    const { setInterlocutorTimezoneTool } =
+      await import('../../../src/tools/set-interlocutor-timezone.js');
     expect(setInterlocutorTimezoneTool.required_actions).toEqual(['schedule_reminder']);
     expect(setInterlocutorTimezoneTool.side_effect).toBe('write');
   });

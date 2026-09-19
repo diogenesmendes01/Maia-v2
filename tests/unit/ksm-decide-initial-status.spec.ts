@@ -13,12 +13,7 @@ import type {
 } from '@/control-plane/knowledge-state-machine/types.js';
 
 const RISKS: KnowledgeRiskLevel[] = ['low', 'medium', 'high', 'critical'];
-const KINDS_NON_RULE: KnowledgeKind[] = [
-  'fact',
-  'memory',
-  'behavioral_hint',
-  'procedure_hint',
-];
+const KINDS_NON_RULE: KnowledgeKind[] = ['fact', 'memory', 'behavioral_hint', 'procedure_hint'];
 
 describe('P10a decideInitialStatus — kind=rule always pending_review', () => {
   it('returns pending_review regardless of risk, confidence, sensitivity', () => {

@@ -64,14 +64,12 @@ export function createExportSweepPorts(): ExportSweepPorts {
     // remoção do dado de um tenant apareceria no balde `system`, e o operador
     // daquele tenant nunca a veria na própria trilha.
     finalize: (record) =>
-      runWithTenantContext(
-        { tenant_id: record.tenant_id, agent_id: record.agent_id },
-        () => finalizeExportPurge(record),
+      runWithTenantContext({ tenant_id: record.tenant_id, agent_id: record.agent_id }, () =>
+        finalizeExportPurge(record),
       ),
     recordRefusal: (record) =>
-      runWithTenantContext(
-        { tenant_id: record.tenant_id, agent_id: record.agent_id },
-        () => recordExportPurgeRefusal(record),
+      runWithTenantContext({ tenant_id: record.tenant_id, agent_id: record.agent_id }, () =>
+        recordExportPurgeRefusal(record),
       ),
     log: (event, detail) => logger.warn(detail, event),
   };

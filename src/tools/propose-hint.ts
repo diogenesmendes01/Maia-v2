@@ -9,27 +9,15 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/index.js';
-import {
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import type {
   KnowledgeKind,
   KnowledgeScope,
 } from '@/control-plane/knowledge-state-machine/types.js';
 
 const inputSchema = z.object({
-  hint_kind: z
-    .enum(['behavioral_hint', 'procedure_hint'])
-    .default('behavioral_hint'),
-  scope_type: z.enum([
-    'interlocutor',
-    'role',
-    'channel',
-    'conversation',
-    'agent',
-    'tenant',
-  ]),
+  hint_kind: z.enum(['behavioral_hint', 'procedure_hint']).default('behavioral_hint'),
+  scope_type: z.enum(['interlocutor', 'role', 'channel', 'conversation', 'agent', 'tenant']),
   subject_id: z.string().optional(),
   hint_text: z.string().min(1).max(2000),
   derived_from_memory_id: z.string().uuid().optional(),
@@ -86,9 +74,7 @@ export const proposeHintTool: Tool<typeof inputSchema, typeof outputSchema> = {
       agent_id: getCurrentAgent(),
       kind,
       scope,
-      ...(args.subject_id !== undefined
-        ? { scope_value: args.subject_id }
-        : {}),
+      ...(args.subject_id !== undefined ? { scope_value: args.subject_id } : {}),
       key: args.hint_kind,
       content: {
         scope_type: args.scope_type,
@@ -115,8 +101,7 @@ export const proposeHintTool: Tool<typeof inputSchema, typeof outputSchema> = {
       },
     });
 
-    const initial_status =
-      result.initial_status === 'ephemeral' ? 'ephemeral' : 'pending_review';
+    const initial_status = result.initial_status === 'ephemeral' ? 'ephemeral' : 'pending_review';
 
     return {
       proposal_id: result.proposal_id,

@@ -10,11 +10,7 @@
  *
  * PURE module: no `process.env` read, no side effects.
  */
-import {
-  type ConfigProblem,
-  type MaiaProfile,
-  MAIA_PROFILES,
-} from '@/config/metadata.js';
+import { type ConfigProblem, type MaiaProfile, MAIA_PROFILES } from '@/config/metadata.js';
 
 export { MAIA_PROFILES };
 export type { MaiaProfile };
@@ -52,9 +48,7 @@ export interface ResolvedProfile {
  * profile and reports a problem, so `maia config check` can list EVERY finding
  * in a single run instead of dying on the first one.
  */
-export function resolveProfile(
-  env: Record<string, string | undefined>,
-): ResolvedProfile {
+export function resolveProfile(env: Record<string, string | undefined>): ResolvedProfile {
   const rawMaiaEnv = env.MAIA_ENV?.trim();
   const nodeEnv = env.NODE_ENV?.trim();
   const problems: ConfigProblem[] = [];
@@ -70,9 +64,7 @@ export function resolveProfile(
     return { profile: profileFromNodeEnv(nodeEnv), explicit: false, problems };
   }
 
-  const profile: MaiaProfile = isMaiaProfile(rawMaiaEnv)
-    ? rawMaiaEnv
-    : profileFromNodeEnv(nodeEnv);
+  const profile: MaiaProfile = isMaiaProfile(rawMaiaEnv) ? rawMaiaEnv : profileFromNodeEnv(nodeEnv);
   const explicit = isMaiaProfile(rawMaiaEnv);
 
   if (explicit && nodeEnv && !COMPATIBLE_NODE_ENV[profile].includes(nodeEnv)) {

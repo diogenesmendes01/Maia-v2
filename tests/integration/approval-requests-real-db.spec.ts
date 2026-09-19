@@ -146,15 +146,27 @@ d('approval store — DB real (migration 095)', () => {
 
     // (4) consume com token errado falha; com o certo, uma única vez.
     const wrong = await inPrimary(() =>
-      approvalRequestsRepo.consume({ id: request!.id, claim_token: 'token-errado', result_ref: null }),
+      approvalRequestsRepo.consume({
+        id: request!.id,
+        claim_token: 'token-errado',
+        result_ref: null,
+      }),
     );
     expect(wrong).toBeNull();
     const consumed = await inPrimary(() =>
-      approvalRequestsRepo.consume({ id: request!.id, claim_token: winnerToken, result_ref: 'tx-1' }),
+      approvalRequestsRepo.consume({
+        id: request!.id,
+        claim_token: winnerToken,
+        result_ref: 'tx-1',
+      }),
     );
     expect(consumed?.status).toBe('consumed');
     const replay = await inPrimary(() =>
-      approvalRequestsRepo.consume({ id: request!.id, claim_token: winnerToken, result_ref: 'tx-2' }),
+      approvalRequestsRepo.consume({
+        id: request!.id,
+        claim_token: winnerToken,
+        result_ref: 'tx-2',
+      }),
     );
     expect(replay).toBeNull();
   });

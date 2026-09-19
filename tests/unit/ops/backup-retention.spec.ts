@@ -36,14 +36,16 @@ function candidate(over: Partial<RetentionCandidate> = {}): RetentionCandidate {
   };
 }
 
-function store(opts: {
-  candidates?: RetentionCandidate[];
-  held?: boolean;
-  holdUnavailable?: boolean;
-  lyingDelete?: boolean;
-  deleteThrowsFor?: string;
-  listThrows?: boolean;
-} = {}) {
+function store(
+  opts: {
+    candidates?: RetentionCandidate[];
+    held?: boolean;
+    holdUnavailable?: boolean;
+    lyingDelete?: boolean;
+    deleteThrowsFor?: string;
+    listThrows?: boolean;
+  } = {},
+) {
   const present = new Set((opts.candidates ?? [candidate()]).map((c) => c.backup_id));
   const audits: { action: string; metadata: Record<string, unknown> }[] = [];
   const logs: { event: string; detail: Record<string, unknown> }[] = [];

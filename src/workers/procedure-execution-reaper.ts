@@ -3,10 +3,7 @@ import { logger } from '@/lib/logger.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { db, withTx } from '@/db/client.js';
 import { procedure_executions } from '@/db/schema.js';
-import {
-  procedureExecutionsRepo,
-  procedureExecutionEventsRepo,
-} from '@/db/repositories.js';
+import { procedureExecutionsRepo, procedureExecutionEventsRepo } from '@/db/repositories.js';
 
 /**
  * P3c Task 9 — `procedure-execution-reaper`.

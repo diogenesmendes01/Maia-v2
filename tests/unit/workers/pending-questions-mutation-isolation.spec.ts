@@ -201,7 +201,12 @@ describe('#355 H2 — pendingQuestionsRepo.cancelOpenForConversaTx() cancels ONL
       openRow({ id: 'A-open', tenant_id: 'tenant-A', agent_id: 'agent-A', conversa_id: 'conv-x' }),
       openRow({ id: 'B-open', tenant_id: 'tenant-B', agent_id: 'agent-B', conversa_id: 'conv-x' }),
       // tenant-A but a different agent on the same conversa — untouched.
-      openRow({ id: 'A-otherAgent', tenant_id: 'tenant-A', agent_id: 'agent-Z', conversa_id: 'conv-x' }),
+      openRow({
+        id: 'A-otherAgent',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-Z',
+        conversa_id: 'conv-x',
+      }),
     ]);
     const { pendingQuestionsRepo } = await import('@/db/repositories.js');
 

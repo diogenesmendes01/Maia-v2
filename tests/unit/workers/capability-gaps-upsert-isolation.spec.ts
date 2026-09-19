@@ -127,7 +127,7 @@ describe("#370 — capabilityGapsRepo.upsert() bumps ONLY the current tenant/age
     expect(stored.agent_id).toBe('agent-A');
   });
 
-  it("does NOT bump a tenant-B row whose id collides when tenant-A has NO matching gap", async () => {
+  it('does NOT bump a tenant-B row whose id collides when tenant-A has NO matching gap', async () => {
     // tenant-B owns the only row for this id+description. tenant-A's SELECT finds
     // nothing of its own, so it falls through to INSERT a NEW row — it must never
     // reach into tenant-B's row via the (old) id-only UPDATE arm.
@@ -143,7 +143,9 @@ describe("#370 — capabilityGapsRepo.upsert() bumps ONLY the current tenant/age
     // tenant-B's row is never bumped.
     expect(store.rows.find((r) => r.tenant_id === 'tenant-B')!.frequency_score).toBe(42);
     // A fresh tenant-A row was inserted instead.
-    const a = store.rows.find((r) => r.tenant_id === 'tenant-A' && r.capability_description === DESC);
+    const a = store.rows.find(
+      (r) => r.tenant_id === 'tenant-A' && r.capability_description === DESC,
+    );
     expect(a).toBeDefined();
   });
 });

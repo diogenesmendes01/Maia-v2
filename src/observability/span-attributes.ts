@@ -33,10 +33,7 @@ import { looksLikePii } from './labels.js';
 /** A value OTLP can encode without a nested structure. */
 export type SpanAttributeValue = string | number | boolean;
 
-export type SpanAttributes = Record<
-  string,
-  string | number | boolean | null | undefined
->;
+export type SpanAttributes = Record<string, string | number | boolean | null | undefined>;
 
 export type SpanAttributeViolationReason =
   | 'key_not_allowed'
@@ -66,8 +63,7 @@ export interface SanitizeSpanAttributesResult {
  * The exemption is narrow by construction: it only accepts a full canonical
  * UUID, which cannot encode a phone number, an e-mail or free text.
  */
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * Shape guard for non-UUID string values. Same spirit as `SAFE_VALUE_RE` in
@@ -159,10 +155,7 @@ export function sanitizeSpanAttributes(
       out[key] = SANITIZED_VALUE;
       continue;
     }
-    if (
-      value.length > MAX_SPAN_ATTRIBUTE_VALUE_LENGTH ||
-      !SAFE_SPAN_VALUE_RE.test(value)
-    ) {
+    if (value.length > MAX_SPAN_ATTRIBUTE_VALUE_LENGTH || !SAFE_SPAN_VALUE_RE.test(value)) {
       violations.push({ key, reason: 'value_shape' });
       out[key] = SANITIZED_VALUE;
       continue;

@@ -6,10 +6,7 @@ import { pendingQuestionsRepo } from '@/db/repositories.js';
 import { withTx } from '@/db/client.js';
 import { audit } from '@/governance/audit.js';
 import { resolveAndDispatch } from './pending-resolver.js';
-import {
-  getTurnExecutionContext,
-  turnOwnershipLost,
-} from '@/runtime/turns/execution-context.js';
+import { getTurnExecutionContext, turnOwnershipLost } from '@/runtime/turns/execution-context.js';
 import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 
 export type GateResult =
@@ -134,10 +131,7 @@ async function haikuClassifier(
     // (A revisão do dono derrubou o argumento anterior, que mandava o turno
     // seguir para o ReAct "cujo guard lança na hora": o guard só existe dentro
     // de `runReActLoop`, ~700 linhas de pipeline depois.)
-    logger.warn(
-      { status: gateResult.status },
-      'pending_gate.classify_failed',
-    );
+    logger.warn({ status: gateResult.status }, 'pending_gate.classify_failed');
     return null;
   }
   try {
@@ -211,8 +205,9 @@ async function applyTx(
   if (resolution.is_topic_change || resolution.is_cancellation) {
     const reason = resolution.is_cancellation ? 'cancelled' : 'topic_change';
     const cancel_reason = resolution.is_cancellation ? 'user_cancelled' : 'topic_change';
-    const audit_acao =
-      resolution.is_cancellation ? 'pending_cancelled' : 'pending_unresolved_topic_change';
+    const audit_acao = resolution.is_cancellation
+      ? 'pending_cancelled'
+      : 'pending_unresolved_topic_change';
     return await withTx(async (tx): Promise<GateResult> => {
       const locked = await pendingQuestionsRepo.findActiveForUpdate(tx, input.conversa.id);
       if (!locked || locked.id !== snapshot_id) {

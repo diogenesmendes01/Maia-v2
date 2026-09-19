@@ -34,9 +34,7 @@ function makeCtx(
     repos: {
       agentsRepo: {
         async findById(_id: string) {
-          return opts?.agent === undefined
-            ? { id: 'agent-a', tenant_id: 'tenant-A' }
-            : opts.agent;
+          return opts?.agent === undefined ? { id: 'agent-a', tenant_id: 'tenant-A' } : opts.agent;
         },
       },
       adminAuditLogRepo: {
@@ -65,9 +63,7 @@ function makeCtx(
           return [];
         },
         async findTaskById(_args: Record<string, unknown>) {
-          return opts?.task === undefined
-            ? { id: TASK_UUID, status: 'waiting_human' }
-            : opts.task;
+          return opts?.task === undefined ? { id: TASK_UUID, status: 'waiting_human' } : opts.task;
         },
         async upsertTask(args: Record<string, unknown>) {
           created.push(args);

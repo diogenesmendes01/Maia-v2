@@ -36,9 +36,7 @@ export async function runScheduling(): Promise<void> {
 
   for (const { tenant_id, agent_id } of tenants) {
     try {
-      const r = await runWithTenantContext({ tenant_id, agent_id }, () =>
-        runSchedulingTick(),
-      );
+      const r = await runWithTenantContext({ tenant_id, agent_id }, () => runSchedulingTick());
       totalClaimed += r.claimed;
       totalAdvanced += r.advanced + r.in_progress_advanced;
       tenantsProcessed++;

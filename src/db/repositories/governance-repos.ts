@@ -7,7 +7,7 @@ import {
   workflow_steps,
   system_health_events,
   dead_letter_jobs,
-  } from '../schema.js';
+} from '../schema.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import {
   getCurrentTenant,
@@ -57,7 +57,9 @@ export function workflowOpenStatusesAny(): SQL {
 }
 
 export const auditRepo = {
-  async write(input: Omit<AuditEntry, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<void> {
+  async write(
+    input: Omit<AuditEntry, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>,
+  ): Promise<void> {
     const guarded = applyTenantGuard(input);
     await db.insert(audit_log).values(guarded);
   },
@@ -137,15 +139,15 @@ export const auditRepo = {
         AND agent_id IS NOT NULL
         AND created_at >= now() - interval '24 hours'
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 };
 
 export const workflowsRepo = {
   // P83-C7: tenant-scoped workflow reads/writes.
-  async create(input: Omit<Workflow, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>): Promise<Workflow> {
+  async create(
+    input: Omit<Workflow, 'id' | 'tenant_id' | 'agent_id' | 'iniciado_em' | 'concluido_em'>,
+  ): Promise<Workflow> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(workflows).values(guarded).returning();
     return rows[0]!;
@@ -156,11 +158,13 @@ export const workflowsRepo = {
     const rows = await db
       .select()
       .from(workflows)
-      .where(and(
-        eq(workflows.id, id),
-        eq(workflows.tenant_id, tenant_id),
-        eq(workflows.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(workflows.id, id),
+          eq(workflows.tenant_id, tenant_id),
+          eq(workflows.agent_id, agent_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -172,11 +176,13 @@ export const workflowsRepo = {
     await db
       .update(workflows)
       .set(update)
-      .where(and(
-        eq(workflows.id, id),
-        eq(workflows.tenant_id, tenant_id),
-        eq(workflows.agent_id, agent_id),
-      ));
+      .where(
+        and(
+          eq(workflows.id, id),
+          eq(workflows.tenant_id, tenant_id),
+          eq(workflows.agent_id, agent_id),
+        ),
+      );
   },
   /**
    * Cancela um workflow VENCIDO por compare-and-swap, e diz se ESTA chamada foi
@@ -205,13 +211,15 @@ export const workflowsRepo = {
     const rows = await db
       .update(workflows)
       .set({ status: 'cancelado' })
-      .where(and(
-        eq(workflows.id, id),
-        eq(workflows.tenant_id, tenant_id),
-        eq(workflows.agent_id, agent_id),
-        inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
-        sql`${workflows.proxima_acao_em} <= now()`,
-      ))
+      .where(
+        and(
+          eq(workflows.id, id),
+          eq(workflows.tenant_id, tenant_id),
+          eq(workflows.agent_id, agent_id),
+          inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
+          sql`${workflows.proxima_acao_em} <= now()`,
+        ),
+      )
       .returning({ id: workflows.id });
     return rows.length > 0;
   },
@@ -221,11 +229,13 @@ export const workflowsRepo = {
     return db
       .select()
       .from(workflows)
-      .where(and(
-        eq(workflows.tenant_id, tenant_id),
-        eq(workflows.agent_id, agent_id),
-        inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
-      ));
+      .where(
+        and(
+          eq(workflows.tenant_id, tenant_id),
+          eq(workflows.agent_id, agent_id),
+          inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
+        ),
+      );
   },
   /**
    * Issue #363 — tenant-scoped read of open workflows for a set of entidades,
@@ -244,12 +254,14 @@ export const workflowsRepo = {
     return db
       .select()
       .from(workflows)
-      .where(and(
-        eq(workflows.tenant_id, tenant_id),
-        eq(workflows.agent_id, agent_id),
-        inArray(workflows.entidade_id, entidades),
-        inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
-      ))
+      .where(
+        and(
+          eq(workflows.tenant_id, tenant_id),
+          eq(workflows.agent_id, agent_id),
+          inArray(workflows.entidade_id, entidades),
+          inArray(workflows.status, WORKFLOW_OPEN_STATUSES),
+        ),
+      )
       .orderBy(desc(workflows.iniciado_em))
       .limit(limit);
   },
@@ -276,9 +288,7 @@ export const workflowsRepo = {
         AND agent_id IS NOT NULL
         AND status = ${workflowOpenStatusesAny()}
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 };
 
@@ -306,11 +316,13 @@ export const workflowStepsRepo = {
     return db
       .select()
       .from(workflow_steps)
-      .where(and(
-        eq(workflow_steps.tenant_id, tenant_id),
-        eq(workflow_steps.agent_id, agent_id),
-        eq(workflow_steps.workflow_id, workflow_id),
-      ))
+      .where(
+        and(
+          eq(workflow_steps.tenant_id, tenant_id),
+          eq(workflow_steps.agent_id, agent_id),
+          eq(workflow_steps.workflow_id, workflow_id),
+        ),
+      )
       .orderBy(workflow_steps.ordem);
   },
 };

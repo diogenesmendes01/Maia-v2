@@ -55,10 +55,7 @@ describe('KnowledgeSliceBuilder', () => {
       fact('f4', 'observed'),
       fact('f5', 'ephemeral'),
     ];
-    const rules = [
-      rule('r1', 'active'),
-      rule('r2', 'verified'),
-    ];
+    const rules = [rule('r1', 'active'), rule('r2', 'verified')];
     const builder = new KnowledgeSliceBuilder(mkRepo(facts, rules), cache);
     const r = await builder.build({
       base: mockBase(),
@@ -71,15 +68,8 @@ describe('KnowledgeSliceBuilder', () => {
   });
 
   it('NEVER exposes proposed lifecycle status (invariant)', async () => {
-    const facts = [
-      fact('f1', 'active'),
-      fact('f2', 'proposed'),
-      fact('f3', 'verified'),
-    ];
-    const rules = [
-      rule('r1', 'proposed'),
-      rule('r2', 'active'),
-    ];
+    const facts = [fact('f1', 'active'), fact('f2', 'proposed'), fact('f3', 'verified')];
+    const rules = [rule('r1', 'proposed'), rule('r2', 'active')];
     const builder = new KnowledgeSliceBuilder(mkRepo(facts, rules), cache);
     const r = await builder.build({
       base: mockBase(),
@@ -93,10 +83,7 @@ describe('KnowledgeSliceBuilder', () => {
   });
 
   it('NEVER exposes pending_review lifecycle status (invariant)', async () => {
-    const facts = [
-      fact('f1', 'pending_review'),
-      fact('f2', 'active'),
-    ];
+    const facts = [fact('f1', 'pending_review'), fact('f2', 'active')];
     const rules = [rule('r1', 'pending_review')];
     const builder = new KnowledgeSliceBuilder(mkRepo(facts, rules), cache);
     const r = await builder.build({
@@ -110,11 +97,7 @@ describe('KnowledgeSliceBuilder', () => {
   });
 
   it('drops any lifecycle status not in the allowlist', async () => {
-    const facts = [
-      fact('f1', 'archived'),
-      fact('f2', 'draft'),
-      fact('f3', 'active'),
-    ];
+    const facts = [fact('f1', 'archived'), fact('f2', 'draft'), fact('f3', 'active')];
     const builder = new KnowledgeSliceBuilder(mkRepo(facts, []), cache);
     const r = await builder.build({
       base: mockBase(),
@@ -180,7 +163,11 @@ describe('KnowledgeSliceBuilder', () => {
     /**
      * Entity-scoped fact factory: sets scope='entity' and attaches entity_id.
      */
-    const entityFact = (key: string, entityId: string, lifecycle_status = 'active'): FactRecord => ({
+    const entityFact = (
+      key: string,
+      entityId: string,
+      lifecycle_status = 'active',
+    ): FactRecord => ({
       key,
       value: `entity-val-${key}`,
       scope: 'entity',
@@ -239,8 +226,12 @@ describe('KnowledgeSliceBuilder', () => {
     it('entity A fact IS included when entity A is authorized', async () => {
       const entityAFact = entityFact('secret-A', 'entity-A');
       const repo: KnowledgeRepoPort = {
-        async listFacts() { return [entityAFact]; },
-        async listRules() { return []; },
+        async listFacts() {
+          return [entityAFact];
+        },
+        async listRules() {
+          return [];
+        },
       };
       const builder = new KnowledgeSliceBuilder(repo, cache);
       const result = await builder.build({
@@ -259,8 +250,12 @@ describe('KnowledgeSliceBuilder', () => {
       const eA = entityFact('fa', 'entity-A');
       const eB = entityFact('fb', 'entity-B');
       const repo: KnowledgeRepoPort = {
-        async listFacts() { return [eA, eB]; },
-        async listRules() { return []; },
+        async listFacts() {
+          return [eA, eB];
+        },
+        async listRules() {
+          return [];
+        },
       };
       const builder = new KnowledgeSliceBuilder(repo, cache);
       const result = await builder.build({

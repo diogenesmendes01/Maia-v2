@@ -41,10 +41,7 @@ function isRequired(spec: EnvVarSpec, profile: MaiaProfile): boolean {
 }
 
 /** Manifest for one service in one profile. */
-export function manifestForService(
-  service: MaiaService,
-  profile: MaiaProfile,
-): ServiceManifest {
+export function manifestForService(service: MaiaService, profile: MaiaProfile): ServiceManifest {
   const variables = entriesForService(service).map((spec) => ({
     name: spec.name,
     secret: spec.secret,

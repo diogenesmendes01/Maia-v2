@@ -32,12 +32,16 @@ import {
   PROBE_CONTEXT,
 } from '@/probe/constants.js';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 let pool: pg.Pool;
 
-async function q<R extends pg.QueryResultRow>(text: string, params?: unknown[]): Promise<pg.QueryResult<R>> {
+async function q<R extends pg.QueryResultRow>(
+  text: string,
+  params?: unknown[],
+): Promise<pg.QueryResult<R>> {
   const c = await pool.connect();
   try {
     return await c.query<R>(text, params);
@@ -47,7 +51,9 @@ async function q<R extends pg.QueryResultRow>(text: string, params?: unknown[]):
 }
 
 /** Insere um "turno completo" simulado no tenant da sonda e devolve os ids. */
-async function seedTurn(wid: string): Promise<{ conversaId: string; inboundId: string; outId: string }> {
+async function seedTurn(
+  wid: string,
+): Promise<{ conversaId: string; inboundId: string; outId: string }> {
   const conv = await q<{ id: string }>(
     `INSERT INTO conversas (tenant_id, agent_id, pessoa_id, channel_id, status)
      VALUES ($1,$2,$3,$4,'ativa') RETURNING id`,
@@ -82,7 +88,9 @@ async function cleanProbeRuntime(): Promise<void> {
   await q(`DELETE FROM transacoes WHERE tenant_id=$1`, [PROBE_TENANT_ID]);
   // wids de teste começam com 'probe-' — pega também a row plantada em 'primary'
   // pelo teste de vazamento (cross-tenant).
-  await q(`DELETE FROM mensagens WHERE tenant_id=$1 OR metadata->>'whatsapp_id' LIKE 'probe-%'`, [PROBE_TENANT_ID]);
+  await q(`DELETE FROM mensagens WHERE tenant_id=$1 OR metadata->>'whatsapp_id' LIKE 'probe-%'`, [
+    PROBE_TENANT_ID,
+  ]);
   await q(`DELETE FROM conversas WHERE tenant_id=$1`, [PROBE_TENANT_ID]);
   // restaura o canal ao estado semeado (inativo) — testes de ativação podem tê-lo ligado.
   await q(`UPDATE channels SET active=false WHERE tenant_id=$1`, [PROBE_TENANT_ID]);
@@ -102,12 +110,24 @@ if (SHOULD_RUN) {
 d('synthetic probe — state machine (durável)', () => {
   it('recordFailure → degraded no K-ésimo, com alert_pending; sobrevive a restart', async () => {
     const K = 3;
-    let r = await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: K });
+    let r = await syntheticProbeRepo.recordFailure({
+      tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
+      alert_after_k: K,
+    });
     expect(r.consecutive_failures).toBe(1);
     expect(r.transitioned_to_degraded).toBe(false);
-    r = await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: K });
+    r = await syntheticProbeRepo.recordFailure({
+      tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
+      alert_after_k: K,
+    });
     expect(r.consecutive_failures).toBe(2);
-    r = await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: K });
+    r = await syntheticProbeRepo.recordFailure({
+      tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
+      alert_after_k: K,
+    });
     expect(r.consecutive_failures).toBe(3);
     expect(r.transitioned_to_degraded).toBe(true);
 
@@ -120,8 +140,16 @@ d('synthetic probe — state machine (durável)', () => {
 
   it('recordOk reseta, marca recovered e limpa alert_pending', async () => {
     const K = 2;
-    await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: K });
-    await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: K });
+    await syntheticProbeRepo.recordFailure({
+      tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
+      alert_after_k: K,
+    });
+    await syntheticProbeRepo.recordFailure({
+      tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
+      alert_after_k: K,
+    });
     const rec = await syntheticProbeRepo.recordOk(PROBE_TENANT_ID, PROBE_AGENT_ID);
     expect(rec.recovered).toBe(true);
     const state = await syntheticProbeRepo.getState(PROBE_TENANT_ID, PROBE_AGENT_ID);
@@ -139,7 +167,11 @@ d('synthetic probe — state machine (durável)', () => {
   });
 
   it('K=1: a PRIMEIRA falha já transiciona para degradado + alerta (P2-E)', async () => {
-    const r = await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: 1 });
+    const r = await syntheticProbeRepo.recordFailure({
+      tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
+      alert_after_k: 1,
+    });
     expect(r.consecutive_failures).toBe(1);
     expect(r.transitioned_to_degraded).toBe(true);
     const state = await syntheticProbeRepo.getState(PROBE_TENANT_ID, PROBE_AGENT_ID);
@@ -149,7 +181,11 @@ d('synthetic probe — state machine (durável)', () => {
 
   it('NEVER GREEN: gauge cresce a partir do first_attempt_at (last_ok_at nulo)', async () => {
     // Uma sonda que falha desde o 1º tick: recordFailure carimba first_attempt_at.
-    await syntheticProbeRepo.recordFailure({ tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, alert_after_k: 3 });
+    await syntheticProbeRepo.recordFailure({
+      tenant_id: PROBE_TENANT_ID,
+      agent_id: PROBE_AGENT_ID,
+      alert_after_k: 3,
+    });
     // Envelhece a primeira tentativa 20min no passado, mantendo last_ok_at nulo.
     await q(
       `UPDATE synthetic_probe_state SET first_attempt_at = now() - interval '20 minutes', last_ok_at = NULL
@@ -213,14 +249,18 @@ d('synthetic probe — correlação, asserção e cleanup', () => {
     });
     expect(removed).toBe(1);
 
-    const tx = await q<{ n: string }>(`SELECT count(*) n FROM transacoes WHERE tenant_id=$1`, [PROBE_TENANT_ID]);
-    expect(Number(tx.rows[0]!.n)).toBe(0); // side-effect removido
-    const msgs = await q<{ n: string }>(`SELECT count(*) n FROM mensagens WHERE tenant_id=$1`, [PROBE_TENANT_ID]);
-    expect(Number(msgs.rows[0]!.n)).toBe(2); // in + out preservados (audit-pinned)
-    const aud = await q<{ n: string }>(`SELECT count(*) n FROM audit_log WHERE tenant_id=$1 AND mensagem_id=$2`, [
+    const tx = await q<{ n: string }>(`SELECT count(*) n FROM transacoes WHERE tenant_id=$1`, [
       PROBE_TENANT_ID,
-      inboundId,
     ]);
+    expect(Number(tx.rows[0]!.n)).toBe(0); // side-effect removido
+    const msgs = await q<{ n: string }>(`SELECT count(*) n FROM mensagens WHERE tenant_id=$1`, [
+      PROBE_TENANT_ID,
+    ]);
+    expect(Number(msgs.rows[0]!.n)).toBe(2); // in + out preservados (audit-pinned)
+    const aud = await q<{ n: string }>(
+      `SELECT count(*) n FROM audit_log WHERE tenant_id=$1 AND mensagem_id=$2`,
+      [PROBE_TENANT_ID, inboundId],
+    );
     expect(Number(aud.rows[0]!.n)).toBe(1); // trilha preservada
   });
 });
@@ -234,10 +274,18 @@ d('synthetic probe — sweep de TTL', () => {
       scenario: 'register_transaction_pendente',
       whatsapp_id: 'probe-orphan',
     });
-    const open = await syntheticProbeRepo.listOpenRunsOlderThan(PROBE_CONTEXT, new Date(Date.now() + 60_000), 100);
+    const open = await syntheticProbeRepo.listOpenRunsOlderThan(
+      PROBE_CONTEXT,
+      new Date(Date.now() + 60_000),
+      100,
+    );
     expect(open.some((r) => r.id === runId)).toBe(true);
     await syntheticProbeRepo.closeOrphanRun(PROBE_CONTEXT, runId);
-    const stillOpen = await syntheticProbeRepo.listOpenRunsOlderThan(PROBE_CONTEXT, new Date(Date.now() + 60_000), 100);
+    const stillOpen = await syntheticProbeRepo.listOpenRunsOlderThan(
+      PROBE_CONTEXT,
+      new Date(Date.now() + 60_000),
+      100,
+    );
     expect(stillOpen.some((r) => r.id === runId)).toBe(false);
   });
 });
@@ -273,14 +321,20 @@ d('synthetic probe — ativação atômica + auditada (P1-B)', () => {
       true,
     );
     expect(on?.active).toBe(true);
-    const dbRow = await q<{ active: boolean }>(`SELECT active FROM channels WHERE id=$1`, [PROBE_CHANNEL_ID]);
+    const dbRow = await q<{ active: boolean }>(`SELECT active FROM channels WHERE id=$1`, [
+      PROBE_CHANNEL_ID,
+    ]);
     expect(dbRow.rows[0]!.active).toBe(true);
   });
 
   it('setChannelActive RECUSA (null) um canal que não é is_synthetic', async () => {
     // um channel_id inexistente/não-sintético não casa o predicado atômico.
     const res = await syntheticProbeRepo.setChannelActive(
-      { tenant_id: PROBE_TENANT_ID, agent_id: PROBE_AGENT_ID, channel_id: '00000000-0000-0000-0000-0000000000aa' },
+      {
+        tenant_id: PROBE_TENANT_ID,
+        agent_id: PROBE_AGENT_ID,
+        channel_id: '00000000-0000-0000-0000-0000000000aa',
+      },
       true,
     );
     expect(res).toBeNull();

@@ -217,7 +217,7 @@ d('102 — data lifecycle is tenant-scoped and fail-closed', () => {
     await expect(insert()).rejects.toThrow(/privacy_requests_open_subject_uq|unique/i);
   });
 
-  it('never returns another tenant\'s tombstones from the reconciliation query', async () => {
+  it("never returns another tenant's tombstones from the reconciliation query", async () => {
     const watermark = new Date(Date.now() - 60_000);
     for (const [t, a] of [
       [T_A, A_A],

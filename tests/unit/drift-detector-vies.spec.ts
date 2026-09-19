@@ -46,7 +46,10 @@ function makeProfile() {
   });
 }
 
-function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {
+function makeAgentMsg(
+  text: string,
+  id = 'm-' + Math.random().toString(36).slice(2),
+): DriftRecentMessage {
   return { id, from: 'agent', text, created_at: new Date() };
 }
 
@@ -152,7 +155,12 @@ describe('viesDetector', () => {
     const out = await viesDetector.detect({
       profile_active: makeProfile(),
       recent_messages: [
-        { id: 'u1', from: 'user', text: 'Todos os clientes preferem PIX, né?', created_at: new Date() },
+        {
+          id: 'u1',
+          from: 'user',
+          text: 'Todos os clientes preferem PIX, né?',
+          created_at: new Date(),
+        },
       ],
     });
 

@@ -119,24 +119,20 @@ describe('#509 exposure — rollback flag', () => {
     vi.unstubAllEnvs();
   });
 
-  it(
-    'FEATURE_STRICT_TOOL_SCHEMAS=false restores the legacy stub without changing visibility',
-    async () => {
-      vi.resetModules();
-      vi.stubEnv('FEATURE_STRICT_TOOL_SCHEMAS', 'false');
-      const registry = await import('../../../src/tools/_registry.js');
-      const schemas = registry.getToolSchemas(OWNER());
-      expect(schemas.length).toBeGreaterThan(10);
-      for (const s of schemas) {
-        expect(s.input_schema).toEqual({ type: 'object', additionalProperties: true });
-      }
-      // The flag NEVER changes WHICH tools are visible — only how they are described.
-      expect(schemas.map((s) => s.name).sort()).toEqual(
-        getToolSchemas(OWNER())
-          .map((s) => s.name)
-          .sort(),
-      );
-    },
-    30_000,
-  );
+  it('FEATURE_STRICT_TOOL_SCHEMAS=false restores the legacy stub without changing visibility', async () => {
+    vi.resetModules();
+    vi.stubEnv('FEATURE_STRICT_TOOL_SCHEMAS', 'false');
+    const registry = await import('../../../src/tools/_registry.js');
+    const schemas = registry.getToolSchemas(OWNER());
+    expect(schemas.length).toBeGreaterThan(10);
+    for (const s of schemas) {
+      expect(s.input_schema).toEqual({ type: 'object', additionalProperties: true });
+    }
+    // The flag NEVER changes WHICH tools are visible — only how they are described.
+    expect(schemas.map((s) => s.name).sort()).toEqual(
+      getToolSchemas(OWNER())
+        .map((s) => s.name)
+        .sort(),
+    );
+  }, 30_000);
 });

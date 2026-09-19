@@ -128,7 +128,6 @@ beforeEach(async () => {
   capabilityGapsListByLevels.mockResolvedValue([]);
   procedureExecutionsFindActiveForConversa.mockResolvedValue(null);
   procedureDefinitionsFindById.mockResolvedValue(null);
-
 });
 
 describe('buildPrompt — injeção de "Modo operacional" (P6 Task 9)', () => {

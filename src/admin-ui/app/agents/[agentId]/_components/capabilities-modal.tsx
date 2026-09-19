@@ -48,9 +48,7 @@ export default function CapabilitiesModal({
 
   // Packs concedidos fora do catálogo (ex.: mcp.<server>) — preservados pelo
   // servidor; mostrados aqui só para o operador saber que existem.
-  const unmanaged = currentPackIds.filter(
-    (id) => id !== 'baseline.core' && !TOOL_PACKS[id],
-  );
+  const unmanaged = currentPackIds.filter((id) => id !== 'baseline.core' && !TOOL_PACKS[id]);
 
   const togglePack = (id: string) => {
     setSelected((prev) => {
@@ -90,9 +88,8 @@ export default function CapabilitiesModal({
       title="Gerenciar capacidades"
       description={
         <>
-          Packs de domínio e negações do agente{' '}
-          <code className="font-mono">{agentId}</code>. Menor privilégio: o
-          agente enxerga só o que a função exige.
+          Packs de domínio e negações do agente <code className="font-mono">{agentId}</code>. Menor
+          privilégio: o agente enxerga só o que a função exige.
         </>
       }
       footer={
@@ -108,14 +105,14 @@ export default function CapabilitiesModal({
     >
       <div className="space-y-5">
         <div>
-          <p className="mb-2 text-xs font-medium text-zinc-500">
-            Packs de domínio
-          </p>
+          <p className="mb-2 text-xs font-medium text-zinc-500">Packs de domínio</p>
           <ul className="space-y-2">
             <li className="flex items-center justify-between gap-2 rounded-lg border border-zinc-100 bg-zinc-50/60 px-3 py-2 opacity-70">
               <span className="flex items-center gap-2 text-sm text-zinc-800">
                 <input type="checkbox" checked disabled aria-label="baseline.core (fixo)" />
-                <span className="font-medium">{TOOL_PACKS['baseline.core']?.name ?? 'Baseline'}</span>
+                <span className="font-medium">
+                  {TOOL_PACKS['baseline.core']?.name ?? 'Baseline'}
+                </span>
                 <code className="font-mono text-2xs text-zinc-400">baseline.core</code>
               </span>
               <Badge tone="neutral">piso da plataforma</Badge>
@@ -129,11 +126,7 @@ export default function CapabilitiesModal({
                   className="flex items-center justify-between gap-2 rounded-lg border border-zinc-100 px-3 py-2"
                 >
                   <label className="flex cursor-pointer items-center gap-2 text-sm text-zinc-800">
-                    <input
-                      type="checkbox"
-                      checked={checked}
-                      onChange={() => togglePack(id)}
-                    />
+                    <input type="checkbox" checked={checked} onChange={() => togglePack(id)} />
                     <span className="font-medium">{def.name}</span>
                     <code className="font-mono text-2xs text-zinc-400">{id}</code>
                   </label>
@@ -161,13 +154,10 @@ export default function CapabilitiesModal({
         </div>
 
         <div>
-          <p className="mb-1 text-xs font-medium text-zinc-500">
-            Negações explícitas (hard deny)
-          </p>
+          <p className="mb-1 text-xs font-medium text-zinc-500">Negações explícitas (hard deny)</p>
           <p className="mb-2 text-xs text-zinc-500">
-            Ferramentas listadas aqui nunca ficam visíveis ao agente, mesmo que
-            um pack as conceda — e o dispatcher as recusa. Use o nome exato da
-            ferramenta.
+            Ferramentas listadas aqui nunca ficam visíveis ao agente, mesmo que um pack as conceda —
+            e o dispatcher as recusa. Use o nome exato da ferramenta.
           </p>
           <ListEditor
             items={deniedTools}

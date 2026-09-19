@@ -118,12 +118,12 @@ describe('risk_signal_classify (none, parse_only)', () => {
     const { riskSignalClassifyTool } = await import('@/tools/risk-signal-classify.js');
     expect(riskSignalClassifyTool.input_schema.safeParse({ topic: 'nope' }).success).toBe(false);
     // 4000 is the cap; 4001 must fail.
-    expect(
-      riskSignalClassifyTool.input_schema.safeParse({ text: 'x'.repeat(4001) }).success,
-    ).toBe(false);
-    expect(
-      riskSignalClassifyTool.input_schema.safeParse({ text: 'x'.repeat(4000) }).success,
-    ).toBe(true);
+    expect(riskSignalClassifyTool.input_schema.safeParse({ text: 'x'.repeat(4001) }).success).toBe(
+      false,
+    );
+    expect(riskSignalClassifyTool.input_schema.safeParse({ text: 'x'.repeat(4000) }).success).toBe(
+      true,
+    );
   });
 
   it('via the shared adapter directly: an adversarial gate cannot downgrade', async () => {
@@ -136,9 +136,8 @@ describe('risk_signal_classify (none, parse_only)', () => {
 
 describe('conversation_summary_compose (none, parse_only)', () => {
   it('declares the conservative baseline contract', async () => {
-    const { conversationSummaryComposeTool } = await import(
-      '@/tools/conversation-summary-compose.js'
-    );
+    const { conversationSummaryComposeTool } =
+      await import('@/tools/conversation-summary-compose.js');
     expect(conversationSummaryComposeTool.side_effect).toBe('none');
     expect(conversationSummaryComposeTool.operation_type).toBe('parse_only');
     expect(conversationSummaryComposeTool.required_actions).toEqual([]);
@@ -158,9 +157,8 @@ describe('conversation_summary_compose (none, parse_only)', () => {
         pending_actions: ['a1'],
       }),
     });
-    const { conversationSummaryComposeTool } = await import(
-      '@/tools/conversation-summary-compose.js'
-    );
+    const { conversationSummaryComposeTool } =
+      await import('@/tools/conversation-summary-compose.js');
     const out = await conversationSummaryComposeTool.handler({ limit: 50 } as never, ctx);
 
     // Reads the caller's own conversation only.
@@ -181,9 +179,8 @@ describe('conversation_summary_compose (none, parse_only)', () => {
 
   it('uses the caller-provided history WITHOUT hitting the DB', async () => {
     callLLMMock.mockResolvedValueOnce({ content: JSON.stringify({ summary: 's' }) });
-    const { conversationSummaryComposeTool } = await import(
-      '@/tools/conversation-summary-compose.js'
-    );
+    const { conversationSummaryComposeTool } =
+      await import('@/tools/conversation-summary-compose.js');
     const out = await conversationSummaryComposeTool.handler(
       { history: [{ direcao: 'in', conteudo: 'oi' }], limit: 50 } as never,
       ctx,
@@ -193,9 +190,8 @@ describe('conversation_summary_compose (none, parse_only)', () => {
   });
 
   it('does NOT accept a conversation_id input (no scope-escape vector)', async () => {
-    const { conversationSummaryComposeTool } = await import(
-      '@/tools/conversation-summary-compose.js'
-    );
+    const { conversationSummaryComposeTool } =
+      await import('@/tools/conversation-summary-compose.js');
     const parsed = conversationSummaryComposeTool.input_schema.parse({
       conversation_id: 'other',
     }) as Record<string, unknown>;
@@ -205,9 +201,7 @@ describe('conversation_summary_compose (none, parse_only)', () => {
 
 describe('conversation_state_update (write, update_meta)', () => {
   it('declares the write contract as agent-internal (no required action key)', async () => {
-    const { conversationStateUpdateTool } = await import(
-      '@/tools/conversation-state-update.js'
-    );
+    const { conversationStateUpdateTool } = await import('@/tools/conversation-state-update.js');
     expect(conversationStateUpdateTool.side_effect).toBe('write');
     expect(conversationStateUpdateTool.operation_type).toBe('update_meta');
     // Fix 3: reclassified to agent-internal bookkeeping — scope-gated, not
@@ -218,9 +212,7 @@ describe('conversation_state_update (write, update_meta)', () => {
 
   it('delegates to conversasRepo.mergeMetadataNamespace under agent_state for the CURRENT conversation', async () => {
     mergeMetadataNamespaceMock.mockResolvedValueOnce(true);
-    const { conversationStateUpdateTool } = await import(
-      '@/tools/conversation-state-update.js'
-    );
+    const { conversationStateUpdateTool } = await import('@/tools/conversation-state-update.js');
     const out = await conversationStateUpdateTool.handler(
       { patch: { topic_tag: 'suporte', resolved: true } } as never,
       ctx,
@@ -241,9 +233,7 @@ describe('conversation_state_update (write, update_meta)', () => {
     // Fix 2: mergeMetadataNamespace returns false (stale/divergent conversa) →
     // the tool must NOT report a fake success.
     mergeMetadataNamespaceMock.mockResolvedValueOnce(false);
-    const { conversationStateUpdateTool } = await import(
-      '@/tools/conversation-state-update.js'
-    );
+    const { conversationStateUpdateTool } = await import('@/tools/conversation-state-update.js');
     const out = await conversationStateUpdateTool.handler(
       { patch: { topic_tag: 'suporte' } } as never,
       ctx,
@@ -256,9 +246,7 @@ describe('conversation_state_update (write, update_meta)', () => {
 
   it('accepts a MATCHING conversation_id but REJECTS a divergent one (scope-escape)', async () => {
     mergeMetadataNamespaceMock.mockResolvedValue(true);
-    const { conversationStateUpdateTool } = await import(
-      '@/tools/conversation-state-update.js'
-    );
+    const { conversationStateUpdateTool } = await import('@/tools/conversation-state-update.js');
     // Matching id → allowed.
     await expect(
       conversationStateUpdateTool.handler(
@@ -283,9 +271,7 @@ describe('conversation_state_update (write, update_meta)', () => {
     // lands under metadata.agent_state.pending_question, never the governed
     // top-level key. The merge target is always the agent_state namespace.
     mergeMetadataNamespaceMock.mockResolvedValueOnce(true);
-    const { conversationStateUpdateTool } = await import(
-      '@/tools/conversation-state-update.js'
-    );
+    const { conversationStateUpdateTool } = await import('@/tools/conversation-state-update.js');
     const out = await conversationStateUpdateTool.handler(
       { patch: { pending_question: 'note-to-self' } } as never,
       ctx,
@@ -297,9 +283,7 @@ describe('conversation_state_update (write, update_meta)', () => {
   });
 
   it('input schema rejects an empty patch and deeply-nested values', async () => {
-    const { conversationStateUpdateTool } = await import(
-      '@/tools/conversation-state-update.js'
-    );
+    const { conversationStateUpdateTool } = await import('@/tools/conversation-state-update.js');
     // A nested object value is not an allowed scalar/flat-array.
     expect(
       conversationStateUpdateTool.input_schema.safeParse({ patch: { k: { nested: 1 } } }).success,

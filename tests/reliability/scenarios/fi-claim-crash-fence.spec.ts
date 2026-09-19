@@ -253,287 +253,275 @@ d('#510 FI-04/05/06/07 — claim, crash e fence com réplicas de PROCESSO', () =
   // ─────────────────────────────────────────────────────────────────────────
   // FI-04
   // ─────────────────────────────────────────────────────────────────────────
-  it(
-    'FI-04 — duas réplicas soltas pela MESMA barreira: exatamente um claim_token vence',
-    async () => {
-      const turn_id = await turnoNovo();
-      const oracle = new InvariantOracle({
-        pool,
-        escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
-        turnIds: [turn_id],
-      });
+  it('FI-04 — duas réplicas soltas pela MESMA barreira: exatamente um claim_token vence', async () => {
+    const turn_id = await turnoNovo();
+    const oracle = new InvariantOracle({
+      pool,
+      escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
+      turnIds: [turn_id],
+    });
 
-      // O gate segura o VENCEDOR logo depois do claim — é o que garante que a
-      // foto do banco seja tirada com a corrida já decidida e ninguém adiante.
-      servidor.arm('after_turn_claim_before_running', 'pause');
+    // O gate segura o VENCEDOR logo depois do claim — é o que garante que a
+    // foto do banco seja tirada com a corrida já decidida e ninguém adiante.
+    servidor.arm('after_turn_claim_before_running', 'pause');
 
-      const a = subirReplica('replica-a', turn_id, {
-        TEST_FI_BARREIRA: 'largada',
-        TEST_FI_ESCREVER: 'running',
-      });
-      const b = subirReplica('replica-b', turn_id, {
-        TEST_FI_BARREIRA: 'largada',
-        TEST_FI_ESCREVER: 'running',
-      });
+    const a = subirReplica('replica-a', turn_id, {
+      TEST_FI_BARREIRA: 'largada',
+      TEST_FI_ESCREVER: 'running',
+    });
+    const b = subirReplica('replica-b', turn_id, {
+      TEST_FI_BARREIRA: 'largada',
+      TEST_FI_ESCREVER: 'running',
+    });
 
-      // A LARGADA. Sem ela quem vence é quem terminou de importar primeiro —
-      // isso não é corrida, é sorteio de tempo de import.
-      await servidor.esperarNaBarreira('largada', 2, 60_000);
-      expect(servidor.abrirBarreira('largada')).toBe(2);
+    // A LARGADA. Sem ela quem vence é quem terminou de importar primeiro —
+    // isso não é corrida, é sorteio de tempo de import.
+    await servidor.esperarNaBarreira('largada', 2, 60_000);
+    expect(servidor.abrirBarreira('largada')).toBe(2);
 
-      const [pa, pb] = await Promise.all([prontidaoDe(a), prontidaoDe(b)]);
-      expect(a.pid).not.toBe(b.pid);
-      expect(pa.worker_id).not.toBe(pb.worker_id);
+    const [pa, pb] = await Promise.all([prontidaoDe(a), prontidaoDe(b)]);
+    expect(a.pid).not.toBe(b.pid);
+    expect(pa.worker_id).not.toBe(pb.worker_id);
 
-      const vencedores = [pa, pb].filter((p) => p.acquired);
-      const perdedores = [pa, pb].filter((p) => !p.acquired);
-      expect(
-        vencedores.length,
-        `esperava UM vencedor; a=${JSON.stringify(pa)} b=${JSON.stringify(pb)}`,
-      ).toBe(1);
-      const vencedor = vencedores[0]!;
-      const perdedor = perdedores[0]!;
+    const vencedores = [pa, pb].filter((p) => p.acquired);
+    const perdedores = [pa, pb].filter((p) => !p.acquired);
+    expect(
+      vencedores.length,
+      `esperava UM vencedor; a=${JSON.stringify(pa)} b=${JSON.stringify(pb)}`,
+    ).toBe(1);
+    const vencedor = vencedores[0]!;
+    const perdedor = perdedores[0]!;
 
-      // A recusa do perdedor tem MOTIVO. "Não conseguiu" sem motivo também
-      // seria o que um processo que nem tentou reportaria.
-      expect(perdedor.motivo).not.toBe('acquired');
-      expect(perdedor.motivo).not.toBe('nenhuma_tentativa');
+    // A recusa do perdedor tem MOTIVO. "Não conseguiu" sem motivo também
+    // seria o que um processo que nem tentou reportaria.
+    expect(perdedor.motivo).not.toBe('acquired');
+    expect(perdedor.motivo).not.toBe('nenhuma_tentativa');
 
-      // A REAÇÃO, no banco: um claim, uma tentativa, um dono.
-      const linha = await linhaDoTurno(turn_id);
-      expect(linha.status).toBe('claimed');
-      expect(linha.attempt_count, 'duas réplicas contaram duas tentativas').toBe(1);
-      expect(linha.claim_token).toBe(vencedor.claim_token);
-      expect(linha.claimed_by).toBe(vencedor.worker_id);
+    // A REAÇÃO, no banco: um claim, uma tentativa, um dono.
+    const linha = await linhaDoTurno(turn_id);
+    expect(linha.status).toBe('claimed');
+    expect(linha.attempt_count, 'duas réplicas contaram duas tentativas').toBe(1);
+    expect(linha.claim_token).toBe(vencedor.claim_token);
+    expect(linha.claimed_by).toBe(vencedor.worker_id);
 
-      // E ela se mantém: o perdedor continua VIVO e insistindo? Não — ele
-      // tentou uma vez. O que se afirma aqui é que nada se move enquanto o
-      // vencedor está parado no gate.
-      await estavelDurante(
-        async () => {
-          const l = await linhaDoTurno(turn_id);
-          return { claim_token: l.claim_token, attempt: l.attempt_count, versao: l.state_version };
-        },
-        {
-          label: 'a posse do turno não muda enquanto o vencedor está no gate',
-          janelaMs: 1_200,
-          justificativa:
-            'não existe evento de "claim que não aconteceu"; a única prova é observar a janela',
-        },
-      );
+    // E ela se mantém: o perdedor continua VIVO e insistindo? Não — ele
+    // tentou uma vez. O que se afirma aqui é que nada se move enquanto o
+    // vencedor está parado no gate.
+    await estavelDurante(
+      async () => {
+        const l = await linhaDoTurno(turn_id);
+        return { claim_token: l.claim_token, attempt: l.attempt_count, versao: l.state_version };
+      },
+      {
+        label: 'a posse do turno não muda enquanto o vencedor está no gate',
+        janelaMs: 1_200,
+        justificativa:
+          'não existe evento de "claim que não aconteceu"; a única prova é observar a janela',
+      },
+    );
 
-      await oracle.assertInvariantes('FI-04');
+    await oracle.assertInvariantes('FI-04');
 
-      // CASO DE CONTROLE do fence: liberado, o vencedor grava com o token
-      // VIGENTE e a gravação PASSA. Sem isto, a recusa de FI-07 também
-      // passaria num fixture que simplesmente não sabe gravar.
-      servidor.liberar('after_turn_claim_before_running');
-      const escritaDoVencedor = await eventually(
-        () => linhasDe(vencedor === pa ? a : b, '##fi-escrita##').at(-1),
-        { label: 'o vencedor grava markRunning com o token vigente', timeoutMs: 15_000 },
-      );
-      expect(escritaDoVencedor).toMatchObject({ operacao: 'markRunning', ok: true, conflict: null });
-      expect((await linhaDoTurno(turn_id)).status).toBe('running');
-    },
-    180_000,
-  );
+    // CASO DE CONTROLE do fence: liberado, o vencedor grava com o token
+    // VIGENTE e a gravação PASSA. Sem isto, a recusa de FI-07 também
+    // passaria num fixture que simplesmente não sabe gravar.
+    servidor.liberar('after_turn_claim_before_running');
+    const escritaDoVencedor = await eventually(
+      () => linhasDe(vencedor === pa ? a : b, '##fi-escrita##').at(-1),
+      { label: 'o vencedor grava markRunning com o token vigente', timeoutMs: 15_000 },
+    );
+    expect(escritaDoVencedor).toMatchObject({ operacao: 'markRunning', ok: true, conflict: null });
+    expect((await linhaDoTurno(turn_id)).status).toBe('running');
+  }, 180_000);
 
   // ─────────────────────────────────────────────────────────────────────────
   // FI-05
   // ─────────────────────────────────────────────────────────────────────────
-  it(
-    'FI-05 — SIGKILL no dono parado no failpoint: o sucessor assume, e só depois do prazo',
-    async () => {
-      const turn_id = await turnoNovo();
-      const oracle = new InvariantOracle({
-        pool,
-        escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
-        turnIds: [turn_id],
-      });
+  it('FI-05 — SIGKILL no dono parado no failpoint: o sucessor assume, e só depois do prazo', async () => {
+    const turn_id = await turnoNovo();
+    const oracle = new InvariantOracle({
+      pool,
+      escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
+      turnIds: [turn_id],
+    });
 
-      servidor.arm('after_turn_claim_before_running', 'pause');
-      const a = subirReplica('dono', turn_id);
-      const pa = await prontidaoDe(a);
-      expect(pa.acquired, `o dono não conseguiu o claim: ${JSON.stringify(pa)}`).toBe(true);
+    servidor.arm('after_turn_claim_before_running', 'pause');
+    const a = subirReplica('dono', turn_id);
+    const pa = await prontidaoDe(a);
+    expect(pa.acquired, `o dono não conseguiu o claim: ${JSON.stringify(pa)}`).toBe(true);
 
-      // O anúncio traz os IDs — o cenário CONFERE o estágio antes de agir, em
-      // vez de assumir que o processo já chegou onde deveria.
-      const evento = await servidor.waitForReached('after_turn_claim_before_running', {
-        timeoutMs: 30_000,
-      });
-      expect(evento.context).toMatchObject({ turn_id, attempt: 1, worker_id: pa.worker_id });
+    // O anúncio traz os IDs — o cenário CONFERE o estágio antes de agir, em
+    // vez de assumir que o processo já chegou onde deveria.
+    const evento = await servidor.waitForReached('after_turn_claim_before_running', {
+      timeoutMs: 30_000,
+    });
+    expect(evento.context).toMatchObject({ turn_id, attempt: 1, worker_id: pa.worker_id });
 
-      const antesDoCrash = await oracle.coletar();
-      const linhaAntes = await linhaDoTurno(turn_id);
+    const antesDoCrash = await oracle.coletar();
+    const linhaAntes = await linhaDoTurno(turn_id);
 
-      // ── O SUCESSOR SOBE ANTES DA MORTE, e PARA na barreira.
-      //
-      // Não é ordem estética: é o que impede o cenário de medir o tempo de
-      // IMPORT em vez da lease. O filho paga de 2s a 7s para carregar a frio o
-      // grafo de produção sob `tsx` (§7.1 do AGENTS.md), e o TTL desta suíte é
-      // de 6s. Subindo o sucessor DEPOIS do `hardKill`, esse import corre
-      // contra o prazo: numa máquina carregada a lease vence enquanto ele ainda
-      // está importando, ele entra na PRIMEIRA tentativa e o controle das
-      // recusas fica vermelho sem que nada da produção tenha mudado — foi
-      // exatamente o que a lane produziu quando a fatia E acrescentou um
-      // terceiro arquivo de cenário rodando em paralelo.
-      //
-      // Com a barreira, o import é pago enquanto o dono ainda está VIVO e
-      // parado no gate, e a primeira tentativa do sucessor acontece
-      // milissegundos depois do `SIGKILL` — que é o instante que o cenário diz
-      // estar observando. O relógio da lease continua sendo o do BANCO.
-      const b = subirReplica('sucessor', turn_id, {
-        TEST_FI_TENTATIVAS: '80',
-        TEST_FI_INTERVALO_MS: '250',
-        TEST_FI_BARREIRA: 'sucessor',
-      });
-      await servidor.esperarNaBarreira('sucessor', 1, 60_000);
+    // ── O SUCESSOR SOBE ANTES DA MORTE, e PARA na barreira.
+    //
+    // Não é ordem estética: é o que impede o cenário de medir o tempo de
+    // IMPORT em vez da lease. O filho paga de 2s a 7s para carregar a frio o
+    // grafo de produção sob `tsx` (§7.1 do AGENTS.md), e o TTL desta suíte é
+    // de 6s. Subindo o sucessor DEPOIS do `hardKill`, esse import corre
+    // contra o prazo: numa máquina carregada a lease vence enquanto ele ainda
+    // está importando, ele entra na PRIMEIRA tentativa e o controle das
+    // recusas fica vermelho sem que nada da produção tenha mudado — foi
+    // exatamente o que a lane produziu quando a fatia E acrescentou um
+    // terceiro arquivo de cenário rodando em paralelo.
+    //
+    // Com a barreira, o import é pago enquanto o dono ainda está VIVO e
+    // parado no gate, e a primeira tentativa do sucessor acontece
+    // milissegundos depois do `SIGKILL` — que é o instante que o cenário diz
+    // estar observando. O relógio da lease continua sendo o do BANCO.
+    const b = subirReplica('sucessor', turn_id, {
+      TEST_FI_TENTATIVAS: '80',
+      TEST_FI_INTERVALO_MS: '250',
+      TEST_FI_BARREIRA: 'sucessor',
+    });
+    await servidor.esperarNaBarreira('sucessor', 1, 60_000);
 
-      // A FALHA: `SIGKILL` num processo PARADO num ponto exato do caminho.
-      sup.hardKill(a);
-      const enc = await a.esperarSaida(10_000);
-      expect(enc.signal).toBe('SIGKILL');
+    // A FALHA: `SIGKILL` num processo PARADO num ponto exato do caminho.
+    sup.hardKill(a);
+    const enc = await a.esperarSaida(10_000);
+    expect(enc.signal).toBe('SIGKILL');
 
-      // Nada foi devolvido. Um `SIGKILL` não roda `finally`, e é isto que o
-      // distingue de um `throw` simulado: a posse do MORTO continua gravada,
-      // com o mesmo token e o prazo que o último heartbeat dele deixou.
-      const logoApos = await linhaDoTurno(turn_id);
-      expect(logoApos.claim_token).toBe(pa.claim_token);
-      expect(logoApos.claimed_by).toBe(pa.worker_id);
-      expect(logoApos.attempt_count).toBe(1);
-      expect(await jaVenceu(logoApos.lease_expires_at)).toBe(false);
+    // Nada foi devolvido. Um `SIGKILL` não roda `finally`, e é isto que o
+    // distingue de um `throw` simulado: a posse do MORTO continua gravada,
+    // com o mesmo token e o prazo que o último heartbeat dele deixou.
+    const logoApos = await linhaDoTurno(turn_id);
+    expect(logoApos.claim_token).toBe(pa.claim_token);
+    expect(logoApos.claimed_by).toBe(pa.worker_id);
+    expect(logoApos.attempt_count).toBe(1);
+    expect(await jaVenceu(logoApos.lease_expires_at)).toBe(false);
 
-      // A LARGADA do sucessor, com a lease do morto ainda VIVA. Ele insiste; o
-      // banco decide quando ele entra.
-      expect(servidor.abrirBarreira('sucessor')).toBe(1);
-      // O gate já foi consumido pelo dono morto (`remaining: 1`), então o
-      // sucessor passa direto por ele.
-      const pb = await prontidaoDe(b);
-      expect(pb.acquired, `o sucessor nunca assumiu: ${JSON.stringify(pb)}`).toBe(true);
+    // A LARGADA do sucessor, com a lease do morto ainda VIVA. Ele insiste; o
+    // banco decide quando ele entra.
+    expect(servidor.abrirBarreira('sucessor')).toBe(1);
+    // O gate já foi consumido pelo dono morto (`remaining: 1`), então o
+    // sucessor passa direto por ele.
+    const pb = await prontidaoDe(b);
+    expect(pb.acquired, `o sucessor nunca assumiu: ${JSON.stringify(pb)}`).toBe(true);
 
-      // O CONTROLE que impede o vácuo: ANTES do vencimento ele foi RECUSADO,
-      // e as recusas estão no stdout dele. Sem elas, "o sucessor assumiu"
-      // também passaria num sistema que nunca teve lease nenhuma.
-      const tentativas = linhasDe(b, '##fi-claim##');
-      const recusas = tentativas.filter((t) => t.result !== 'acquired');
-      expect(
-        recusas.length,
-        `o sucessor entrou na PRIMEIRA tentativa — a lease do morto não barrou nada: ${JSON.stringify(tentativas)}`,
-      ).toBeGreaterThanOrEqual(2);
-      for (const r of recusas) expect(r.result).toBe('not_eligible');
+    // O CONTROLE que impede o vácuo: ANTES do vencimento ele foi RECUSADO,
+    // e as recusas estão no stdout dele. Sem elas, "o sucessor assumiu"
+    // também passaria num sistema que nunca teve lease nenhuma.
+    const tentativas = linhasDe(b, '##fi-claim##');
+    const recusas = tentativas.filter((t) => t.result !== 'acquired');
+    expect(
+      recusas.length,
+      `o sucessor entrou na PRIMEIRA tentativa — a lease do morto não barrou nada: ${JSON.stringify(tentativas)}`,
+    ).toBeGreaterThanOrEqual(2);
+    for (const r of recusas) expect(r.result).toBe('not_eligible');
 
-      // A REAÇÃO: tentativa nova, token novo, dono novo.
-      const depois = await linhaDoTurno(turn_id);
-      expect(depois.attempt_count).toBe(2);
-      expect(depois.claim_token).not.toBe(pa.claim_token);
-      expect(depois.claimed_by).toBe(pb.worker_id);
-      expect(depois.state_version).toBeGreaterThan(linhaAntes.state_version);
+    // A REAÇÃO: tentativa nova, token novo, dono novo.
+    const depois = await linhaDoTurno(turn_id);
+    expect(depois.attempt_count).toBe(2);
+    expect(depois.claim_token).not.toBe(pa.claim_token);
+    expect(depois.claimed_by).toBe(pb.worker_id);
+    expect(depois.state_version).toBeGreaterThan(linhaAntes.state_version);
 
-      const depoisDaRecuperacao = await oracle.coletar();
-      expect(verificarProgresso(antesDoCrash, depoisDaRecuperacao)).toEqual([]);
-      await oracle.assertInvariantes('FI-05');
-    },
-    180_000,
-  );
+    const depoisDaRecuperacao = await oracle.coletar();
+    expect(verificarProgresso(antesDoCrash, depoisDaRecuperacao)).toEqual([]);
+    await oracle.assertInvariantes('FI-05');
+  }, 180_000);
 
   // ─────────────────────────────────────────────────────────────────────────
   // FI-06 + FI-07
   // ─────────────────────────────────────────────────────────────────────────
-  it(
-    'FI-06/FI-07 — dono CONGELADO perde a lease; ao voltar, sua gravação é recusada pelo fence',
-    async () => {
-      expect(
-        ProcessSupervisor.suportaCongelamento(),
-        'esta plataforma não implementa SIGSTOP — o cenário não pode ser executado, e passar seria vácuo',
-      ).toBe(true);
+  it('FI-06/FI-07 — dono CONGELADO perde a lease; ao voltar, sua gravação é recusada pelo fence', async () => {
+    expect(
+      ProcessSupervisor.suportaCongelamento(),
+      'esta plataforma não implementa SIGSTOP — o cenário não pode ser executado, e passar seria vácuo',
+    ).toBe(true);
 
-      const turn_id = await turnoNovo();
-      const oracle = new InvariantOracle({
-        pool,
-        escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
-        turnIds: [turn_id],
-      });
+    const turn_id = await turnoNovo();
+    const oracle = new InvariantOracle({
+      pool,
+      escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
+      turnIds: [turn_id],
+    });
 
-      servidor.arm('after_turn_claim_before_running', 'pause');
-      const a = subirReplica('dono-congelado', turn_id, { TEST_FI_ESCREVER: 'running' });
-      const pa = await prontidaoDe(a);
-      expect(pa.acquired).toBe(true);
-      await servidor.waitForReached('after_turn_claim_before_running', { timeoutMs: 30_000 });
+    servidor.arm('after_turn_claim_before_running', 'pause');
+    const a = subirReplica('dono-congelado', turn_id, { TEST_FI_ESCREVER: 'running' });
+    const pa = await prontidaoDe(a);
+    expect(pa.acquired).toBe(true);
+    await servidor.waitForReached('after_turn_claim_before_running', { timeoutMs: 30_000 });
 
-      // FI-06 — A FALHA: o heartbeat para, mas o processo NÃO morre. É a falha
-      // que o `SIGKILL` não modela: pausa longa de GC, VM suspensa, `fsync`
-      // travado. O dono continua vivo, com o `claim_token` na memória.
-      sup.congelar(a);
-      const congeladoEm = await linhaDoTurno(turn_id);
-      expect(congeladoEm.claim_token).toBe(pa.claim_token);
+    // FI-06 — A FALHA: o heartbeat para, mas o processo NÃO morre. É a falha
+    // que o `SIGKILL` não modela: pausa longa de GC, VM suspensa, `fsync`
+    // travado. O dono continua vivo, com o `claim_token` na memória.
+    sup.congelar(a);
+    const congeladoEm = await linhaDoTurno(turn_id);
+    expect(congeladoEm.claim_token).toBe(pa.claim_token);
 
-      // A REAÇÃO: a lease vence pelo relógio do BANCO, mesmo com o dono vivo.
-      await eventually(async () => await jaVenceu((await linhaDoTurno(turn_id)).lease_expires_at), {
-        label: 'a lease do dono congelado vence pelo relógio do banco',
-        timeoutMs: TTL_MS * 3,
-        intervalMs: 100,
-        describeState: async () => await linhaDoTurno(turn_id),
-      });
+    // A REAÇÃO: a lease vence pelo relógio do BANCO, mesmo com o dono vivo.
+    await eventually(async () => await jaVenceu((await linhaDoTurno(turn_id)).lease_expires_at), {
+      label: 'a lease do dono congelado vence pelo relógio do banco',
+      timeoutMs: TTL_MS * 3,
+      intervalMs: 100,
+      describeState: async () => await linhaDoTurno(turn_id),
+    });
 
-      // E o sucessor assume.
-      const b = subirReplica('sucessor', turn_id, {
-        TEST_FI_TENTATIVAS: '80',
-        TEST_FI_INTERVALO_MS: '250',
-      });
-      const pb = await prontidaoDe(b);
-      expect(pb.acquired, `o sucessor não assumiu do dono congelado: ${JSON.stringify(pb)}`).toBe(
-        true,
-      );
-      const noTakeover = await linhaDoTurno(turn_id);
-      expect(noTakeover.claim_token).not.toBe(pa.claim_token);
-      expect(noTakeover.attempt_count).toBe(2);
+    // E o sucessor assume.
+    const b = subirReplica('sucessor', turn_id, {
+      TEST_FI_TENTATIVAS: '80',
+      TEST_FI_INTERVALO_MS: '250',
+    });
+    const pb = await prontidaoDe(b);
+    expect(pb.acquired, `o sucessor não assumiu do dono congelado: ${JSON.stringify(pb)}`).toBe(
+      true,
+    );
+    const noTakeover = await linhaDoTurno(turn_id);
+    expect(noTakeover.claim_token).not.toBe(pa.claim_token);
+    expect(noTakeover.attempt_count).toBe(2);
 
-      // FI-07 — O DONO DEPOSTO VOLTA. `SIGCONT` devolve o processo com todo o
-      // estado que ele tinha, inclusive o `claim_token` que já não vale.
-      sup.descongelar(a);
-      servidor.liberar('after_turn_claim_before_running');
+    // FI-07 — O DONO DEPOSTO VOLTA. `SIGCONT` devolve o processo com todo o
+    // estado que ele tinha, inclusive o `claim_token` que já não vale.
+    sup.descongelar(a);
+    servidor.liberar('after_turn_claim_before_running');
 
-      const escrita = await eventually(() => linhasDe(a, '##fi-escrita##').at(-1), {
-        label: 'o dono deposto tenta a gravação fenced',
-        timeoutMs: 30_000,
-        describeState: () => ({ stdout: a.stdout.split('\n').slice(-6) }),
-      });
+    const escrita = await eventually(() => linhasDe(a, '##fi-escrita##').at(-1), {
+      label: 'o dono deposto tenta a gravação fenced',
+      timeoutMs: 30_000,
+      describeState: () => ({ stdout: a.stdout.split('\n').slice(-6) }),
+    });
 
-      // A REAÇÃO, e ela é do BANCO: `stale_claim`. O fixture usou o token
-      // CAPTURADO no claim, não `lease.token` — então o que recusou foi o
-      // `WHERE claim_token = …` de `turnWriteConditions`, e não um guard em
-      // memória do processo zumbi.
-      expect(escrita).toMatchObject({
-        operacao: 'markRunning',
-        ok: false,
-        conflict: 'stale_claim',
-      });
+    // A REAÇÃO, e ela é do BANCO: `stale_claim`. O fixture usou o token
+    // CAPTURADO no claim, não `lease.token` — então o que recusou foi o
+    // `WHERE claim_token = …` de `turnWriteConditions`, e não um guard em
+    // memória do processo zumbi.
+    expect(escrita).toMatchObject({
+      operacao: 'markRunning',
+      ok: false,
+      conflict: 'stale_claim',
+    });
 
-      // E a linha NÃO se moveu desde o takeover.
-      const depois = await oracle.coletar();
-      expect(
-        verificarFenceDeTokenDeposto(depois, {
-          turn_id,
-          claim_token: pa.claim_token as string,
-          state_version_no_takeover: noTakeover.state_version,
-        }),
-      ).toEqual([]);
+    // E a linha NÃO se moveu desde o takeover.
+    const depois = await oracle.coletar();
+    expect(
+      verificarFenceDeTokenDeposto(depois, {
+        turn_id,
+        claim_token: pa.claim_token as string,
+        state_version_no_takeover: noTakeover.state_version,
+      }),
+    ).toEqual([]);
 
-      await estavelDurante(
-        async () => {
-          const l = await linhaDoTurno(turn_id);
-          return { claim_token: l.claim_token, dono: l.claimed_by, versao: l.state_version };
-        },
-        {
-          label: 'o zumbi não move a linha depois de voltar',
-          janelaMs: 1_500,
-          justificativa:
-            'a invariante é NEGATIVA ("nada mudou"); não há evento de gravação que não aconteceu',
-        },
-      );
+    await estavelDurante(
+      async () => {
+        const l = await linhaDoTurno(turn_id);
+        return { claim_token: l.claim_token, dono: l.claimed_by, versao: l.state_version };
+      },
+      {
+        label: 'o zumbi não move a linha depois de voltar',
+        janelaMs: 1_500,
+        justificativa:
+          'a invariante é NEGATIVA ("nada mudou"); não há evento de gravação que não aconteceu',
+      },
+    );
 
-      await oracle.assertInvariantes('FI-06/FI-07');
-    },
-    180_000,
-  );
+    await oracle.assertInvariantes('FI-06/FI-07');
+  }, 180_000);
 });

@@ -38,10 +38,12 @@ function makeAnthropicReply(jsonObj: Record<string, unknown>): {
   };
 }
 
-function makeProfile(opts: {
-  role_descriptor?: string;
-  priorities?: string[];
-} = {}) {
+function makeProfile(
+  opts: {
+    role_descriptor?: string;
+    priorities?: string[];
+  } = {},
+) {
   return buildProfileVersion({
     profile_body: {
       identity: {
@@ -59,7 +61,10 @@ function makeProfile(opts: {
   });
 }
 
-function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {
+function makeAgentMsg(
+  text: string,
+  id = 'm-' + Math.random().toString(36).slice(2),
+): DriftRecentMessage {
   return {
     id,
     from: 'agent',
@@ -100,9 +105,7 @@ describe('papelDriftDetector (§6)', () => {
     expect(out.detected_by).toBe('drift_detector_papel');
     expect(out.payload['severity_hint']).toBe('alto');
     expect(out.payload['declared_role']).toBe('atendimento_financeiro_pf');
-    expect(out.payload['observed_role_inferred']).toBe(
-      'consultoria_juridica_e_investimentos',
-    );
+    expect(out.payload['observed_role_inferred']).toBe('consultoria_juridica_e_investimentos');
     const offRole = out.payload['off_role_examples'];
     expect(Array.isArray(offRole)).toBe(true);
     expect(offRole).toHaveLength(2);
@@ -111,9 +114,7 @@ describe('papelDriftDetector (§6)', () => {
   });
 
   it('drift_detected=false → retorna null', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: false }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: false }));
     const out = await papelDriftDetector.detect({
       profile_active: makeProfile(),
       recent_messages: [makeAgentMsg('Lançado: -R$ 100,00, energia, Itaú.')],
@@ -142,9 +143,7 @@ describe('papelDriftDetector (§6)', () => {
   it('sem mensagens do agente → retorna null sem chamar Anthropic', async () => {
     const out = await papelDriftDetector.detect({
       profile_active: makeProfile(),
-      recent_messages: [
-        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
-      ],
+      recent_messages: [{ id: 'u1', from: 'user', text: 'oi', created_at: new Date() }],
     });
     expect(out).toBeNull();
     expect(messagesCreateMock).not.toHaveBeenCalled();
@@ -171,9 +170,7 @@ describe('papelDriftDetector (§6)', () => {
   });
 
   it('drift_detected=true sem campos opcionais → defaults aplicados', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: true }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: true }));
     const out = await papelDriftDetector.detect({
       profile_active: makeProfile(),
       recent_messages: [makeAgentMsg('algo')],
@@ -188,9 +185,7 @@ describe('papelDriftDetector (§6)', () => {
   });
 
   it('priorities vazias → continua chamando Anthropic (drift independe)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: false }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: false }));
     const out = await papelDriftDetector.detect({
       profile_active: makeProfile({ priorities: [] }),
       recent_messages: [makeAgentMsg('algo')],
@@ -222,12 +217,14 @@ describe('papelDriftDetector (§6)', () => {
    *
    * Caller can opt to omit either layer to simulate further degradation.
    */
-  function makeMigration061Profile(opts: {
-    priorities?: unknown[];
-    identityPrinciples?: unknown[];
-    coreImmutablePrinciples?: unknown[];
-    role_descriptor?: string;
-  } = {}) {
+  function makeMigration061Profile(
+    opts: {
+      priorities?: unknown[];
+      identityPrinciples?: unknown[];
+      coreImmutablePrinciples?: unknown[];
+      role_descriptor?: string;
+    } = {},
+  ) {
     const profile = buildProfileVersion({
       profile_body: {
         identity: {
@@ -257,9 +254,7 @@ describe('papelDriftDetector (§6)', () => {
   }
 
   it('priorities=[] + identity.principles populated → usa identity.principles (fallback 1)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: false }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: false }));
     const out = await papelDriftDetector.detect({
       profile_active: makeMigration061Profile({
         priorities: [],
@@ -276,9 +271,7 @@ describe('papelDriftDetector (§6)', () => {
   });
 
   it('priorities=[] + identity.principles=[] + core_immutable.principles populated → usa core_immutable (fallback 2)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: false }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: false }));
     const out = await papelDriftDetector.detect({
       profile_active: makeMigration061Profile({
         priorities: [],
@@ -300,9 +293,7 @@ describe('papelDriftDetector (§6)', () => {
 
   it('tudo vazio → segue auditando role (LLM ainda é chamado, PRIORIDADES=(nenhuma)) e loga warn (sem vazar role_descriptor)', async () => {
     const warnSpy = vi.spyOn(logger, 'warn').mockImplementation(() => undefined);
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: false }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: false }));
     const out = await papelDriftDetector.detect({
       profile_active: makeMigration061Profile({
         priorities: [],
@@ -348,9 +339,7 @@ describe('papelDriftDetector (§6)', () => {
         identityPrinciples: [],
         coreImmutablePrinciples: [],
       }),
-      recent_messages: [
-        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
-      ],
+      recent_messages: [{ id: 'u1', from: 'user', text: 'oi', created_at: new Date() }],
     });
     expect(out).toBeNull();
     expect(messagesCreateMock).not.toHaveBeenCalled();
@@ -376,9 +365,7 @@ describe('papelDriftDetector (§6)', () => {
         identityPrinciples: ['preservar_capital', 'clareza_acima_de_tudo'],
         coreImmutablePrinciples: ['preservar_capital', 'clareza_acima_de_tudo'],
       }),
-      recent_messages: [
-        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
-      ],
+      recent_messages: [{ id: 'u1', from: 'user', text: 'oi', created_at: new Date() }],
     });
     expect(out).toBeNull();
     expect(messagesCreateMock).not.toHaveBeenCalled();
@@ -391,9 +378,7 @@ describe('papelDriftDetector (§6)', () => {
 
   it('fallback usado uma vez (info) → não loga novamente para o mesmo profile_id', async () => {
     const infoSpy = vi.spyOn(logger, 'info').mockImplementation(() => undefined);
-    messagesCreateMock.mockResolvedValue(
-      makeAnthropicReply({ drift_detected: false }),
-    );
+    messagesCreateMock.mockResolvedValue(makeAnthropicReply({ drift_detected: false }));
 
     const profile = makeMigration061Profile({
       priorities: [],
@@ -418,9 +403,7 @@ describe('papelDriftDetector (§6)', () => {
   });
 
   it('non-string entries em principles são filtradas (não vazam pro prompt)', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: false }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: false }));
     await papelDriftDetector.detect({
       profile_active: makeMigration061Profile({
         priorities: [],

@@ -264,7 +264,9 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(teto.code).toBe(1);
       const v = teto.failed.find((x) => x.label.includes('veio do BANCO'))!;
       expect(v).toBeDefined();
-      expect(v.detail).toContain(`escopo resolvido=1–500 entidades (esperado 1–${Math.max(...CARDINALITIES)})`);
+      expect(v.detail).toContain(
+        `escopo resolvido=1–500 entidades (esperado 1–${Math.max(...CARDINALITIES)})`,
+      );
 
       // CONTROLE: com o maior escopo resolvido igual ao semeado, aprova.
       expect(run({}).failed.some((x) => x.label.includes('veio do BANCO'))).toBe(false);
@@ -764,10 +766,11 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
     for (const caso of casos) {
       for (const baseline of [null, BASELINE_FOLGADO]) {
         for (const v of run(caso, baseline).verdicts) {
-          if (v.skipped) expect({ label: v.label, passed: v.passed }).toEqual({
-            label: v.label,
-            passed: false,
-          });
+          if (v.skipped)
+            expect({ label: v.label, passed: v.passed }).toEqual({
+              label: v.label,
+              passed: false,
+            });
         }
       }
     }
@@ -879,7 +882,9 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(v).toBeDefined();
       expect(v.detail).toContain('teto=44.0 ms');
       // …e o critério ABSOLUTO continua verde: são dois critérios distintos.
-      expect(regride.verdicts.find((x) => x.label.includes('p95 da carga de contexto ≤ 600 ms'))!.passed).toBe(true);
+      expect(
+        regride.verdicts.find((x) => x.label.includes('p95 da carga de contexto ≤ 600 ms'))!.passed,
+      ).toBe(true);
 
       // CONTROLE: exatamente no teto aprova.
       expect(run({ p95_ms: 44 }, baseline(40)).codeParcial).toBe(0);
@@ -917,7 +922,9 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(v).toBeDefined();
       expect(v.detail).toContain('N=100: p95=100.0/40.0 ms');
       // …e o critério do BRAÇO continua verde (p95 agregado injetado é 40):
-      expect(elefante.verdicts.find((x) => x.label.includes('p95 ≤ baseline × 1.10'))!.passed).toBe(true);
+      expect(elefante.verdicts.find((x) => x.label.includes('p95 ≤ baseline × 1.10'))!.passed).toBe(
+        true,
+      );
 
       // CONTROLE: sem a regressão pontual, aprova.
       expect(run({}, baseline(40)).codeParcial).toBe(0);
@@ -1033,7 +1040,14 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // `pool_max: 10` concordaria consigo mesmo no dia em que alguém subisse o
       // pool para 20 — que é o dia em que o baseline deixa de valer.
       const fp = runFingerprint(
-        { pairs: 50, concurrency: 20, think_ms: 150, identity: 'profile', turns: 600, sustain_s: 60 },
+        {
+          pairs: 50,
+          concurrency: 20,
+          think_ms: 150,
+          identity: 'profile',
+          turns: 600,
+          sustain_s: 60,
+        },
         8,
         20,
       );
@@ -1279,7 +1293,9 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       // ela seria julgada — e "medição absoluta" e "gate" voltam a ser a mesma
       // saída, que é a origem do achado.
       expect(() => parseArgs(['--write-baseline'], 6)).toThrow(/--mode measure/);
-      expect(() => parseArgs(['--write-baseline', '--sustain-s', '60'], 6)).toThrow(/--mode measure/);
+      expect(() => parseArgs(['--write-baseline', '--sustain-s', '60'], 6)).toThrow(
+        /--mode measure/,
+      );
       expect(parseArgs(['--mode', 'measure', '--write-baseline'], 6).write_baseline).toBe(true);
     });
 
@@ -1299,9 +1315,9 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
       expect(() => parseArgs(['--self-test', '--self-test-baseline', 'nada'], 6)).toThrow(
         /--self-test-baseline inválido/,
       );
-      expect(parseArgs(['--self-test', '--self-test-baseline', 'missing'], 6).self_test_baseline).toBe(
-        'missing',
-      );
+      expect(
+        parseArgs(['--self-test', '--self-test-baseline', 'missing'], 6).self_test_baseline,
+      ).toBe('missing');
     });
   });
 
@@ -1316,9 +1332,8 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
   });
 
   it('o teto de leituras por turno vem do CÓDIGO, não de um literal no gate', async () => {
-    const { TURN_CONTEXT_MAX_CONCURRENT_READS } = await import(
-      '../../../src/agent/turn-context/types.js'
-    );
+    const { TURN_CONTEXT_MAX_CONCURRENT_READS } =
+      await import('../../../src/agent/turn-context/types.js');
     expect(parseArgs([], TURN_CONTEXT_MAX_CONCURRENT_READS).thresholds.max_peak_reads).toBe(
       TURN_CONTEXT_MAX_CONCURRENT_READS,
     );
@@ -1377,7 +1392,10 @@ describe('#525 — o gate do benchmark de carga de contexto', () => {
         { section: 'gaps', ms: 2 },
         { section: 'procedure', ms: 6 },
       ];
-      const agora = gateMakespan(reads.map((r) => r.ms), 6);
+      const agora = gateMakespan(
+        reads.map((r) => r.ms),
+        6,
+      );
       const com8 = gateMakespan(mergeTwoPairs(reads), 6);
       expect(com8).toBeLessThanOrEqual(agora);
     });

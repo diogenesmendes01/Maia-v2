@@ -8,7 +8,12 @@ import { runCognitiveModule } from './runner.js';
 // deterministic formula in `confidence.ts`. North-star invariant: confidence
 // NEVER comes from the LLM (see `project_self_model_design` / `project_reflection_pipeline_design`).
 const ClassifiedSchema = z.discriminatedUnion('type', [
-  z.object({ type: z.literal('fato'), content: z.string(), scope: z.enum(['agent', 'role', 'conversation']), subject_id: z.string().optional() }),
+  z.object({
+    type: z.literal('fato'),
+    content: z.string(),
+    scope: z.enum(['agent', 'role', 'conversation']),
+    subject_id: z.string().optional(),
+  }),
   z.object({
     type: z.literal('regra'),
     contexto: z.string(),
@@ -18,9 +23,25 @@ const ClassifiedSchema = z.discriminatedUnion('type', [
     // outputs still parse.
     confianca_sugerida_llm: z.number().min(0).max(1).optional(),
   }),
-  z.object({ type: z.literal('procedimento'), nome: z.string(), intencao: z.string(), passos_draft: z.array(z.string()) }),
-  z.object({ type: z.literal('lacuna'), capability_description: z.string(), tipo: z.enum(['tool', 'knowledge', 'procedure']), contexto: z.string() }),
-  z.object({ type: z.literal('tool_request'), tool_name_sketch: z.string(), description: z.string(), inputs_sketch: z.string(), outputs_sketch: z.string() }),
+  z.object({
+    type: z.literal('procedimento'),
+    nome: z.string(),
+    intencao: z.string(),
+    passos_draft: z.array(z.string()),
+  }),
+  z.object({
+    type: z.literal('lacuna'),
+    capability_description: z.string(),
+    tipo: z.enum(['tool', 'knowledge', 'procedure']),
+    contexto: z.string(),
+  }),
+  z.object({
+    type: z.literal('tool_request'),
+    tool_name_sketch: z.string(),
+    description: z.string(),
+    inputs_sketch: z.string(),
+    outputs_sketch: z.string(),
+  }),
   z.object({ type: z.literal('descarte'), reason: z.string() }),
 ]);
 

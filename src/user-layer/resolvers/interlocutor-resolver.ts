@@ -13,19 +13,11 @@ export interface InterlocutorItem {
 }
 
 export const interlocutorResolver = {
-  async get(input: {
-    tenant_id: string;
-    pessoa_id: string;
-  }): Promise<InterlocutorItem> {
+  async get(input: { tenant_id: string; pessoa_id: string }): Promise<InterlocutorItem> {
     const row = await db
       .select()
       .from(pessoas)
-      .where(
-        and(
-          eq(pessoas.tenant_id, input.tenant_id),
-          eq(pessoas.id, input.pessoa_id),
-        ),
-      )
+      .where(and(eq(pessoas.tenant_id, input.tenant_id), eq(pessoas.id, input.pessoa_id)))
       .limit(1);
 
     if (!row || row.length === 0) {

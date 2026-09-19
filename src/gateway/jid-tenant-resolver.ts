@@ -273,14 +273,10 @@ export async function resolveScopeForJid(
         },
       );
     }
-    throw new TypedError(
-      'channel_resolution_failed',
-      'jid unparseable for tenant routing',
-      {
-        resolver_path: 'jid_unparseable',
-        raw_jid,
-      },
-    );
+    throw new TypedError('channel_resolution_failed', 'jid unparseable for tenant routing', {
+      resolver_path: 'jid_unparseable',
+      raw_jid,
+    });
   }
 
   // Reuse the canonical resolver (single source of truth for

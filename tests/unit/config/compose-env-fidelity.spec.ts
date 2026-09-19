@@ -299,23 +299,31 @@ describe('CANÁRIO de vazamento — a CLI, em stdout, stderr e --json', () => {
   it.each([
     ['linha malformada', MALFORMADO],
     ['shape inesperado', SHAPE_INESPERADO],
-  ])('%s: nada do valor sai em stdout nem em stderr', (_nome, composeText) => {
-    expect(composeText).toContain(CANARIO); // a entrada tem o canário, senão o caso não mede nada
-    const r = rodarPreflight(composeText, false);
-    expect(r.status).toBe(1);
-    expect(r.stdout).not.toContain(CANARIO);
-    expect(r.stderr).not.toContain(CANARIO);
-  }, 60_000);
+  ])(
+    '%s: nada do valor sai em stdout nem em stderr',
+    (_nome, composeText) => {
+      expect(composeText).toContain(CANARIO); // a entrada tem o canário, senão o caso não mede nada
+      const r = rodarPreflight(composeText, false);
+      expect(r.status).toBe(1);
+      expect(r.stdout).not.toContain(CANARIO);
+      expect(r.stderr).not.toContain(CANARIO);
+    },
+    60_000,
+  );
 
   it.each([
     ['linha malformada', MALFORMADO],
     ['shape inesperado', SHAPE_INESPERADO],
-  ])('%s: nada do valor sai na saída --json', (_nome, composeText) => {
-    const r = rodarPreflight(composeText, true);
-    expect(r.status).toBe(1);
-    expect(r.stdout).not.toContain(CANARIO);
-    expect(r.stderr).not.toContain(CANARIO);
-  }, 60_000);
+  ])(
+    '%s: nada do valor sai na saída --json',
+    (_nome, composeText) => {
+      const r = rodarPreflight(composeText, true);
+      expect(r.status).toBe(1);
+      expect(r.stdout).not.toContain(CANARIO);
+      expect(r.stderr).not.toContain(CANARIO);
+    },
+    60_000,
+  );
 
   // ─────────────────────────────────────────────────────────────────────────
   // Divergência de shell numa variável que só existe DENTRO do `env_file`

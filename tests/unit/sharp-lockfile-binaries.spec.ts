@@ -77,10 +77,14 @@ const MUSL_PACKAGES = [
 
 describe('sharp declarado e com binários musl no lockfile da raiz (item 10)', () => {
   it('é dependência DIRETA da raiz — não uma peer implícita do Baileys', () => {
-    expect(pkg.dependencies?.sharp, 'declare "sharp" em dependencies do package.json da raiz').toBeTypeOf(
-      'string',
-    );
-    expect(pkg.devDependencies?.sharp, '"sharp" é usado em runtime; não pode ser devDependency').toBeUndefined();
+    expect(
+      pkg.dependencies?.sharp,
+      'declare "sharp" em dependencies do package.json da raiz',
+    ).toBeTypeOf('string');
+    expect(
+      pkg.devDependencies?.sharp,
+      '"sharp" é usado em runtime; não pode ser devDependency',
+    ).toBeUndefined();
   });
 
   it('o lockfile registra sharp como dependência do projeto, não como peer', () => {

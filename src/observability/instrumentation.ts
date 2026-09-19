@@ -31,13 +31,7 @@
  * participant.
  */
 import { counter, histogram } from './metrics.js';
-import {
-  METRIC,
-  SPAN,
-  type ContextLoadStage,
-  type SpanName,
-  type SpanStatus,
-} from './taxonomy.js';
+import { METRIC, SPAN, type ContextLoadStage, type SpanName, type SpanStatus } from './taxonomy.js';
 import { recordElapsedSpan, withSpan } from './tracer.js';
 import type { SpanAttributes } from './span-attributes.js';
 import {
@@ -122,10 +116,7 @@ export function classifyToolResult(result: unknown): ToolDispatchOutcome {
  * in `LABEL_CARDINALITY_BUDGET`, so a bug that passes user input as a tool name
  * degrades into `__overflow__` instead of unbounded series growth.
  */
-export async function instrumentToolDispatch<T>(
-  tool: string,
-  fn: () => Promise<T>,
-): Promise<T> {
+export async function instrumentToolDispatch<T>(tool: string, fn: () => Promise<T>): Promise<T> {
   const t0 = Date.now();
   let outcome: ToolDispatchOutcome = 'error';
   // The bag is read by `withSpan` when the span ENDS, so filling `result` in
@@ -249,16 +240,15 @@ export async function instrumentContextLoad<T>(
  * deciding what it means for a trace fails `npm run typecheck`. That is the
  * closure; a review convention would not survive the next status.
  */
-const SPAN_STATUS_BY_LLM_STATUS: Readonly<Record<LLMCallStatus, SpanStatus>> =
-  Object.freeze({
-    ok: 'ok',
-    error: 'error',
-    timeout: 'timeout',
-    rate_limit: 'error',
-    cancelled: 'cancelled',
-    budget_exhausted: 'blocked',
-    circuit_open: 'blocked',
-  });
+const SPAN_STATUS_BY_LLM_STATUS: Readonly<Record<LLMCallStatus, SpanStatus>> = Object.freeze({
+  ok: 'ok',
+  error: 'error',
+  timeout: 'timeout',
+  rate_limit: 'error',
+  cancelled: 'cancelled',
+  budget_exhausted: 'blocked',
+  circuit_open: 'blocked',
+});
 
 export interface LlmRequestSpanInput {
   /** The gateway's own measurement of the call, in ms. */
@@ -276,9 +266,7 @@ export interface LlmRequestSpanInput {
 
 export function recordLlmRequestSpan(input: LlmRequestSpanInput): void {
   const end = input.observed_at_ms;
-  const duration = Number.isFinite(input.duration_ms)
-    ? Math.max(0, input.duration_ms)
-    : 0;
+  const duration = Number.isFinite(input.duration_ms) ? Math.max(0, input.duration_ms) : 0;
   recordElapsedSpan(
     SPAN.LLM_REQUEST,
     end - duration,
@@ -457,10 +445,7 @@ export function instrumentAudienceResolve<T>(
  * `item_count` is the number of nodes mounted (today 1 or 2). Bounded by the
  * graph definition, never by input.
  */
-export function instrumentPreturnGraph<T>(
-  nodeCount: number,
-  fn: () => Promise<T>,
-): Promise<T> {
+export function instrumentPreturnGraph<T>(nodeCount: number, fn: () => Promise<T>): Promise<T> {
   return withOutcomeSpan(SPAN.PRETURN_GRAPH, fn, () => ({}), { item_count: nodeCount });
 }
 
@@ -529,9 +514,9 @@ export function instrumentDecisionEvaluate<T>(
  * assembled by the scorer, which is precisely the shape the span deny list
  * exists to keep off a third-party collector.
  */
-export function instrumentRiskClassify<
-  T extends { level: string; requires_human_review: boolean },
->(fn: () => Promise<T>): Promise<T> {
+export function instrumentRiskClassify<T extends { level: string; requires_human_review: boolean }>(
+  fn: () => Promise<T>,
+): Promise<T> {
   return withOutcomeSpan(SPAN.RISK_CLASSIFY, fn, (r) => ({
     severity: r.level,
     required: r.requires_human_review,
@@ -574,10 +559,7 @@ export function instrumentPromptRender<T extends { messages: readonly unknown[] 
  * is the TURN's retry index, stamped on every span by `correlationAttributes()`
  * — the same collision `recordLlmRequestSpan` avoids for the same reason.
  */
-export function instrumentReactIteration<T>(
-  iteration: number,
-  fn: () => Promise<T>,
-): Promise<T> {
+export function instrumentReactIteration<T>(iteration: number, fn: () => Promise<T>): Promise<T> {
   return withSpan(SPAN.REACT_ITERATION, fn, {
     attributes: { attempt_count: iteration },
   });
@@ -605,12 +587,7 @@ export function instrumentConstitutionalCheck<T>(
   fn: () => T,
   classify: (value: T) => ConstitutionalOutcome,
 ): T {
-  return recordSyncSpan(
-    SPAN.CONSTITUTIONAL_CHECK,
-    fn,
-    (v) => ({ result: classify(v) }),
-    { tool },
-  );
+  return recordSyncSpan(SPAN.CONSTITUTIONAL_CHECK, fn, (v) => ({ result: classify(v) }), { tool });
 }
 
 /**
@@ -632,12 +609,10 @@ export function instrumentPermissionCheck<T>(
   fn: () => T,
   classify: (value: T) => 'allowed' | 'denied',
 ): T {
-  return recordSyncSpan(
-    SPAN.PERMISSION_CHECK,
-    fn,
-    (v) => ({ result: classify(v) }),
-    { tool, item_count: actionCount },
-  );
+  return recordSyncSpan(SPAN.PERMISSION_CHECK, fn, (v) => ({ result: classify(v) }), {
+    tool,
+    item_count: actionCount,
+  });
 }
 
 /**

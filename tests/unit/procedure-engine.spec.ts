@@ -19,7 +19,8 @@ vi.mock('@/db/client.js', async () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureExecutionsRepo: {
@@ -43,9 +44,15 @@ vi.mock('@/db/repositories.js', async () => {
       findActiveForConversa: vi.fn(async () => null),
     },
     procedureExecutionEventsRepo: {
-      record: vi.fn(async (input: any) => { events.push(input); }),
-      recordTx: vi.fn(async (_tx: unknown, input: any) => { events.push(input); }),
-      listByExecution: vi.fn(async (execution_id: string) => events.filter((e) => e.execution_id === execution_id)),
+      record: vi.fn(async (input: any) => {
+        events.push(input);
+      }),
+      recordTx: vi.fn(async (_tx: unknown, input: any) => {
+        events.push(input);
+      }),
+      listByExecution: vi.fn(async (execution_id: string) =>
+        events.filter((e) => e.execution_id === execution_id),
+      ),
     },
   };
 });
@@ -87,8 +94,17 @@ describe('procedure engine', () => {
 
   it('advanceStep registra event + atualiza state', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const { execution: exec } = await startExecution({ definition_id: 'def-1', definition_version: 1, conversa_id: 'c1', first_step_id: 'step-1' });
-      await advanceStep({ execution_id: exec.id, next_step_id: 'step-2', completed_step_id: 'step-1' });
+      const { execution: exec } = await startExecution({
+        definition_id: 'def-1',
+        definition_version: 1,
+        conversa_id: 'c1',
+        first_step_id: 'step-1',
+      });
+      await advanceStep({
+        execution_id: exec.id,
+        next_step_id: 'step-2',
+        completed_step_id: 'step-1',
+      });
 
       expect(events.some((e) => e.event_type === 'step_completed')).toBe(true);
       // P84-C4: state_updated event is emitted on every state mutation.
@@ -100,7 +116,12 @@ describe('procedure engine', () => {
 
   it('completeExecution finaliza com outcome + emite state_updated', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const { execution: exec } = await startExecution({ definition_id: 'def-1', definition_version: 1, conversa_id: 'c1', first_step_id: 'step-1' });
+      const { execution: exec } = await startExecution({
+        definition_id: 'def-1',
+        definition_version: 1,
+        conversa_id: 'c1',
+        first_step_id: 'step-1',
+      });
       await completeExecution({ execution_id: exec.id, outcome: 'success' });
       expect(execState[exec.id].status).toBe('completed');
       expect(execState[exec.id].outcome).toBe('success');
@@ -111,18 +132,34 @@ describe('procedure engine', () => {
 
   it('abortExecution registra com reason + state_updated', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const { execution: exec } = await startExecution({ definition_id: 'def-1', definition_version: 1, conversa_id: 'c1', first_step_id: 'step-1' });
+      const { execution: exec } = await startExecution({
+        definition_id: 'def-1',
+        definition_version: 1,
+        conversa_id: 'c1',
+        first_step_id: 'step-1',
+      });
       await abortExecution({ execution_id: exec.id, reason: 'user_request' });
       expect(execState[exec.id].status).toBe('aborted');
       expect(events.some((e) => e.event_type === 'execution_aborted')).toBe(true);
-      expect(events.some((e) => e.event_type === 'state_updated' && e.payload.status === 'aborted')).toBe(true);
+      expect(
+        events.some((e) => e.event_type === 'state_updated' && e.payload.status === 'aborted'),
+      ).toBe(true);
     });
   });
 
   it('replayState reconstroi state inclusive outcome/notes a partir de state_updated', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const { execution: exec } = await startExecution({ definition_id: 'def-1', definition_version: 1, conversa_id: 'c1', first_step_id: 'step-1' });
-      await advanceStep({ execution_id: exec.id, next_step_id: 'step-2', completed_step_id: 'step-1' });
+      const { execution: exec } = await startExecution({
+        definition_id: 'def-1',
+        definition_version: 1,
+        conversa_id: 'c1',
+        first_step_id: 'step-1',
+      });
+      await advanceStep({
+        execution_id: exec.id,
+        next_step_id: 'step-2',
+        completed_step_id: 'step-1',
+      });
       const state = await replayState(exec.id);
       expect(state.completed_steps).toContain('step-1');
       expect(state.current_step_id).toBe('step-2');
@@ -133,7 +170,12 @@ describe('procedure engine', () => {
 
   it('P84-C4: recordCriterionChecked emite criterion_checked event', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const { execution: exec } = await startExecution({ definition_id: 'def-1', definition_version: 1, conversa_id: 'c1', first_step_id: 'step-1' });
+      const { execution: exec } = await startExecution({
+        definition_id: 'def-1',
+        definition_version: 1,
+        conversa_id: 'c1',
+        first_step_id: 'step-1',
+      });
       events.length = 0; // drop the execution_started event
       await recordCriterionChecked({
         execution_id: exec.id,
@@ -152,7 +194,12 @@ describe('procedure engine', () => {
 
   it('P84-C4: recordToolCalled emite tool_called event com truncation', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const { execution: exec } = await startExecution({ definition_id: 'def-1', definition_version: 1, conversa_id: 'c1', first_step_id: 'step-1' });
+      const { execution: exec } = await startExecution({
+        definition_id: 'def-1',
+        definition_version: 1,
+        conversa_id: 'c1',
+        first_step_id: 'step-1',
+      });
       events.length = 0;
       const big = 'x'.repeat(5000);
       await recordToolCalled({

@@ -79,7 +79,9 @@ vi.mock('../../src/db/repositories.js', () => ({
     byIdsWithState: h.count('entidadesRepo.byIdsWithState', async () => []),
   },
   entityStatesRepo: { byIds: h.count('entityStatesRepo.byIds', async () => []) },
-  factsRepo: { listMentionableForScopes: h.count('factsRepo.listMentionableForScopes', async () => []) },
+  factsRepo: {
+    listMentionableForScopes: h.count('factsRepo.listMentionableForScopes', async () => []),
+  },
   rulesRepo: { listActive: h.count('rulesRepo.listActive', async () => []) },
   memoryEntryRepo: { findRelevant: h.count('memoryEntryRepo.findRelevant', async () => []) },
   behavioralHintRepo: {
@@ -91,9 +93,14 @@ vi.mock('../../src/db/repositories.js', () => ({
     listParaOTurno: h.count('capabilityGapsRepo.listParaOTurno', async () => []),
   },
   procedureExecutionsRepo: {
-    findActiveForConversa: h.count('procedureExecutionsRepo.findActiveForConversa', async () => null),
+    findActiveForConversa: h.count(
+      'procedureExecutionsRepo.findActiveForConversa',
+      async () => null,
+    ),
   },
-  procedureDefinitionsRepo: { findById: h.count('procedureDefinitionsRepo.findById', async () => null) },
+  procedureDefinitionsRepo: {
+    findById: h.count('procedureDefinitionsRepo.findById', async () => null),
+  },
 }));
 
 import { buildPrompt, type PromptContext } from '../../src/agent/prompt-builder.js';

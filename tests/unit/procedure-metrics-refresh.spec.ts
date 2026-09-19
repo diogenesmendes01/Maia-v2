@@ -61,9 +61,8 @@ describe('runProcedureMetricsRefresh', () => {
   it('happy path: chama db.execute uma vez com REFRESH MATERIALIZED VIEW CONCURRENTLY procedure_metrics', async () => {
     dbExecuteMock.mockResolvedValueOnce(undefined);
 
-    const { runProcedureMetricsRefresh } = await import(
-      '../../src/workers/procedure-metrics-refresh.js'
-    );
+    const { runProcedureMetricsRefresh } =
+      await import('../../src/workers/procedure-metrics-refresh.js');
     await runProcedureMetricsRefresh();
 
     expect(dbExecuteMock).toHaveBeenCalledTimes(1);
@@ -84,9 +83,8 @@ describe('runProcedureMetricsRefresh', () => {
     const boom = new Error('refresh blew up');
     dbExecuteMock.mockRejectedValueOnce(boom);
 
-    const { runProcedureMetricsRefresh } = await import(
-      '../../src/workers/procedure-metrics-refresh.js'
-    );
+    const { runProcedureMetricsRefresh } =
+      await import('../../src/workers/procedure-metrics-refresh.js');
 
     await expect(runProcedureMetricsRefresh()).rejects.toThrow('refresh blew up');
 
@@ -103,9 +101,8 @@ describe('runProcedureMetricsRefresh', () => {
   it('happy path: emite system_health_events row com status=ok e duration_ms', async () => {
     dbExecuteMock.mockResolvedValueOnce(undefined);
 
-    const { runProcedureMetricsRefresh } = await import(
-      '../../src/workers/procedure-metrics-refresh.js'
-    );
+    const { runProcedureMetricsRefresh } =
+      await import('../../src/workers/procedure-metrics-refresh.js');
     await runProcedureMetricsRefresh();
 
     expect(healthRecordMock).toHaveBeenCalledTimes(1);
@@ -123,9 +120,8 @@ describe('runProcedureMetricsRefresh', () => {
     const boom = new Error('matview deadlocked');
     dbExecuteMock.mockRejectedValueOnce(boom);
 
-    const { runProcedureMetricsRefresh } = await import(
-      '../../src/workers/procedure-metrics-refresh.js'
-    );
+    const { runProcedureMetricsRefresh } =
+      await import('../../src/workers/procedure-metrics-refresh.js');
     await expect(runProcedureMetricsRefresh()).rejects.toThrow('matview deadlocked');
 
     expect(healthRecordMock).toHaveBeenCalledTimes(1);
@@ -144,9 +140,8 @@ describe('runProcedureMetricsRefresh', () => {
     dbExecuteMock.mockResolvedValueOnce(undefined);
     healthRecordMock.mockRejectedValueOnce(new Error('health insert failed'));
 
-    const { runProcedureMetricsRefresh } = await import(
-      '../../src/workers/procedure-metrics-refresh.js'
-    );
+    const { runProcedureMetricsRefresh } =
+      await import('../../src/workers/procedure-metrics-refresh.js');
     // Should NOT throw — health emission is best-effort.
     await runProcedureMetricsRefresh();
 

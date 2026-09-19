@@ -47,7 +47,8 @@ const RECUSADOS: readonly { linha: string; porque: string }[] = [
   },
   {
     linha: 'co-authored-by:   Claude Opus 5   <noreply@anthropic.com>  ',
-    porque: 'caixa e espaçamento são folga que o git aceita — o guard não pode ser burlado por isso',
+    porque:
+      'caixa e espaçamento são folga que o git aceita — o guard não pode ser burlado por isso',
   },
 ];
 
@@ -65,7 +66,8 @@ const ACEITOS: readonly { linha: string; porque: string }[] = [
   },
   {
     linha: 'Co-Authored-By: Ana Lima <12345+analima@users.noreply.github.com>',
-    porque: '`noreply` do GitHub é o endereço normal de quem esconde o e-mail; sem nome de modelo, passa',
+    porque:
+      '`noreply` do GitHub é o endereço normal de quem esconde o e-mail; sem nome de modelo, passa',
   },
 ];
 
@@ -142,7 +144,10 @@ describe('mensagensDaPr lê os commits do intervalo sem partir a mensagem', () =
    */
   function rodarScript(dir: string, base: string, head: string): { code: number; saida: string } {
     const evento = join(dir, 'evento.json');
-    writeFileSync(evento, JSON.stringify({ pull_request: { base: { sha: base }, head: { sha: head } } }));
+    writeFileSync(
+      evento,
+      JSON.stringify({ pull_request: { base: { sha: base }, head: { sha: head } } }),
+    );
     const script = join(import.meta.dirname, '../../../scripts/check-commit-trailers.ts');
     // Caminho ABSOLUTO do CLI do tsx: o `cwd` do subprocesso é o repositório
     // temporário (o script lê o git do diretório corrente), e de lá um

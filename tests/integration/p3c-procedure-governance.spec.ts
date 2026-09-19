@@ -81,10 +81,7 @@ function enumerateStaleTuplesOrdered(): Array<{ tenant_id: string; agent_id: str
     ex.last_activity_at instanceof Date
       ? ex.last_activity_at.getTime()
       : new Date(ex.last_activity_at).getTime();
-  const oldestByTuple = new Map<
-    string,
-    { tenant_id: string; agent_id: string; oldest: number }
-  >();
+  const oldestByTuple = new Map<string, { tenant_id: string; agent_id: string; oldest: number }>();
   for (const ex of Object.values(execState) as any[]) {
     if (ex.status !== 'in_progress') continue;
     if (lastActivityMs(ex) >= cutoff) continue; // fresh — not stale
@@ -148,9 +145,8 @@ vi.mock('@/db/client.js', () => ({
 
 // ---------- repositories mock ----------
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureDefinitionsRepo: {
@@ -183,11 +179,7 @@ vi.mock('@/db/repositories.js', async () => {
       // P83-C4: atomic activation in a single transaction.
       // Required by procedure-status.ts when transitioning proposed → active.
       atomicActivate: vi.fn(
-        async (args: {
-          target_id: string;
-          actor: string;
-          preserve_activated_at?: boolean;
-        }) => {
+        async (args: { target_id: string; actor: string; preserve_activated_at?: boolean }) => {
           const target = definitionsState[args.target_id];
           if (!target) throw new Error('not found');
           const now = new Date();
@@ -460,93 +452,82 @@ describe('P3c procedure governance', () => {
   });
 
   it('cenário 1: definition draft → proposed OK; proposed → active sem tests falha (tests_required)', async () => {
-    await runWithTenantContext(
-      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
-      async () => {
-        const def = await seedDraftDefinition('lifecycle-1');
+    await runWithTenantContext({ tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID }, async () => {
+      const def = await seedDraftDefinition('lifecycle-1');
 
-        // draft → proposed (gate não dispara aqui)
-        const promoteToProposed = await transitionProcedureStatus({
-          definition: def,
-          to: 'proposed',
-          actor: 'owner-1',
-        });
-        expect(promoteToProposed.ok).toBe(true);
-        expect(definitionsState[def.id].status).toBe('proposed');
+      // draft → proposed (gate não dispara aqui)
+      const promoteToProposed = await transitionProcedureStatus({
+        definition: def,
+        to: 'proposed',
+        actor: 'owner-1',
+      });
+      expect(promoteToProposed.ok).toBe(true);
+      expect(definitionsState[def.id].status).toBe('proposed');
 
-        // proposed → active SEM tests → falha com tests_required
-        const promoteToActive = await transitionProcedureStatus({
-          definition: definitionsState[def.id],
-          to: 'active',
-          actor: 'owner-1',
-        });
-        expect(promoteToActive.ok).toBe(false);
-        if (promoteToActive.ok === false) {
-          expect(promoteToActive.reason).toBe('tests_required');
-          // o tipo discriminado garante missing_tests neste branch
-          expect(
-            (promoteToActive as { missing_tests: true }).missing_tests,
-          ).toBe(true);
-        }
-        // status permanece em 'proposed' — gate abortou a transição
-        expect(definitionsState[def.id].status).toBe('proposed');
-      },
-    );
+      // proposed → active SEM tests → falha com tests_required
+      const promoteToActive = await transitionProcedureStatus({
+        definition: definitionsState[def.id],
+        to: 'active',
+        actor: 'owner-1',
+      });
+      expect(promoteToActive.ok).toBe(false);
+      if (promoteToActive.ok === false) {
+        expect(promoteToActive.reason).toBe('tests_required');
+        // o tipo discriminado garante missing_tests neste branch
+        expect((promoteToActive as { missing_tests: true }).missing_tests).toBe(true);
+      }
+      // status permanece em 'proposed' — gate abortou a transição
+      expect(definitionsState[def.id].status).toBe('proposed');
+    });
   });
 
   it('cenário 2: 1 test passing + 1 test failing → bloqueia com tests_not_passing e failing_tests populado', async () => {
-    await runWithTenantContext(
-      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
-      async () => {
-        const def = await seedProposedDefinition('lifecycle-2');
-        await seedTest(def.id, 'pass');
-        const failing = await seedTest(def.id, 'fail');
+    await runWithTenantContext({ tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID }, async () => {
+      const def = await seedProposedDefinition('lifecycle-2');
+      await seedTest(def.id, 'pass');
+      const failing = await seedTest(def.id, 'fail');
 
-        const result = await transitionProcedureStatus({
-          definition: def,
-          to: 'active',
-          actor: 'owner-1',
-        });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'active',
+        actor: 'owner-1',
+      });
 
-        expect(result.ok).toBe(false);
-        if (result.ok === false) {
-          expect(result.reason).toBe('tests_not_passing');
-          const failingTests = (result as { failing_tests: any[] }).failing_tests;
-          expect(Array.isArray(failingTests)).toBe(true);
-          expect(failingTests).toHaveLength(1);
-          expect(failingTests[0].id).toBe(failing.id);
-        }
-        expect(definitionsState[def.id].status).toBe('proposed');
-      },
-    );
+      expect(result.ok).toBe(false);
+      if (result.ok === false) {
+        expect(result.reason).toBe('tests_not_passing');
+        const failingTests = (result as { failing_tests: any[] }).failing_tests;
+        expect(Array.isArray(failingTests)).toBe(true);
+        expect(failingTests).toHaveLength(1);
+        expect(failingTests[0].id).toBe(failing.id);
+      }
+      expect(definitionsState[def.id].status).toBe('proposed');
+    });
   });
 
   it('cenário 3: todos tests passing → promoção succeeds', async () => {
-    await runWithTenantContext(
-      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
-      async () => {
-        const def = await seedProposedDefinition('lifecycle-3');
-        const t1 = await seedTest(def.id, 'fail');
-        const t2 = await seedTest(def.id, 'pass');
+    await runWithTenantContext({ tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID }, async () => {
+      const def = await seedProposedDefinition('lifecycle-3');
+      const t1 = await seedTest(def.id, 'fail');
+      const t2 = await seedTest(def.id, 'pass');
 
-        // Atualiza o primeiro test para pass — agora ambos verdes.
-        const { procedureTestsRepo } = await import('@/db/repositories.js');
-        await procedureTestsRepo.recordRun({ id: t1.id, status: 'pass', details: {} });
-        // sanity check do helper de update
-        expect(testsState[t1.id].last_run_status).toBe('pass');
-        expect(testsState[t2.id].last_run_status).toBe('pass');
+      // Atualiza o primeiro test para pass — agora ambos verdes.
+      const { procedureTestsRepo } = await import('@/db/repositories.js');
+      await procedureTestsRepo.recordRun({ id: t1.id, status: 'pass', details: {} });
+      // sanity check do helper de update
+      expect(testsState[t1.id].last_run_status).toBe('pass');
+      expect(testsState[t2.id].last_run_status).toBe('pass');
 
-        const result = await transitionProcedureStatus({
-          definition: def,
-          to: 'active',
-          actor: 'owner-1',
-        });
-        expect(result.ok).toBe(true);
-        expect(definitionsState[def.id].status).toBe('active');
-        expect(definitionsState[def.id].approved_by).toBe('owner-1');
-        expect(definitionsState[def.id].activated_at).toBeDefined();
-      },
-    );
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'active',
+        actor: 'owner-1',
+      });
+      expect(result.ok).toBe(true);
+      expect(definitionsState[def.id].status).toBe('active');
+      expect(definitionsState[def.id].approved_by).toBe('owner-1');
+      expect(definitionsState[def.id].activated_at).toBeDefined();
+    });
   });
 
   it('cenário 4: step evaluator chain — llm_judge → user_signal → human_confirmed → outcome=success', async () => {
@@ -601,57 +582,50 @@ describe('P3c procedure governance', () => {
     // Anthropic mock retorna score 0.85 — acima do threshold 0.7 → llm_judge
     // passa para step A. mockResolvedValue (não mockResolvedValueOnce) para
     // tolerar re-avaliações no test-runner.
-    messagesCreateMock.mockResolvedValue(
-      makeAnthropicReply({ score: 0.85, reasoning: 'cumpre' }),
-    );
+    messagesCreateMock.mockResolvedValue(makeAnthropicReply({ score: 0.85, reasoning: 'cumpre' }));
 
-    await runWithTenantContext(
-      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
-      async () => {
-        const result = await runProcedureTest({
-          test_id: 'chain',
-          definition,
-          scenario: {
-            turns: [
-              // Step A: agente responde, judge retorna score acima do threshold.
-              { role: 'user', message: 'olá' },
-              { role: 'agent', response_text: 'Resposta bem fundamentada.' },
-              // Step B: user diz "sim" → agreement → step-B passa.
-              { role: 'user', message: 'sim' },
-              { role: 'agent', response_text: 'Combinado!' },
-              // Step C: agent turn; runner injeta human_confirmation no at_step=C
-              // antes de re-avaliar → human_confirmed passa.
-              { role: 'agent', response_text: 'Aguardando confirmação humana...' },
-            ],
-            human_confirmations: [
-              { at_step: 'C', decision: 'approved', operator_id: 'op-1' },
-            ],
-          },
-          expected_outcome: 'success',
-          expected_step_path: ['A', 'B', 'C'],
-        });
+    await runWithTenantContext({ tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID }, async () => {
+      const result = await runProcedureTest({
+        test_id: 'chain',
+        definition,
+        scenario: {
+          turns: [
+            // Step A: agente responde, judge retorna score acima do threshold.
+            { role: 'user', message: 'olá' },
+            { role: 'agent', response_text: 'Resposta bem fundamentada.' },
+            // Step B: user diz "sim" → agreement → step-B passa.
+            { role: 'user', message: 'sim' },
+            { role: 'agent', response_text: 'Combinado!' },
+            // Step C: agent turn; runner injeta human_confirmation no at_step=C
+            // antes de re-avaliar → human_confirmed passa.
+            { role: 'agent', response_text: 'Aguardando confirmação humana...' },
+          ],
+          human_confirmations: [{ at_step: 'C', decision: 'approved', operator_id: 'op-1' }],
+        },
+        expected_outcome: 'success',
+        expected_step_path: ['A', 'B', 'C'],
+      });
 
-        expect(result.status).toBe('pass');
-        expect(result.details.actual_outcome).toBe('success');
-        expect(result.details.actual_step_path).toEqual(['A', 'B', 'C']);
-        expect(result.details.diff).toEqual([]);
+      expect(result.status).toBe('pass');
+      expect(result.details.actual_outcome).toBe('success');
+      expect(result.details.actual_step_path).toEqual(['A', 'B', 'C']);
+      expect(result.details.diff).toEqual([]);
 
-        // Issue #346: prove the flow under test runs under a concrete,
-        // non-`'default'` (tenant, agent). `runProcedureTest` deliberately
-        // opens its OWN dedicated sandbox context ('sandbox-test' / 'sandbox')
-        // and ignores the caller's — so the execution rows are stamped with the
-        // sandbox tuple, NEVER the legacy `'default'` sentinel. Asserting the
-        // captured context here pins that isolation and catches any regression
-        // that let the flow fall back to the default path.
-        expect(procedureTestContextsSeen.length).toBeGreaterThan(0);
-        for (const ctx of procedureTestContextsSeen) {
-          expect(ctx.tenant_id).not.toBe('default');
-          expect(ctx.agent_id).not.toBe('default');
-          expect(ctx.tenant_id).toBe('sandbox-test');
-          expect(ctx.agent_id).toBe('sandbox');
-        }
-      },
-    );
+      // Issue #346: prove the flow under test runs under a concrete,
+      // non-`'default'` (tenant, agent). `runProcedureTest` deliberately
+      // opens its OWN dedicated sandbox context ('sandbox-test' / 'sandbox')
+      // and ignores the caller's — so the execution rows are stamped with the
+      // sandbox tuple, NEVER the legacy `'default'` sentinel. Asserting the
+      // captured context here pins that isolation and catches any regression
+      // that let the flow fall back to the default path.
+      expect(procedureTestContextsSeen.length).toBeGreaterThan(0);
+      for (const ctx of procedureTestContextsSeen) {
+        expect(ctx.tenant_id).not.toBe('default');
+        expect(ctx.agent_id).not.toBe('default');
+        expect(ctx.tenant_id).toBe('sandbox-test');
+        expect(ctx.agent_id).toBe('sandbox');
+      }
+    });
   });
 
   it('cenário 5: reaper marca execução stale (8d in_progress) como abandoned/no_response com event auto_abandoned', async () => {

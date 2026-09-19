@@ -169,24 +169,24 @@ describe('risk level utilities', () => {
 
   describe('compareRiskLevel — fail-closed em inválido', () => {
     it('throw em string fora do enum', () => {
-      expect(() =>
-        compareRiskLevel('bogus' as unknown as RiskLevel, RiskLevel.LOW),
-      ).toThrow(InvalidRiskLevelError);
-      expect(() =>
-        compareRiskLevel(RiskLevel.LOW, 'bogus' as unknown as RiskLevel),
-      ).toThrow(InvalidRiskLevelError);
+      expect(() => compareRiskLevel('bogus' as unknown as RiskLevel, RiskLevel.LOW)).toThrow(
+        InvalidRiskLevelError,
+      );
+      expect(() => compareRiskLevel(RiskLevel.LOW, 'bogus' as unknown as RiskLevel)).toThrow(
+        InvalidRiskLevelError,
+      );
     });
 
     it('throw em undefined', () => {
-      expect(() =>
-        compareRiskLevel(undefined as unknown as RiskLevel, RiskLevel.LOW),
-      ).toThrow(InvalidRiskLevelError);
+      expect(() => compareRiskLevel(undefined as unknown as RiskLevel, RiskLevel.LOW)).toThrow(
+        InvalidRiskLevelError,
+      );
     });
 
     it('throw em número', () => {
-      expect(() =>
-        compareRiskLevel(3 as unknown as RiskLevel, RiskLevel.LOW),
-      ).toThrow(InvalidRiskLevelError);
+      expect(() => compareRiskLevel(3 as unknown as RiskLevel, RiskLevel.LOW)).toThrow(
+        InvalidRiskLevelError,
+      );
     });
 
     it('NUNCA retorna NaN (regressão Codex)', () => {
@@ -204,12 +204,12 @@ describe('risk level utilities', () => {
 
   describe('maxRiskLevel — fail-closed em inválido', () => {
     it('throw em operando inválido', () => {
-      expect(() =>
-        maxRiskLevel('bogus' as unknown as RiskLevel, RiskLevel.LOW),
-      ).toThrow(InvalidRiskLevelError);
-      expect(() =>
-        maxRiskLevel(RiskLevel.HIGH, 'bogus' as unknown as RiskLevel),
-      ).toThrow(InvalidRiskLevelError);
+      expect(() => maxRiskLevel('bogus' as unknown as RiskLevel, RiskLevel.LOW)).toThrow(
+        InvalidRiskLevelError,
+      );
+      expect(() => maxRiskLevel(RiskLevel.HIGH, 'bogus' as unknown as RiskLevel)).toThrow(
+        InvalidRiskLevelError,
+      );
     });
 
     it('NUNCA retorna string fora do enum (regressão Codex)', () => {

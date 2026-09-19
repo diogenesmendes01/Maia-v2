@@ -71,7 +71,7 @@ const KIND_TO_KNOWLEDGE_TYPE: Record<
 > = {
   fact: 'fato',
   rule: 'regra',
-  memory: 'fato',           // memory is a scoped fact
+  memory: 'fato', // memory is a scoped fact
   behavioral_hint: 'lacuna', // behavioral hints are observed gaps / tendencies
   procedure_hint: 'procedimento',
 };
@@ -80,9 +80,7 @@ const KIND_TO_KNOWLEDGE_TYPE: Record<
 // Adapter: sensitivity_hint → topic proxy
 // ---------------------------------------------------------------------------
 
-function sensitivityToTopic(
-  s: KnowledgeSensitivity | undefined,
-): TopicSignal | undefined {
+function sensitivityToTopic(s: KnowledgeSensitivity | undefined): TopicSignal | undefined {
   if (s === 'high') return 'critical_decision';
   if (s === 'medium') return 'financial';
   return undefined;
@@ -100,17 +98,17 @@ export class KnowledgeRiskScorer {
     const gate = opts?.gate ?? input.gate;
 
     // Derive knowledge_type (allow test override for coercion path validation)
-    const knowledge_type = (
-      input._test_force_knowledge_type ??
-      KIND_TO_KNOWLEDGE_TYPE[input.kind]
-    ) as 'fato' | 'regra' | 'procedimento' | 'lacuna' | 'tool_request';
+    const knowledge_type = (input._test_force_knowledge_type ??
+      KIND_TO_KNOWLEDGE_TYPE[input.kind]) as
+      | 'fato'
+      | 'regra'
+      | 'procedimento'
+      | 'lacuna'
+      | 'tool_request';
 
     // Boost derived_confidence for human-provided origins
-    const isHumanProvided =
-      input.origin === 'user_explicit' || input.origin === 'human_approved';
-    const derived_confidence = isHumanProvided
-      ? Math.max(input.confidence, 0.8)
-      : input.confidence;
+    const isHumanProvided = input.origin === 'user_explicit' || input.origin === 'human_approved';
+    const derived_confidence = isHumanProvided ? Math.max(input.confidence, 0.8) : input.confidence;
 
     const scored = await scoreKnowledge(
       {
@@ -127,11 +125,7 @@ export class KnowledgeRiskScorer {
     // Map ScoredRisk → KnowledgeRiskScoreOutput
     const level = scored.level as KnowledgeRiskLevel;
     const sensitivity: KnowledgeSensitivity =
-      level === 'critical' || level === 'high'
-        ? 'high'
-        : level === 'medium'
-          ? 'medium'
-          : 'low';
+      level === 'critical' || level === 'high' ? 'high' : level === 'medium' ? 'medium' : 'low';
 
     const reasons = [
       ...scored.triggers.map((t) => t.signal),

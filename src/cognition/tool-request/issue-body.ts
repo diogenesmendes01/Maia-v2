@@ -254,16 +254,12 @@ export function corpoDaIssue(args: {
   );
   if (pedido.root_trace_ids.length > 0) {
     linhas.push('');
-    linhas.push(
-      `Traces de referência: ${pedido.root_trace_ids.map((t) => `\`${t}\``).join(', ')}`,
-    );
+    linhas.push(`Traces de referência: ${pedido.root_trace_ids.map((t) => `\`${t}\``).join(', ')}`);
   }
   linhas.push('');
   linhas.push('---');
   linhas.push('');
-  linhas.push(
-    `<!-- ${MARCADOR_DE_PEDIDO}${args.idempotency_key} -->`,
-  );
+  linhas.push(`<!-- ${MARCADOR_DE_PEDIDO}${args.idempotency_key} -->`);
   linhas.push(
     `_Gerado pela triagem de pedidos de ferramenta (issue #638). ${TOOL_REQUEST_GUARDRAIL}._`,
   );

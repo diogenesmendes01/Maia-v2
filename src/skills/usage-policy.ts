@@ -295,9 +295,7 @@ export function parseUsagePolicy(raw: unknown): SkillUsagePolicy | null {
  */
 export function safeParseUsagePolicy(
   raw: unknown,
-):
-  | { ok: true; policy: SkillUsagePolicy | null }
-  | { ok: false; error: string } {
+): { ok: true; policy: SkillUsagePolicy | null } | { ok: false; error: string } {
   if (raw === null || raw === undefined) return { ok: true, policy: null };
   if (
     typeof raw === 'object' &&

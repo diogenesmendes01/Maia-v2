@@ -87,15 +87,10 @@ export async function signalStreamPromotion(
       source: args.source,
       status_before: promotion.status_before,
       status_after: promotion.status_after,
-      ...(args.promoted_by_turn_id
-        ? { promoted_by_turn_id: args.promoted_by_turn_id }
-        : {}),
+      ...(args.promoted_by_turn_id ? { promoted_by_turn_id: args.promoted_by_turn_id } : {}),
     },
   }).catch((err) =>
-    logger.warn(
-      { err: (err as Error).message },
-      'stream.turn_promoted_audit_failed',
-    ),
+    logger.warn({ err: (err as Error).message }, 'stream.turn_promoted_audit_failed'),
   );
 
   try {
@@ -110,9 +105,7 @@ export async function signalStreamPromotion(
       mensagem_id: promotion.representative_message_id,
       turn_id: promotion.turn_id,
     });
-    recordStreamPromotion(
-      args.source === 'recovery_reconciliation' ? 'recovered' : 'promoted',
-    );
+    recordStreamPromotion(args.source === 'recovery_reconciliation' ? 'recovered' : 'promoted');
     logger.info(
       {
         turn_id: promotion.turn_id,
@@ -205,10 +198,7 @@ export async function notePromotionReconciled(args: {
       status_after: args.status,
     },
   }).catch((err) =>
-    logger.warn(
-      { err: (err as Error).message },
-      'stream.turn_promoted_audit_failed',
-    ),
+    logger.warn({ err: (err as Error).message }, 'stream.turn_promoted_audit_failed'),
   );
 }
 
@@ -253,9 +243,6 @@ export async function reportPromotionFenceRejected(args: {
       reason: 'stale_claim',
     },
   }).catch((err) =>
-    logger.warn(
-      { err: (err as Error).message },
-      'stream.turn_promotion_rejected_audit_failed',
-    ),
+    logger.warn({ err: (err as Error).message }, 'stream.turn_promotion_rejected_audit_failed'),
   );
 }

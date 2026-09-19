@@ -79,9 +79,10 @@ export const inboundUnroutedRepo = {
    * caminho feliz já ter armado o job. O re-add com jobId estável é
    * idempotente, então varrer uma row cujo job está vivo é inofensivo.
    */
-  async listPendingStale(olderThanMs: number, limit: number): Promise<
-    Array<{ id: string; line_external_id: string; whatsapp_message_id: string }>
-  > {
+  async listPendingStale(
+    olderThanMs: number,
+    limit: number,
+  ): Promise<Array<{ id: string; line_external_id: string; whatsapp_message_id: string }>> {
     const cutoff = new Date(Date.now() - olderThanMs);
     return db
       .select({
@@ -129,10 +130,7 @@ export const inboundUnroutedRepo = {
       .selectDistinct({ enc_key_id: inbound_unrouted.enc_key_id })
       .from(inbound_unrouted)
       .where(
-        and(
-          eq(inbound_unrouted.status, 'pending'),
-          gt(inbound_unrouted.expires_at, new Date()),
-        ),
+        and(eq(inbound_unrouted.status, 'pending'), gt(inbound_unrouted.expires_at, new Date())),
       );
     return rows.map((r) => r.enc_key_id);
   },

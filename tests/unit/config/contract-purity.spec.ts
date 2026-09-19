@@ -177,9 +177,7 @@ describe('config contract — import purity (#515)', () => {
         // are stripped first: the wrapper's docstring explains precisely why
         // `dotenv.config` is off limits, and must not trip its own guard.
         const source = stripComments(readFileSync(join(REPO_ROOT, node.file), 'utf8'));
-        expect(/dotenv\s*\.\s*config/.test(source), `${node.file} calls dotenv.config`).toBe(
-          false,
-        );
+        expect(/dotenv\s*\.\s*config/.test(source), `${node.file} calls dotenv.config`).toBe(false);
       }
     }
   });
@@ -208,9 +206,8 @@ describe('config contract — import purity (#515)', () => {
   });
 
   it('generators are deterministic (same input ⇒ byte-identical output)', async () => {
-    const { renderEnvExample, renderConfigDoc, renderFixture } = await import(
-      '@/config/generate.js'
-    );
+    const { renderEnvExample, renderConfigDoc, renderFixture } =
+      await import('@/config/generate.js');
     expect(renderEnvExample()).toBe(renderEnvExample());
     expect(renderConfigDoc()).toBe(renderConfigDoc());
     expect(renderFixture('production')).toBe(renderFixture('production'));

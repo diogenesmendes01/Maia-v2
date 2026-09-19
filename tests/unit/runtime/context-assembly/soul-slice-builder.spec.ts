@@ -19,11 +19,7 @@ import { InMemorySliceCache } from '@/runtime/context-packet/cache/slice-cache.j
 import type { SoulBias } from '@/db/schema.js';
 import { mockBase, mockDecision } from './_fixture.js';
 
-function bias(
-  id: string,
-  strength: number,
-  principle = `principle-${id}`,
-): SoulBias {
+function bias(id: string, strength: number, principle = `principle-${id}`): SoulBias {
   return {
     id,
     tenant_id: 'tenant1',
@@ -80,9 +76,7 @@ describe('SoulSliceBuilder', () => {
   });
 
   it('truncates to max_biases (total_active > truncated_to)', async () => {
-    const port = mkPort(
-      Array.from({ length: 10 }, (_, i) => bias(`b${i}`, 1 - i * 0.05)),
-    );
+    const port = mkPort(Array.from({ length: 10 }, (_, i) => bias(`b${i}`, 1 - i * 0.05)));
     const builder = new SoulSliceBuilder(port, cache);
     const r = await builder.build({
       base: mockBase(),

@@ -69,9 +69,7 @@ export const factsResolver = {
         ? sql`AND af.chave = ANY(${new Param(input.keys)})`
         : sql``;
     // PR #94 round-2 high: enforce agent isolation when agent_id supplied.
-    const agentFilter = input.agent_id
-      ? sql`AND af.agent_id = ${input.agent_id}`
-      : sql``;
+    const agentFilter = input.agent_id ? sql`AND af.agent_id = ${input.agent_id}` : sql``;
 
     const rows = await db.execute<{
       id: string;

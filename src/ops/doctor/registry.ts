@@ -33,9 +33,7 @@ export function isDoctorCategory(value: string): value is DoctorCategory {
 }
 
 /** Registry narrowed to a set of categories; empty set means "everything". */
-export function checksForCategories(
-  categories: readonly DoctorCategory[],
-): readonly DoctorCheck[] {
+export function checksForCategories(categories: readonly DoctorCategory[]): readonly DoctorCheck[] {
   if (categories.length === 0) return DOCTOR_CHECKS;
   const wanted = new Set(categories);
   return DOCTOR_CHECKS.filter((c) => wanted.has(c.category));

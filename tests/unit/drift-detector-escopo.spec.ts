@@ -45,7 +45,10 @@ function makeProfile() {
   });
 }
 
-function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {
+function makeAgentMsg(
+  text: string,
+  id = 'm-' + Math.random().toString(36).slice(2),
+): DriftRecentMessage {
   return { id, from: 'agent', text, created_at: new Date() };
 }
 
@@ -112,9 +115,7 @@ describe('escopoDetector', () => {
   it('sem mensagens do agente → null sem chamar Anthropic', async () => {
     const out = await escopoDetector.detect({
       profile_active: makeProfile(),
-      recent_messages: [
-        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
-      ],
+      recent_messages: [{ id: 'u1', from: 'user', text: 'oi', created_at: new Date() }],
       capabilities: [{ name: 'envio_pix', status: 'active' }],
     });
 

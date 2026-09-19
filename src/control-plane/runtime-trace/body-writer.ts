@@ -87,10 +87,7 @@ export async function writeBody(input: TraceBodyInput): Promise<TraceBodyWritten
   // --- Idempotency guard: skip all external writes if body already exists ---
   const existing = await findExistingBody(input.trace_id);
   if (existing) {
-    logger.debug(
-      { trace_id: input.trace_id },
-      'runtime_trace.body_already_exists_skip_write',
-    );
+    logger.debug({ trace_id: input.trace_id }, 'runtime_trace.body_already_exists_skip_write');
     // Still attempt the envelope flip — it may have failed on the prior pass.
     try {
       await db.execute(
@@ -113,7 +110,8 @@ export async function writeBody(input: TraceBodyInput): Promise<TraceBodyWritten
       trace_id: input.trace_id,
       packet_hmac: existing.packet_hmac,
       hmac_key_version: existing.hmac_key_version,
-      redaction_applied: existing.redaction_applied as import('./types.js').TraceBodyWritten['redaction_applied'],
+      redaction_applied:
+        existing.redaction_applied as import('./types.js').TraceBodyWritten['redaction_applied'],
       bytes_redacted: existing.bytes_redacted,
       encrypted: existing.encrypted,
       s3_uri: existing.s3_uri,

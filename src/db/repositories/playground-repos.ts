@@ -215,10 +215,7 @@ export const playgroundRepo = {
       .select()
       .from(playground_turns)
       .where(
-        and(
-          eq(playground_turns.session_id, args.session_id),
-          eq(playground_turns.status, 'done'),
-        ),
+        and(eq(playground_turns.session_id, args.session_id), eq(playground_turns.status, 'done')),
       )
       .orderBy(desc(playground_turns.created_at))
       .limit(args.limit ?? 20);

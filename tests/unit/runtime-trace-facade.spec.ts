@@ -12,40 +12,46 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
  * one DB transaction (durable). The in-process enqueue is a perf accelerator
  * only; the worker drains the durable outbox as source of truth.
  */
-const { dbInsertMock, txInsertValuesMock, txOnConflictMock, dbTransactionMock, isEnabledMock, enqueueMock } =
-  vi.hoisted(() => {
-    const txOnConflictMock = vi.fn().mockResolvedValue(undefined);
-    const txInsertValuesMock = vi.fn();
-    return {
-      dbInsertMock: vi.fn().mockResolvedValue(undefined),
-      txInsertValuesMock,
-      txOnConflictMock,
-      dbTransactionMock: vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
-        const tx = {
-          insert: vi.fn(() => ({
-            values: vi.fn((row: unknown) => {
-              txInsertValuesMock(row);
-              return {
-                then: (resolve: (v: unknown) => void) => resolve(undefined),
-                onConflictDoNothing: () => {
-                  txOnConflictMock();
-                  // #514 round 2: RETURNING is how the writer detects a replay.
-                  const rows = [{ trace_id: 'inserted' }];
-                  return {
-                    then: (r: (v: unknown) => void) => r(rows),
-                    returning: () => Promise.resolve(rows),
-                  };
-                },
-              };
-            }),
-          })),
-        };
-        await fn(tx);
-      }),
-      isEnabledMock: vi.fn(),
-      enqueueMock: vi.fn(),
-    };
-  });
+const {
+  dbInsertMock,
+  txInsertValuesMock,
+  txOnConflictMock,
+  dbTransactionMock,
+  isEnabledMock,
+  enqueueMock,
+} = vi.hoisted(() => {
+  const txOnConflictMock = vi.fn().mockResolvedValue(undefined);
+  const txInsertValuesMock = vi.fn();
+  return {
+    dbInsertMock: vi.fn().mockResolvedValue(undefined),
+    txInsertValuesMock,
+    txOnConflictMock,
+    dbTransactionMock: vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
+      const tx = {
+        insert: vi.fn(() => ({
+          values: vi.fn((row: unknown) => {
+            txInsertValuesMock(row);
+            return {
+              then: (resolve: (v: unknown) => void) => resolve(undefined),
+              onConflictDoNothing: () => {
+                txOnConflictMock();
+                // #514 round 2: RETURNING is how the writer detects a replay.
+                const rows = [{ trace_id: 'inserted' }];
+                return {
+                  then: (r: (v: unknown) => void) => r(rows),
+                  returning: () => Promise.resolve(rows),
+                };
+              },
+            };
+          }),
+        })),
+      };
+      await fn(tx);
+    }),
+    isEnabledMock: vi.fn(),
+    enqueueMock: vi.fn(),
+  };
+});
 
 vi.mock('../../src/db/client.js', () => ({
   db: {

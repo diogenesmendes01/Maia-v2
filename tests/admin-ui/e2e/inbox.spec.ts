@@ -67,10 +67,7 @@ test.describe('Inbox — Tela 1', () => {
 
   test('clicar numa proposta abre o detalhe', async ({ page }) => {
     await page.goto('/inbox');
-    await page
-      .getByRole('row')
-      .filter({ hasText: 'Jornada E2E — proposta simples' })
-      .click();
+    await page.getByRole('row').filter({ hasText: 'Jornada E2E — proposta simples' }).click();
     await expect(page).toHaveURL(/\/proposals\/[0-9a-f-]{36}$/);
     await expect(page.locator('h1')).toContainText('Jornada E2E — proposta simples');
   });
@@ -82,9 +79,7 @@ test.describe('Inbox — Tela 1', () => {
     await expect(page.getByRole('checkbox', { name: 'Selecionar todas' })).toBeVisible();
     await expect(page.getByRole('button', { name: 'Rejeitar em massa' })).toBeHidden();
 
-    await page
-      .getByRole('checkbox', { name: 'Selecionar Jornada E2E — proposta simples' })
-      .check();
+    await page.getByRole('checkbox', { name: 'Selecionar Jornada E2E — proposta simples' }).check();
     await expect(page.getByRole('button', { name: 'Rejeitar em massa' })).toBeVisible();
   });
 });

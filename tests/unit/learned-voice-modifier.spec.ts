@@ -54,9 +54,7 @@ describe('LearnedVoiceModifier (§4)', () => {
   });
 
   it('rejects confidence outside [0, 1]', () => {
-    expect(() =>
-      LearnedVoiceModifierSchema.parse({ ...validModifier, confidence: 1.5 }),
-    ).toThrow();
+    expect(() => LearnedVoiceModifierSchema.parse({ ...validModifier, confidence: 1.5 })).toThrow();
     expect(() =>
       LearnedVoiceModifierSchema.parse({ ...validModifier, confidence: -0.1 }),
     ).toThrow();
@@ -109,9 +107,7 @@ describe('LearnedVoiceModifier (§4)', () => {
   it('accepts all 4 valid statuses', () => {
     const statuses = ['proposed', 'active', 'deprecated', 'rolled_back'] as const;
     for (const s of statuses) {
-      expect(() =>
-        LearnedVoiceModifierSchema.parse({ ...validModifier, status: s }),
-      ).not.toThrow();
+      expect(() => LearnedVoiceModifierSchema.parse({ ...validModifier, status: s })).not.toThrow();
     }
   });
 });

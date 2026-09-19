@@ -40,7 +40,14 @@ const outputSchema = z.object({
 const LEGAL_LEXICON: ReadonlyArray<{ reason: string; terms: readonly string[] }> = [
   {
     reason: 'lawyer',
-    terms: ['advogad', 'advocacia', 'escritorio de advocacia', 'meu juridico', 'lawyer', 'attorney'],
+    terms: [
+      'advogad',
+      'advocacia',
+      'escritorio de advocacia',
+      'meu juridico',
+      'lawyer',
+      'attorney',
+    ],
   },
   {
     reason: 'legal_department',
@@ -48,29 +55,72 @@ const LEGAL_LEXICON: ReadonlyArray<{ reason: string; terms: readonly string[] }>
   },
   {
     reason: 'lawsuit',
-    terms: ['processar', 'processo judicial', 'vou processar', 'acao judicial', 'acao na justica', 'lawsuit', 'sue you', 'litig'],
+    terms: [
+      'processar',
+      'processo judicial',
+      'vou processar',
+      'acao judicial',
+      'acao na justica',
+      'lawsuit',
+      'sue you',
+      'litig',
+    ],
   },
   {
     reason: 'court_action',
-    terms: ['justica', 'tribunal', 'judicial', 'na justica', 'court', 'juiz', 'vara civel', 'mandado'],
+    terms: [
+      'justica',
+      'tribunal',
+      'judicial',
+      'na justica',
+      'court',
+      'juiz',
+      'vara civel',
+      'mandado',
+    ],
   },
   {
     reason: 'formal_complaint',
-    terms: ['reclamacao formal', 'queixa formal', 'notificacao extrajudicial', 'formal complaint', 'reclamacao no'],
+    terms: [
+      'reclamacao formal',
+      'queixa formal',
+      'notificacao extrajudicial',
+      'formal complaint',
+      'reclamacao no',
+    ],
   },
   {
     reason: 'consumer_protection',
-    terms: ['procon', 'codigo de defesa do consumidor', 'defesa do consumidor', 'cdc', 'consumer protection', 'reclame aqui'],
+    terms: [
+      'procon',
+      'codigo de defesa do consumidor',
+      'defesa do consumidor',
+      'cdc',
+      'consumer protection',
+      'reclame aqui',
+    ],
   },
   {
     reason: 'legal_notification',
-    terms: ['notificacao judicial', 'notificacao legal', 'intimacao', 'intimar', 'legal notice', 'cease and desist'],
+    terms: [
+      'notificacao judicial',
+      'notificacao legal',
+      'intimacao',
+      'intimar',
+      'legal notice',
+      'cease and desist',
+    ],
   },
 ];
 
 /** Pull a short excerpt around a matched term so the agent/policy can see the
  * context without re-reading the whole message. */
-function excerptAround(original: string, _normalized: string, termStart: number, termLen: number): string {
+function excerptAround(
+  original: string,
+  _normalized: string,
+  termStart: number,
+  termLen: number,
+): string {
   // termStart/termLen are indices in the NORMALIZED string, which is the same
   // length as the lowercased original (stripDiacritics preserves length for the
   // combining-mark removal we do). Clamp a small window.

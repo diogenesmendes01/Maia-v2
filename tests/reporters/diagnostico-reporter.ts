@@ -232,15 +232,9 @@ export default class DiagnosticoReporter implements Reporter {
       out.push('prazos estourados: nenhum.');
     } else {
       out.push(`PRAZOS ESTOURADOS: ${totalEstouros}`);
-      out.push(
-        '  O timeout do vitest NÃO aborta o corpo async. A tentativa que estourou',
-      );
-      out.push(
-        '  continua rodando e disputa mocks, linhas no banco e estado de módulo com',
-      );
-      out.push(
-        '  o que vier depois. Qualquer outra falha nestes arquivos é suspeita de ser',
-      );
+      out.push('  O timeout do vitest NÃO aborta o corpo async. A tentativa que estourou');
+      out.push('  continua rodando e disputa mocks, linhas no banco e estado de módulo com');
+      out.push('  o que vier depois. Qualquer outra falha nestes arquivos é suspeita de ser');
       out.push('  consequência, não causa. Leia o prazo primeiro.');
       for (const r of estouros) {
         const marca = r.estado === 'passed' ? 'PASSOU MESMO ASSIM' : r.estado.toUpperCase();

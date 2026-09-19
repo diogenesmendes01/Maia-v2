@@ -23,7 +23,11 @@ vi.mock('@/gateway/presence.js', () => ({
   markRead: vi.fn(),
   startTyping: vi.fn(() => ({ stop: vi.fn() })),
   sendReaction: vi.fn(),
-  sendPoll: vi.fn(async () => ({ whatsapp_id: 'real-poll', message_secret: null, creator_jid: null })),
+  sendPoll: vi.fn(async () => ({
+    whatsapp_id: 'real-poll',
+    message_secret: null,
+    creator_jid: null,
+  })),
 }));
 vi.mock('@/gateway/line-session-manager.js', () => ({
   getLineSessionManager: () => ({
@@ -33,7 +37,12 @@ vi.mock('@/gateway/line-session-manager.js', () => ({
   }),
 }));
 
-import { buildSyntheticMessage, classifyOutcome, runProbeTick, type ProbeTickDeps } from '@/probe/probe.js';
+import {
+  buildSyntheticMessage,
+  classifyOutcome,
+  runProbeTick,
+  type ProbeTickDeps,
+} from '@/probe/probe.js';
 import { PROBE_SCOPE, PROBE_CHANNEL_ID, PROBE_CLIENT_TEL } from '@/probe/constants.js';
 import { _setSyntheticChannelIdsForTests, isSyntheticChannel } from '@/probe/sink-guard.js';
 import { _buildOutputForTests } from '@/gateway/line-output.js';
@@ -51,19 +60,29 @@ describe('buildSyntheticMessage', () => {
 
 describe('classifyOutcome', () => {
   it('ok quando efeito satisfeito dentro do SLO_warn', () => {
-    expect(classifyOutcome({ effectSatisfied: true, liveness: true, elapsedMs: 1000, slowMs: 2000 })).toBe('ok');
+    expect(
+      classifyOutcome({ effectSatisfied: true, liveness: true, elapsedMs: 1000, slowMs: 2000 }),
+    ).toBe('ok');
   });
   it('slow quando efeito satisfeito mas acima do SLO_warn', () => {
-    expect(classifyOutcome({ effectSatisfied: true, liveness: true, elapsedMs: 3000, slowMs: 2000 })).toBe('slow');
+    expect(
+      classifyOutcome({ effectSatisfied: true, liveness: true, elapsedMs: 3000, slowMs: 2000 }),
+    ).toBe('slow');
   });
   it('wrong quando respondeu (liveness) mas sem efeito', () => {
-    expect(classifyOutcome({ effectSatisfied: false, liveness: true, elapsedMs: 5000, slowMs: 2000 })).toBe('wrong');
+    expect(
+      classifyOutcome({ effectSatisfied: false, liveness: true, elapsedMs: 5000, slowMs: 2000 }),
+    ).toBe('wrong');
   });
   it('wrong quando efeito satisfeito mas SEM resposta (liveness) — não é sucesso', () => {
-    expect(classifyOutcome({ effectSatisfied: true, liveness: false, elapsedMs: 1000, slowMs: 2000 })).toBe('wrong');
+    expect(
+      classifyOutcome({ effectSatisfied: true, liveness: false, elapsedMs: 1000, slowMs: 2000 }),
+    ).toBe('wrong');
   });
   it('silent quando nem respondeu', () => {
-    expect(classifyOutcome({ effectSatisfied: false, liveness: false, elapsedMs: 5000, slowMs: 2000 })).toBe('silent');
+    expect(
+      classifyOutcome({ effectSatisfied: false, liveness: false, elapsedMs: 5000, slowMs: 2000 }),
+    ).toBe('silent');
   });
 });
 
@@ -94,7 +113,11 @@ describe('outbound sink (buildOutput) — flag-independente (P1-C)', () => {
 
   it('canal NÃO-sintético ⇒ caminho normal (primitiva chamada)', async () => {
     _setSyntheticChannelIdsForTests([PROBE_CHANNEL_ID]);
-    const out = _buildOutputForTests({ tenant_id: 'primary', agent_id: 'primary', channel_id: 'c-real' });
+    const out = _buildOutputForTests({
+      tenant_id: 'primary',
+      agent_id: 'primary',
+      channel_id: 'c-real',
+    });
     const wid = await noOutbox(() => out.sendText('jid', 'oi'));
     expect(wid).toBe('real-text-wid');
     expect(h.sendOutboundText).toHaveBeenCalledOnce();
@@ -119,7 +142,10 @@ function fakeRepo(overrides: Record<string, unknown> = {}) {
     completeRun: vi.fn(async () => undefined),
     cleanupRunTraffic: vi.fn(async () => 1),
     recordOk: vi.fn(async () => ({ recovered: false })),
-    recordFailure: vi.fn(async () => ({ consecutive_failures: 1, transitioned_to_degraded: false })),
+    recordFailure: vi.fn(async () => ({
+      consecutive_failures: 1,
+      transitioned_to_degraded: false,
+    })),
     recordAlertAttempt: vi.fn(async () => undefined),
     ...overrides,
   };
@@ -137,7 +163,11 @@ function baseDeps(overrides: Partial<ProbeTickDeps> = {}): ProbeTickDeps {
       id: 'register_transaction_pendente',
       prompt: 'registre despesa pendente de 50',
       intent: 'registrar despesa pendente',
-      assert: vi.fn(async () => ({ effect_satisfied: true, liveness: true, detail: { transacao_id: 't-1' } })),
+      assert: vi.fn(async () => ({
+        effect_satisfied: true,
+        liveness: true,
+        detail: { transacao_id: 't-1' },
+      })),
     },
     ingress: vi.fn(async () => 'handled' as const),
     resolveInboundId: vi.fn(async () => 'm-1'),
@@ -174,7 +204,11 @@ describe('runProbeTick', () => {
     expect(res.outcome).toBe('ok');
     expect(deps.ingress).toHaveBeenCalledOnce();
     expect(repo.cleanupRunTraffic).toHaveBeenCalledWith(
-      expect.objectContaining({ mensagem_id: 'm-1', tenant_id: expect.any(String), agent_id: expect.any(String) }),
+      expect.objectContaining({
+        mensagem_id: 'm-1',
+        tenant_id: expect.any(String),
+        agent_id: expect.any(String),
+      }),
     );
     expect(repo.recordOk).toHaveBeenCalled();
     expect(repo.completeRun).toHaveBeenCalledWith(
@@ -254,7 +288,10 @@ describe('runProbeTick', () => {
 
   it('transição saudável→degradado ⇒ deliverAlert + recordAlertAttempt', async () => {
     const repo = fakeRepo({
-      recordFailure: vi.fn(async () => ({ consecutive_failures: 3, transitioned_to_degraded: true })),
+      recordFailure: vi.fn(async () => ({
+        consecutive_failures: 3,
+        transitioned_to_degraded: true,
+      })),
     });
     const deps = baseDeps({
       repo: repo as unknown as ProbeTickDeps['repo'],
@@ -269,7 +306,9 @@ describe('runProbeTick', () => {
     expect(res.outcome).toBe('silent');
     expect(res.consecutiveFailures).toBe(3);
     expect(deps.deliverAlert).toHaveBeenCalledOnce();
-    expect(repo.recordAlertAttempt).toHaveBeenCalledWith(expect.objectContaining({ delivered: true }));
+    expect(repo.recordAlertAttempt).toHaveBeenCalledWith(
+      expect.objectContaining({ delivered: true }),
+    );
   });
 
   it('judge habilitado ⇒ consulta a resposta e julga (quando há liveness)', async () => {

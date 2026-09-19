@@ -83,9 +83,7 @@ describe('Requirement 6 — multi-pending disambiguation', () => {
       { id: 'task-await-A', kind: 'await_response', status: 'in_progress' },
     ]);
 
-    const { captureInboundForOutreach } = await import(
-      '../../../src/scheduling/disambiguation.js'
-    );
+    const { captureInboundForOutreach } = await import('../../../src/scheduling/disambiguation.js');
     const result = await captureInboundForOutreach({
       sender: mariana as never,
       inbound: {
@@ -125,9 +123,7 @@ describe('Requirement 6 — multi-pending disambiguation', () => {
     pessoasFindByIdMock.mockResolvedValue(owner);
     conversasFindActiveMock.mockResolvedValue({ id: 'owner-conv' });
 
-    const { captureInboundForOutreach } = await import(
-      '../../../src/scheduling/disambiguation.js'
-    );
+    const { captureInboundForOutreach } = await import('../../../src/scheduling/disambiguation.js');
     const r = await captureInboundForOutreach({
       sender: mariana as never,
       inbound: { id: 'inb-no-token', conteudo: 'segue' } as never,
@@ -164,9 +160,8 @@ describe('Requirement 6 — multi-pending disambiguation', () => {
     tasksByOccMock.mockResolvedValue([
       { id: 'task-await-A', kind: 'await_response', status: 'in_progress' },
     ]);
-    const { applyDisambiguationDecision } = await import(
-      '../../../src/scheduling/disambiguation.js'
-    );
+    const { applyDisambiguationDecision } =
+      await import('../../../src/scheduling/disambiguation.js');
     const r = await applyDisambiguationDecision({
       pending_question_id: 'pq-disambig',
       chosen_key: 'A',

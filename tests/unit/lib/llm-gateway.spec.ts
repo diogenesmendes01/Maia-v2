@@ -350,18 +350,18 @@ describe('executeLLM — deadline e cancelamento', () => {
   });
 
   it('deadline já vencido é rejeitado como timeout sem chamar o provider', async () => {
-    await expect(
-      executeLLM(req({ ctx: { deadline_at: Date.now() - 1 } })),
-    ).rejects.toMatchObject({ kind: 'timeout' });
+    await expect(executeLLM(req({ ctx: { deadline_at: Date.now() - 1 } }))).rejects.toMatchObject({
+      kind: 'timeout',
+    });
     expect(anthropicCreateMock).not.toHaveBeenCalled();
   });
 
   it('deadline curto impede o backoff e o fallback (não reinicia a cada retry)', async () => {
     anthropicCreateMock.mockRejectedValue(apiError(503));
     const t0 = Date.now();
-    await expect(
-      executeLLM(req({ ctx: { deadline_at: Date.now() + 120 } })),
-    ).rejects.toMatchObject({ kind: 'timeout' });
+    await expect(executeLLM(req({ ctx: { deadline_at: Date.now() + 120 } }))).rejects.toMatchObject(
+      { kind: 'timeout' },
+    );
     // Uma tentativa; o backoff (≥1s) não cabe no que sobrou do deadline.
     expect(anthropicCreateMock).toHaveBeenCalledTimes(1);
     expect(Date.now() - t0).toBeLessThan(900);
@@ -420,7 +420,12 @@ describe('executeLLM — telemetria e custo', () => {
     const tokens = counterCalls('maia_llm_tokens_total');
     expect(tokens.map((l) => l.kind)).toEqual(expect.arrayContaining(['input', 'output']));
     expect(recordCostMock).toHaveBeenCalledWith(
-      expect.objectContaining({ model: MAIN_MODEL, tokens_input: 11, tokens_output: 7, pessoa_id: 'p1' }),
+      expect.objectContaining({
+        model: MAIN_MODEL,
+        tokens_input: 11,
+        tokens_output: 7,
+        pessoa_id: 'p1',
+      }),
     );
   });
 
@@ -490,7 +495,11 @@ describe('executeLLM — telemetria e custo', () => {
     anthropicCreateMock.mockResolvedValueOnce(okReply());
     await executeLLM(req());
 
-    for (const metric of ['maia_llm_requests_total', 'maia_llm_tokens_total', 'maia_llm_attempts_total']) {
+    for (const metric of [
+      'maia_llm_requests_total',
+      'maia_llm_tokens_total',
+      'maia_llm_attempts_total',
+    ]) {
       const calls = counterCalls(metric);
       expect(calls.length, `${metric} não foi emitida`).toBeGreaterThan(0);
       for (const labels of calls) {
@@ -522,9 +531,9 @@ describe('executeLLM — telemetria e custo', () => {
     anthropicCreateMock.mockRejectedValue(apiError(503));
     // `reasoner` retenta, então o backoff (≥1s) não cabe no que resta do
     // deadline (40ms) e o desfecho é `timeout`, não `error`.
-    await executeLLM(
-      req({ workload: 'reasoner', ctx: { deadline_at: Date.now() + 40 } }),
-    ).catch(() => undefined);
+    await executeLLM(req({ workload: 'reasoner', ctx: { deadline_at: Date.now() + 40 } })).catch(
+      () => undefined,
+    );
     expect(counterCalls('maia_llm_timeouts_total')[0] ?? {}).toMatchObject({
       tenant_id: 'acme',
       agent_id: 'ana',
@@ -571,9 +580,7 @@ describe('LLMGatewayError — redaction', () => {
     const echoed =
       'invalid_request_error: messages.0.content: "Cliente Maria Silva, CPF 123.456.789-00, ' +
       'telefone (11) 98765-4321, transferir R$ 12.500,00 para a conta 4455-6" is too long';
-    anthropicCreateMock.mockRejectedValue(
-      apiError(400, echoed, { 'request-id': 'req_abc123' }),
-    );
+    anthropicCreateMock.mockRejectedValue(apiError(400, echoed, { 'request-id': 'req_abc123' }));
 
     const err = await executeLLM(
       req({ messages: [{ role: 'user', content: 'Maria Silva, CPF 123.456.789-00' }] }),

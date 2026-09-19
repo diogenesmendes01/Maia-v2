@@ -126,10 +126,9 @@ async function criarLinhaComPayloadInvalido(): Promise<string> {
 }
 
 async function linha(id: string): Promise<{ status: string; attempt: number }> {
-  const { rows } = await pool.query(
-    `SELECT status, attempt FROM outbound_messages WHERE id = $1`,
-    [id],
-  );
+  const { rows } = await pool.query(`SELECT status, attempt FROM outbound_messages WHERE id = $1`, [
+    id,
+  ]);
   return rows[0];
 }
 
@@ -218,7 +217,10 @@ d('#633 — job de entrega determinístico (Redis + Postgres reais)', () => {
     // Fechar a fila PRIMEIRO torna a corrida não-representável: sem worker
     // vivo, não há escrita concorrente com a limpeza.
     for (const id of armados) {
-      await outboundDeliveryQueue.getJob(id).then((j) => j?.remove()).catch(() => undefined);
+      await outboundDeliveryQueue
+        .getJob(id)
+        .then((j) => j?.remove())
+        .catch(() => undefined);
     }
     const { shutdownQueue } = await import('@/gateway/queue.js');
     await shutdownQueue();

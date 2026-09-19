@@ -166,10 +166,7 @@ describe('UserSliceBuilder', () => {
   });
 
   it('returns empty pessoa block when port returns null pessoa', async () => {
-    const builder = new UserSliceBuilder(
-      mkPort([memory('m1', true)], [], null),
-      cache,
-    );
+    const builder = new UserSliceBuilder(mkPort([memory('m1', true)], [], null), cache);
     const r = await builder.build({
       base: mockBase(),
       requirements: { depth: 'relevant', max_items: 5 },

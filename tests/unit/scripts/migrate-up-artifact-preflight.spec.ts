@@ -26,7 +26,11 @@ const discoverMigrationsMock = vi.fn<(dir: string) => Promise<MigrationArtifact>
 
 vi.mock('@/migrations/index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/migrations/index.js')>();
-  return { ...actual, runMigrations: runMigrationsMock, discoverMigrations: discoverMigrationsMock };
+  return {
+    ...actual,
+    runMigrations: runMigrationsMock,
+    discoverMigrations: discoverMigrationsMock,
+  };
 });
 
 const poolTouched = vi.fn<(method: string) => void>();
@@ -118,15 +122,19 @@ describe('scripts/migrate.ts up — artifact pre-flight (#733)', () => {
   it('refuses a no-transaction file with a dollar-quoted body before the runner, the lock or any connection — and runs the same file without the marker', async () => {
     // The refusal.
     const broken = artifactOf(DOLLAR_BODY_UNDER_MARKER);
-    expect(broken.problems.map((p) => p.kind), 'fixture sanity').toEqual([
-      'no_transaction_unsplittable',
-    ]);
+    expect(
+      broken.problems.map((p) => p.kind),
+      'fixture sanity',
+    ).toEqual(['no_transaction_unsplittable']);
     discoverMigrationsMock.mockResolvedValueOnce(broken);
 
     const refused = await runUp();
 
     expect(refused.code).toBe(1);
-    expect(runMigrationsMock, 'the runner (and with it the lock) must not be reached').not.toHaveBeenCalled();
+    expect(
+      runMigrationsMock,
+      'the runner (and with it the lock) must not be reached',
+    ).not.toHaveBeenCalled();
     expect(poolTouched, 'no connection, no query').not.toHaveBeenCalled();
     const blocked = refused.stderr.find((line) => line.includes('BLOCKED artifact_integrity'));
     expect(blocked).toBeDefined();

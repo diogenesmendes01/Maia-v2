@@ -47,10 +47,7 @@ export const explainLimitationTool: Tool<typeof inputSchema, typeof outputSchema
   operation_type: 'read',
   audit_action: 'limitation_explained',
   handler: async (args) => {
-    const parts = [
-      `Não consigo ${args.requested}.`,
-      args.reason,
-    ];
+    const parts = [`Não consigo ${args.requested}.`, args.reason];
     if (args.suggestion) parts.push(args.suggestion);
     return {
       status: 'limitation_explained' as const,

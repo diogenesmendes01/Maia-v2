@@ -120,7 +120,12 @@ describe('advanceInProgressOccurrence — Blocker 3 (review 2)', () => {
     claimInProgressMock.mockResolvedValue([occBase]);
     findSeriesMock.mockResolvedValue(seriesBase);
     tasksByOccMock.mockResolvedValue([
-      { id: 'tw', kind: 'await_response', status: 'completed', result: { response_text: 'segue em anexo' } },
+      {
+        id: 'tw',
+        kind: 'await_response',
+        status: 'completed',
+        result: { response_text: 'segue em anexo' },
+      },
       { id: 'tf', kind: 'forward', status: 'pending' },
     ]);
     pessoasFindByIdMock.mockResolvedValue({
@@ -192,9 +197,7 @@ describe('advanceInProgressOccurrence — Blocker 3 (review 2)', () => {
     );
     expect(insertNextMock).toHaveBeenCalledTimes(1);
     expect(
-      auditMock.mock.calls.some(
-        (c) => (c[0] as { acao: string }).acao === 'occurrence_completed',
-      ),
+      auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'occurrence_completed'),
     ).toBe(true);
   });
 

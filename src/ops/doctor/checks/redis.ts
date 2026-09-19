@@ -26,7 +26,8 @@ import { pass, skip, type DoctorCheck, type DoctorContext, type DoctorResult } f
 function noRedisHandle(): DoctorResult {
   return {
     status: 'fail',
-    summary: 'nenhum handle de Redis foi aberto: `--online` foi pedido e REDIS_URL está ausente ou vazia',
+    summary:
+      'nenhum handle de Redis foi aberto: `--online` foi pedido e REDIS_URL está ausente ou vazia',
     evidence: { handle_open: false, requested_online: true },
     remediation: [
       'Defina REDIS_URL no ambiente DESTE container e rode de novo com `--online`.',
@@ -293,7 +294,10 @@ export const persistenceCheck: DoctorCheck = {
     }
 
     if (rdb === null) {
-      return skip('sem AOF, e `CONFIG GET save` não devolveu o parâmetro (usuário sem permissão?)', evidence);
+      return skip(
+        'sem AOF, e `CONFIG GET save` não devolveu o parâmetro (usuário sem permissão?)',
+        evidence,
+      );
     }
 
     if (!rdb) {
@@ -320,7 +324,10 @@ export const persistenceCheck: DoctorCheck = {
       };
     }
 
-    return pass(`RDB configurado (save: ${saveRule ?? ''}; último bgsave: ${lastBgsave})`, evidence);
+    return pass(
+      `RDB configurado (save: ${saveRule ?? ''}; último bgsave: ${lastBgsave})`,
+      evidence,
+    );
   },
 };
 

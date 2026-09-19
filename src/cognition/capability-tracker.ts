@@ -51,10 +51,7 @@ export async function recordSuccess(args: { domain?: string }): Promise<void> {
       confidence: new_confidence.toFixed(3) as unknown as AgentCapabilityDomain['confidence'],
     });
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, domain },
-      'capability_tracker.success.failed',
-    );
+    logger.warn({ err: (err as Error).message, domain }, 'capability_tracker.success.failed');
   }
 }
 
@@ -69,10 +66,9 @@ export async function recordFailure(args: {
     const failure_count = (existing?.failure_count ?? 0) + 1;
     const evidence_count = (existing?.evidence_count ?? 0) + 1;
     const existing_modes = (existing?.failure_modes as string[] | null) ?? [];
-    const failure_modes = [
-      ...existing_modes,
-      args.failure_mode ?? 'unknown',
-    ].slice(-FAILURE_MODES_CAP);
+    const failure_modes = [...existing_modes, args.failure_mode ?? 'unknown'].slice(
+      -FAILURE_MODES_CAP,
+    );
     const new_confidence = computeConfidence({
       success_count,
       failure_count,
@@ -91,9 +87,6 @@ export async function recordFailure(args: {
       confidence: new_confidence.toFixed(3) as unknown as AgentCapabilityDomain['confidence'],
     });
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, domain },
-      'capability_tracker.failure.failed',
-    );
+    logger.warn({ err: (err as Error).message, domain }, 'capability_tracker.failure.failed');
   }
 }

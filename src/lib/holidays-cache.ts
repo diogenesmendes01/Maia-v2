@@ -71,14 +71,7 @@ function buildKey(
   year: number,
   kind: BusinessDayKind,
 ): CacheKey {
-  return buildCacheKey(
-    `${KEY_PREFIX}:`,
-    tenant_id,
-    agent_id,
-    entidadeId ?? 'global',
-    year,
-    kind,
-  );
+  return buildCacheKey(`${KEY_PREFIX}:`, tenant_id, agent_id, entidadeId ?? 'global', year, kind);
 }
 
 // Public alias for buildKey() preserved as `cacheKey` for backwards-compat

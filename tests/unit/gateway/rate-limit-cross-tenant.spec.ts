@@ -40,10 +40,7 @@
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { buildCacheKey } from '@/lib/cache-key.js';
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 import type { Pessoa } from '@/db/schema.js';
 
 // ---------------------------------------------------------------------------
@@ -79,15 +76,12 @@ const redisStub = {
     evictIfExpired(key);
     return kv.get(key)?.value ?? null;
   }),
-  set: vi.fn(
-    async (key: string, value: string, ex?: 'EX', s?: number) => {
-      calls.push({ op: 'set', key, args: [value, ex, s] });
-      const expiresAt =
-        ex === 'EX' && typeof s === 'number' ? Date.now() + s * 1000 : undefined;
-      kv.set(key, { value, expiresAt });
-      return 'OK' as const;
-    },
-  ),
+  set: vi.fn(async (key: string, value: string, ex?: 'EX', s?: number) => {
+    calls.push({ op: 'set', key, args: [value, ex, s] });
+    const expiresAt = ex === 'EX' && typeof s === 'number' ? Date.now() + s * 1000 : undefined;
+    kv.set(key, { value, expiresAt });
+    return 'OK' as const;
+  }),
   expire: vi.fn(async (key: string, s: number) => {
     calls.push({ op: 'expire', key, args: [s] });
     const e = kv.get(key);
@@ -201,12 +195,9 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
   describe('key shape', () => {
     it('count key (sorted-set) is prefixed with tenant_id and agent_id', async () => {
       const pessoa = pessoaFixture(PESSOA_SHARED);
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+      });
 
       // The 3 sorted-set ops (zremrangebyscore, zadd, expire, zcard) all
       // target the SAME count key — production passes one `countKey` local
@@ -223,16 +214,13 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       const pessoa = pessoaFixture(PESSOA_SHARED);
       // RATE_LIMIT_MSGS_PER_HOUR=3 (mocked above). 4th call triggers `warn`,
       // which is the path that writes BOTH the warned and silence flags.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-          await checkRateLimit(pessoa);
-          await checkRateLimit(pessoa);
-          const overage = await checkRateLimit(pessoa);
-          expect(overage.kind).toBe('warn');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+        await checkRateLimit(pessoa);
+        await checkRateLimit(pessoa);
+        const overage = await checkRateLimit(pessoa);
+        expect(overage.kind).toBe('warn');
+      });
 
       const expectedWarned = `maia:ratelimit:${TENANT_A}:${AGENT_A}:warned:${PESSOA_SHARED}`;
       const expectedSilence = `maia:ratelimit:${TENANT_A}:${AGENT_A}:silence:${PESSOA_SHARED}`;
@@ -255,33 +243,23 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
     it('same pessoa_id under tenant-A vs tenant-B produces DIFFERENT count keys', async () => {
       const pessoa = pessoaFixture(PESSOA_SHARED);
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const tenantACountKey = calls.find((c) => c.op === 'zadd')?.key;
 
       resetStub();
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const tenantBCountKey = calls.find((c) => c.op === 'zadd')?.key;
 
       expect(tenantACountKey).toBeDefined();
       expect(tenantBCountKey).toBeDefined();
       expect(tenantACountKey).not.toBe(tenantBCountKey);
-      expect(tenantACountKey).toBe(
-        `maia:ratelimit:${TENANT_A}:${AGENT_A}:hour:${PESSOA_SHARED}`,
-      );
-      expect(tenantBCountKey).toBe(
-        `maia:ratelimit:${TENANT_B}:${AGENT_B}:hour:${PESSOA_SHARED}`,
-      );
+      expect(tenantACountKey).toBe(`maia:ratelimit:${TENANT_A}:${AGENT_A}:hour:${PESSOA_SHARED}`);
+      expect(tenantBCountKey).toBe(`maia:ratelimit:${TENANT_B}:${AGENT_B}:hour:${PESSOA_SHARED}`);
     });
 
     it('SYMMETRY: B→A is also isolated (different count keys)', async () => {
@@ -289,31 +267,21 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       // and we didn't just hard-code tenant-A as a "primary" path.
       const pessoa = pessoaFixture(PESSOA_SHARED);
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const tenantBCountKey = calls.find((c) => c.op === 'zadd')?.key;
 
       resetStub();
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const tenantACountKey = calls.find((c) => c.op === 'zadd')?.key;
 
       expect(tenantACountKey).not.toBe(tenantBCountKey);
-      expect(tenantACountKey).toBe(
-        `maia:ratelimit:${TENANT_A}:${AGENT_A}:hour:${PESSOA_SHARED}`,
-      );
-      expect(tenantBCountKey).toBe(
-        `maia:ratelimit:${TENANT_B}:${AGENT_B}:hour:${PESSOA_SHARED}`,
-      );
+      expect(tenantACountKey).toBe(`maia:ratelimit:${TENANT_A}:${AGENT_A}:hour:${PESSOA_SHARED}`);
+      expect(tenantBCountKey).toBe(`maia:ratelimit:${TENANT_B}:${AGENT_B}:hour:${PESSOA_SHARED}`);
     });
 
     it('same pessoa_id, same tenant, DIFFERENT agents → different count keys', async () => {
@@ -322,22 +290,16 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       // from the prefix thinking `tenant_id` alone is enough.
       const pessoa = pessoaFixture(PESSOA_SHARED);
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const keyAgentA = calls.find((c) => c.op === 'zadd')?.key;
 
       resetStub();
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_B },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_B }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const keyAgentB = calls.find((c) => c.op === 'zadd')?.key;
 
       expect(keyAgentA).toBeDefined();
@@ -360,24 +322,17 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       // 1. Tenant-B blasts past threshold (3) — first 3 allowed, 4th warn,
       //    5th silence. After this, tenant-B's warned + silence flags are
       //    set in Redis.
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          expect((await checkRateLimit(pessoa)).kind).toBe('allow');
-          expect((await checkRateLimit(pessoa)).kind).toBe('allow');
-          expect((await checkRateLimit(pessoa)).kind).toBe('allow');
-          expect((await checkRateLimit(pessoa)).kind).toBe('warn');
-          expect((await checkRateLimit(pessoa)).kind).toBe('silence');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        expect((await checkRateLimit(pessoa)).kind).toBe('allow');
+        expect((await checkRateLimit(pessoa)).kind).toBe('allow');
+        expect((await checkRateLimit(pessoa)).kind).toBe('allow');
+        expect((await checkRateLimit(pessoa)).kind).toBe('warn');
+        expect((await checkRateLimit(pessoa)).kind).toBe('silence');
+      });
 
       // Sanity: tenant-B's silence flag IS in Redis under tenant-B's key.
-      expect(
-        kv.has(`maia:ratelimit:${TENANT_B}:${AGENT_B}:silence:${PESSOA_SHARED}`),
-      ).toBe(true);
-      expect(
-        kv.has(`maia:ratelimit:${TENANT_B}:${AGENT_B}:warned:${PESSOA_SHARED}`),
-      ).toBe(true);
+      expect(kv.has(`maia:ratelimit:${TENANT_B}:${AGENT_B}:silence:${PESSOA_SHARED}`)).toBe(true);
+      expect(kv.has(`maia:ratelimit:${TENANT_B}:${AGENT_B}:warned:${PESSOA_SHARED}`)).toBe(true);
 
       // 2. Tenant-A's first call for the SAME pessoa_id. Under the
       //    pre-fix code (`maia:ratelimit:silence:${pessoa_id}` with no
@@ -385,13 +340,10 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       //    and immediately return `silence` despite having sent nothing.
       //    Post-fix: tenant-A gets `allow` because its silence key is
       //    a SEPARATE key that has never been set.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          const decision = await checkRateLimit(pessoa);
-          expect(decision.kind).toBe('allow');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        const decision = await checkRateLimit(pessoa);
+        expect(decision.kind).toBe('allow');
+      });
 
       // And tenant-A's count key is empty before this call had run, so the
       // sorted-set under tenant-A's key holds exactly one entry now.
@@ -405,23 +357,17 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       // way to its OWN warn boundary independently of tenant-B's state.
       const pessoa = pessoaFixture(PESSOA_SHARED);
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          for (let i = 0; i < 5; i++) await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        for (let i = 0; i < 5; i++) await checkRateLimit(pessoa);
+      });
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          expect((await checkRateLimit(pessoa)).kind).toBe('allow'); // 1
-          expect((await checkRateLimit(pessoa)).kind).toBe('allow'); // 2
-          expect((await checkRateLimit(pessoa)).kind).toBe('allow'); // 3
-          expect((await checkRateLimit(pessoa)).kind).toBe('warn');   // 4
-          expect((await checkRateLimit(pessoa)).kind).toBe('silence');// 5
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        expect((await checkRateLimit(pessoa)).kind).toBe('allow'); // 1
+        expect((await checkRateLimit(pessoa)).kind).toBe('allow'); // 2
+        expect((await checkRateLimit(pessoa)).kind).toBe('allow'); // 3
+        expect((await checkRateLimit(pessoa)).kind).toBe('warn'); // 4
+        expect((await checkRateLimit(pessoa)).kind).toBe('silence'); // 5
+      });
     });
   });
 
@@ -473,22 +419,16 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       // two distinct tenant/agent buckets into one.
       const pessoa = pessoaFixture(PESSOA_SHARED);
 
-      await runWithTenantContext(
-        { tenant_id: 'acme:dev', agent_id: 'prod' },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme:dev', agent_id: 'prod' }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const keyA = calls.find((c) => c.op === 'zadd')?.key;
 
       resetStub();
 
-      await runWithTenantContext(
-        { tenant_id: 'acme', agent_id: 'dev:prod' },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'dev:prod' }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const keyB = calls.find((c) => c.op === 'zadd')?.key;
 
       expect(keyA).toBeDefined();
@@ -506,12 +446,9 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       // applied as defense-in-depth against future ID-generation changes
       // or test fixtures that use free-form ids.
       const pessoa = pessoaFixture('weird:id');
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const key = calls.find((c) => c.op === 'zadd')?.key;
       expect(key).toBe(`maia:ratelimit:${TENANT_A}:${AGENT_A}:hour:weird%3Aid`);
     });
@@ -524,12 +461,9 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
     it('issue #287: key equals the buildCacheKey composition and neutralizes glob metachars', async () => {
       const GLOB_TENANT = 'acme*';
       const pessoa = pessoaFixture(PESSOA_SHARED);
-      await runWithTenantContext(
-        { tenant_id: GLOB_TENANT, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: GLOB_TENANT, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+      });
       const key = calls.find((c) => c.op === 'zadd')?.key;
       expect(key).toBe(
         buildCacheKey('maia:ratelimit:', GLOB_TENANT, AGENT_A, 'hour', PESSOA_SHARED),
@@ -556,40 +490,31 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
       // Saturate threshold (3 allowed) so the NEXT call enters the
       // overage path where `redis.get(silenceKey)` is the first Redis op
       // outside the zset block.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-          await checkRateLimit(pessoa);
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+        await checkRateLimit(pessoa);
+        await checkRateLimit(pessoa);
+      });
 
       // Arm a one-shot rejection on the NEXT `get` call.
       redisStub.get.mockImplementationOnce(async () => {
         throw new Error('redis blip during silence probe');
       });
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          const decision = await checkRateLimit(pessoa);
-          expect(decision.kind).toBe('silence');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        const decision = await checkRateLimit(pessoa);
+        expect(decision.kind).toBe('silence');
+      });
     });
 
     it('redis.get failure on warned probe → silence decision (not propagated)', async () => {
       const pessoa = pessoaFixture(PESSOA_SHARED);
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-          await checkRateLimit(pessoa);
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+        await checkRateLimit(pessoa);
+        await checkRateLimit(pessoa);
+      });
 
       // First `get` (silence probe) returns null, second (warned probe)
       // throws — exercises the deeper branch of the overage path.
@@ -600,13 +525,10 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
         throw new Error('redis blip during warned probe');
       });
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          const decision = await checkRateLimit(pessoa);
-          expect(decision.kind).toBe('silence');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        const decision = await checkRateLimit(pessoa);
+        expect(decision.kind).toBe('silence');
+      });
 
       // Restore the default `get` implementation for other tests in this
       // describe block (resetStub between top-level `it`s handles this,
@@ -621,14 +543,11 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
     it('redis.set failure on warn-flag write → silence decision (not propagated)', async () => {
       const pessoa = pessoaFixture(PESSOA_SHARED);
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkRateLimit(pessoa);
-          await checkRateLimit(pessoa);
-          await checkRateLimit(pessoa);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkRateLimit(pessoa);
+        await checkRateLimit(pessoa);
+        await checkRateLimit(pessoa);
+      });
 
       // Both `get` probes return null (no silence, no prior warn), so the
       // overage path proceeds to `redis.set(warnedKey, …)`. Make THAT
@@ -637,13 +556,10 @@ describe('issue #245 — gateway rate-limit Redis keys are tenant+agent scoped',
         throw new Error('redis blip during warned write');
       });
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          const decision = await checkRateLimit(pessoa);
-          expect(decision.kind).toBe('silence');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        const decision = await checkRateLimit(pessoa);
+        expect(decision.kind).toBe('silence');
+      });
     });
   });
 });

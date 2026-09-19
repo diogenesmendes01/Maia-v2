@@ -12,7 +12,10 @@ export function isAuditModeActive(pessoa: Pessoa): boolean {
   return dt > new Date();
 }
 
-export async function activateAuditMode(target: Pessoa, hours = config.AUDIT_MODE_TTL_HOURS): Promise<void> {
+export async function activateAuditMode(
+  target: Pessoa,
+  hours = config.AUDIT_MODE_TTL_HOURS,
+): Promise<void> {
   const prefs = { ...(target.preferencias as Record<string, unknown>) };
   prefs.modo_auditoria_ate = new Date(Date.now() + hours * 3600 * 1000).toISOString();
   await pessoasRepo.updatePreferencias(target.id, prefs);

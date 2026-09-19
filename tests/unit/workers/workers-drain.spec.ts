@@ -76,7 +76,12 @@ describe('cron tick guard', () => {
     d.resolve();
     await new Promise((r) => setImmediate(r));
     // Once the previous run finished, a new tick is accepted again.
-    _internal.runTick(job('outbox_drain', vi.fn(async () => undefined)));
+    _internal.runTick(
+      job(
+        'outbox_drain',
+        vi.fn(async () => undefined),
+      ),
+    );
     await new Promise((r) => setImmediate(r));
     expect(activeWorkerJobs()).toEqual([]);
   });

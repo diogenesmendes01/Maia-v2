@@ -157,11 +157,7 @@ function anterioresNaoTerminais(input: { tenant: SQL; agent: SQL; alvo: SQL }): 
  * (`created_at`, por exemplo) seria usar timestamp como fonte primária de
  * ordenação — o que a issue-mãe proíbe explicitamente.
  */
-export function streamHeadOfLineNotExists(input: {
-  tenant: SQL;
-  agent: SQL;
-  alvo: SQL;
-}): SQL {
+export function streamHeadOfLineNotExists(input: { tenant: SQL; agent: SQL; alvo: SQL }): SQL {
   return sql`(
         ${input.alvo}.stream_key IS NULL
      OR ${input.alvo}.first_ingress_seq IS NULL
@@ -369,11 +365,7 @@ export function streamNotPoisoned(input: { tenant: SQL; agent: SQL; alvo: SQL })
  * diferente, e um booleano apagaria essa diferença exatamente no registro que
  * existe para ser lido depois.
  */
-export function committedOrderAfterCount(input: {
-  tenant: SQL;
-  agent: SQL;
-  alvo: SQL;
-}): SQL {
+export function committedOrderAfterCount(input: { tenant: SQL; agent: SQL; alvo: SQL }): SQL {
   return sql`(
     SELECT count(*)::int
       FROM ${agent_turns} AS posterior
@@ -434,11 +426,7 @@ export function committedOrderNotBroken(input: { tenant: SQL; agent: SQL; alvo: 
  *
  * Devolve `blocked_by_turn_id` — o turno ENVENENADO —, nunca a `stream_key`.
  */
-export function streamPoisonProbe(input: {
-  tenant: SQL;
-  agent: SQL;
-  turn_id: string;
-}): SQL {
+export function streamPoisonProbe(input: { tenant: SQL; agent: SQL; turn_id: string }): SQL {
   return sql`
     SELECT bloqueio.id, bloqueio.blocked_by_turn_id, bloqueio.reason, bloqueio.category
       FROM ${agent_turns} AS alvo
@@ -454,11 +442,7 @@ export function streamPoisonProbe(input: {
      LIMIT 1`;
 }
 
-export function earlierLiveTurnProbe(input: {
-  tenant: SQL;
-  agent: SQL;
-  turn_id: string;
-}): SQL {
+export function earlierLiveTurnProbe(input: { tenant: SQL; agent: SQL; turn_id: string }): SQL {
   const alvo = sql`alvo`;
   return sql`
     SELECT anterior.id, anterior.status

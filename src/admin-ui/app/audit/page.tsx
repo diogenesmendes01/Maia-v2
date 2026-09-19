@@ -6,19 +6,8 @@ import { trpc } from '../../trpc/client.js';
 import { PageHeader } from '../../components/ui/page-header.js';
 import { Badge } from '../../components/ui/badge.js';
 import { Field, Input, Select } from '../../components/ui/field.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../components/ui/states.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState } from '../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../components/ui/table.js';
 import { IconShield } from '../../components/ui/icons.js';
 
 /**
@@ -49,9 +38,7 @@ export default function AuditPage() {
   const items = auditQuery.data?.items ?? [];
 
   // Tipos de recurso distintos da página atual — viram filtro rápido.
-  const resourceTypes = Array.from(
-    new Set(items.map((e) => e.resource_type)),
-  ).sort();
+  const resourceTypes = Array.from(new Set(items.map((e) => e.resource_type))).sort();
 
   return (
     <div>
@@ -69,10 +56,7 @@ export default function AuditPage() {
           />
         </Field>
         <Field label="Tipo de recurso" className="w-56">
-          <Select
-            value={resourceType}
-            onChange={(e) => setResourceType(e.target.value)}
-          >
+          <Select value={resourceType} onChange={(e) => setResourceType(e.target.value)}>
             <option value="">Todos</option>
             {resourceTypes.map((rt) => (
               <option key={rt} value={rt}>
@@ -82,10 +66,7 @@ export default function AuditPage() {
           </Select>
         </Field>
         <Field label="Limite" className="w-28">
-          <Select
-            value={String(limit)}
-            onChange={(e) => setLimit(Number(e.target.value))}
-          >
+          <Select value={String(limit)} onChange={(e) => setLimit(Number(e.target.value))}>
             {[50, 100, 250, 500].map((n) => (
               <option key={n} value={n}>
                 {n}
@@ -98,10 +79,7 @@ export default function AuditPage() {
       {auditQuery.isLoading ? (
         <LoadingState label="Carregando auditoria…" />
       ) : auditQuery.error ? (
-        <ErrorState
-          message={auditQuery.error.message}
-          onRetry={() => void auditQuery.refetch()}
-        />
+        <ErrorState message={auditQuery.error.message} onRetry={() => void auditQuery.refetch()} />
       ) : items.length === 0 ? (
         <EmptyState
           icon={<IconShield size={36} />}
@@ -131,9 +109,7 @@ export default function AuditPage() {
                     </Badge>
                   </Td>
                   <Td>
-                    <span className="font-mono text-xs font-medium text-zinc-800">
-                      {e.action}
-                    </span>
+                    <span className="font-mono text-xs font-medium text-zinc-800">{e.action}</span>
                   </Td>
                   <Td>
                     <span className="font-mono text-xs text-zinc-600">

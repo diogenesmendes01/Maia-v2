@@ -150,7 +150,8 @@ export function evaluateBackupReadiness(input: BackupReadinessInput): BackupRead
       // else this is a deliberate operator choice, so WARN and move on.
       level: 'WARN',
       evidence: { profile: profile.name, enabled: false },
-      remediation: 'Backups are disabled (BACKUP_ENABLED=false). No recovery point is being produced.',
+      remediation:
+        'Backups are disabled (BACKUP_ENABLED=false). No recovery point is being produced.',
     });
     return {
       level: 'WARN',
@@ -248,8 +249,7 @@ export function evaluateBackupReadiness(input: BackupReadinessInput): BackupRead
         'its process died with a decrypted copy of production possibly still on the host, and ' +
         'nothing has proven the teardown. Inspect the host and terminalize the row before ' +
         'another drill may start (runbook §4.2).'
-      :
-      input.last_restore_drill_result === 'failed'
+      : input.last_restore_drill_result === 'failed'
         ? // Readiness grades on `status` alone, which is deliberately
           // conservative: a drill that restored perfectly but left a copy of
           // production on the host is `failed` too (`cleanup_failed`), and it
@@ -376,8 +376,7 @@ export function readinessGauges(readiness: BackupReadiness): Record<string, numb
   // level above carries that case; a sentinel age would be a lie either way
   // (0 reads as "just drilled", a huge number as "drilled long ago"). The
   // collector, which cannot omit a registered series, renders `-1` instead.
-  const drillAge = readiness.checks.find((c) => c.id === 'restore_drill_age')?.evidence
-    .age_seconds;
+  const drillAge = readiness.checks.find((c) => c.id === 'restore_drill_age')?.evidence.age_seconds;
   if (typeof drillAge === 'number') out[METRIC.RESTORE_DRILL_AGE_SECONDS] = drillAge;
   return out;
 }

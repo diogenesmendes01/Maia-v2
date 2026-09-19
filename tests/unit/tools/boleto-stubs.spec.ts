@@ -164,9 +164,8 @@ describe('write stubs — explicit non-executed status, no fake success', () => 
   });
 
   it('company_campaign_remove returns executed=false / stub_not_executed with NO protocol', async () => {
-    const { companyCampaignRemoveTool } = await import(
-      '../../../src/tools/company-campaign-remove.js'
-    );
+    const { companyCampaignRemoveTool } =
+      await import('../../../src/tools/company-campaign-remove.js');
     const out = await companyCampaignRemoveTool.handler(
       { entidade_id: 'e1', company_id: 'co1', reason: 'opt-out' } as never,
       ctx,
@@ -180,7 +179,12 @@ describe('write stubs — explicit non-executed status, no fake success', () => 
   it('refund_create returns executed=false / stub_not_executed with NO refund_protocol', async () => {
     const { refundCreateTool } = await import('../../../src/tools/refund-create.js');
     const out = await refundCreateTool.handler(
-      { entidade_id: 'e1', valor: 100, receipt_reference: 'r1', reason: 'cobrança indevida' } as never,
+      {
+        entidade_id: 'e1',
+        valor: 100,
+        receipt_reference: 'r1',
+        reason: 'cobrança indevida',
+      } as never,
       ctx,
     );
     expect(out.executed).toBe(false);
@@ -190,9 +194,8 @@ describe('write stubs — explicit non-executed status, no fake success', () => 
   });
 
   it('operational_ticket_create returns created=false / stub_not_created with NO ticket_number', async () => {
-    const { operationalTicketCreateTool } = await import(
-      '../../../src/tools/operational-ticket-create.js'
-    );
+    const { operationalTicketCreateTool } =
+      await import('../../../src/tools/operational-ticket-create.js');
     const out = await operationalTicketCreateTool.handler(
       { reason: 'precisa de humano', summary: 'caso complexo' } as never,
       ctx,
@@ -224,9 +227,8 @@ describe('write stubs — explicit non-executed status, no fake success', () => 
 // ===========================================================================
 describe('read stubs — structured unknown/not-found, no faked data', () => {
   it('company_history_lookup returns empty history arrays (no fabricated rows)', async () => {
-    const { companyHistoryLookupTool } = await import(
-      '../../../src/tools/company-history-lookup.js'
-    );
+    const { companyHistoryLookupTool } =
+      await import('../../../src/tools/company-history-lookup.js');
     const out = await companyHistoryLookupTool.handler({ company_id: 'co1' } as never, ctx);
     expect(out.interactions).toEqual([]);
     expect(out.complaints).toEqual([]);
@@ -247,9 +249,8 @@ describe('read stubs — structured unknown/not-found, no faked data', () => {
   });
 
   it('campaign_status_lookup returns status=unknown (never a fabricated status)', async () => {
-    const { campaignStatusLookupTool } = await import(
-      '../../../src/tools/campaign-status-lookup.js'
-    );
+    const { campaignStatusLookupTool } =
+      await import('../../../src/tools/campaign-status-lookup.js');
     const out = await campaignStatusLookupTool.handler({ company_id: 'co1' } as never, ctx);
     expect(out.status).toBe('unknown');
   });
@@ -266,9 +267,8 @@ describe('read stubs — structured unknown/not-found, no faked data', () => {
 // ===========================================================================
 describe('company_blacklist_check — NEVER a false `clear` certainty (#432)', () => {
   it('returns status=unknown (not clear) absent a real blocklist check', async () => {
-    const { companyBlacklistCheckTool } = await import(
-      '../../../src/tools/company-blacklist-check.js'
-    );
+    const { companyBlacklistCheckTool } =
+      await import('../../../src/tools/company-blacklist-check.js');
     const out = await companyBlacklistCheckTool.handler({ company_id: 'co1' } as never, ctx);
     expect(out.status).toBe('unknown');
     expect(out.status).not.toBe('clear');
@@ -276,12 +276,12 @@ describe('company_blacklist_check — NEVER a false `clear` certainty (#432)', (
   });
 
   it('the output schema admits a future clear/blocked, but the stub emits unknown', async () => {
-    const { companyBlacklistCheckTool } = await import(
-      '../../../src/tools/company-blacklist-check.js'
-    );
+    const { companyBlacklistCheckTool } =
+      await import('../../../src/tools/company-blacklist-check.js');
     // A real integration may later return clear/blocked/attention...
     expect(
-      companyBlacklistCheckTool.output_schema.safeParse({ status: 'blocked', observations: [] }).success,
+      companyBlacklistCheckTool.output_schema.safeParse({ status: 'blocked', observations: [] })
+        .success,
     ).toBe(true);
     // ...but the stub, with no integration, yields exactly 'unknown'.
     const out = await companyBlacklistCheckTool.handler({ cnpj: '00000000000000' } as never, ctx);
@@ -292,28 +292,22 @@ describe('company_blacklist_check — NEVER a false `clear` certainty (#432)', (
 // ===========================================================================
 describe('payment_verification — NEVER paid:false absent real evidence (#432)', () => {
   it('returns paid:null (not false) with source=stub', async () => {
-    const { paymentVerificationTool } = await import(
-      '../../../src/tools/payment-verification.js'
-    );
-    const out = await paymentVerificationTool.handler(
-      { boleto_id: 'b1' } as never,
-      ctx,
-    );
+    const { paymentVerificationTool } = await import('../../../src/tools/payment-verification.js');
+    const out = await paymentVerificationTool.handler({ boleto_id: 'b1' } as never, ctx);
     expect(out.paid).toBeNull();
     expect(out.paid).not.toBe(false);
     expect(out.source).toBe('stub');
   });
 
   it('the output schema admits boolean|null but the stub never emits false', async () => {
-    const { paymentVerificationTool } = await import(
-      '../../../src/tools/payment-verification.js'
-    );
+    const { paymentVerificationTool } = await import('../../../src/tools/payment-verification.js');
     // Schema accepts boolean|null (a future integration may set true/false)...
     expect(
       paymentVerificationTool.output_schema.safeParse({ paid: null, source: 'stub' }).success,
     ).toBe(true);
     expect(
-      paymentVerificationTool.output_schema.safeParse({ paid: true, source: 'integration' }).success,
+      paymentVerificationTool.output_schema.safeParse({ paid: true, source: 'integration' })
+        .success,
     ).toBe(true);
     // ...but the stub handler yields exactly null.
     const out = await paymentVerificationTool.handler({ boleto_id: 'b1' } as never, ctx);

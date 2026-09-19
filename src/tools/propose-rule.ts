@@ -9,18 +9,10 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/index.js';
-import {
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 
 const inputSchema = z.object({
-  tipo: z.enum([
-    'classificacao',
-    'identificacao_entidade',
-    'tom_resposta',
-    'recorrencia',
-  ]),
+  tipo: z.enum(['classificacao', 'identificacao_entidade', 'tom_resposta', 'recorrencia']),
   contexto: z.string().min(1).max(4000),
   acao: z.string().min(1).max(2000),
   contexto_jsonb: z.record(z.unknown()).default({}),

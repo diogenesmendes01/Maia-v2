@@ -68,12 +68,7 @@
  * construction and the DB fallback (`findByWhatsappId`) still catches any
  * actual duplicate that races the cache miss.
  */
-import {
-  redis,
-  isRedisConnected,
-  isRedisOomError,
-  recordRedisOomDegraded,
-} from '@/lib/redis.js';
+import { redis, isRedisConnected, isRedisOomError, recordRedisOomDegraded } from '@/lib/redis.js';
 import { mensagensRepo } from '@/db/repositories.js';
 import {
   getCurrentTenant,
@@ -114,11 +109,7 @@ function assertTenantSegment(
   value: unknown,
   name: 'tenant_id' | 'agent_id',
 ): asserts value is string {
-  if (
-    typeof value !== 'string' ||
-    value.trim().length === 0 ||
-    value !== value.trim()
-  ) {
+  if (typeof value !== 'string' || value.trim().length === 0 || value !== value.trim()) {
     const err = new MissingTenantContextError();
     err.message = `${err.message} (dedup: ${name} is empty, whitespace-only, or has surrounding whitespace)`;
     throw err;
@@ -136,11 +127,7 @@ function assertTenantSegment(
  * confuse error dashboards that key off `.code === 'MISSING_TENANT_CONTEXT'`.
  */
 function assertWhatsappId(value: unknown): asserts value is string {
-  if (
-    typeof value !== 'string' ||
-    value.trim().length === 0 ||
-    value !== value.trim()
-  ) {
+  if (typeof value !== 'string' || value.trim().length === 0 || value !== value.trim()) {
     throw new TypeError(
       'dedup: whatsapp_id must be a non-empty string with no surrounding whitespace',
     );
@@ -162,11 +149,7 @@ function assertWhatsappId(value: unknown): asserts value is string {
  * ages out via the 24h TTL; the tenant+agent-scoped DB fallback
  * (`findByWhatsappId`) still catches any real duplicate in the window.
  */
-function buildKey(
-  tenant_id: string,
-  agent_id: string,
-  whatsapp_id: string,
-): string {
+function buildKey(tenant_id: string, agent_id: string, whatsapp_id: string): string {
   assertTenantSegment(tenant_id, 'tenant_id');
   assertTenantSegment(agent_id, 'agent_id');
   assertWhatsappId(whatsapp_id);

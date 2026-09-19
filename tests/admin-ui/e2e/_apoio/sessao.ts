@@ -92,9 +92,9 @@ let encodeCache: Encode | null = null;
 async function carregarEncode(): Promise<Encode> {
   if (encodeCache) return encodeCache;
   const requireDoConsole = createRequire(resolvePath(RAIZ, 'src/admin-ui/package.json'));
-  const modulo = (await import(
-    pathToFileURL(requireDoConsole.resolve('next-auth/jwt')).href
-  )) as { encode: Encode };
+  const modulo = (await import(pathToFileURL(requireDoConsole.resolve('next-auth/jwt')).href)) as {
+    encode: Encode;
+  };
   encodeCache = modulo.encode;
   return encodeCache;
 }
@@ -127,10 +127,7 @@ export function baseDoConsole(): string {
  * jornada que medisse a tela de login por cookie errado seria exatamente o
  * tipo de verde mentiroso que a #623 foi aberta para tirar da suíte.
  */
-const NOMES_DE_COOKIE = [
-  '__Secure-authjs.session-token',
-  'authjs.session-token',
-] as const;
+const NOMES_DE_COOKIE = ['__Secure-authjs.session-token', 'authjs.session-token'] as const;
 
 function segredoDoConsole(): string {
   const segredo = process.env.NEXTAUTH_SECRET ?? process.env.AUTH_SECRET;

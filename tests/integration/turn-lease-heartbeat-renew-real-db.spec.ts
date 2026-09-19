@@ -22,18 +22,17 @@
  * uma renovação que o banco recusa — ou pior, um verde que não diz nada sobre
  * o mecanismo real. O tempo aqui é o do banco.
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
-import pg from "pg";
-import { randomUUID } from "node:crypto";
-import { runWithTenantContext } from "@/db/tenant-context.js";
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import pg from 'pg';
+import { randomUUID } from 'node:crypto';
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 const SHOULD_RUN =
-  !!process.env.TEST_DB_URL &&
-  process.env.DATABASE_URL === process.env.TEST_DB_URL;
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
-const T = "hb504-tenant";
-const A = "hb504-agent";
+const T = 'hb504-tenant';
+const A = 'hb504-agent';
 
 /** Curto de propósito: o teste PRECISA ver renovação acontecer. */
 const TTL_MS = 3_000;
@@ -53,7 +52,7 @@ async function mkTurn(): Promise<string> {
     [mensagem_id, T, A],
   );
   createdMensagens.push(mensagem_id);
-  const { agentTurnsRepo } = await import("../../src/db/repositories.js");
+  const { agentTurnsRepo } = await import('../../src/db/repositories.js');
   const turn = await inT(() =>
     agentTurnsRepo.ensureTurnForMessage({
       id: mensagem_id,
@@ -79,13 +78,10 @@ async function leaseNoBanco(
   return row;
 }
 
-d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () => {
+d('#504 — o heartbeat renova a lease no Postgres, não só em memória', () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
-    await pool.query(
-      `INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT DO NOTHING`,
-      [T],
-    );
+    await pool.query(`INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT DO NOTHING`, [T]);
     await pool.query(
       `INSERT INTO agents(id, tenant_id, nome) VALUES ($1,$2,$1) ON CONFLICT DO NOTHING`,
       [A, T],
@@ -100,9 +96,9 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
     await pool.end();
   });
 
-  it("`heartbeat_at` e `lease_expires_at` AVANÇAM no banco com a lease viva", async () => {
-    const { agentTurnsRepo } = await import("@/db/repositories.js");
-    const { TurnLease } = await import("@/runtime/turns/lease.js");
+  it('`heartbeat_at` e `lease_expires_at` AVANÇAM no banco com a lease viva', async () => {
+    const { agentTurnsRepo } = await import('@/db/repositories.js');
+    const { TurnLease } = await import('@/runtime/turns/lease.js');
 
     const turn_id = await mkTurn();
     const claimed = await inT(() =>
@@ -112,8 +108,8 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
         lease_ms: TTL_MS,
       }),
     );
-    expect(claimed.ok, "o claim inicial deveria ter sido concedido").toBe(true);
-    if (!claimed.ok) throw new Error("claim não concedido");
+    expect(claimed.ok, 'o claim inicial deveria ter sido concedido').toBe(true);
+    if (!claimed.ok) throw new Error('claim não concedido');
 
     const antes = await leaseNoBanco(turn_id);
 
@@ -147,21 +143,18 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
 
         expect(
           depois.heartbeat_at.getTime(),
-          "o `heartbeat_at` do banco não avançou: o timer não disparou, ou a renovação " +
-            "devolveu sucesso sem escrever — que é o buraco que este teste existe para fechar",
+          'o `heartbeat_at` do banco não avançou: o timer não disparou, ou a renovação ' +
+            'devolveu sucesso sem escrever — que é o buraco que este teste existe para fechar',
         ).toBeGreaterThan(antes.heartbeat_at.getTime());
 
         expect(
           depois.lease_expires_at.getTime(),
-          "o `heartbeat_at` avançou mas o vencimento não: renovar sem ESTENDER deixa a " +
-            "lease morrer no prazo original",
+          'o `heartbeat_at` avançou mas o vencimento não: renovar sem ESTENDER deixa a ' +
+            'lease morrer no prazo original',
         ).toBeGreaterThan(antes.lease_expires_at.getTime());
 
         // E a posse continua nossa: renovação não é takeover.
-        expect(
-          lease.alive,
-          "a lease deveria seguir viva depois de renovar",
-        ).toBe(true);
+        expect(lease.alive, 'a lease deveria seguir viva depois de renovar').toBe(true);
         expect(lease.lostReason).toBeNull();
       } finally {
         lease.stop();
@@ -169,13 +162,13 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
     });
   }, 30_000);
 
-  it("renovação que chega DEPOIS do vencimento é recusada — e vira `token_mismatch`", async () => {
+  it('renovação que chega DEPOIS do vencimento é recusada — e vira `token_mismatch`', async () => {
     // O mecanismo que de fato derrubava os casos de CONTROLE antes da #592, e
     // que eu tinha atribuído erradamente a `MAX_HEARTBEAT_FAILURES`. O
     // predicado do `UPDATE` é `AND lease_expires_at > now()`: expirada a
     // lease, a renovação devolve ZERO linhas mesmo com o banco saudável e
     // sem nenhum sucessor. Não é falha de heartbeat; é CAS recusado.
-    const { agentTurnsRepo } = await import("@/db/repositories.js");
+    const { agentTurnsRepo } = await import('@/db/repositories.js');
 
     const turn_id = await mkTurn();
     const claimed = await inT(() =>
@@ -186,7 +179,7 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
       }),
     );
     expect(claimed.ok).toBe(true);
-    if (!claimed.ok) throw new Error("claim não concedido");
+    if (!claimed.ok) throw new Error('claim não concedido');
 
     // Vence a lease no BANCO, sem tocar em nada mais — nenhum sucessor, nenhum
     // erro de conexão.
@@ -205,7 +198,7 @@ d("#504 — o heartbeat renova a lease no Postgres, não só em memória", () =>
 
     expect(
       renovada.ok,
-      "com a lease vencida o CAS tem de recusar, mesmo com o banco saudável",
+      'com a lease vencida o CAS tem de recusar, mesmo com o banco saudável',
     ).toBe(false);
   }, 30_000);
 });
