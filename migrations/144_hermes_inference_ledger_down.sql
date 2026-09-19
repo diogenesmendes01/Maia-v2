@@ -20,7 +20,7 @@ DECLARE
   abertas integer;
   expostas integer;
 BEGIN
-  IF to_regclass('public.engine_inference_attempts') IS NOT NULL THEN
+  IF to_regclass('engine_inference_attempts') IS NOT NULL THEN
     SELECT count(*) INTO abertas FROM engine_inference_attempts
       WHERE state = 'reserved' OR accounting_status IN ('reserved', 'unknown');
     IF abertas > 0 THEN
@@ -29,7 +29,7 @@ BEGIN
     END IF;
   END IF;
 
-  IF to_regclass('public.engine_budget_accounts') IS NOT NULL THEN
+  IF to_regclass('engine_budget_accounts') IS NOT NULL THEN
     SELECT count(*) INTO expostas FROM engine_budget_accounts WHERE reserved_microusd > 0;
     IF expostas > 0 THEN
       RAISE EXCEPTION 'down da 144 recusado: % conta(s) com exposicao reservada', expostas

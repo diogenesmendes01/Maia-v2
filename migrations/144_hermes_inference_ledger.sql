@@ -12,9 +12,10 @@
 -- * `engine_inference_grants`: a credencial curta do run, guardada só pela
 --   HASH. O texto do token nunca toca o banco (§9.2 "nunca texto do token").
 --   Revogação é monotônica e o resto do grant é imutável.
--- * `engine_budget_accounts`: a conta por (tenant, agente, dia UTC, moeda),
---   com limite, reservado e liquidado em microusd inteiros. É a trava da
---   admissão; o budget legado da Maia (Redis, fail-open) não é herdado.
+-- * `engine_budget_accounts`: a conta por (tenant, agente, dia UTC), com
+--   limite, reservado e liquidado em microusd inteiros (a unidade está no nome
+--   da coluna; não há coluna de moeda). É a trava da admissão; o budget
+--   legado da Maia (Redis, fail-open) não é herdado.
 -- * `engine_inference_attempts`: uma linha por request HTTP que passou pela
 --   admissão, com o que foi reservado e o que foi liquidado. `reserved` é o
 --   intento persistido ANTES do provider; uma linha que ficou em `reserved`
@@ -48,8 +49,7 @@ CREATE TABLE IF NOT EXISTS engine_budget_accounts (
   tenant_id text NOT NULL,
   agent_id text NOT NULL,
   period_start_utc date NOT NULL,
-  -- Unidade EXPLÍCITA: dinheiro nunca em float (§4.2).
-  currency text NOT NULL CHECK (currency = 'microusd'),
+  -- Dinheiro nunca em float (§4.2): microusd inteiros, unidade no nome.
   limit_microusd bigint NOT NULL CHECK (limit_microusd >= 0),
   -- Exposição reservada e ainda não liquidada (inclui o desconhecido).
   reserved_microusd bigint NOT NULL DEFAULT 0 CHECK (reserved_microusd >= 0),
@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS engine_budget_accounts (
     AND length(tenant_id) > 0 AND length(agent_id) > 0
   ),
   CONSTRAINT engine_budget_accounts_scope_id_uq UNIQUE (tenant_id, agent_id, id),
-  CONSTRAINT engine_budget_accounts_period_uq UNIQUE (tenant_id, agent_id, period_start_utc, currency)
+  CONSTRAINT engine_budget_accounts_period_uq UNIQUE (tenant_id, agent_id, period_start_utc)
 );
 
 COMMENT ON TABLE engine_budget_accounts IS

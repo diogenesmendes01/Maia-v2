@@ -4608,8 +4608,6 @@ export const engine_budget_accounts = pgTable(
     tenant_id: text('tenant_id').notNull(),
     agent_id: text('agent_id').notNull(),
     period_start_utc: date('period_start_utc').notNull(),
-    /** Sempre `microusd`. */
-    currency: text('currency').notNull(),
     limit_microusd: bigint('limit_microusd', { mode: 'bigint' }).notNull(),
     reserved_microusd: bigint('reserved_microusd', { mode: 'bigint' })
       .notNull()
@@ -4627,7 +4625,6 @@ export const engine_budget_accounts = pgTable(
       t.tenant_id,
       t.agent_id,
       t.period_start_utc,
-      t.currency,
     ),
   }),
 );

@@ -468,7 +468,6 @@ export const inferenceRepo = {
                  settled_microusd::text AS settled_microusd, row_version
             FROM ${engine_budget_accounts}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
-             AND currency = 'microusd'
              AND period_start_utc = (clock_timestamp() AT TIME ZONE 'UTC')::date
            FOR UPDATE`),
       );
@@ -665,10 +664,10 @@ export const inferenceRepo = {
     const criada = linhas<{ id: string }>(
       await db.execute(sql`
         INSERT INTO ${engine_budget_accounts}
-          (tenant_id, agent_id, period_start_utc, currency, limit_microusd)
-        VALUES (${tenant_id}, ${agent_id}, ${input.period_start_utc}::date, 'microusd',
+          (tenant_id, agent_id, period_start_utc, limit_microusd)
+        VALUES (${tenant_id}, ${agent_id}, ${input.period_start_utc}::date,
                 ${input.limit_microusd}::bigint)
-        ON CONFLICT (tenant_id, agent_id, period_start_utc, currency) DO NOTHING
+        ON CONFLICT (tenant_id, agent_id, period_start_utc) DO NOTHING
         RETURNING id`),
     );
     if (criada[0]) return { account_id: criada[0].id, created: true };
@@ -676,7 +675,7 @@ export const inferenceRepo = {
       await db.execute(sql`
         SELECT id FROM ${engine_budget_accounts}
          WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
-           AND period_start_utc = ${input.period_start_utc}::date AND currency = 'microusd'`),
+           AND period_start_utc = ${input.period_start_utc}::date`),
     );
     return { account_id: existente[0]!.id, created: false };
   },

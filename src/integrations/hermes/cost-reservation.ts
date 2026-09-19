@@ -42,7 +42,7 @@ export type AdmissionGuarantee = typeof ADMISSION_GUARANTEE;
 
 /**
  * `engine_budget_accounts` (§9.2), na forma que a decisão precisa: conta por
- * `(tenant_id, agent_id, period_start_utc, currency)` já resolvida e travada.
+ * `(tenant_id, agent_id, period_start_utc)` já resolvida e travada.
  *
  * Não há `tenant_id` aqui: quem resolveu a conta foi o repositório, sob ALS. A
  * política não escolhe conta — escolher conta a partir de um parâmetro é como se
