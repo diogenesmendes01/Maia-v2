@@ -31,9 +31,7 @@ const inbound = {
   metadata: null,
 } as unknown as Mensagem;
 
-function mkPinned(
-  overrides?: Partial<PinnedSkillIdentity>,
-): PinnedSkillIdentity {
+function mkPinned(overrides?: Partial<PinnedSkillIdentity>): PinnedSkillIdentity {
   return {
     selected_skill_descriptor: 'faq.answer',
     selected_skill_version: 3,
@@ -42,13 +40,9 @@ function mkPinned(
   };
 }
 
-function mkDeps(
-  overrides?: Partial<ExecuteSelectedSkillDeps>,
-): ExecuteSelectedSkillDeps {
+function mkDeps(overrides?: Partial<ExecuteSelectedSkillDeps>): ExecuteSelectedSkillDeps {
   return {
-    resolveActiveSkill: vi
-      .fn()
-      .mockResolvedValue({ id: 'skill_faq', version: 3 }),
+    resolveActiveSkill: vi.fn().mockResolvedValue({ id: 'skill_faq', version: 3 }),
     runSkill: vi.fn().mockResolvedValue({
       ok: true,
       output: { reply: 'Aqui está sua resposta.' },
@@ -76,9 +70,11 @@ function mkArgs() {
 
 describe('F1 Phase 1 — buildSkillInput', () => {
   it('builds the conventional { message, pessoa_id, conversa_id } payload', () => {
-    expect(
-      buildSkillInput({ message: 'oi', pessoa_id: 'p_1', conversa_id: 'c_1' }),
-    ).toEqual({ message: 'oi', pessoa_id: 'p_1', conversa_id: 'c_1' });
+    expect(buildSkillInput({ message: 'oi', pessoa_id: 'p_1', conversa_id: 'c_1' })).toEqual({
+      message: 'oi',
+      pessoa_id: 'p_1',
+      conversa_id: 'c_1',
+    });
   });
 });
 
@@ -156,8 +152,7 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     expect(deps.runSkill).toHaveBeenCalledOnce();
     expect(deps.safeDispatchOutput).toHaveBeenCalledOnce();
     // The reply went through safeDispatchOutput with the skill text + channel ctx.
-    const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock
-      .calls[0]![0];
+    const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock.calls[0]![0];
     expect(ctx.text).toBe('Aqui está sua resposta.');
     expect(ctx.pessoa).toBe(pessoa);
     expect(ctx.conversa).toBe(conversa);
@@ -188,26 +183,19 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
   it('identity mismatch (version bumped between select and execute) ⇒ fall through, runSkill NOT called', async () => {
     const deps = mkDeps({
       // The active row was re-activated at a higher version after selection.
-      resolveActiveSkill: vi
-        .fn()
-        .mockResolvedValue({ id: 'skill_faq', version: 4 }),
+      resolveActiveSkill: vi.fn().mockResolvedValue({ id: 'skill_faq', version: 4 }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
     expect(outcome).toEqual({ handled: false, reason: 'identity_mismatch' });
     expect(deps.runSkill).not.toHaveBeenCalled();
     expect(deps.safeDispatchOutput).not.toHaveBeenCalled();
-    expect(deps.logger.warn).toHaveBeenCalledWith(
-      expect.anything(),
-      'skill.identity_mismatch',
-    );
+    expect(deps.logger.warn).toHaveBeenCalledWith(expect.anything(), 'skill.identity_mismatch');
   });
 
   it('identity mismatch (different id, same version) ⇒ fall through, runSkill NOT called', async () => {
     const deps = mkDeps({
-      resolveActiveSkill: vi
-        .fn()
-        .mockResolvedValue({ id: 'skill_other', version: 3 }),
+      resolveActiveSkill: vi.fn().mockResolvedValue({ id: 'skill_other', version: 3 }),
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
     expect(outcome).toEqual({ handled: false, reason: 'identity_mismatch' });
@@ -225,10 +213,7 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
 
   it('no pinned identity ⇒ fall through without resolving or executing', async () => {
     const deps = mkDeps();
-    const outcome = await executeSelectedSkill(
-      { ...mkArgs(), pinned: null },
-      deps,
-    );
+    const outcome = await executeSelectedSkill({ ...mkArgs(), pinned: null }, deps);
     expect(outcome).toEqual({ handled: false, reason: 'no_pinned_identity' });
     expect(deps.resolveActiveSkill).not.toHaveBeenCalled();
     expect(deps.runSkill).not.toHaveBeenCalled();
@@ -380,8 +365,7 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
     const outcome = await executeSelectedSkill(mkArgs(), deps);
 
     expect(outcome).toEqual({ handled: true });
-    const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock
-      .calls[0]![0];
+    const ctx = (deps.safeDispatchOutput as ReturnType<typeof vi.fn>).mock.calls[0]![0];
     expect(ctx.text).toBe('Sua solicitação foi aprovada.');
   });
 });
@@ -400,12 +384,10 @@ describe('F1 Phase 1 — executeSelectedSkill', () => {
 describe('#238 Improvement 2 — per-turn outbound ledger guard', () => {
   const origFlag = config.FEATURE_OUTBOUND_DEDUP;
   beforeAll(() => {
-    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
-      true;
+    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP = true;
   });
   afterAll(() => {
-    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
-      origFlag;
+    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP = origFlag;
   });
 
   function row(status: 'pending' | 'sent' | 'failed' | 'unknown') {
@@ -484,9 +466,7 @@ describe('#238 Improvement 2 — per-turn outbound ledger guard', () => {
   it('ledger lookup THROWS ⇒ fail-OPEN: skill runs (DB hiccup MUST NOT silence the user)', async () => {
     const warn = vi.fn();
     const deps = mkDeps({
-      findOutboundLedgerForTurn: vi
-        .fn()
-        .mockRejectedValue(new Error('db_blip')),
+      findOutboundLedgerForTurn: vi.fn().mockRejectedValue(new Error('db_blip')),
       logger: { info: vi.fn(), warn, error: vi.fn() },
     });
     const outcome = await executeSelectedSkill(mkArgs(), deps);
@@ -500,8 +480,7 @@ describe('#238 Improvement 2 — per-turn outbound ledger guard', () => {
   });
 
   it('FLAG OFF ⇒ guard is a NO-OP (skill runs unconditionally)', async () => {
-    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
-      false;
+    (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP = false;
     try {
       const findOutboundLedgerForTurn = vi.fn().mockResolvedValue(row('sent'));
       const deps = mkDeps({ findOutboundLedgerForTurn });
@@ -511,8 +490,7 @@ describe('#238 Improvement 2 — per-turn outbound ledger guard', () => {
       expect(findOutboundLedgerForTurn).not.toHaveBeenCalled();
       expect(deps.runSkill).toHaveBeenCalledOnce();
     } finally {
-      (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP =
-        true;
+      (config as { FEATURE_OUTBOUND_DEDUP: boolean }).FEATURE_OUTBOUND_DEDUP = true;
     }
   });
 

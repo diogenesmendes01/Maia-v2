@@ -117,8 +117,7 @@ function localDayAndMinute(now: Date, timezone: string): { isoDay: number; minut
   return { isoDay, minute };
 }
 
-const hhmmToMinute = (s: string): number =>
-  Number(s.slice(0, 2)) * 60 + Number(s.slice(3, 5));
+const hhmmToMinute = (s: string): number => Number(s.slice(0, 2)) * 60 + Number(s.slice(3, 5));
 
 /**
  * Janela de horário permitida. `inicio <= fim` é janela intradia; `inicio >
@@ -148,9 +147,7 @@ function evaluateTimeWindow(
   const inicio = hhmmToMinute(window.inicio);
   const fim = hhmmToMinute(window.fim);
   if (inicio <= fim) {
-    return window.dias.includes(isoDay) && minute >= inicio && minute <= fim
-      ? 'inside'
-      : 'outside';
+    return window.dias.includes(isoDay) && minute >= inicio && minute <= fim ? 'inside' : 'outside';
   }
   // Janela overnight: [inicio, 23:59] do dia D ∪ [00:00, fim] do dia D+1.
   const previousDay = isoDay === 1 ? 7 : isoDay - 1;

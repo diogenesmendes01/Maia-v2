@@ -13,9 +13,6 @@ import { resolve } from 'node:path';
 export default defineConfig({
   test: {
     include: ['tests/reporters/fixtures/*.fixture.ts'],
-    reporters: [
-      'default',
-      resolve(__dirname, '../../../tests/reporters/diagnostico-reporter.ts'),
-    ],
+    reporters: ['default', resolve(__dirname, '../../../tests/reporters/diagnostico-reporter.ts')],
   },
 });

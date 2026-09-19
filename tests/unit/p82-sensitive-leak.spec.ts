@@ -247,7 +247,7 @@ describe('[P82-NB Finding 2] listMentionableForScopes matches both content shape
     // the real implementation will call.
     vi.doMock('../../src/db/repositories.js', async () => {
       const actual = await vi.importActual<typeof import('../../src/db/repositories.js')>(
-        '../../src/db/repositories.js'
+        '../../src/db/repositories.js',
       );
       return actual;
     });
@@ -297,7 +297,9 @@ describe('[P82-NB Finding 2] listMentionableForScopes matches both content shape
     expect(text).toContain('memory_entry');
     // OR between the two me.content equalities — guard against a future
     // regression that drops the second branch back to AND or removes it.
-    expect(text).toMatch(/me\.content\s*=\s*\(af\.valor->>'content'\)\s*\n?\s*or\s+me\.content\s*=/);
+    expect(text).toMatch(
+      /me\.content\s*=\s*\(af\.valor->>'content'\)\s*\n?\s*or\s+me\.content\s*=/,
+    );
   });
 
   it('still gates by needs_review OR mention_allowed=false (the sensitivity verdict is unchanged)', async () => {

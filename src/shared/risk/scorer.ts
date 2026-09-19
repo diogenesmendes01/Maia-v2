@@ -78,9 +78,7 @@ function assertNoCriticalSignalLoss(
   resolvedLevel: RiskLevel,
   context: 'turn' | 'knowledge',
 ): RiskLevel {
-  const hasCriticalTrigger = triggers.some(
-    (t) => t.contributes_to === RiskLevel.CRITICAL,
-  );
+  const hasCriticalTrigger = triggers.some((t) => t.contributes_to === RiskLevel.CRITICAL);
   if (!hasCriticalTrigger) return resolvedLevel;
   if (isAtLeast(resolvedLevel, RiskLevel.CRITICAL)) return resolvedLevel;
   // Defesa-em-profundidade: re-escala para CRITICAL e loga audit-visible.
@@ -104,15 +102,19 @@ function assertNoCriticalSignalLoss(
  * + diagnóstico.
  */
 async function applyGate(
-  heuristic: { level: RiskLevel; confidence: number; ambiguous: boolean; triggers: ScoredRisk['triggers'] },
+  heuristic: {
+    level: RiskLevel;
+    confidence: number;
+    ambiguous: boolean;
+    triggers: ScoredRisk['triggers'];
+  },
   opts: ScorerOptions,
   context: 'turn' | 'knowledge',
 ): Promise<ScoredRisk> {
   // Pula gate se não-ambíguo OU se nível >= high (gastar Haiku para
   // tentar elevar HIGH→CRITICAL não vale; CRITICAL via LLM precisa de
   // sinal determinístico forte, nunca de inferência).
-  const skipGate = !heuristic.ambiguous ||
-    compareRiskLevel(heuristic.level, RiskLevel.HIGH) >= 0;
+  const skipGate = !heuristic.ambiguous || compareRiskLevel(heuristic.level, RiskLevel.HIGH) >= 0;
   if (skipGate) {
     const level = assertNoCriticalSignalLoss(heuristic.triggers, heuristic.level, context);
     return {

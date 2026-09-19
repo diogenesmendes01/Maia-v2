@@ -31,7 +31,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 const T = 'issue184-tenant';
@@ -69,8 +70,14 @@ const validProfileBody = {
 async function cleanupAgent(agentId: string): Promise<void> {
   const c = await pool.connect();
   try {
-    await c.query(`DELETE FROM admin_audit_log WHERE tenant_id = $1 AND resource_id = $2`, [T, agentId]);
-    await c.query(`DELETE FROM agent_operational_profile_versions WHERE tenant_id = $1 AND agent_id = $2`, [T, agentId]);
+    await c.query(`DELETE FROM admin_audit_log WHERE tenant_id = $1 AND resource_id = $2`, [
+      T,
+      agentId,
+    ]);
+    await c.query(
+      `DELETE FROM agent_operational_profile_versions WHERE tenant_id = $1 AND agent_id = $2`,
+      [T, agentId],
+    );
     await c.query(`DELETE FROM agents WHERE tenant_id = $1 AND id = $2`, [T, agentId]);
   } finally {
     c.release();

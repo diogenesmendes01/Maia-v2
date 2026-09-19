@@ -165,9 +165,7 @@ d('colisão de unique no ledger de agendamento é sucesso idempotente', () => {
 
   it('CONTROLE: sem colisão, os três caminhos GRAVAM — o null não é incondicional', async () => {
     // Sem este caso, um `return null` fixo passaria nos três testes acima.
-    const { outboxRepo, advanceWithTx, seriesRepo } = await import(
-      '../../src/scheduling/repos.js'
-    );
+    const { outboxRepo, advanceWithTx, seriesRepo } = await import('../../src/scheduling/repos.js');
     const base = { kind: 'email_alert', payload: { a: 1 } };
 
     const a = await noEscopo(() =>

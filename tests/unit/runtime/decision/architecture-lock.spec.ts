@@ -35,8 +35,7 @@ describe('P9b — Architecture lock (G7)', () => {
       const content = await readFile(f, 'utf8');
       // Allow comments referencing the resolver as documentation/TODO.
       // Forbid only actual import statements.
-      const importPattern =
-        /^\s*import\s.*from\s+['"][^'"]*policy-descriptor-resolver[^'"]*['"]/m;
+      const importPattern = /^\s*import\s.*from\s+['"][^'"]*policy-descriptor-resolver[^'"]*['"]/m;
       expect(
         importPattern.test(content),
         `file ${f} imports policy-descriptor-resolver directly`,
@@ -50,8 +49,7 @@ describe('P9b — Architecture lock (G7)', () => {
     expect(files.length).toBeGreaterThan(0);
     for (const f of files) {
       const content = await readFile(f, 'utf8');
-      const importPattern =
-        /^\s*import\s.*from\s+['"][^'"]*policy-descriptor-resolver[^'"]*['"]/m;
+      const importPattern = /^\s*import\s.*from\s+['"][^'"]*policy-descriptor-resolver[^'"]*['"]/m;
       expect(
         importPattern.test(content),
         `file ${f} imports policy-descriptor-resolver directly`,

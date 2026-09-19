@@ -45,8 +45,7 @@ vi.mock('@/config/contract-env.js', async (orig) => {
   return {
     ...real,
     contractEnv: new Proxy(real.contractEnv, {
-      get: (alvo, chave) =>
-        chave === 'FEATURE_TURN_STREAM_KEY' ? true : Reflect.get(alvo, chave),
+      get: (alvo, chave) => (chave === 'FEATURE_TURN_STREAM_KEY' ? true : Reflect.get(alvo, chave)),
     }),
   };
 });
@@ -172,7 +171,11 @@ function inbound(over: Record<string, unknown> = {}) {
     tipo: 'texto',
     conteudo: 'oi',
     midia_url: null,
-    metadata: { whatsapp_id: 'wa-1', remote_jid: '5511999998888@s.whatsapp.net', telefone: '+5511999998888' },
+    metadata: {
+      whatsapp_id: 'wa-1',
+      remote_jid: '5511999998888@s.whatsapp.net',
+      telefone: '+5511999998888',
+    },
     processada_em: null,
     ferramentas_chamadas: [],
     tokens_usados: null,
@@ -225,7 +228,6 @@ describe('#505 — createInbound recusa identidade irresolúvel (call site real)
     ).rejects.toMatchObject({ reason: 'reserved_scope_literal' });
     expect(inserts('mensagens')).toHaveLength(0);
   });
-
 });
 
 describe('#505 — createInbound sequencia o ingresso resolvido', () => {
@@ -250,9 +252,7 @@ describe('#505 — createInbound sequencia o ingresso resolvido', () => {
     // tirar a alocação da transação) mataria essa propriedade.
     await runWithTenantContext(ESCOPO, () => mensagensRepo.createInbound(inbound()));
     const posUpsert = operacoes.findIndex((o) => o.kind === 'execute');
-    const posInsert = operacoes.findIndex(
-      (o) => o.kind === 'insert' && o.table === 'mensagens',
-    );
+    const posInsert = operacoes.findIndex((o) => o.kind === 'insert' && o.table === 'mensagens');
     expect(posUpsert).toBeGreaterThanOrEqual(0);
     expect(posInsert).toBeGreaterThan(posUpsert);
   });

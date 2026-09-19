@@ -226,9 +226,7 @@ async function runOne(
         status: 'fail',
         summary: `o check lançou (${errorClass(finished.err)})`,
         evidence: { error_class: errorClass(finished.err) },
-        remediation: [
-          'Rode com `--verbose` para o detalhe redigido e verifique o serviço alvo.',
-        ],
+        remediation: ['Rode com `--verbose` para o detalhe redigido e verifique o serviço alvo.'],
       },
       duration,
     );

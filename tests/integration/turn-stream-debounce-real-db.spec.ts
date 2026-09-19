@@ -283,8 +283,7 @@ d('#628 — debounce transacional (DB real)', () => {
     );
     await texto();
     const t = await lerTurno(m1.turn_id);
-    const restante =
-      new Date(t['debounce_deadline_at'] as string).getTime() - Date.now();
+    const restante = new Date(t['debounce_deadline_at'] as string).getTime() - Date.now();
     // O reset pediria +5s; o teto (abertura + 30s) só permite ~0,5s. `LEAST`
     // faz o teto vencer — é o que impede um usuário que digita sem parar de
     // adiar a resposta para sempre.
@@ -345,9 +344,7 @@ d('#628 — debounce transacional (DB real)', () => {
 
     // Os INPUTS foram reancorados: a composição do batch é um FATO do banco,
     // legível pelo executor, que roda em outro processo e outro instante.
-    const batch = await inA(() =>
-      repos().agentTurnsRepo.listClosedDebounceBatch(m1.turn_id),
-    );
+    const batch = await inA(() => repos().agentTurnsRepo.listClosedDebounceBatch(m1.turn_id));
     expect(batch.map((b) => b.mensagem_id)).toEqual([
       m1.mensagem_id,
       m2.mensagem_id,
@@ -423,10 +420,9 @@ d('#628 — debounce transacional (DB real)', () => {
     const m1 = await texto();
     const m2 = await texto();
     const chave = chaveDe(T_A, A_A, CANAL_A);
-    await pool.query(
-      `UPDATE agent_turns SET status = 'queued', queued_at = now() WHERE id = $1`,
-      [m1.turn_id],
-    );
+    await pool.query(`UPDATE agent_turns SET status = 'queued', queued_at = now() WHERE id = $1`, [
+      m1.turn_id,
+    ]);
     await vencerJanela(chave);
 
     const [a, b] = await Promise.all([

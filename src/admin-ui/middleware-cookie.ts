@@ -134,9 +134,7 @@ function classifySessionCookieName(
  * #179) and prevents unauthenticated users from rendering an admin page
  * shell.
  */
-export function hasSessionCookie(
-  cookies: ReadonlyArray<{ name: string; value: string }>,
-): boolean {
+export function hasSessionCookie(cookies: ReadonlyArray<{ name: string; value: string }>): boolean {
   // Group chunked cookies by prefix; track exact (unchunked) matches separately.
   // We need both buckets per-prefix because a request can technically carry
   // (stale) chunks under one prefix and a fresh unchunked cookie under another

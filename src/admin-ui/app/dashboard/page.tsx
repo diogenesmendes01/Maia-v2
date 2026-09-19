@@ -9,11 +9,7 @@ import { StatCard } from '../../components/ui/stat-card.js';
 import { Card, CardHeader, CardBody } from '../../components/ui/card.js';
 import { Badge } from '../../components/ui/badge.js';
 import { Button } from '../../components/ui/button.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../components/ui/states.js';
+import { LoadingState, ErrorState, EmptyState } from '../../components/ui/states.js';
 import { IconPlus, IconChevronRight } from '../../components/ui/icons.js';
 
 /**
@@ -77,8 +73,7 @@ export default function DashboardPage() {
       cta: 'Configurar canal',
     },
   ];
-  const activationPending =
-    !profileVersionsQuery.isLoading && activationSteps.some((s) => !s.done);
+  const activationPending = !profileVersionsQuery.isLoading && activationSteps.some((s) => !s.done);
 
   return (
     <div>
@@ -213,10 +208,7 @@ export default function DashboardPage() {
         </Card>
 
         <Card>
-          <CardHeader
-            title="Atalhos"
-            description="O ciclo diário de operação da plataforma."
-          />
+          <CardHeader title="Atalhos" description="O ciclo diário de operação da plataforma." />
           <CardBody className="p-0">
             <ul className="divide-y divide-zinc-100 text-sm">
               {[

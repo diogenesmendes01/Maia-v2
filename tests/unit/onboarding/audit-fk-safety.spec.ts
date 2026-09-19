@@ -125,7 +125,9 @@ function makeTx(schema: {
             ...v,
           };
           state.runs.push(row);
-          const ret = Promise.resolve([row]) as Promise<Row[]> & { returning: () => Promise<Row[]> };
+          const ret = Promise.resolve([row]) as Promise<Row[]> & {
+            returning: () => Promise<Row[]>;
+          };
           ret.returning = () => Promise.resolve([row]);
           return ret;
         }
@@ -161,7 +163,9 @@ function makeTx(schema: {
 vi.mock('../../../src/db/client.js', async () => {
   const schema = await import('../../../src/db/schema.js');
   return {
-    db: { select: () => ({ from: () => ({ where: () => ({ limit: () => Promise.resolve([]) }) }) }) },
+    db: {
+      select: () => ({ from: () => ({ where: () => ({ limit: () => Promise.resolve([]) }) }) }),
+    },
     withTx: async (fn: (tx: unknown) => Promise<unknown>) => {
       state.committed = false;
       // Snapshot para emular o ROLLBACK: se `fn` lançar, nada persiste.
@@ -225,9 +229,9 @@ describe('onboarding — auditoria não viola a FK de admin_audit_log', () => {
   it('o tx falso REALMENTE recusa um tenant inexistente (guarda do próprio teste)', async () => {
     const schema = await import('../../../src/db/schema.js');
     const tx = makeTx(schema as never);
-    expect(() =>
-      tx.insert(schema.admin_audit_log).values({ tenant_id: 'nao-existe' }),
-    ).toThrow(/admin_audit_log_tenant_id_fkey/);
+    expect(() => tx.insert(schema.admin_audit_log).values({ tenant_id: 'nao-existe' })).toThrow(
+      /admin_audit_log_tenant_id_fkey/,
+    );
   });
 
   it('criar a run do tenant que AINDA NÃO EXISTE não viola a FK', async () => {
@@ -273,9 +277,9 @@ describe('onboarding — auditoria não viola a FK de admin_audit_log', () => {
     expect(out.outcome).toBe('committed');
     expect(state.audit).toHaveLength(1);
     expect(state.audit[0]!.tenant_id).toBe('system');
-    expect(
-      (state.audit[0]!.change_summary as Record<string, unknown>).target_tenant_id,
-    ).toBe(TARGET_TENANT);
+    expect((state.audit[0]!.change_summary as Record<string, unknown>).target_tenant_id).toBe(
+      TARGET_TENANT,
+    );
   });
 
   it('depois de provision_tenant, a auditoria do MESMO tx já usa o tenant real', async () => {
@@ -321,8 +325,6 @@ describe('onboarding — auditoria não viola a FK de admin_audit_log', () => {
     const r = await repo();
     await r.create({ ...baseCreate(), kind: 'global_bootstrap', tenant_id: null });
     expect(state.audit[0]!.tenant_id).toBe('system');
-    expect(
-      (state.audit[0]!.change_summary as Record<string, unknown>).target_tenant_id,
-    ).toBeNull();
+    expect((state.audit[0]!.change_summary as Record<string, unknown>).target_tenant_id).toBeNull();
   });
 });

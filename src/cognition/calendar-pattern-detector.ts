@@ -10,10 +10,7 @@
  */
 import { callLLM } from '@/lib/claude.js';
 import { runCognitiveModule } from './runner.js';
-import {
-  buildHolidayDescriptor,
-  type HolidayProposalType,
-} from './holiday-descriptor.js';
+import { buildHolidayDescriptor, type HolidayProposalType } from './holiday-descriptor.js';
 
 export interface CalendarDetectorInput {
   text: string;

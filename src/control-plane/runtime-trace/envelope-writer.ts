@@ -20,10 +20,7 @@
  *   the packet — the worker picks it up from the durable outbox table.
  */
 import { db } from '@/db/client.js';
-import {
-  runtime_trace_envelopes,
-  runtime_trace_body_outbox,
-} from '@/db/schema.js';
+import { runtime_trace_envelopes, runtime_trace_body_outbox } from '@/db/schema.js';
 import type {
   TraceEnvelopeInput,
   TraceEnvelopeWritten,

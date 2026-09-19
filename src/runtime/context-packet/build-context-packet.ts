@@ -53,11 +53,7 @@ export interface HistoryRequirements {
 }
 
 export interface HistoryLoader {
-  (
-    base: BaseContextPacket,
-    req: HistoryRequirements,
-    signal: AbortSignal,
-  ): Promise<HistorySlice>;
+  (base: BaseContextPacket, req: HistoryRequirements, signal: AbortSignal): Promise<HistorySlice>;
 }
 
 export interface MetricsClient {
@@ -216,8 +212,7 @@ export async function buildContextPacket(
   const clock = deps.clock ?? (() => performance.now());
   const startedAtMs = clock();
   const budgetMs = deps.budgetMs ?? DEFAULT_TOTAL_BUDGET_MS;
-  const timeoutPerSliceMs =
-    deps.timeoutPerSliceMs ?? DEFAULT_TIMEOUT_PER_SLICE_MS;
+  const timeoutPerSliceMs = deps.timeoutPerSliceMs ?? DEFAULT_TIMEOUT_PER_SLICE_MS;
 
   // Compose final abort signal — combine caller-provided signal with our
   // internal budget timeout. Builders that DO respect the signal will abort
@@ -247,8 +242,7 @@ export async function buildContextPacket(
     const elapsed = clock() - startedAtMs;
     return Math.max(0, budgetMs - elapsed);
   };
-  const effectiveSliceDeadline = (): number =>
-    Math.min(timeoutPerSliceMs, remainingBudgetMs());
+  const effectiveSliceDeadline = (): number => Math.min(timeoutPerSliceMs, remainingBudgetMs());
 
   try {
     const ctxRequirements = input.decision.context_requirements;
@@ -420,8 +414,7 @@ export async function buildContextPacket(
         assemblyMeta.cache_hits[name] = result.value.cache_hit;
         assemblyMeta.builder_durations_ms[name] = result.value.duration_ms;
         if (result.value.fallback_depth_applied) {
-          assemblyMeta.fallback_depths_applied[name] =
-            result.value.fallback_depth_applied;
+          assemblyMeta.fallback_depths_applied[name] = result.value.fallback_depth_applied;
         }
         return result.value.slice;
       }
@@ -440,10 +433,7 @@ export async function buildContextPacket(
      * without depending on the (possibly hanging) builder. We swallow any
      * cacheKey-builder error — best-effort lookup only.
      */
-    const safeCacheKey = <TReq>(
-      builder: SliceBuilder<TReq, unknown>,
-      req: TReq,
-    ): string | null => {
+    const safeCacheKey = <TReq>(builder: SliceBuilder<TReq, unknown>, req: TReq): string | null => {
       try {
         return builder.cacheKey(input.base, req);
       } catch {
@@ -500,18 +490,14 @@ export async function buildContextPacket(
       'tool',
       toolResult,
       EMPTY_FALLBACKS.tool,
-      safeCacheKey(
-        deps.builders.tool as SliceBuilder<unknown, ToolPermissionSlice>,
-        {} as unknown,
-      ),
+      safeCacheKey(deps.builders.tool as SliceBuilder<unknown, ToolPermissionSlice>, {} as unknown),
     );
 
     // Policy fulfilled (rejection / timeout threw earlier)
     assemblyMeta.cache_hits.policy = policySliceResult.cache_hit;
     assemblyMeta.builder_durations_ms.policy = policySliceResult.duration_ms;
     if (policySliceResult.fallback_depth_applied) {
-      assemblyMeta.fallback_depths_applied.policy =
-        policySliceResult.fallback_depth_applied;
+      assemblyMeta.fallback_depths_applied.policy = policySliceResult.fallback_depth_applied;
     }
 
     let historySlice: HistorySlice;
@@ -558,10 +544,7 @@ export async function buildContextPacket(
       assembly_meta: assemblyMeta,
     };
 
-    deps.metrics?.recordHistogram?.(
-      'context_assembly.duration_ms',
-      assemblyMeta.duration_ms,
-    );
+    deps.metrics?.recordHistogram?.('context_assembly.duration_ms', assemblyMeta.duration_ms);
 
     return packet;
   } finally {
@@ -570,8 +553,5 @@ export async function buildContextPacket(
 }
 
 function hashShort16(obj: unknown): string {
-  return createHash('sha256')
-    .update(JSON.stringify(obj))
-    .digest('hex')
-    .substring(0, 16);
+  return createHash('sha256').update(JSON.stringify(obj)).digest('hex').substring(0, 16);
 }

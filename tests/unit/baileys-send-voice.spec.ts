@@ -52,7 +52,7 @@ const baileys = moduloDeProducao(() => import('../../src/gateway/baileys.js'));
 
 describe('sendOutboundVoice', () => {
   it('passes { audio: Buffer, mimetype, ptt: true } to socket.sendMessage', async () => {
-    const buf = Buffer.from([0x4F, 0x67, 0x67, 0x53, 0x00]); // 'OggS\0' fake
+    const buf = Buffer.from([0x4f, 0x67, 0x67, 0x53, 0x00]); // 'OggS\0' fake
     const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const wid = await mod.sendOutboundVoice('5511999999999@s.whatsapp.net', buf);
@@ -70,7 +70,7 @@ describe('sendOutboundVoice', () => {
   });
 
   it('forwards quoted as third arg when provided', async () => {
-    const buf = Buffer.from([0x4F, 0x67]);
+    const buf = Buffer.from([0x4f, 0x67]);
     const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const quoted = { key: { id: 'WAID-IN' } } as never;

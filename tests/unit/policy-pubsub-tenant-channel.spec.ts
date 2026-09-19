@@ -47,12 +47,8 @@ import {
 // ---------------------------------------------------------------------------
 describe('issue #249 — channel name format', () => {
   it('builds `policy_rule_lifecycle:{tenant_id}` for a normal tenant', () => {
-    expect(buildPolicyLifecycleChannel('tenant-a')).toBe(
-      'policy_rule_lifecycle:tenant-a',
-    );
-    expect(buildPolicyLifecycleChannel('tenant-b')).toBe(
-      'policy_rule_lifecycle:tenant-b',
-    );
+    expect(buildPolicyLifecycleChannel('tenant-a')).toBe('policy_rule_lifecycle:tenant-a');
+    expect(buildPolicyLifecycleChannel('tenant-b')).toBe('policy_rule_lifecycle:tenant-b');
   });
 
   it('channel name starts with the prefix and embeds tenant_id', () => {
@@ -76,12 +72,10 @@ describe('issue #249 — channel name format', () => {
   });
 
   it('parse() recovers the tenant_id from a per-tenant channel', () => {
-    expect(parsePolicyLifecycleChannel('policy_rule_lifecycle:foo')).toBe(
-      'foo',
+    expect(parsePolicyLifecycleChannel('policy_rule_lifecycle:foo')).toBe('foo');
+    expect(parsePolicyLifecycleChannel('policy_rule_lifecycle:tenant-with-dashes')).toBe(
+      'tenant-with-dashes',
     );
-    expect(
-      parsePolicyLifecycleChannel('policy_rule_lifecycle:tenant-with-dashes'),
-    ).toBe('tenant-with-dashes');
   });
 
   it('parse() returns null for the legacy bare channel and unrelated channels', () => {
@@ -111,9 +105,7 @@ vi.mock('@/lib/redis.js', () => ({
 }));
 
 // Re-import the repo AFTER the mock so it binds to the mocked redis.
-const { policyRulesRepo } = await import(
-  '@/control-plane/policy/policy-rules-repo.js'
-);
+const { policyRulesRepo } = await import('@/control-plane/policy/policy-rules-repo.js');
 
 beforeEach(() => {
   publishCalls.length = 0;
@@ -137,39 +129,33 @@ describe('issue #249 — publisher routes to per-tenant channel', () => {
 
   it('publish target is the per-tenant channel built from ALS context', async () => {
     const { redis } = await import('@/lib/redis.js');
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'default' },
-      async () => {
-        const channel = buildPolicyLifecycleChannel('tenant-a');
-        const evt: PolicyLifecycleEvent = {
-          event: 'policy_rule_activated',
-          tenant_id: 'tenant-a',
-          agent_id: null,
-          descriptor: 'd',
-        };
-        await redis.publish(channel, JSON.stringify(evt));
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
+      const channel = buildPolicyLifecycleChannel('tenant-a');
+      const evt: PolicyLifecycleEvent = {
+        event: 'policy_rule_activated',
+        tenant_id: 'tenant-a',
+        agent_id: null,
+        descriptor: 'd',
+      };
+      await redis.publish(channel, JSON.stringify(evt));
+    });
     expect(publishCalls).toHaveLength(1);
     expect(publishCalls[0]?.channel).toBe('policy_rule_lifecycle:tenant-a');
   });
 
   it('publish in tenant-A context does NOT use tenant-B channel', async () => {
     const { redis } = await import('@/lib/redis.js');
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'default' },
-      async () => {
-        await redis.publish(
-          buildPolicyLifecycleChannel('tenant-a'),
-          JSON.stringify({
-            event: 'policy_rule_activated',
-            tenant_id: 'tenant-a',
-            agent_id: null,
-            descriptor: 'd',
-          } satisfies PolicyLifecycleEvent),
-        );
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
+      await redis.publish(
+        buildPolicyLifecycleChannel('tenant-a'),
+        JSON.stringify({
+          event: 'policy_rule_activated',
+          tenant_id: 'tenant-a',
+          agent_id: null,
+          descriptor: 'd',
+        } satisfies PolicyLifecycleEvent),
+      );
+    });
     // Channel must NOT contain tenant-b.
     expect(publishCalls[0]?.channel).not.toContain('tenant-b');
   });
@@ -362,11 +348,7 @@ describe('issue #249 — subscriber tenant routing', () => {
       descriptor: 'd',
       scope: {},
     });
-    handlePolicyLifecycleMessage(
-      buildPolicyLifecycleChannel('tenant-a'),
-      '{not valid json',
-      cache,
-    );
+    handlePolicyLifecycleMessage(buildPolicyLifecycleChannel('tenant-a'), '{not valid json', cache);
     expect(
       cache.get({
         tenant_id: 'tenant-a',

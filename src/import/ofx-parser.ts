@@ -23,7 +23,8 @@ export function parseOFX(input: string): OFXParsed {
   const periodo_de = isoDate(match1(text, /<DTSTART>([^<\n]+)/i));
   const periodo_ate = isoDate(match1(text, /<DTEND>([^<\n]+)/i));
   const entries: OFXEntry[] = [];
-  const re = /<STMTTRN>([\s\S]*?)<\/STMTTRN>|<STMTTRN>([\s\S]*?)(?=<STMTTRN>|<\/BANKTRANLIST>|<\/CCSTMTTRNRS>)/gi;
+  const re =
+    /<STMTTRN>([\s\S]*?)<\/STMTTRN>|<STMTTRN>([\s\S]*?)(?=<STMTTRN>|<\/BANKTRANLIST>|<\/CCSTMTTRNRS>)/gi;
   let m: RegExpExecArray | null;
   while ((m = re.exec(text)) !== null) {
     const block = m[1] ?? m[2] ?? '';

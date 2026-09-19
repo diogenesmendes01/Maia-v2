@@ -24,11 +24,12 @@ function pool(options: {
 }): { pool: LockPool; state: { attempts: number; releases: number; queries: string[] } } {
   const state = { attempts: 0, releases: 0, queries: [] as string[] };
   const client: LockClient = {
-    query: <R,>(text: string): Promise<{ rows: R[] }> => {
+    query: <R>(text: string): Promise<{ rows: R[] }> => {
       state.queries.push(text);
       if (text.includes('pg_try_advisory_lock')) {
         state.attempts += 1;
-        if (options.queryThrows) return Promise.reject(Object.assign(new Error('boom'), { code: '57P01' }));
+        if (options.queryThrows)
+          return Promise.reject(Object.assign(new Error('boom'), { code: '57P01' }));
         const granted = state.attempts >= (options.grantOnAttempt ?? 1);
         return Promise.resolve({ rows: [{ locked: granted }] as R[] });
       }
@@ -49,7 +50,12 @@ function pool(options: {
 
 function clock(): { now: () => number; advance: (ms: number) => void } {
   let t = 0;
-  return { now: () => t, advance: (ms) => { t += ms; } };
+  return {
+    now: () => t,
+    advance: (ms) => {
+      t += ms;
+    },
+  };
 }
 
 describe('lock namespace', () => {
@@ -98,7 +104,14 @@ describe('acquireMigrationLock', () => {
     const { pool: p, state } = pool({ grantOnAttempt: 999 });
     const c = clock();
     const result = await acquireMigrationLock(
-      { pool: p, now: c.now, sleep: (ms) => { c.advance(ms); return Promise.resolve(); } },
+      {
+        pool: p,
+        now: c.now,
+        sleep: (ms) => {
+          c.advance(ms);
+          return Promise.resolve();
+        },
+      },
       { waitMs: 1000, pollMs: 500 },
     );
     expect(result.acquired).toBe(false);
@@ -153,7 +166,14 @@ describe('withMigrationLock', () => {
     const fn = vi.fn();
     const c = clock();
     const outcome = await withMigrationLock(
-      { pool: p, now: c.now, sleep: (ms) => { c.advance(ms); return Promise.resolve(); } },
+      {
+        pool: p,
+        now: c.now,
+        sleep: (ms) => {
+          c.advance(ms);
+          return Promise.resolve();
+        },
+      },
       { waitMs: 0, pollMs: 100 },
       fn,
     );

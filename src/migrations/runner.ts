@@ -92,11 +92,7 @@ import {
 import { acquireMigrationLock, type LockDeps, type LockOptions } from './lock.js';
 import { computeMigrationStatus } from './status.js';
 import { shortChecksum } from './checksum.js';
-import {
-  invalidIndexBlockers,
-  invalidIndexKey,
-  readInvalidIndexes,
-} from './invalid-indexes.js';
+import { invalidIndexBlockers, invalidIndexKey, readInvalidIndexes } from './invalid-indexes.js';
 import type {
   DiscoveredMigration,
   InvalidIndex,
@@ -168,12 +164,7 @@ export interface RunOptions extends LockOptions {
   readonly statementTimeoutMs?: number | null;
 }
 
-export type RunOutcome =
-  | 'applied'
-  | 'up_to_date'
-  | 'blocked'
-  | 'lock_unavailable'
-  | 'failed';
+export type RunOutcome = 'applied' | 'up_to_date' | 'blocked' | 'lock_unavailable' | 'failed';
 
 export interface MigrationRunResult {
   readonly ok: boolean;
@@ -356,7 +347,9 @@ async function applyTimeouts(
 ): Promise<void> {
   // Numeric interpolation only — both values are validated numbers, and
   // Postgres does not accept a bind parameter in SET.
-  await client.query(`SET lock_timeout = ${lockTimeoutMs === null ? 0 : Math.trunc(lockTimeoutMs)}`);
+  await client.query(
+    `SET lock_timeout = ${lockTimeoutMs === null ? 0 : Math.trunc(lockTimeoutMs)}`,
+  );
   await client.query(
     `SET statement_timeout = ${statementTimeoutMs === null ? 0 : Math.trunc(statementTimeoutMs)}`,
   );
@@ -764,7 +757,11 @@ export async function repairMigration(
 ): Promise<RepairResult> {
   const emit = deps.onEvent ?? (() => undefined);
   if (request.reason.trim().length === 0) {
-    return { ok: false, reason: 'a repair requires a non-empty --reason; it is persisted on the ledger row as the audit trail' };
+    return {
+      ok: false,
+      reason:
+        'a repair requires a non-empty --reason; it is persisted on the ledger row as the audit trail',
+    };
   }
   const artifact = await discoverMigrations(deps.migrationsDir);
   const packaged = artifact.byId.get(request.id) ?? null;
@@ -785,7 +782,10 @@ export async function repairMigration(
     options,
   );
   if (!acquisition.acquired) {
-    return { ok: false, reason: `could not acquire the global migration lock (${acquisition.reason})` };
+    return {
+      ok: false,
+      reason: `could not acquire the global migration lock (${acquisition.reason})`,
+    };
   }
   const client = acquisition.lock.client as RunnerPoolClient;
   try {

@@ -213,7 +213,12 @@ async function turnoMedido(
   deps: Partial<TurnStageDeps> = {},
 ): Promise<{
   reads: Array<{ section: string; ms: number }>;
-  amostra: { entities: number; scope_entities: number; scope_ms: number; reads: Array<{ section: string }> };
+  amostra: {
+    entities: number;
+    scope_entities: number;
+    scope_ms: number;
+    reads: Array<{ section: string }>;
+  };
   ctx: { scope: ResolvedScope } | null;
 }> {
   let ctx: { scope: ResolvedScope } | null = null;
@@ -224,7 +229,9 @@ async function turnoMedido(
       // estágio faz — fixar esse número no harness seria o gate concordando
       // consigo mesmo.
       resolveScope: (pessoa) =>
-        permissions().resolveScope(pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0]) as Promise<ResolvedScope>,
+        permissions().resolveScope(
+          pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
+        ) as Promise<ResolvedScope>,
       buildPrompt: async (c) => {
         ctx = c as { scope: ResolvedScope };
         return undefined;
@@ -355,7 +362,10 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     const metricsComTeto = scopeMetricsFromSamples([...amostras, comTeto.amostra]);
     expect(metricsComTeto.scope_entities_max).toBe(500);
     expect(metricsComTeto.scope_cardinality_mismatches).toBe(1);
-    const ruins = evaluateGate(bracoCom(metricsComTeto), TH, null, { mode: 'gate', fingerprint: FP });
+    const ruins = evaluateGate(bracoCom(metricsComTeto), TH, null, {
+      mode: 'gate',
+      fingerprint: FP,
+    });
     expect(gateExitCode(ruins, 'gate')).toBe(1);
     expect(ruins.find((v) => v.label.includes('veio do BANCO'))!.passed).toBe(false);
     expect(ruins.find((v) => v.label.includes('aceite completo'))!.passed).toBe(false);
@@ -368,7 +378,10 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
       (await turnoMedido(pessoaDe(ACIMA_DO_TETO_ANTIGO))).amostra,
     ]);
     expect(metricsSemTeto.scope_entities_max).toBe(ACIMA_DO_TETO_ANTIGO);
-    const bons = evaluateGate(bracoCom(metricsSemTeto), TH, null, { mode: 'gate', fingerprint: FP });
+    const bons = evaluateGate(bracoCom(metricsSemTeto), TH, null, {
+      mode: 'gate',
+      fingerprint: FP,
+    });
     expect(bons.find((v) => v.label.includes('veio do BANCO'))!.passed).toBe(true);
     expect(bons.find((v) => v.label.includes('aceite completo'))!.passed).toBe(true);
   });
@@ -394,9 +407,7 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     // …e o veredicto, alimentado com o que o contador REALMENTE produziu.
     const ruins = evaluateGate(bracoCom(metricsRuins), TH, null, { mode: 'gate', fingerprint: FP });
     expect(gateExitCode(ruins, 'gate')).toBe(1);
-    expect(
-      ruins.filter((v) => !v.passed).map((v) => v.label),
-    ).toEqual(
+    expect(ruins.filter((v) => !v.passed).map((v) => v.label)).toEqual(
       expect.arrayContaining([
         expect.stringContaining('aceite completo do orçamento do turno'),
         expect.stringContaining('foi EXERCITADO'),
@@ -525,7 +536,9 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     const frame = newTurnFrame(0, 'bench525-t0', 10);
     await runInTurnFrame(frame, async () => {
       await (
-        fundido.permissoesRepo as unknown as { forPessoaComProfile: (id: string) => Promise<unknown> }
+        fundido.permissoesRepo as unknown as {
+          forPessoaComProfile: (id: string) => Promise<unknown>;
+        }
       ).forPessoaComProfile('p0');
     });
     expect(frame.reads.map((r) => r.section)).toEqual([SCOPE_SECTIONS.permissoes_com_profile]);
@@ -573,7 +586,9 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
     await runInTurnFrame(frame, () =>
       runTurnOnce(parDe(pessoaDe(100)), pessoaDe(100), {
         resolveScope: (pessoa) =>
-          permissions().resolveScope(pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0]) as Promise<ResolvedScope>,
+          permissions().resolveScope(
+            pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
+          ) as Promise<ResolvedScope>,
         buildPrompt: async () => undefined,
         runWithTenantContext: (_t, fn) => fn(),
       }),
@@ -666,19 +681,14 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
       // CONTROLE, no mesmo caso: sem atraso, o mesmo caminho mede um turno
       // barato — a asserção acima não passou por o número ser grande sempre.
       banco.atraso_ms = 0;
-      const rapido = await measureTurn(
-        parDe(person),
-        10,
-        newTurnFrame(1, 'bench525-t0', 10),
-        {
-          resolveScope: (pessoa) =>
-            permissions().resolveScope(
-              pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
-            ) as Promise<ResolvedScope>,
-          buildPrompt: async () => undefined,
-          runWithTenantContext: (_t, fn) => fn(),
-        },
-      );
+      const rapido = await measureTurn(parDe(person), 10, newTurnFrame(1, 'bench525-t0', 10), {
+        resolveScope: (pessoa) =>
+          permissions().resolveScope(
+            pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
+          ) as Promise<ResolvedScope>,
+        buildPrompt: async () => undefined,
+        runWithTenantContext: (_t, fn) => fn(),
+      });
       expect(rapido.ms).toBeLessThan(50);
       expect(rapido.ms).toBeGreaterThanOrEqual(rapido.scope_ms);
     });
@@ -695,14 +705,16 @@ describe('#700 — o resolveScope está DENTRO da medição do turno', () => {
       banco.atraso_ms = 10;
       for (const n of CARDINALITIES) {
         semear(n);
-        medidos.push(await measureTurn(parDe(pessoaDe(n)), n, newTurnFrame(0, 'bench525-t0', n), {
-          resolveScope: (pessoa) =>
-            permissions().resolveScope(
-              pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
-            ) as Promise<ResolvedScope>,
-          buildPrompt: async () => undefined,
-          runWithTenantContext: (_t, fn) => fn(),
-        }));
+        medidos.push(
+          await measureTurn(parDe(pessoaDe(n)), n, newTurnFrame(0, 'bench525-t0', n), {
+            resolveScope: (pessoa) =>
+              permissions().resolveScope(
+                pessoa as Parameters<ReturnType<typeof permissions>['resolveScope']>[0],
+              ) as Promise<ResolvedScope>,
+            buildPrompt: async () => undefined,
+            runWithTenantContext: (_t, fn) => fn(),
+          }),
+        );
       }
       for (const m of medidos) {
         expect(countScopeReads(m.reads)).toBe(2);

@@ -243,7 +243,12 @@ describe('Issue #345 — conversation-summarizer mutates ONLY the current tenant
       // Tenant A but a DIFFERENT agent (MUST stay untouched).
       conv({ id: 'A-otherAgent', tenant_id: 'tenant-A', agent_id: 'agent-Z' }),
       // Tenant A but FRESH (not stale) — predicate must spare it.
-      conv({ id: 'A-fresh', tenant_id: 'tenant-A', agent_id: 'agent-A', ultima_atividade_em: FRESH }),
+      conv({
+        id: 'A-fresh',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        ultima_atividade_em: FRESH,
+      }),
     ]);
   });
 

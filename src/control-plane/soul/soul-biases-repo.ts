@@ -332,10 +332,7 @@ export const soulBiasesRepo = {
   },
 
   /** Active → deprecated. Não toca lineage. */
-  async deprecate(args: {
-    id: string;
-    deprecated_reason: string;
-  }): Promise<DeprecateResult> {
+  async deprecate(args: { id: string; deprecated_reason: string }): Promise<DeprecateResult> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const current = await this.getById(args.id);

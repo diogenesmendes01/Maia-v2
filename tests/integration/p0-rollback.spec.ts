@@ -20,7 +20,7 @@ d('P0 rollback NOT NULL', () => {
     // Verifica que coluna agora aceita NULL
     const result = await db.execute<{ is_nullable: string }>(
       sql`SELECT is_nullable FROM information_schema.columns
-      WHERE table_name = 'transacoes' AND column_name = 'tenant_id'`
+      WHERE table_name = 'transacoes' AND column_name = 'tenant_id'`,
     );
     expect((result.rows[0] as Record<string, unknown>)?.is_nullable).toBe('YES');
 

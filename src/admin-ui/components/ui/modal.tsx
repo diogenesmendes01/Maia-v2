@@ -36,8 +36,7 @@ export function Modal({
 
   if (!open) return null;
 
-  const width =
-    size === 'xl' ? 'max-w-4xl' : size === 'lg' ? 'max-w-2xl' : 'max-w-lg';
+  const width = size === 'xl' ? 'max-w-4xl' : size === 'lg' ? 'max-w-2xl' : 'max-w-lg';
 
   return (
     <div
@@ -45,10 +44,7 @@ export function Modal({
       role="dialog"
       aria-modal="true"
     >
-      <div
-        className="absolute inset-0 bg-zinc-950/40 backdrop-blur-[2px]"
-        onClick={onClose}
-      />
+      <div className="absolute inset-0 bg-zinc-950/40 backdrop-blur-[2px]" onClick={onClose} />
       <div
         className={cn(
           'relative flex max-h-[90vh] w-full flex-col rounded-xl bg-white shadow-overlay animate-fade-in-up',
@@ -59,9 +55,7 @@ export function Modal({
           <div className="min-w-0">
             <h2 className="text-base font-semibold text-zinc-900">{title}</h2>
             {description && (
-              <p className="mt-0.5 text-xs leading-relaxed text-zinc-500">
-                {description}
-              </p>
+              <p className="mt-0.5 text-xs leading-relaxed text-zinc-500">{description}</p>
             )}
           </div>
           <button
@@ -69,7 +63,15 @@ export function Modal({
             aria-label="Fechar"
             className="rounded-md p-1 text-zinc-400 transition-colors hover:bg-zinc-100 hover:text-zinc-700"
           >
-            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round">
+            <svg
+              width="16"
+              height="16"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="2"
+              strokeLinecap="round"
+            >
               <path d="M18 6 6 18M6 6l12 12" />
             </svg>
           </button>

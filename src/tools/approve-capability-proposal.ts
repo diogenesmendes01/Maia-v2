@@ -84,9 +84,7 @@ export const approveCapabilityProposalTool: Tool<typeof inputSchema, typeof outp
         (payload?.type === 'entity_custom' || payload?.type === 'holding_recess')
       ) {
         if (!ctx.scope.entidades.includes(targetEntidadeId)) {
-          throw new Error(
-            `entidade alvo do proposal fora do escopo: ${targetEntidadeId}`,
-          );
+          throw new Error(`entidade alvo do proposal fora do escopo: ${targetEntidadeId}`);
         }
         const resolved = ctx.scope.byEntity.get(targetEntidadeId);
         const allow = canAct({

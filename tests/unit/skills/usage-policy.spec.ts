@@ -77,9 +77,9 @@ describe('SkillUsagePolicySchema (Zod contract)', () => {
   });
 
   it('is .strict() — rejects an unknown key (malformed not silently waved through)', () => {
-    expect(
-      SkillUsagePolicySchema.safeParse({ ...CUSTOMER_SKILL, surprise: true }).success,
-    ).toBe(false);
+    expect(SkillUsagePolicySchema.safeParse({ ...CUSTOMER_SKILL, surprise: true }).success).toBe(
+      false,
+    );
   });
 
   it('parseUsagePolicy returns null for NULL and {} (treated as absent)', () => {
@@ -295,7 +295,9 @@ describe('no-policy conservative default + audience→data-scope table', () => {
   });
 
   it('allowedDataScopesForAudience: owner sees all, customer sees only own+public, unknown sees public', () => {
-    expect(allowedDataScopesForAudience('owner', 'trusted_internal')).toContain('financial_summary');
+    expect(allowedDataScopesForAudience('owner', 'trusted_internal')).toContain(
+      'financial_summary',
+    );
     expect(allowedDataScopesForAudience('customer', 'known_external')).toEqual([
       'own_customer_data_only',
       'public_info',

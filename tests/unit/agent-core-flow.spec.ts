@@ -53,7 +53,9 @@ const runDecisionEngineForTurn = vi.fn();
 // produção, falso vermelho aqui). `SANDBOX` é a mesma raiz onde a spec escreve
 // o PDF de fixture.
 vi.mock('../../src/gateway/baileys.js', () => ({
-  sendOutboundText, sendOutboundDocument, sendOutboundVoice,
+  sendOutboundText,
+  sendOutboundDocument,
+  sendOutboundVoice,
   isBaileysConnected: () => true,
   MEDIA_ROOT: SANDBOX,
 }));
@@ -91,15 +93,17 @@ vi.mock('../../src/lib/tts.js', () => ({
 vi.mock('../../src/db/repositories.js', () => ({
   pessoasRepo: { findById },
   mensagensRepo: {
-    create: createMensagem, findById: findMensagem, markProcessed,
-    recentInConversation, setConversaId: vi.fn(), createInbound: vi.fn(),
+    create: createMensagem,
+    findById: findMensagem,
+    markProcessed,
+    recentInConversation,
+    setConversaId: vi.fn(),
+    createInbound: vi.fn(),
   },
   pendingQuestionsRepo: { findActiveSnapshot: vi.fn().mockResolvedValue(null) },
   conversasRepo: {
     byIdWithPessoa: vi.fn(async () => {
-      const row = dbState.conversaResult[0] as
-        | { conversas: unknown; pessoas: unknown }
-        | undefined;
+      const row = dbState.conversaResult[0] as { conversas: unknown; pessoas: unknown } | undefined;
       return row ? { conversa: row.conversas, pessoa: row.pessoas } : null;
     }),
     touch: vi.fn(),
@@ -116,14 +120,19 @@ vi.mock('../../src/db/repositories.js', () => ({
     record: vi.fn().mockResolvedValue(undefined),
   },
   selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
-  factsRepo: { listForScopes: vi.fn().mockResolvedValue([]), listMentionableForScopes: vi.fn().mockResolvedValue([]) },
+  factsRepo: {
+    listForScopes: vi.fn().mockResolvedValue([]),
+    listMentionableForScopes: vi.fn().mockResolvedValue([]),
+  },
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
   entityStatesRepo: { byId: vi.fn().mockResolvedValue(null), byIds: vi.fn().mockResolvedValue([]) },
   entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },
 }));
 vi.mock('../../src/db/client.js', () => {
   const fakeQuery = {
-    from: () => fakeQuery, innerJoin: () => fakeQuery, where: () => fakeQuery,
+    from: () => fakeQuery,
+    innerJoin: () => fakeQuery,
+    where: () => fakeQuery,
     limit: () => Promise.resolve(dbState.conversaResult),
   };
   return {
@@ -135,7 +144,11 @@ vi.mock('../../src/db/client.js', () => {
 // (it reads `mensagens.metadata` before the resolver). Without it the probe
 // deref throws and, post-#417 fail-closed, that propagates instead of being
 // silently swallowed.
-vi.mock('../../src/db/schema.js', () => ({ conversas: {}, pessoas: {}, mensagens: { metadata: {}, id: {} } }));
+vi.mock('../../src/db/schema.js', () => ({
+  conversas: {},
+  pessoas: {},
+  mensagens: { metadata: {}, id: {} },
+}));
 vi.mock('drizzle-orm', () => ({ eq: () => ({}) }));
 vi.mock('../../src/governance/audit.js', () => ({ audit }));
 vi.mock('../../src/lib/logger.js', () => ({
@@ -174,23 +187,26 @@ vi.mock('../../src/tools/runtime-filter.js', () => ({
 }));
 vi.mock('../../src/lib/claude.js', () => ({ callLLM }));
 vi.mock('../../src/agent/prompt-builder.js', () => ({
-  buildPrompt, PROMPT_TOKEN_BUDGET_INPUT: 11000, PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
+  buildPrompt,
+  PROMPT_TOKEN_BUDGET_INPUT: 11000,
+  PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
 }));
 vi.mock('../../src/agent/pending-gate.js', () => ({
   checkPendingFirst: vi.fn().mockResolvedValue({ kind: 'no_pending' }),
 }));
 vi.mock('../../src/identity/resolver.js', () => ({ resolveIdentity: vi.fn() }));
 vi.mock('../../src/identity/quarantine.js', () => ({
-  handleQuarantineFirstContact: vi.fn(), handleOwnerIdentityReply: vi.fn(),
+  handleQuarantineFirstContact: vi.fn(),
+  handleOwnerIdentityReply: vi.fn(),
 }));
 vi.mock('../../src/governance/permissions.js', () => ({
   resolveScope: vi.fn().mockResolvedValue({ entidades: [], byEntity: new Map() }),
 }));
-vi.mock("../../src/cognitive-graph/orchestrator.js", () => ({
+vi.mock('../../src/cognitive-graph/orchestrator.js', () => ({
   runNodes: vi.fn().mockResolvedValue({ nodes: {} }),
 }));
-vi.mock("../../src/gateway/rate-limit.js", () => ({
-  checkRateLimit: vi.fn().mockResolvedValue({ kind: "allow" }),
+vi.mock('../../src/gateway/rate-limit.js', () => ({
+  checkRateLimit: vi.fn().mockResolvedValue({ kind: 'allow' }),
   formatPoliteReply: vi.fn(),
 }));
 vi.mock('../../src/gateway/presence.js', () => ({
@@ -206,39 +222,39 @@ vi.mock('../../src/agent/reflection.js', () => ({
 }));
 
 const PESSOA = {
-  id: "p1",
-  telefone_whatsapp: "+5511888888888",
-  nome: "Owner",
-  tenant_id: "primary",
-  agent_id: "primary",
-  tipo: "owner",
-  status: "ativa",
+  id: 'p1',
+  telefone_whatsapp: '+5511888888888',
+  nome: 'Owner',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  tipo: 'owner',
+  status: 'ativa',
   preferencias: {},
 } as never;
 const CONVERSA = {
-  id: "c1",
-  pessoa_id: "p1",
-  status: "ativa",
-  channel_id: "ch-primary",
+  id: 'c1',
+  pessoa_id: 'p1',
+  status: 'ativa',
+  channel_id: 'ch-primary',
 } as never;
 const AUDIENCE_PROFILE = {
-  id: "aud-1",
-  tenant_id: "primary",
-  agent_id: "primary",
-  pessoa_id: "p1",
-  audience_type: "owner",
-  trust_level: "trusted_internal",
-  status: "active",
+  id: 'aud-1',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  pessoa_id: 'p1',
+  audience_type: 'owner',
+  trust_level: 'trusted_internal',
+  status: 'active',
   permission_profile_ids: [],
   labels: [],
   metadata: {},
 } as never;
 const DEFAULT_ROLE = {
-  id: "role-default",
-  tenant_id: "primary",
-  agent_id: "primary",
-  role_key: "default",
-  display_name: "Default",
+  id: 'role-default',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  role_key: 'default',
+  display_name: 'Default',
   description: null,
   prompt_addendum: null,
   granted_packs: [],
@@ -247,23 +263,33 @@ const DEFAULT_ROLE = {
   metadata: {},
 } as never;
 const CHANNEL_POLICY = {
-  id: "policy-1",
-  tenant_id: "primary",
-  agent_id: "primary",
-  channel_id: "ch-primary",
-  default_role_id: "role-default",
-  switch_behavior: "fixed",
-  announce_mode: "never",
+  id: 'policy-1',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  channel_id: 'ch-primary',
+  default_role_id: 'role-default',
+  switch_behavior: 'fixed',
+  announce_mode: 'never',
   by_context_guards: {},
   allowed_role_ids: [],
 } as never;
 const TEXT_INBOUND = {
-  id: 'in1', conversa_id: 'c1', direcao: 'in' as const, tipo: 'texto' as const,
-  conteudo: 'oi', metadata: { whatsapp_id: 'WAID-IN' }, processada_em: null,
+  id: 'in1',
+  conversa_id: 'c1',
+  direcao: 'in' as const,
+  tipo: 'texto' as const,
+  conteudo: 'oi',
+  metadata: { whatsapp_id: 'WAID-IN' },
+  processada_em: null,
 };
 const VOICE_INBOUND = {
-  id: 'in1', conversa_id: 'c1', direcao: 'in' as const, tipo: 'audio' as const,
-  conteudo: '[transcribed: oi]', metadata: { whatsapp_id: 'WAID-IN' }, processada_em: null,
+  id: 'in1',
+  conversa_id: 'c1',
+  direcao: 'in' as const,
+  tipo: 'audio' as const,
+  conteudo: '[transcribed: oi]',
+  metadata: { whatsapp_id: 'WAID-IN' },
+  processada_em: null,
 };
 const ALLOWING_DECISION = {
   engine_ran: true,
@@ -289,17 +315,21 @@ describe('agent core flow — output dispatch routing (smoke)', () => {
   });
 
   beforeEach(async () => {
-    callLLM.mockReset(); dispatchTool.mockReset();
-    sendOutboundText.mockReset(); sendOutboundDocument.mockReset();
-    sendOutboundVoice.mockReset(); sendPoll.mockReset();
-    audit.mockReset(); createMensagem.mockReset();
-    findById.mockReset(); findMensagem.mockReset(); markProcessed.mockReset();
+    callLLM.mockReset();
+    dispatchTool.mockReset();
+    sendOutboundText.mockReset();
+    sendOutboundDocument.mockReset();
+    sendOutboundVoice.mockReset();
+    sendPoll.mockReset();
+    audit.mockReset();
+    createMensagem.mockReset();
+    findById.mockReset();
+    findMensagem.mockReset();
+    markProcessed.mockReset();
     synthesizeSpeech.mockReset();
     recentInConversation.mockReset().mockResolvedValue([]);
-    buildPrompt.mockReset().mockResolvedValue({ system: "s", messages: [] });
-    runDecisionEngineForTurn
-      .mockReset()
-      .mockResolvedValue(ALLOWING_DECISION);
+    buildPrompt.mockReset().mockResolvedValue({ system: 's', messages: [] });
+    runDecisionEngineForTurn.mockReset().mockResolvedValue(ALLOWING_DECISION);
     findAudienceProfile.mockReset().mockResolvedValue(AUDIENCE_PROFILE);
     getChannelPolicy.mockReset().mockResolvedValue(CHANNEL_POLICY);
     listActiveRoles.mockReset().mockResolvedValue([DEFAULT_ROLE]);
@@ -367,7 +397,8 @@ describe('agent core flow — output dispatch routing (smoke)', () => {
       findMensagem.mockResolvedValue({ ...TEXT_INBOUND });
       runDecisionEngineForTurn.mockResolvedValue(blockingDecision('respond', false));
       callLLM.mockResolvedValueOnce({
-        content: 'ok', tool_uses: [],
+        content: 'ok',
+        tool_uses: [],
         usage: { input_tokens: 10, output_tokens: 5 },
       });
 
@@ -382,7 +413,8 @@ describe('agent core flow — output dispatch routing (smoke)', () => {
   it('plain text turn → sendOutboundText', async () => {
     findMensagem.mockResolvedValue({ ...TEXT_INBOUND });
     callLLM.mockResolvedValueOnce({
-      content: 'oi! tudo bem?', tool_uses: [],
+      content: 'oi! tudo bem?',
+      tool_uses: [],
       usage: { input_tokens: 10, output_tokens: 5 },
     });
     const { runAgentForMensagem } = await import('../../src/agent/core.js');
@@ -401,12 +433,15 @@ describe('agent core flow — output dispatch routing (smoke)', () => {
       usage: { input_tokens: 80, output_tokens: 5 },
     });
     callLLM.mockResolvedValueOnce({
-      content: 'aqui está o extrato', tool_uses: [],
+      content: 'aqui está o extrato',
+      tool_uses: [],
       usage: { input_tokens: 30, output_tokens: 10 },
     });
     dispatchTool.mockResolvedValue({
-      path: pdfPath, fileName: 'extrato.pdf',
-      mimetype: 'application/pdf', tipo: 'extrato',
+      path: pdfPath,
+      fileName: 'extrato.pdf',
+      mimetype: 'application/pdf',
+      tipo: 'extrato',
     });
     const { runAgentForMensagem } = await import('../../src/agent/core.js');
     await runAgentForMensagem('in1');
@@ -420,7 +455,8 @@ describe('agent core flow — output dispatch routing (smoke)', () => {
     findMensagem.mockResolvedValue({ ...VOICE_INBOUND });
     synthesizeSpeech.mockResolvedValue(Buffer.from('audio-bytes'));
     callLLM.mockResolvedValueOnce({
-      content: 'curto', tool_uses: [],
+      content: 'curto',
+      tool_uses: [],
       usage: { input_tokens: 10, output_tokens: 2 },
     });
     const { runAgentForMensagem } = await import('../../src/agent/core.js');
@@ -440,21 +476,33 @@ describe('agent core flow — output dispatch routing (smoke)', () => {
     ];
     callLLM.mockResolvedValueOnce({
       content: '',
-      tool_uses: [{ id: 'tu1', tool: 'ask_pending_question', args: { pergunta: 'qual?', opcoes_validas: opcoes } }],
+      tool_uses: [
+        {
+          id: 'tu1',
+          tool: 'ask_pending_question',
+          args: { pergunta: 'qual?', opcoes_validas: opcoes },
+        },
+      ],
       usage: { input_tokens: 40, output_tokens: 5 },
     });
     callLLM.mockResolvedValueOnce({
-      content: 'qual delas?', tool_uses: [],
+      content: 'qual delas?',
+      tool_uses: [],
       usage: { input_tokens: 30, output_tokens: 5 },
     });
     dispatchTool.mockResolvedValue({
-      pending_question_id: 'pq1', opcoes_validas: opcoes,
+      pending_question_id: 'pq1',
+      opcoes_validas: opcoes,
     });
     // Re-validation in react-loop hits findActiveSnapshot — make it match.
     const { pendingQuestionsRepo } = await import('../../src/db/repositories.js');
-    (pendingQuestionsRepo.findActiveSnapshot as ReturnType<typeof vi.fn>).mockResolvedValue({ id: 'pq1' });
+    (pendingQuestionsRepo.findActiveSnapshot as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 'pq1',
+    });
     sendPoll.mockResolvedValue({
-      whatsapp_id: 'WAID-POLL', message_secret: 'sec', creator_jid: 'jid',
+      whatsapp_id: 'WAID-POLL',
+      message_secret: 'sec',
+      creator_jid: 'jid',
     });
     const { runAgentForMensagem } = await import('../../src/agent/core.js');
     await runAgentForMensagem('in1');

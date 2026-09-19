@@ -56,10 +56,7 @@ async function runDivergenceProbe(): Promise<void> {
       );
     }
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'message_recovery.divergence_probe_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'message_recovery.divergence_probe_failed');
   }
 }
 
@@ -263,10 +260,7 @@ async function auditarFifoDoRecovery(turn_ids: readonly string[]): Promise<void>
       await reportStreamFifoViolation(turn_id, { stage: 'recovery', earlier_live });
     }
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'turn_recovery.fifo_canary_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'turn_recovery.fifo_canary_failed');
   }
 }
 
@@ -301,7 +295,11 @@ async function runMessageRecoveryInner(): Promise<void> {
       // shouldn't stall recovery of the others). `enqueueAgent` re-threw the
       // raw error untouched, so the message text is preserved here.
       logger.warn(
-        { err: (err as Error).message, err_code: (err as { code?: string }).code, mensagem_id: m.id },
+        {
+          err: (err as Error).message,
+          err_code: (err as { code?: string }).code,
+          mensagem_id: m.id,
+        },
         'message_recovery.enqueue_failed',
       );
     }

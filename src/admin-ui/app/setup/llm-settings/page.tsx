@@ -21,11 +21,7 @@ import { Button } from '../../../components/ui/button.js';
 import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
 import { Field, Input, Textarea } from '../../../components/ui/field.js';
 import { ModelSelect } from './_components/model-select.js';
-import {
-  LoadingState,
-  ErrorState,
-  Alert,
-} from '../../../components/ui/states.js';
+import { LoadingState, ErrorState, Alert } from '../../../components/ui/states.js';
 
 export default function LlmSettingsPage() {
   const { data: session, status } = useSession();
@@ -74,10 +70,9 @@ export default function LlmSettingsPage() {
       <div>
         <PageHeader title="Modelos LLM" />
         <Alert tone="danger" title="Acesso restrito">
-          Alterar o modelo LLM do runtime exige o papel{' '}
-          <code className="font-mono">founder</code> (alto raio de impacto —
-          afeta as chamadas de runtime de todos os tenants). Seu papel atual é{' '}
-          <code className="font-mono">{role || '(nenhum)'}</code>.
+          Alterar o modelo LLM do runtime exige o papel <code className="font-mono">founder</code>{' '}
+          (alto raio de impacto — afeta as chamadas de runtime de todos os tenants). Seu papel atual
+          é <code className="font-mono">{role || '(nenhum)'}</code>.
         </Alert>
       </div>
     );
@@ -86,19 +81,15 @@ export default function LlmSettingsPage() {
   // O campo livre (slug custom) vence a seleção do dropdown quando preenchido
   // — espelha o comportamento do legado /dashboard/llm-settings para slugs
   // recém-publicados que ainda não estão no snapshot do catálogo OpenRouter.
-  const effectiveMain =
-    mainCustom.trim().length > 0 ? mainCustom.trim() : mainPick;
-  const effectiveFast =
-    fastCustom.trim().length > 0 ? fastCustom.trim() : fastPick;
+  const effectiveMain = mainCustom.trim().length > 0 ? mainCustom.trim() : mainPick;
+  const effectiveFast = fastCustom.trim().length > 0 ? fastCustom.trim() : fastPick;
 
   const hasChange =
     getQuery.data !== undefined &&
-    (effectiveMain !== getQuery.data.main ||
-      effectiveFast !== getQuery.data.fast);
+    (effectiveMain !== getQuery.data.main || effectiveFast !== getQuery.data.fast);
 
   const commentOk = comment.trim().length >= 10;
-  const canSubmit =
-    !mutation.isPending && hasChange && commentOk && effectiveMain && effectiveFast;
+  const canSubmit = !mutation.isPending && hasChange && commentOk && effectiveMain && effectiveFast;
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -169,10 +160,10 @@ export default function LlmSettingsPage() {
         title="Modelos LLM"
         description={
           <>
-            Troque o modelo LLM usado pelo loop do agente. O próximo turno do
-            ReAct aplica a mudança — sem restart. Toda alteração é registrada
-            em <code className="font-mono">admin_audit_log</code> com o
-            snapshot antes/depois e um comentário obrigatório.
+            Troque o modelo LLM usado pelo loop do agente. O próximo turno do ReAct aplica a mudança
+            — sem restart. Toda alteração é registrada em{' '}
+            <code className="font-mono">admin_audit_log</code> com o snapshot antes/depois e um
+            comentário obrigatório.
           </>
         }
       />
@@ -180,10 +171,7 @@ export default function LlmSettingsPage() {
       {getQuery.isLoading ? (
         <LoadingState label="Carregando configurações atuais…" />
       ) : getQuery.error ? (
-        <ErrorState
-          message={getQuery.error.message}
-          onRetry={() => void getQuery.refetch()}
-        />
+        <ErrorState message={getQuery.error.message} onRetry={() => void getQuery.refetch()} />
       ) : getQuery.data ? (
         <>
           {/* Divergência de provider: existe linha persistida cujo provider
@@ -193,32 +181,24 @@ export default function LlmSettingsPage() {
               assumiria que a linha simplesmente não existe. */}
           {(getQuery.data.mainSource === 'global_mismatched' ||
             getQuery.data.fastSource === 'global_mismatched') && (
-            <Alert
-              tone="warning"
-              title="Divergência de provider nas configurações persistidas"
-            >
+            <Alert tone="warning" title="Divergência de provider nas configurações persistidas">
               <p>
-                Uma linha persistida tem provider diferente do provider ativo
-                (<code className="font-mono">{getQuery.data.env.provider}</code>
-                ). O runtime está servindo o default do env por segurança.
-                Salvar aqui sobrescreve a linha divergente com um valor
-                compatível com o provider, atomicamente.
+                Uma linha persistida tem provider diferente do provider ativo (
+                <code className="font-mono">{getQuery.data.env.provider}</code>
+                ). O runtime está servindo o default do env por segurança. Salvar aqui sobrescreve a
+                linha divergente com um valor compatível com o provider, atomicamente.
               </p>
               <ul className="mt-1 list-inside list-disc">
                 {getQuery.data.mainSource === 'global_mismatched' && (
                   <li>
                     main: armazenado=
-                    <code className="font-mono">
-                      {JSON.stringify(getQuery.data.stored_main)}
-                    </code>
+                    <code className="font-mono">{JSON.stringify(getQuery.data.stored_main)}</code>
                   </li>
                 )}
                 {getQuery.data.fastSource === 'global_mismatched' && (
                   <li>
                     fast: armazenado=
-                    <code className="font-mono">
-                      {JSON.stringify(getQuery.data.stored_fast)}
-                    </code>
+                    <code className="font-mono">{JSON.stringify(getQuery.data.stored_fast)}</code>
                   </li>
                 )}
               </ul>
@@ -236,24 +216,20 @@ export default function LlmSettingsPage() {
                 <dd>
                   <code className="font-mono">{getQuery.data.main}</code>
                   {getQuery.data.main === getQuery.data.env.main && (
-                    <span className="ml-2 text-xs text-zinc-500">
-                      (default do env)
-                    </span>
+                    <span className="ml-2 text-xs text-zinc-500">(default do env)</span>
                   )}
                 </dd>
                 <dt className="font-medium text-zinc-600">Modelo fast:</dt>
                 <dd>
                   <code className="font-mono">{getQuery.data.fast}</code>
                   {getQuery.data.fast === getQuery.data.env.fast && (
-                    <span className="ml-2 text-xs text-zinc-500">
-                      (default do env)
-                    </span>
+                    <span className="ml-2 text-xs text-zinc-500">(default do env)</span>
                   )}
                 </dd>
                 <dt className="font-medium text-zinc-600">Defaults do env:</dt>
                 <dd className="text-xs text-zinc-600">
-                  main=<code className="font-mono">{getQuery.data.env.main}</code>,
-                  fast=<code className="font-mono">{getQuery.data.env.fast}</code>
+                  main=<code className="font-mono">{getQuery.data.env.main}</code>, fast=
+                  <code className="font-mono">{getQuery.data.env.fast}</code>
                 </dd>
               </dl>
             </CardBody>
@@ -272,24 +248,21 @@ export default function LlmSettingsPage() {
                 `Catálogo indisponível: ${catalogQuery.error.message}. Use os campos de slug custom abaixo.`
               ) : (
                 <>
-                  {catalogQuery.data?.items.length ?? 0} modelo(s) com suporte a
-                  tool-calling (OpenRouter, cache de 1h).
+                  {catalogQuery.data?.items.length ?? 0} modelo(s) com suporte a tool-calling
+                  (OpenRouter, cache de 1h).
                   {/* O catálogo é filtrado pelo LLM_PROVIDER ativo no
                       servidor. Com provider=anthropic só aparecem slugs
                       anthropic/* porque o runtime não chama slugs de outros
                       vendors com o provider ativo. */}
-                  {catalogQuery.data?.provider &&
-                    catalogQuery.data.provider !== 'openrouter' && (
-                      <>
-                        {' '}
-                        Filtrado para provider=
-                        <code className="font-mono">
-                          {catalogQuery.data.provider}
-                        </code>{' '}
-                        — slugs de outros vendors ficam ocultos porque o
-                        runtime não consegue chamá-los com o provider ativo.
-                      </>
-                    )}
+                  {catalogQuery.data?.provider && catalogQuery.data.provider !== 'openrouter' && (
+                    <>
+                      {' '}
+                      Filtrado para provider=
+                      <code className="font-mono">{catalogQuery.data.provider}</code> — slugs de
+                      outros vendors ficam ocultos porque o runtime não consegue chamá-los com o
+                      provider ativo.
+                    </>
+                  )}
                 </>
               )
             }
@@ -319,9 +292,8 @@ export default function LlmSettingsPage() {
               </summary>
               <div className="mt-3 space-y-3 border-l-2 border-zinc-200 pl-4">
                 <p className="text-xs text-zinc-500">
-                  Use quando um slug recém-publicado ainda não está no snapshot
-                  do catálogo OpenRouter. O texto livre vence a seleção do
-                  dropdown na mesma linha.
+                  Use quando um slug recém-publicado ainda não está no snapshot do catálogo
+                  OpenRouter. O texto livre vence a seleção do dropdown na mesma linha.
                 </p>
                 <Field label="Slug custom do main">
                   <Input
@@ -375,14 +347,14 @@ export default function LlmSettingsPage() {
             <ul className="list-inside list-disc">
               {getQuery.data && effectiveMain !== getQuery.data.main && (
                 <li>
-                  main: <code className="font-mono">{getQuery.data.main}</code>{' '}
-                  → <code className="font-mono">{effectiveMain}</code>
+                  main: <code className="font-mono">{getQuery.data.main}</code> →{' '}
+                  <code className="font-mono">{effectiveMain}</code>
                 </li>
               )}
               {getQuery.data && effectiveFast !== getQuery.data.fast && (
                 <li>
-                  fast: <code className="font-mono">{getQuery.data.fast}</code>{' '}
-                  → <code className="font-mono">{effectiveFast}</code>
+                  fast: <code className="font-mono">{getQuery.data.fast}</code> →{' '}
+                  <code className="font-mono">{effectiveFast}</code>
                 </li>
               )}
             </ul>
@@ -421,17 +393,12 @@ export default function LlmSettingsPage() {
 
         {successAt && !mutation.error && (
           <Alert tone="success">
-            Aplicado em {successAt.toLocaleString('pt-BR')}. O próximo turno do
-            ReAct usará o novo modelo. Linha de auditoria registrada.
+            Aplicado em {successAt.toLocaleString('pt-BR')}. O próximo turno do ReAct usará o novo
+            modelo. Linha de auditoria registrada.
           </Alert>
         )}
 
-        <Button
-          type="submit"
-          variant="danger"
-          disabled={!canSubmit}
-          loading={mutation.isPending}
-        >
+        <Button type="submit" variant="danger" disabled={!canSubmit} loading={mutation.isPending}>
           Aplicar mudança
         </Button>
       </form>

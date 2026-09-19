@@ -48,14 +48,14 @@ export async function reconcile(input: {
     const from = new Date(new Date(e.data_oper).getTime() - 7 * 86_400_000)
       .toISOString()
       .slice(0, 10);
-    const to = new Date(new Date(e.data_oper).getTime() + 2 * 86_400_000).toISOString().slice(0, 10);
+    const to = new Date(new Date(e.data_oper).getTime() + 2 * 86_400_000)
+      .toISOString()
+      .slice(0, 10);
     const candidates = await transacoesRepo.byScope(
       { pessoa_id: input.pessoa_id, entidades: [input.entidade_id] },
       { date_from: from, date_to: to, limit: 200 },
     );
-    const ranked = candidates
-      .map((t) => ({ t, sc: score(e, t) }))
-      .sort((a, b) => b.sc - a.sc);
+    const ranked = candidates.map((t) => ({ t, sc: score(e, t) })).sort((a, b) => b.sc - a.sc);
     const top = ranked[0];
     if (!top || ranked.length === 0) {
       out.push({ entry: e, status: 'new' });

@@ -35,9 +35,8 @@ vi.mock('@anthropic-ai/sdk', () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -80,9 +79,7 @@ describe('haikuRiskGate', () => {
 
   it('suggested_level inválido (não no enum) → null + runner status=error', async () => {
     anthropicCreateMock.mockResolvedValueOnce({
-      content: [
-        { type: 'text', text: '{"suggested_level":"super_high","reason":"x"}' },
-      ],
+      content: [{ type: 'text', text: '{"suggested_level":"super_high","reason":"x"}' }],
     });
     const r = await withCtx(() =>
       haikuRiskGate({ current_level: RiskLevel.LOW, context_text: 'x' }),
@@ -174,13 +171,9 @@ describe('haikuRiskGate', () => {
 
   it('cognitive_module_log.record chamado com module_name=risk_assessor_llm', async () => {
     anthropicCreateMock.mockResolvedValueOnce({
-      content: [
-        { type: 'text', text: '{"suggested_level":"medium","reason":"x"}' },
-      ],
+      content: [{ type: 'text', text: '{"suggested_level":"medium","reason":"x"}' }],
     });
-    await withCtx(() =>
-      haikuRiskGate({ current_level: RiskLevel.LOW, context_text: 'x' }),
-    );
+    await withCtx(() => haikuRiskGate({ current_level: RiskLevel.LOW, context_text: 'x' }));
     expect(recordMock).toHaveBeenCalledTimes(1);
     const call = recordMock.mock.calls[0]?.[0] as { module_name?: string; status?: string };
     expect(call?.module_name).toBe('risk_assessor_llm');

@@ -18,9 +18,8 @@ const mockMemories: any[] = [];
 const mockHints: any[] = [];
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     memoryEntryRepo: {
@@ -73,19 +72,16 @@ describe('P2 memory scoping integration', () => {
     });
 
     const { memoryEntryRepo } = await import('@/db/repositories.js');
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const result = await memoryEntryRepo.findRelevant({ conversa_id: 'conv-1' });
-        // A memória sensitive é retornada pelo findRelevant — o filtro de
-        // visibilidade vive no prompt-builder, não no repo.
-        expect(result.length).toBe(1);
-        // O prompt-builder não pode incluir o conteúdo literal: precisa
-        // checar mention_allowed antes de renderizar.
-        const mentionable = result.filter((m: any) => m.mention_allowed);
-        expect(mentionable.length).toBe(0);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const result = await memoryEntryRepo.findRelevant({ conversa_id: 'conv-1' });
+      // A memória sensitive é retornada pelo findRelevant — o filtro de
+      // visibilidade vive no prompt-builder, não no repo.
+      expect(result.length).toBe(1);
+      // O prompt-builder não pode incluir o conteúdo literal: precisa
+      // checar mention_allowed antes de renderizar.
+      const mentionable = result.filter((m: any) => m.mention_allowed);
+      expect(mentionable.length).toBe(0);
+    });
   });
 
   it('behavioral hint vira instrução genérica no prompt', async () => {
@@ -99,19 +95,16 @@ describe('P2 memory scoping integration', () => {
     });
 
     const { behavioralHintRepo } = await import('@/db/repositories.js');
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const hints = await behavioralHintRepo.findActiveForScope({
-          scope_type: 'conversation',
-          subject_id: 'conv-1',
-        });
-        expect(hints[0]?.hint_text).toContain('paciente');
-        // Hint nunca vaza conteúdo bruto da memória original.
-        expect(hints[0]?.hint_text).not.toContain('filha');
-        expect(hints[0]?.hint_text).not.toContain('doente');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const hints = await behavioralHintRepo.findActiveForScope({
+        scope_type: 'conversation',
+        subject_id: 'conv-1',
+      });
+      expect(hints[0]?.hint_text).toContain('paciente');
+      // Hint nunca vaza conteúdo bruto da memória original.
+      expect(hints[0]?.hint_text).not.toContain('filha');
+      expect(hints[0]?.hint_text).not.toContain('doente');
+    });
   });
 
   it('memória personal com scope_type=role NÃO atravessa pra outro role', async () => {
@@ -129,20 +122,17 @@ describe('P2 memory scoping integration', () => {
     });
 
     const { memoryEntryRepo } = await import('@/db/repositories.js');
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        // findRelevant retorna todas — o filtro por role é uma contract
-        // verification: scope_type='role' + subject_id deve travar leitura
-        // de outros roles via prompt-builder.
-        const result = await memoryEntryRepo.findRelevant({});
-        const mem = result.find((m: any) => m.id === 'm-role-a');
-        expect(mem?.scope_type).toBe('role');
-        expect(mem?.subject_id).toBe('role-comercial');
-        // prompt-builder deve checar: current role === subject_id; caso
-        // contrário, excluir a entry.
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      // findRelevant retorna todas — o filtro por role é uma contract
+      // verification: scope_type='role' + subject_id deve travar leitura
+      // de outros roles via prompt-builder.
+      const result = await memoryEntryRepo.findRelevant({});
+      const mem = result.find((m: any) => m.id === 'm-role-a');
+      expect(mem?.scope_type).toBe('role');
+      expect(mem?.subject_id).toBe('role-comercial');
+      // prompt-builder deve checar: current role === subject_id; caso
+      // contrário, excluir a entry.
+    });
   });
 
   it('memória operational com scope_type=agent atravessa todos os roles', async () => {
@@ -159,15 +149,12 @@ describe('P2 memory scoping integration', () => {
     });
 
     const { memoryEntryRepo } = await import('@/db/repositories.js');
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const result = await memoryEntryRepo.findRelevant({});
-        const mem = result.find((m: any) => m.id === 'm-op');
-        expect(mem?.scope_type).toBe('agent');
-        expect(mem?.mention_allowed).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const result = await memoryEntryRepo.findRelevant({});
+      const mem = result.find((m: any) => m.id === 'm-op');
+      expect(mem?.scope_type).toBe('agent');
+      expect(mem?.mention_allowed).toBe(true);
+    });
   });
 
   it('memória needs_review=true não entra em findRelevant (filtro no repo)', async () => {
@@ -202,15 +189,12 @@ describe('P2 memory scoping integration', () => {
     mockMemories.push(...[pending, reviewed].filter((m) => !m.needs_review));
 
     const { memoryEntryRepo } = await import('@/db/repositories.js');
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const result = await memoryEntryRepo.findRelevant({});
-        const ids = result.map((m: any) => m.id);
-        expect(ids).toContain('m-reviewed');
-        expect(ids).not.toContain('m-pending');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const result = await memoryEntryRepo.findRelevant({});
+      const ids = result.map((m: any) => m.id);
+      expect(ids).toContain('m-reviewed');
+      expect(ids).not.toContain('m-pending');
+    });
   });
 
   it('[PR82-C2] memória com expires_at no passado é filtrada por findRelevant', async () => {
@@ -252,14 +236,11 @@ describe('P2 memory scoping integration', () => {
     );
 
     const { memoryEntryRepo } = await import('@/db/repositories.js');
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const result = await memoryEntryRepo.findRelevant({});
-        const ids = result.map((m: any) => m.id);
-        expect(ids).toContain('m-active');
-        expect(ids).not.toContain('m-expired');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const result = await memoryEntryRepo.findRelevant({});
+      const ids = result.map((m: any) => m.id);
+      expect(ids).toContain('m-active');
+      expect(ids).not.toContain('m-expired');
+    });
   });
 });

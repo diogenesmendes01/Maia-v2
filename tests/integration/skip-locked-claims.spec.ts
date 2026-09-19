@@ -71,9 +71,7 @@ async function drain(
   let rounds = 0;
   while (remaining.size > 0 && rounds < MAX_ROUNDS) {
     rounds += 1;
-    const results = await Promise.all(
-      Array.from({ length: PARALLEL }, () => claim()),
-    );
+    const results = await Promise.all(Array.from({ length: PARALLEL }, () => claim()));
     for (const id of results) {
       if (id === null) continue;
       delivered.push(id);

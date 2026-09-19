@@ -137,8 +137,16 @@ function makeCtx(redacted_packet: unknown) {
           };
         },
       },
-      debugSnapshotGrantsRepo: { async findActive() { return null; } },
-      adminAuditLogRepo: { async append(r: unknown) { return r; } },
+      debugSnapshotGrantsRepo: {
+        async findActive() {
+          return null;
+        },
+      },
+      adminAuditLogRepo: {
+        async append(r: unknown) {
+          return r;
+        },
+      },
     } as unknown as typeof import('@/db/repositories.js'),
     assertTenant: () => {},
     assertRole: (...roles: string[]) => {
@@ -190,9 +198,7 @@ describe('issue #514 [P2] — PEP decisions survive writer → redaction → rep
   it('policy_refs list every policy that participated', async () => {
     const ctx = makeCtx(persistedBody());
     const res = await tracesRouter.createCaller(ctx).getTrace({ traceId: TRACE_ID });
-    expect(res.policy_refs).toEqual(
-      expect.arrayContaining(['pol-early', 'pol-mid', 'pol-late']),
-    );
+    expect(res.policy_refs).toEqual(expect.arrayContaining(['pol-early', 'pol-mid', 'pol-late']));
     // De-duplicated: `trace.policy_id` is also `pol-mid`.
     expect(res.policy_refs.filter((p) => p === 'pol-mid')).toHaveLength(1);
   });

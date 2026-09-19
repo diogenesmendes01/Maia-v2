@@ -47,7 +47,8 @@ const renderedSqls: string[] = [];
 const _dialect = new PgDialect();
 
 // Capture tenant context active at each UPDATE/DELETE call site.
-const sweepCallTenants: Array<{ tenant_id: string; agent_id: string; op: 'update' | 'delete' }> = [];
+const sweepCallTenants: Array<{ tenant_id: string; agent_id: string; op: 'update' | 'delete' }> =
+  [];
 
 // Per-row advisory-lock fence (#292 blocker #4): set of
 // `${tenant}:${agent}:${idempotency_key}` strings whose advisory xact lock is
@@ -293,8 +294,7 @@ function seed(input: {
   idempotency_key?: string;
   channel?: string;
 }): OutboundRow {
-  const ageMs =
-    (input.age_seconds ?? 0) * 1000 + (input.age_days ?? 0) * 24 * 60 * 60 * 1000;
+  const ageMs = (input.age_seconds ?? 0) * 1000 + (input.age_days ?? 0) * 24 * 60 * 60 * 1000;
   const created_at = new Date(Date.now() - ageMs);
   const row: OutboundRow = {
     id: `row-${nextId++}`,
@@ -340,9 +340,7 @@ describe('outbound_messages_sweeper — stale-pending recovery', () => {
     // 10 minutes old > 5min cutoff → promoted.
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(store).toHaveLength(1);
@@ -356,9 +354,7 @@ describe('outbound_messages_sweeper — stale-pending recovery', () => {
     // 60s old < 5min cutoff → preserved.
     seed({ ...A_CTX, status: 'pending', age_seconds: 60 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(store).toHaveLength(1);
@@ -374,9 +370,7 @@ describe('outbound_messages_sweeper — stale-pending recovery', () => {
       idempotency_key: 'conv1:msg1',
     });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     const loggerMod = await import('@/lib/logger.js');
     const warnSpy = loggerMod.logger.warn as ReturnType<typeof vi.fn>;
     warnSpy.mockClear();
@@ -401,17 +395,13 @@ describe('outbound_messages_sweeper — stale-pending recovery', () => {
     seed({ ...A_CTX, status: 'failed', age_seconds: 600 });
     seed({ ...A_CTX, status: 'unknown', age_seconds: 600 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(store).toHaveLength(3);
     // None transitioned to 'unknown' via the sweeper UPDATE (the existing
     // 'unknown' was 'unknown' to start with).
-    const sweeperPromoted = store.filter(
-      (r) => r.error === 'sweeper_promoted_stale_pending',
-    );
+    const sweeperPromoted = store.filter((r) => r.error === 'sweeper_promoted_stale_pending');
     expect(sweeperPromoted).toHaveLength(0);
   });
 });
@@ -420,9 +410,7 @@ describe('outbound_messages_sweeper — retention cleanup', () => {
   it('DELETES sent row OLDER than retention_days', async () => {
     seed({ ...A_CTX, status: 'sent', age_days: 40 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(store).toHaveLength(0);
@@ -431,9 +419,7 @@ describe('outbound_messages_sweeper — retention cleanup', () => {
   it('DELETES failed row OLDER than retention_days', async () => {
     seed({ ...A_CTX, status: 'failed', age_days: 40 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(store).toHaveLength(0);
@@ -442,9 +428,7 @@ describe('outbound_messages_sweeper — retention cleanup', () => {
   it('DELETES unknown row OLDER than retention_days', async () => {
     seed({ ...A_CTX, status: 'unknown', age_days: 40 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(store).toHaveLength(0);
@@ -453,9 +437,7 @@ describe('outbound_messages_sweeper — retention cleanup', () => {
   it('PRESERVES sent row NEWER than retention_days', async () => {
     seed({ ...A_CTX, status: 'sent', age_days: 5 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(store).toHaveLength(1);
@@ -476,9 +458,7 @@ describe('outbound_messages_sweeper — retention cleanup', () => {
     // signal isn't lost; retention then reclaims the row.
     seed({ ...A_CTX, status: 'pending', age_days: 60 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     // Row is gone: promoted then cleaned.
@@ -489,9 +469,7 @@ describe('outbound_messages_sweeper — retention cleanup', () => {
     seed({ ...A_CTX, status: 'sent', age_days: 40 });
     seed({ ...A_CTX, status: 'failed', age_days: 40 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     const loggerMod = await import('@/lib/logger.js');
     const warnSpy = loggerMod.logger.warn as ReturnType<typeof vi.fn>;
     warnSpy.mockClear();
@@ -519,9 +497,7 @@ describe('outbound_messages_sweeper — metrics', () => {
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
 
     const metrics = await import('@/lib/metrics.js');
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     const promText = await metrics.renderPrometheus();
@@ -536,9 +512,7 @@ describe('outbound_messages_sweeper — metrics', () => {
     seed({ ...A_CTX, status: 'failed', age_days: 40 });
 
     const metrics = await import('@/lib/metrics.js');
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     const promText = await metrics.renderPrometheus();
@@ -553,9 +527,7 @@ describe('outbound_messages_sweeper — metrics', () => {
     seed({ ...A_CTX, status: 'sent', age_days: 5 });
 
     const metrics = await import('@/lib/metrics.js');
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     const promText = await metrics.renderPrometheus();
@@ -570,9 +542,7 @@ describe('outbound_messages_sweeper — per-tenant fan-out (espelha #240/#251)',
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
     seed({ ...B_CTX, status: 'pending', age_seconds: 600 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     // Each tenant got its own UPDATE (promotion) AND DELETE (retention)
@@ -593,9 +563,7 @@ describe('outbound_messages_sweeper — per-tenant fan-out (espelha #240/#251)',
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
     seed({ ...B_CTX, status: 'sent', age_days: 40 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     const allTenants = new Set(sweepCallTenants.map((c) => `${c.tenant_id}|${c.agent_id}`));
@@ -604,9 +572,7 @@ describe('outbound_messages_sweeper — per-tenant fan-out (espelha #240/#251)',
   });
 
   it('empty store → no-op (no tenant context opened, no UPDATE/DELETE fired)', async () => {
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(sweepCallTenants).toHaveLength(0);
@@ -615,18 +581,14 @@ describe('outbound_messages_sweeper — per-tenant fan-out (espelha #240/#251)',
       /SELECT\s+DISTINCT\s+tenant_id,\s*agent_id/i.test(s),
     );
     expect(dispatcherSqls).toHaveLength(1);
-    const updateSqls = renderedSqls.filter((s) =>
-      /UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(s),
-    );
+    const updateSqls = renderedSqls.filter((s) => /UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(s));
     expect(updateSqls).toHaveLength(0);
   });
 
   it('dispatcher SQL inclui tenant_id IS NOT NULL AND agent_id IS NOT NULL (belt-and-suspenders)', async () => {
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     const dispatcherSql = renderedSqls.find((s) =>
@@ -645,9 +607,7 @@ describe('outbound_messages_sweeper — per-tenant fan-out (espelha #240/#251)',
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
     seed({ ...B_CTX, status: 'pending', age_seconds: 600 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await expect(runOutboundMessagesSweeper()).resolves.toBeUndefined();
   });
 });
@@ -673,15 +633,11 @@ describe('outbound_messages_sweeper — fail-isolated', () => {
       return origImpl!(query);
     });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await expect(runOutboundMessagesSweeper()).resolves.toBeUndefined();
 
     // tenant-B's pending row STILL got promoted.
-    const bRow = store.find(
-      (r) => r.tenant_id === 'tenant-B' && r.agent_id === 'agent-B',
-    );
+    const bRow = store.find((r) => r.tenant_id === 'tenant-B' && r.agent_id === 'agent-B');
     expect(bRow).toBeDefined();
     expect(bRow!.status).toBe('unknown');
   });
@@ -708,14 +664,10 @@ describe('outbound_messages_sweeper — fail-isolated', () => {
     const infoSpy = loggerMod.logger.info as ReturnType<typeof vi.fn>;
     infoSpy.mockClear();
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
-    const doneLogs = infoSpy.mock.calls.filter(
-      (c) => c[1] === 'outbound_messages_sweeper.done',
-    );
+    const doneLogs = infoSpy.mock.calls.filter((c) => c[1] === 'outbound_messages_sweeper.done');
     expect(doneLogs).toHaveLength(1);
     const doneFields = doneLogs[0]![0] as {
       tenants: number;
@@ -744,9 +696,7 @@ describe('outbound_messages_sweeper — sender fence (#292 blocker #4, no double
     });
     heldSenderLocks.add('tenant-A:agent-A:conv-inflight:msg-inflight');
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     // Row stays pending — the sweeper fenced off the in-flight claim.
@@ -773,9 +723,7 @@ describe('outbound_messages_sweeper — sender fence (#292 blocker #4, no double
     });
     heldSenderLocks.add('tenant-A:agent-A:conv-live:msg-live');
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     const stuck = store.find((r) => r.idempotency_key === 'conv-stuck:msg-stuck');
@@ -787,14 +735,10 @@ describe('outbound_messages_sweeper — sender fence (#292 blocker #4, no double
   it('the recovery query carries pg_try_advisory_xact_lock on the per-row sender key', async () => {
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
-    const recoverySql = renderedSqls.find((s) =>
-      /UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(s),
-    );
+    const recoverySql = renderedSqls.find((s) => /UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(s));
     expect(recoverySql).toBeDefined();
     // The fence: the SAME advisory-lock primitive the sender uses in
     // upsertPending (repositories.ts), keyed on the per-row idempotency key.
@@ -810,14 +754,10 @@ describe('outbound_messages_sweeper — bounded retention DELETE (#292 blocker #
   it('the DELETE is LIMIT-bounded (DELETE ... WHERE id IN (SELECT ... LIMIT N))', async () => {
     seed({ ...A_CTX, status: 'sent', age_days: 40 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
-    const deleteSql = renderedSqls.find((s) =>
-      /DELETE\s+FROM.+outbound_messages/i.test(s),
-    );
+    const deleteSql = renderedSqls.find((s) => /DELETE\s+FROM.+outbound_messages/i.test(s));
     expect(deleteSql).toBeDefined();
     // Bounded: a subquery with LIMIT, not an unbounded DELETE.
     expect(deleteSql!).toMatch(/limit/i);
@@ -833,17 +773,13 @@ describe('outbound_messages_sweeper — bounded retention DELETE (#292 blocker #
       seed({ ...A_CTX, status: 'sent', age_days: 40, idempotency_key: `k-${i}` });
     }
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     // Every eligible row is gone...
     expect(store).toHaveLength(0);
     // ...and it took MORE THAN ONE DELETE statement to get there (bounded loop).
-    const deleteCalls = renderedSqls.filter((s) =>
-      /DELETE\s+FROM.+outbound_messages/i.test(s),
-    );
+    const deleteCalls = renderedSqls.filter((s) => /DELETE\s+FROM.+outbound_messages/i.test(s));
     expect(deleteCalls.length).toBeGreaterThanOrEqual(2);
   });
 
@@ -853,15 +789,11 @@ describe('outbound_messages_sweeper — bounded retention DELETE (#292 blocker #
       seed({ ...A_CTX, status: 'failed', age_days: 40, idempotency_key: `s-${i}` });
     }
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     expect(store).toHaveLength(0);
-    const deleteCalls = renderedSqls.filter((s) =>
-      /DELETE\s+FROM.+outbound_messages/i.test(s),
-    );
+    const deleteCalls = renderedSqls.filter((s) => /DELETE\s+FROM.+outbound_messages/i.test(s));
     expect(deleteCalls).toHaveLength(1);
   });
 });
@@ -874,9 +806,7 @@ describe('outbound_messages_sweeper — per-tenant fairness (#292 blocker #2)', 
       seed({ ...A_CTX, status: 'pending', age_seconds: 600, idempotency_key: `a-${i}` });
     }
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     const promoted = store.filter((r) => r.status === 'unknown');
@@ -897,32 +827,24 @@ describe('outbound_messages_sweeper — per-tenant fairness (#292 blocker #2)', 
     }
     seed({ ...B_CTX, status: 'pending', age_seconds: 600, idempotency_key: 'b-only' });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     // tenant-B's row WAS promoted despite tenant-A's flood.
     const bRow = store.find((r) => r.idempotency_key === 'b-only');
     expect(bRow!.status).toBe('unknown');
     // tenant-A still capped.
-    const aPromoted = store.filter(
-      (r) => r.tenant_id === 'tenant-A' && r.status === 'unknown',
-    );
+    const aPromoted = store.filter((r) => r.tenant_id === 'tenant-A' && r.status === 'unknown');
     expect(aPromoted).toHaveLength(RECOVERY_LIMIT_PER_TENANT);
   });
 
   it('recovery query is ORDER BY created_at ASC + LIMIT (oldest-first fairness)', async () => {
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
-    const recoverySql = renderedSqls.find((s) =>
-      /UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(s),
-    );
+    const recoverySql = renderedSqls.find((s) => /UPDATE.+SET\s+status\s*=\s*'unknown'/is.test(s));
     expect(recoverySql).toBeDefined();
     expect(recoverySql!).toMatch(/order\s+by\s+created_at\s+asc/i);
     expect(recoverySql!).toMatch(/limit/i);
@@ -933,9 +855,7 @@ describe('outbound_messages_sweeper — single-flight advisory lock (#292 blocke
   it('acquires a GLOBAL advisory lock at start and releases it on completion', async () => {
     seed({ ...A_CTX, status: 'pending', age_seconds: 600 });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     await runOutboundMessagesSweeper();
 
     // pg_try_advisory_lock called exactly once (one acquire), released once.
@@ -952,9 +872,7 @@ describe('outbound_messages_sweeper — single-flight advisory lock (#292 blocke
     // Simulate a concurrent worker instance holding the sweep lock.
     sweepLockHeldByOther = true;
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     const loggerMod = await import('@/lib/logger.js');
     const infoSpy = loggerMod.logger.info as ReturnType<typeof vi.fn>;
     infoSpy.mockClear();
@@ -996,14 +914,10 @@ describe('outbound_messages_sweeper — single-flight advisory lock (#292 blocke
       return origImpl!(query);
     });
 
-    const { runOutboundMessagesSweeper } = await import(
-      '@/workers/outbound-messages-sweeper.js'
-    );
+    const { runOutboundMessagesSweeper } = await import('@/workers/outbound-messages-sweeper.js');
     // The throw propagates (the dispatcher SELECT is not per-tenant fail-isolated),
     // but the lock MUST be released regardless.
-    await expect(runOutboundMessagesSweeper()).rejects.toThrow(
-      'synthetic dispatcher failure',
-    );
+    await expect(runOutboundMessagesSweeper()).rejects.toThrow('synthetic dispatcher failure');
     expect(poolStats.acquiredOk).toBe(1);
     expect(poolStats.unlocks).toBe(1); // released in finally
     expect(poolStats.releases).toBe(1); // client returned to pool

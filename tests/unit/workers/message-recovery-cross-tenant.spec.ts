@@ -235,94 +235,93 @@ for (const regime of [
   { label: 'AUTORITATIVO (padrão desde #504)', authoritative: true },
   { label: 'LEGADO (caminho de rollback emergencial)', authoritative: false },
 ] as const) {
-describe(`Issue #345 — runMessageRecovery is per-tenant scoped (no default/default leak) — ${regime.label}`, () => {
-  beforeEach(() => {
-    flags.authoritative = regime.authoritative;
+  describe(`Issue #345 — runMessageRecovery is per-tenant scoped (no default/default leak) — ${regime.label}`, () => {
+    beforeEach(() => {
+      flags.authoritative = regime.authoritative;
+    });
+
+    it('MULTI-TENANT — inner runs once per enumerated tuple under its own context', async () => {
+      enumeratedPairs = [A, B];
+
+      const { runMessageRecovery } = await import('@/workers/message-recovery.js');
+      await runMessageRecovery();
+
+      expect(enumerationMock()).toHaveBeenCalledTimes(1);
+      expect(contextsSeen).toHaveLength(2);
+      const seen = new Set(contextsSeen.map((c) => `${c.tenant_id}|${c.agent_id}`));
+      expect(seen).toEqual(new Set(['tenant-A|agent-A', 'tenant-B|agent-B']));
+    });
+
+    it('NO default/default — inner never runs under the legacy sentinel when real tuples exist', async () => {
+      enumeratedPairs = [A, B];
+
+      const { runMessageRecovery } = await import('@/workers/message-recovery.js');
+      await runMessageRecovery();
+
+      for (const c of contextsSeen) {
+        expect(c.tenant_id).not.toBe('default');
+        expect(c.agent_id).not.toBe('default');
+      }
+    });
+
+    it('SINGLE-TENANT PRESERVED — only (default,default) enumerated → inner runs once under default', async () => {
+      enumeratedPairs = [DEFAULT];
+
+      const { runMessageRecovery } = await import('@/workers/message-recovery.js');
+      await runMessageRecovery();
+
+      expect(contextsSeen).toEqual([DEFAULT]);
+    });
+
+    it('EMPTY enumeration → no-op (inner read never fires)', async () => {
+      enumeratedPairs = [];
+
+      const { runMessageRecovery } = await import('@/workers/message-recovery.js');
+      await runMessageRecovery();
+
+      expect(innerReadMock()).not.toHaveBeenCalled();
+      expect(contextsSeen).toHaveLength(0);
+    });
+
+    it('FAIL-ISOLATED — a throw under tenant-A does not abort tenant-B', async () => {
+      enumeratedPairs = [A, B];
+      throwForTuple = new Set(['tenant-A|agent-A']);
+
+      const { runMessageRecovery } = await import('@/workers/message-recovery.js');
+      await expect(runMessageRecovery()).resolves.toBeUndefined();
+
+      const seen = new Set(contextsSeen.map((c) => `${c.tenant_id}|${c.agent_id}`));
+      expect(seen).toEqual(new Set(['tenant-A|agent-A', 'tenant-B|agent-B']));
+    });
+
+    it('DISPATCHER runs without an ambient tenant context (cron path)', async () => {
+      enumeratedPairs = [A];
+
+      const { runMessageRecovery } = await import('@/workers/message-recovery.js');
+      await expect(runMessageRecovery()).resolves.toBeUndefined();
+      expect(contextsSeen).toEqual([A]);
+    });
+
+    it('NOT COUPLED TO CALLER CONTEXT — ambient tenant-A does not override enumerated tenant-B', async () => {
+      enumeratedPairs = [B];
+
+      const { runMessageRecovery } = await import('@/workers/message-recovery.js');
+      await runWithTenantContext(A, runMessageRecovery);
+
+      expect(contextsSeen).toEqual([B]);
+    });
+
+    it('the dispatcher passes the SAME staleness threshold (STUCK_AFTER_MS) to enumeration', async () => {
+      enumeratedPairs = [A];
+
+      const { runMessageRecovery } = await import('@/workers/message-recovery.js');
+      await runMessageRecovery();
+
+      // STUCK_AFTER_MS = 2 * 60 * 1000. Enumeration must receive it so dispatcher
+      // and inner agree on which messages are "stuck".
+      expect(enumerationMock()).toHaveBeenCalledWith(2 * 60 * 1000);
+    });
   });
-
-  it('MULTI-TENANT — inner runs once per enumerated tuple under its own context', async () => {
-    enumeratedPairs = [A, B];
-
-    const { runMessageRecovery } = await import('@/workers/message-recovery.js');
-    await runMessageRecovery();
-
-    expect(enumerationMock()).toHaveBeenCalledTimes(1);
-    expect(contextsSeen).toHaveLength(2);
-    const seen = new Set(contextsSeen.map((c) => `${c.tenant_id}|${c.agent_id}`));
-    expect(seen).toEqual(new Set(['tenant-A|agent-A', 'tenant-B|agent-B']));
-  });
-
-  it('NO default/default — inner never runs under the legacy sentinel when real tuples exist', async () => {
-    enumeratedPairs = [A, B];
-
-    const { runMessageRecovery } = await import('@/workers/message-recovery.js');
-    await runMessageRecovery();
-
-    for (const c of contextsSeen) {
-      expect(c.tenant_id).not.toBe('default');
-      expect(c.agent_id).not.toBe('default');
-    }
-  });
-
-  it('SINGLE-TENANT PRESERVED — only (default,default) enumerated → inner runs once under default', async () => {
-    enumeratedPairs = [DEFAULT];
-
-    const { runMessageRecovery } = await import('@/workers/message-recovery.js');
-    await runMessageRecovery();
-
-    expect(contextsSeen).toEqual([DEFAULT]);
-  });
-
-  it('EMPTY enumeration → no-op (inner read never fires)', async () => {
-    enumeratedPairs = [];
-
-    const { runMessageRecovery } = await import('@/workers/message-recovery.js');
-    await runMessageRecovery();
-
-    expect(innerReadMock()).not.toHaveBeenCalled();
-    expect(contextsSeen).toHaveLength(0);
-  });
-
-  it('FAIL-ISOLATED — a throw under tenant-A does not abort tenant-B', async () => {
-    enumeratedPairs = [A, B];
-    throwForTuple = new Set(['tenant-A|agent-A']);
-
-    const { runMessageRecovery } = await import('@/workers/message-recovery.js');
-    await expect(runMessageRecovery()).resolves.toBeUndefined();
-
-    const seen = new Set(contextsSeen.map((c) => `${c.tenant_id}|${c.agent_id}`));
-    expect(seen).toEqual(new Set(['tenant-A|agent-A', 'tenant-B|agent-B']));
-  });
-
-  it('DISPATCHER runs without an ambient tenant context (cron path)', async () => {
-    enumeratedPairs = [A];
-
-    const { runMessageRecovery } = await import('@/workers/message-recovery.js');
-    await expect(runMessageRecovery()).resolves.toBeUndefined();
-    expect(contextsSeen).toEqual([A]);
-  });
-
-  it('NOT COUPLED TO CALLER CONTEXT — ambient tenant-A does not override enumerated tenant-B', async () => {
-    enumeratedPairs = [B];
-
-    const { runMessageRecovery } = await import('@/workers/message-recovery.js');
-    await runWithTenantContext(A, runMessageRecovery);
-
-    expect(contextsSeen).toEqual([B]);
-  });
-
-  it('the dispatcher passes the SAME staleness threshold (STUCK_AFTER_MS) to enumeration', async () => {
-    enumeratedPairs = [A];
-
-    const { runMessageRecovery } = await import('@/workers/message-recovery.js');
-    await runMessageRecovery();
-
-    // STUCK_AFTER_MS = 2 * 60 * 1000. Enumeration must receive it so dispatcher
-    // and inner agree on which messages are "stuck".
-    expect(enumerationMock()).toHaveBeenCalledWith(2 * 60 * 1000);
-  });
-});
-
 }
 
 /**
@@ -353,9 +352,8 @@ describe('Issue #345 — message-recovery reads ONLY the current tenant/agent (r
     // Use the REAL repo so its drizzle WHERE predicate is exercised against the
     // store; keep enumeration overridden to return [A].
     vi.doMock('@/db/repositories.js', async () => {
-      const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-        '@/db/repositories.js',
-      );
+      const actual =
+        await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
       return {
         ...actual,
         mensagensRepo: {
@@ -371,7 +369,9 @@ describe('Issue #345 — message-recovery reads ONLY the current tenant/agent (r
     await runMessageRecovery();
 
     // Only tenant-A/agent-A's stuck row was re-enqueued.
-    const enqueuedIds = enqueueAgentMock.mock.calls.map((c) => (c[0] as { mensagem_id: string }).mensagem_id);
+    const enqueuedIds = enqueueAgentMock.mock.calls.map(
+      (c) => (c[0] as { mensagem_id: string }).mensagem_id,
+    );
     expect(enqueuedIds).toEqual(['A-stuck']);
     expect(enqueuedIds).not.toContain('B-stuck');
     expect(enqueuedIds).not.toContain('A-otherAgent');

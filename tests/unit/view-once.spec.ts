@@ -81,9 +81,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   pendingQuestionsRepo: { findActiveSnapshot: vi.fn() },
   conversasRepo: {
     byIdWithPessoa: vi.fn(async () => {
-      const row = dbState.conversaResult[0] as
-        | { conversas: unknown; pessoas: unknown }
-        | undefined;
+      const row = dbState.conversaResult[0] as { conversas: unknown; pessoas: unknown } | undefined;
       return row ? { conversa: row.conversas, pessoa: row.pessoas } : null;
     }),
     touch: vi.fn(),
@@ -100,7 +98,10 @@ vi.mock('../../src/db/repositories.js', () => ({
     record: vi.fn().mockResolvedValue(undefined),
   },
   selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
-  factsRepo: { listForScopes: vi.fn().mockResolvedValue([]), listMentionableForScopes: vi.fn().mockResolvedValue([]) },
+  factsRepo: {
+    listForScopes: vi.fn().mockResolvedValue([]),
+    listMentionableForScopes: vi.fn().mockResolvedValue([]),
+  },
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
   entityStatesRepo: { byId: vi.fn().mockResolvedValue(null), byIds: vi.fn().mockResolvedValue([]) },
   entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },
@@ -178,11 +179,11 @@ vi.mock('../../src/identity/quarantine.js', () => ({
 vi.mock('../../src/governance/permissions.js', () => ({
   resolveScope: vi.fn().mockResolvedValue({ entidades: [], byEntity: new Map() }),
 }));
-vi.mock("../../src/cognitive-graph/orchestrator.js", () => ({
+vi.mock('../../src/cognitive-graph/orchestrator.js', () => ({
   runNodes: vi.fn().mockResolvedValue({ nodes: {} }),
 }));
-vi.mock("../../src/gateway/rate-limit.js", () => ({
-  checkRateLimit: vi.fn().mockResolvedValue({ kind: "allow" }),
+vi.mock('../../src/gateway/rate-limit.js', () => ({
+  checkRateLimit: vi.fn().mockResolvedValue({ kind: 'allow' }),
   formatPoliteReply: vi.fn(),
 }));
 vi.mock('../../src/gateway/presence.js', () => ({
@@ -242,13 +243,13 @@ describe('Tool.sensitive registry surface', () => {
 });
 
 const PESSOA = {
-  id: "p1",
-  telefone_whatsapp: "+5511888888888",
-  nome: "Test",
-  tenant_id: "primary",
-  agent_id: "primary",
-  tipo: "owner",
-  status: "ativa",
+  id: 'p1',
+  telefone_whatsapp: '+5511888888888',
+  nome: 'Test',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  tipo: 'owner',
+  status: 'ativa',
   preferencias: {},
 } as never;
 const INBOUND = {
@@ -262,29 +263,29 @@ const INBOUND = {
 };
 
 const CONVERSA = {
-  id: "c1",
-  pessoa_id: "p1",
-  status: "ativa",
-  channel_id: "ch-1",
+  id: 'c1',
+  pessoa_id: 'p1',
+  status: 'ativa',
+  channel_id: 'ch-1',
 } as never;
 const AUDIENCE_PROFILE = {
-  id: "aud-1",
-  tenant_id: "primary",
-  agent_id: "primary",
-  pessoa_id: "p1",
-  audience_type: "owner",
-  trust_level: "trusted_internal",
-  status: "active",
+  id: 'aud-1',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  pessoa_id: 'p1',
+  audience_type: 'owner',
+  trust_level: 'trusted_internal',
+  status: 'active',
   permission_profile_ids: [],
   labels: [],
   metadata: {},
 } as never;
 const DEFAULT_ROLE = {
-  id: "role-default",
-  tenant_id: "primary",
-  agent_id: "primary",
-  role_key: "default",
-  display_name: "Default",
+  id: 'role-default',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  role_key: 'default',
+  display_name: 'Default',
   description: null,
   prompt_addendum: null,
   granted_packs: [],
@@ -293,13 +294,13 @@ const DEFAULT_ROLE = {
   metadata: {},
 } as never;
 const CHANNEL_POLICY = {
-  id: "policy-1",
-  tenant_id: "primary",
-  agent_id: "primary",
-  channel_id: "ch-1",
-  default_role_id: "role-default",
-  switch_behavior: "fixed",
-  announce_mode: "never",
+  id: 'policy-1',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  channel_id: 'ch-1',
+  default_role_id: 'role-default',
+  switch_behavior: 'fixed',
+  announce_mode: 'never',
   by_context_guards: {},
   allowed_role_ids: [],
 } as never;
@@ -315,7 +316,7 @@ describe('agent loop — view-once decision + audit', () => {
     findMensagem.mockReset();
     markProcessed.mockReset();
     recentInConversation.mockReset().mockResolvedValue([]);
-    buildPrompt.mockResolvedValue({ system: "s", messages: [] });
+    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
     findAudienceProfile.mockReset().mockResolvedValue(AUDIENCE_PROFILE);
     getChannelPolicy.mockReset().mockResolvedValue(CHANNEL_POLICY);
     listActiveRoles.mockReset().mockResolvedValue([DEFAULT_ROLE]);
@@ -425,7 +426,7 @@ describe('agent loop — preference override', () => {
     findMensagem.mockReset();
     markProcessed.mockReset();
     recentInConversation.mockReset().mockResolvedValue([]);
-    buildPrompt.mockResolvedValue({ system: "s", messages: [] });
+    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
     findAudienceProfile.mockReset().mockResolvedValue(AUDIENCE_PROFILE);
     getChannelPolicy.mockReset().mockResolvedValue(CHANNEL_POLICY);
     listActiveRoles.mockReset().mockResolvedValue([DEFAULT_ROLE]);

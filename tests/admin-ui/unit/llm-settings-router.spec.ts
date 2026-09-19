@@ -40,10 +40,8 @@ let mockFast = 'anthropic/claude-haiku-4.5';
 // Codex round 6 [high]: 'global_mismatched' added. When this source
 // is set, the router exposes the stored row in stored_main/stored_fast
 // and the UI sends that row back as the expected token.
-let mockMainSource: 'global' | 'global_mismatched' | 'legacy' | 'env' =
-  'global';
-let mockFastSource: 'global' | 'global_mismatched' | 'legacy' | 'env' =
-  'global';
+let mockMainSource: 'global' | 'global_mismatched' | 'legacy' | 'env' = 'global';
+let mockFastSource: 'global' | 'global_mismatched' | 'legacy' | 'env' = 'global';
 let mockMainStored: Record<string, unknown> | undefined;
 let mockFastStored: Record<string, unknown> | undefined;
 
@@ -160,9 +158,7 @@ vi.mock('@/lib/openrouter-models.js', () => ({
 }));
 
 // Import the router after mocks are in place.
-const { llmSettingsRouter } = await import(
-  '@/admin-ui/trpc/routers/llmSettings.js'
-);
+const { llmSettingsRouter } = await import('@/admin-ui/trpc/routers/llmSettings.js');
 
 function caller(role: string, tenantId = 'tenant-test', userId = 'user-1') {
   const ctx = {
@@ -386,14 +382,12 @@ describe('llmSettingsRouter.update — gate + delegate + atomic semantics', () =
     // the helper would normally return before={main:null, fast:null}. We
     // bypass the mock's normal flip path and craft the return shape directly.
     const llmModule = await import('@/lib/llm-settings.js');
-    const spy = vi
-      .spyOn(llmModule, 'setGlobalLLMSettingsAtomic')
-      .mockResolvedValueOnce({
-        ok: true as const,
-        applied_at: new Date('2026-05-22T14:30:00Z'),
-        before: { main: null, fast: null },
-        after: { main: 'openai/gpt-5', fast: 'openai/gpt-5' },
-      });
+    const spy = vi.spyOn(llmModule, 'setGlobalLLMSettingsAtomic').mockResolvedValueOnce({
+      ok: true as const,
+      applied_at: new Date('2026-05-22T14:30:00Z'),
+      before: { main: null, fast: null },
+      after: { main: 'openai/gpt-5', fast: 'openai/gpt-5' },
+    });
 
     const res = await caller('founder').update({
       main: 'openai/gpt-5',
@@ -439,10 +433,7 @@ describe('llmSettingsRouter — provider gate (Codex round 4)', () => {
     mockProvider = 'openrouter';
     const res = await caller('founder').catalog();
     expect(res.provider).toBe('openrouter');
-    expect(res.items.map((m) => m.id)).toEqual([
-      'anthropic/claude-sonnet-4.6',
-      'openai/gpt-5',
-    ]);
+    expect(res.items.map((m) => m.id)).toEqual(['anthropic/claude-sonnet-4.6', 'openai/gpt-5']);
   });
 
   it('update rejects openai/* slug when provider=anthropic (main side)', async () => {
@@ -784,7 +775,7 @@ describe('llmSettingsRouter.update — input validation', () => {
         // expected_main intentionally omitted
         expected_fast: 'anthropic/claude-haiku-4.5',
         comment: 'expected_main must be present',
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
     ).rejects.toThrow();
     expect(atomicCalls).toHaveLength(0);
@@ -798,7 +789,7 @@ describe('llmSettingsRouter.update — input validation', () => {
         expected_main: 'anthropic/claude-sonnet-4.6',
         // expected_fast intentionally omitted
         comment: 'expected_fast must be present',
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
       } as any),
     ).rejects.toThrow();
     expect(atomicCalls).toHaveLength(0);

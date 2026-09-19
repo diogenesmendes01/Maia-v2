@@ -158,7 +158,9 @@ function envWithout(profile: 'development' | 'production', name: string, deltas:
 
 describe('requiredWhen — cobertura exata do contrato (#515)', () => {
   it('todo requiredWhen do contrato tem um caso de teste (e vice-versa)', () => {
-    const declared = CONTRACT_ENTRIES.filter((s) => s.requiredWhen).map((s) => s.name).sort();
+    const declared = CONTRACT_ENTRIES.filter((s) => s.requiredWhen)
+      .map((s) => s.name)
+      .sort();
     expect(
       Object.keys(CASES).sort(),
       'adicionou um requiredWhen? adicione o caso aqui — condição sem teste não existe',

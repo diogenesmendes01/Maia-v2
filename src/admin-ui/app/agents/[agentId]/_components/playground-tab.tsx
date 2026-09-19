@@ -42,9 +42,7 @@ export default function PlaygroundTab({
       enabled: sessionId !== null,
       refetchInterval: (query) => {
         const items = query.state.data?.items ?? [];
-        const pending = items.some(
-          (t) => t.status === 'queued' || t.status === 'running',
-        );
+        const pending = items.some((t) => t.status === 'queued' || t.status === 'running');
         return pending ? 2_000 : 10_000;
       },
     },
@@ -88,8 +86,7 @@ export default function PlaygroundTab({
   if (!hasActiveProfile && proposedVersions.length === 0) {
     return (
       <Alert tone="info" title="Nada para testar ainda">
-        O agente não tem perfil ativo nem versões propostas. Crie ou proponha um
-        perfil primeiro.
+        O agente não tem perfil ativo nem versões propostas. Crie ou proponha um perfil primeiro.
       </Alert>
     );
   }
@@ -140,8 +137,8 @@ export default function PlaygroundTab({
   return (
     <div className="space-y-3">
       <Alert tone="info">
-        <strong>Ambiente de teste</strong> — nada aqui afeta clientes, memória ou
-        aprendizado. Conversando com{' '}
+        <strong>Ambiente de teste</strong> — nada aqui afeta clientes, memória ou aprendizado.
+        Conversando com{' '}
         {turnsQuery.data?.session.profile_version_id ? (
           <Badge tone="warning">versão proposta</Badge>
         ) : (
@@ -198,8 +195,7 @@ export default function PlaygroundTab({
           )}
           {waiting && (
             <div className="flex items-center gap-2 text-xs text-zinc-500">
-              <Spinner className="h-3 w-3" />
-              O agente está respondendo…
+              <Spinner className="h-3 w-3" />O agente está respondendo…
             </div>
           )}
           <div ref={bottomRef} />
@@ -227,9 +223,7 @@ export default function PlaygroundTab({
               Enviar
             </Button>
           </div>
-          {error && (
-            <p className="mt-2 text-xs text-red-600">{error}</p>
-          )}
+          {error && <p className="mt-2 text-xs text-red-600">{error}</p>}
         </div>
       </Card>
 

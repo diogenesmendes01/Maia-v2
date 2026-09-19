@@ -760,7 +760,6 @@ async function attemptResync(sub: IORedis, life: SubscriberLifecycle): Promise<R
   };
 }
 
-
 type ResyncOutcome =
   | 'applied'
   | 'cleared'
@@ -825,9 +824,7 @@ const DIVERGENT_OUTCOMES: ReadonlySet<ResyncOutcome> = new Set<ResyncOutcome>([
  * que confie em `{reason="resynced"}` estaria lendo evidência verde falsa.
  * Nenhum alerta o seleciona, de propósito: uma réplica saindo não é incidente.
  */
-function resyncReason(
-  outcome: ResyncOutcome,
-): 'resynced' | 'resync_failed' | 'resync_cancelled' {
+function resyncReason(outcome: ResyncOutcome): 'resynced' | 'resync_failed' | 'resync_cancelled' {
   if (outcome === 'cancelled') return 'resync_cancelled';
   return DIVERGENT_OUTCOMES.has(outcome) ? 'resync_failed' : 'resynced';
 }
@@ -915,10 +912,7 @@ export function handleLLMSettingsInvalidation(channel: string, payload = ''): vo
   }
   if (channel !== LLM_SETTINGS_INVALIDATION_CHANNEL) return;
   invalidateModelCache();
-  logger.info(
-    { channel },
-    'llm_gateway.settings_cache_invalidated',
-  );
+  logger.info({ channel }, 'llm_gateway.settings_cache_invalidated');
 }
 
 /**
@@ -982,10 +976,7 @@ export function startLLMSettingsInvalidationSubscriber(): void {
     logger.warn({ err: err.message }, 'llm_gateway.settings_subscriber_error');
   });
   sub.connect().catch((err) => {
-    logger.warn(
-      { err: (err as Error).message },
-      'llm_gateway.settings_subscribe_connect_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'llm_gateway.settings_subscribe_connect_failed');
   });
   sub.on('message', (channel, payload) => handleLLMSettingsInvalidation(channel, payload));
 
@@ -1094,10 +1085,7 @@ export async function stopLLMSettingsInvalidationSubscriber(): Promise<void> {
     await pending.quit();
   } catch (err) {
     // Já caiu, ou nunca terminou de conectar. Não há o que fechar.
-    logger.warn(
-      { err: (err as Error).message },
-      'llm_gateway.settings_subscriber_close_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'llm_gateway.settings_subscriber_close_failed');
   }
 }
 

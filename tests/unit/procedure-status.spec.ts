@@ -1,5 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { canTransition, validateTransition, transitionProcedureStatus, ProcedureNotFoundError, OptimisticLockError, StatusMismatchError } from '@/cognition/procedure-status.js';
+import {
+  canTransition,
+  validateTransition,
+  transitionProcedureStatus,
+  ProcedureNotFoundError,
+  OptimisticLockError,
+  StatusMismatchError,
+} from '@/cognition/procedure-status.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 // ---------------------------------------------------------------------------
@@ -28,9 +35,8 @@ vi.mock('@/db/client.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureDefinitionsRepo: {
@@ -43,7 +49,12 @@ vi.mock('@/db/repositories.js', async () => {
         return 0; // cross-tenant / not-found
       }),
       atomicActivate: vi.fn(
-        async (args: { target_id: string; actor: string; preserve_activated_at?: boolean; expected_from_status: string }) => {
+        async (args: {
+          target_id: string;
+          actor: string;
+          preserve_activated_at?: boolean;
+          expected_from_status: string;
+        }) => {
           const target = mockState[args.target_id];
           if (!target) throw new Error('not found');
           const now = new Date();
@@ -149,7 +160,10 @@ function buildTxSentinel(
               // captured before entering the transaction).
               // If expectedFromStatus is not provided, apply to first row found
               // (covers simple non-race test cases where only 1 row exists).
-              if (opts?.expectedFromStatus !== undefined && row.status !== opts.expectedFromStatus) {
+              if (
+                opts?.expectedFromStatus !== undefined &&
+                row.status !== opts.expectedFromStatus
+              ) {
                 continue; // Row already moved — WHERE predicate fails → 0 rows
               }
               state[k] = { ...row, ...patch };
@@ -217,7 +231,12 @@ describe('transitionProcedureStatus — event recording', () => {
 
       // Step 2: proposed → active (active path → atomicActivate mock pushes its own event)
       const proposed = mockState['walk-1'];
-      await procedureTestsRepo.create({ definition_id: 'walk-1', name: 'p', scenario: {}, expected_outcome: 'ok' });
+      await procedureTestsRepo.create({
+        definition_id: 'walk-1',
+        name: 'p',
+        scenario: {},
+        expected_outcome: 'ok',
+      });
       await transitionProcedureStatus({ definition: proposed, to: 'active', actor: 'actor-a' });
 
       // Step 3: separate def active → frozen (non-active path → tx.insert pushes event)
@@ -230,12 +249,22 @@ describe('transitionProcedureStatus — event recording', () => {
 
       expect(walk1Events).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ definition_id: 'walk-1', from_status: 'draft', to_status: 'proposed', actor: 'actor-a' }),
+          expect.objectContaining({
+            definition_id: 'walk-1',
+            from_status: 'draft',
+            to_status: 'proposed',
+            actor: 'actor-a',
+          }),
         ]),
       );
       expect(frozenEvents).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ definition_id: 'walk-frozen', from_status: 'active', to_status: 'frozen', actor: 'actor-b' }),
+          expect.objectContaining({
+            definition_id: 'walk-frozen',
+            from_status: 'active',
+            to_status: 'frozen',
+            actor: 'actor-b',
+          }),
         ]),
       );
       // At minimum 2 events total (walk-1 proposed + walk-frozen frozen; walk-1 active is from atomicActivate mock)
@@ -253,12 +282,21 @@ describe('transitionProcedureStatus — event recording', () => {
       // draft→proposed goes through tx.insert → event in mockEvents
       expect(mockEvents).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ definition_id: 'lifecycle-1', from_status: 'draft', to_status: 'proposed' }),
+          expect.objectContaining({
+            definition_id: 'lifecycle-1',
+            from_status: 'draft',
+            to_status: 'proposed',
+          }),
         ]),
       );
 
       const proposed = mockState['lifecycle-1'];
-      await procedureTestsRepo.create({ definition_id: 'lifecycle-1', name: 'p', scenario: {}, expected_outcome: 'ok' });
+      await procedureTestsRepo.create({
+        definition_id: 'lifecycle-1',
+        name: 'p',
+        scenario: {},
+        expected_outcome: 'ok',
+      });
       await transitionProcedureStatus({ definition: proposed, to: 'active', actor: 'tester' });
 
       // Active transition goes through atomicActivate (mock records its own event),
@@ -305,7 +343,11 @@ describe('transitionProcedureStatus — cross-tenant proposed→active pre-check
   it('Test C1: throws ProcedureNotFoundError when findById returns null for proposed→active, NOT tests_required', async () => {
     await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'default' }, async () => {
       // Definition object comes from tenant A (ID not visible in tenant B's mockState)
-      const crossTenantDef = { id: 'tenant-a-proc-id', status: 'proposed', nome: 'some-proc' } as any;
+      const crossTenantDef = {
+        id: 'tenant-a-proc-id',
+        status: 'proposed',
+        nome: 'some-proc',
+      } as any;
       // mockState is empty → findById returns null for this ID (cross-tenant / invisible)
 
       await expect(
@@ -318,7 +360,11 @@ describe('transitionProcedureStatus — cross-tenant proposed→active pre-check
     await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'default' }, async () => {
       const { procedureTestsRepo } = await import('@/db/repositories.js');
 
-      const crossTenantDef = { id: 'tenant-a-proc-id-2', status: 'proposed', nome: 'proc-2' } as any;
+      const crossTenantDef = {
+        id: 'tenant-a-proc-id-2',
+        status: 'proposed',
+        nome: 'proc-2',
+      } as any;
 
       await expect(
         transitionProcedureStatus({ definition: crossTenantDef, to: 'active', actor: 'attacker' }),
@@ -386,14 +432,22 @@ describe('transitionProcedureStatus — atomic non-active transition [round-1-C2
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const def = seedDef('atomic-ok-id', 'draft');
 
-      const result = await transitionProcedureStatus({ definition: def, to: 'proposed', actor: 'tester' });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'proposed',
+        actor: 'tester',
+      });
 
       expect(result.ok).toBe(true);
       expect(mockState['atomic-ok-id']?.status).toBe('proposed');
       // tx.insert pushed event to mockEvents
       expect(mockEvents).toEqual(
         expect.arrayContaining([
-          expect.objectContaining({ definition_id: 'atomic-ok-id', from_status: 'draft', to_status: 'proposed' }),
+          expect.objectContaining({
+            definition_id: 'atomic-ok-id',
+            from_status: 'draft',
+            to_status: 'proposed',
+          }),
         ]),
       );
     });
@@ -446,7 +500,8 @@ describe('transitionProcedureStatus — D1: tx-aware writes + real rollback [rou
         insert: vi.fn((table: any) => {
           txWriteCalls.push('tx.insert');
           return {
-            values: (_vals: any) => Promise.reject(new Error('event insert failed — simulated DB error')),
+            values: (_vals: any) =>
+              Promise.reject(new Error('event insert failed — simulated DB error')),
           };
         }),
       };
@@ -518,7 +573,11 @@ describe('transitionProcedureStatus — D2: persisted status is source of truth 
 
       // Caller honestly reflects proposed, gate should fire (no tests)
       const def = { id: 'd2b-gate-id', status: 'proposed', nome: 'proc' } as any;
-      const result = await transitionProcedureStatus({ definition: def, to: 'active', actor: 'reviewer' });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'active',
+        actor: 'reviewer',
+      });
 
       // Gate fires because owned.status='proposed' and no tests exist
       expect(result.ok).toBe(false);
@@ -625,7 +684,12 @@ describe('transitionProcedureStatus — R1/R2/R3: atomicActivate expected_from_s
       // We simulate by overriding atomicActivate to mimic the post-fix behaviour:
       // inside the tx it re-reads status='rolled_back' but expected 'frozen' → throws.
       (procedureDefinitionsRepo.atomicActivate as any).mockImplementationOnce(
-        async (args: { target_id: string; actor: string; preserve_activated_at?: boolean; expected_from_status: string }) => {
+        async (args: {
+          target_id: string;
+          actor: string;
+          preserve_activated_at?: boolean;
+          expected_from_status: string;
+        }) => {
           // Simulate Thread B having advanced the row to rolled_back just before the lock.
           const lockedStatus = 'rolled_back'; // what the DB row now contains
           if (lockedStatus !== args.expected_from_status) {
@@ -658,11 +722,21 @@ describe('transitionProcedureStatus — R1/R2/R3: atomicActivate expected_from_s
       seedDef('r2-proposed-id', 'proposed');
 
       // Add tests so the P3c gate does not block us before atomicActivate.
-      await procedureTestsRepo.create({ definition_id: 'r2-proposed-id', name: 'p', scenario: {}, expected_outcome: 'ok' });
+      await procedureTestsRepo.create({
+        definition_id: 'r2-proposed-id',
+        name: 'p',
+        scenario: {},
+        expected_outcome: 'ok',
+      });
 
       // Thread B races: proposed → draft before atomicActivate fires.
       (procedureDefinitionsRepo.atomicActivate as any).mockImplementationOnce(
-        async (args: { target_id: string; actor: string; preserve_activated_at?: boolean; expected_from_status: string }) => {
+        async (args: {
+          target_id: string;
+          actor: string;
+          preserve_activated_at?: boolean;
+          expected_from_status: string;
+        }) => {
           const lockedStatus = 'draft'; // Thread B moved it back to draft
           if (lockedStatus !== args.expected_from_status) {
             throw new OptimisticLockError(
@@ -689,7 +763,12 @@ describe('transitionProcedureStatus — R1/R2/R3: atomicActivate expected_from_s
       const { procedureTestsRepo } = await import('@/db/repositories.js');
 
       seedDef('r3-happy-id', 'proposed');
-      await procedureTestsRepo.create({ definition_id: 'r3-happy-id', name: 'p', scenario: {}, expected_outcome: 'ok' });
+      await procedureTestsRepo.create({
+        definition_id: 'r3-happy-id',
+        name: 'p',
+        scenario: {},
+        expected_outcome: 'ok',
+      });
 
       // Default atomicActivate mock (no race) should now receive expected_from_status='proposed'
       // and succeed normally. The default mock does NOT check expected_from_status, so this
@@ -698,7 +777,11 @@ describe('transitionProcedureStatus — R1/R2/R3: atomicActivate expected_from_s
       const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
 
       const def = { id: 'r3-happy-id', status: 'proposed', nome: 'proc' } as any;
-      const result = await transitionProcedureStatus({ definition: def, to: 'active', actor: 'approver' });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'active',
+        actor: 'approver',
+      });
 
       expect(result.ok).toBe(true);
       if (result.ok) {

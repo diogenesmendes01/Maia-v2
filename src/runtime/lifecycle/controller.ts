@@ -126,11 +126,13 @@ async function withDeadline<T>(
   });
   try {
     const settled = await Promise.race([
-      p.then((value) => ({ ok: true as const, value })).catch((err) => ({
-        ok: false as const,
-        timedOut: false,
-        err,
-      })),
+      p
+        .then((value) => ({ ok: true as const, value }))
+        .catch((err) => ({
+          ok: false as const,
+          timedOut: false,
+          err,
+        })),
       timeout,
     ]);
     return settled;

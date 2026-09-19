@@ -34,10 +34,7 @@
  * its WHERE clause); these tests run inside a fixed tenant context.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  computePayloadHash,
-  PAYLOAD_HASH_VERSION_PREFIX,
-} from '@/governance/idempotency.js';
+import { computePayloadHash, PAYLOAD_HASH_VERSION_PREFIX } from '@/governance/idempotency.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 const TEST_CTX = { tenant_id: 'test-tenant', agent_id: 'test-agent' };

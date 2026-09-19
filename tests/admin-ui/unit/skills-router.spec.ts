@@ -107,9 +107,7 @@ function makeRepos(skills: Skill[], capture?: { lastListLimit?: number }) {
             if (agentId === null) return r.agent_id === null;
             // explicit agent: must equal context agent (cross-agent rejected)
             if (agentId !== agent) {
-              throw new Error(
-                `agent_scope_violation: input agent ${agentId} vs context ${agent}`,
-              );
+              throw new Error(`agent_scope_violation: input agent ${agentId} vs context ${agent}`);
             }
             return r.agent_id === agentId;
           })
@@ -132,11 +130,7 @@ function makeRepos(skills: Skill[], capture?: { lastListLimit?: number }) {
   };
 }
 
-function caller(
-  role: string,
-  sessionTenant: string,
-  repos: ReturnType<typeof makeRepos>,
-) {
+function caller(role: string, sessionTenant: string, repos: ReturnType<typeof makeRepos>) {
   const ctx = {
     session: { user: { id: 'u1', role, tenant_id: sessionTenant } },
     userId: 'u1',
@@ -170,12 +164,47 @@ function collisionFixture(): Skill[] {
   };
   return [
     // Agent-scoped versions (agent-x): v1, v2.
-    { ...base, id: 'a1', tenant_id: 'tenant-A', agent_id: 'agent-x', skill_descriptor: SHARED, version: 1 },
-    { ...base, id: 'a2', tenant_id: 'tenant-A', agent_id: 'agent-x', skill_descriptor: SHARED, version: 2 },
+    {
+      ...base,
+      id: 'a1',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      skill_descriptor: SHARED,
+      version: 1,
+    },
+    {
+      ...base,
+      id: 'a2',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-x',
+      skill_descriptor: SHARED,
+      version: 2,
+    },
     // Tenant-wide versions (agent_id null): v1, v2, v3.
-    { ...base, id: 'tw1', tenant_id: 'tenant-A', agent_id: null, skill_descriptor: SHARED, version: 1 },
-    { ...base, id: 'tw2', tenant_id: 'tenant-A', agent_id: null, skill_descriptor: SHARED, version: 2 },
-    { ...base, id: 'tw3', tenant_id: 'tenant-A', agent_id: null, skill_descriptor: SHARED, version: 3 },
+    {
+      ...base,
+      id: 'tw1',
+      tenant_id: 'tenant-A',
+      agent_id: null,
+      skill_descriptor: SHARED,
+      version: 1,
+    },
+    {
+      ...base,
+      id: 'tw2',
+      tenant_id: 'tenant-A',
+      agent_id: null,
+      skill_descriptor: SHARED,
+      version: 2,
+    },
+    {
+      ...base,
+      id: 'tw3',
+      tenant_id: 'tenant-A',
+      agent_id: null,
+      skill_descriptor: SHARED,
+      version: 3,
+    },
   ];
 }
 

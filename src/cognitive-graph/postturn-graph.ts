@@ -3,7 +3,11 @@ import type { ModuleDescriptor, GraphContext } from './types.js';
 import { evaluateCurrentStep } from '@/cognition/step-evaluator.js';
 import * as procedureEngine from '@/procedures/engine.js';
 import { procedureExecutionsRepo, procedureDefinitionsRepo } from '@/db/repositories.js';
-import { reflectOnCorrection, detectCorrection, findPreviousAssistantMessage } from '@/agent/reflection.js';
+import {
+  reflectOnCorrection,
+  detectCorrection,
+  findPreviousAssistantMessage,
+} from '@/agent/reflection.js';
 import { detectSuccess } from '@/agent/success-detector.js';
 import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';

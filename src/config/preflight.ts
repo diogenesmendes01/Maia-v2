@@ -230,9 +230,7 @@ export function runPreflight(input: PreflightInput): PreflightReport {
           s.failure === undefined &&
           s.bootGateProblems.length === 0 &&
           s.contracts.length > 0 &&
-          s.contracts.every(
-            (c) => c.result.ok && (c.homologation === null || c.homologation.ok),
-          ),
+          s.contracts.every((c) => c.result.ok && (c.homologation === null || c.homologation.ok)),
       ),
     services,
     shellDivergence,

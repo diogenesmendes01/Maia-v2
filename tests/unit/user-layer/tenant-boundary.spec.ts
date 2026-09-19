@@ -24,9 +24,9 @@ import {
 describe('enforceTenantBoundary', () => {
   it('[critical] throws MissingTenantContextError when called without ALS context', () => {
     // No runWithTenantContext wrapper — context is absent.
-    expect(() =>
-      enforceTenantBoundary({ tenant_id: 'some-tenant' }),
-    ).toThrow(MissingTenantContextError);
+    expect(() => enforceTenantBoundary({ tenant_id: 'some-tenant' })).toThrow(
+      MissingTenantContextError,
+    );
   });
 
   it('[critical] error code is MISSING_TENANT_CONTEXT', () => {
@@ -42,9 +42,9 @@ describe('enforceTenantBoundary', () => {
 
   it('throws TenantBoundaryViolation when input.tenant_id mismatches context', async () => {
     await runWithTenantContext({ tenant_id: 'ctx-tenant', agent_id: 'ctx-agent' }, async () => {
-      expect(() =>
-        enforceTenantBoundary({ tenant_id: 'other-tenant' }),
-      ).toThrow(TenantBoundaryViolation);
+      expect(() => enforceTenantBoundary({ tenant_id: 'other-tenant' })).toThrow(
+        TenantBoundaryViolation,
+      );
     });
   });
 

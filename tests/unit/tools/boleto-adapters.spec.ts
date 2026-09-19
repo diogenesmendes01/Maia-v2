@@ -65,9 +65,8 @@ vi.mock('@/lib/attachment-resolver.js', () => ({
 }));
 const readStoredMediaMock = vi.fn();
 vi.mock('@/lib/media-guard.js', async () => {
-  const actual = await vi.importActual<typeof import('@/lib/media-guard.js')>(
-    '@/lib/media-guard.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/lib/media-guard.js')>('@/lib/media-guard.js');
   return { ...actual, readStoredMedia: readStoredMediaMock };
 });
 
@@ -398,7 +397,14 @@ describe('conversation_attachment_lookup — scope + opaque attachment ids', () 
         created_at: new Date('2026-05-01T00:00:00Z'),
       },
       // text-only message → no attachment.
-      { id: 'm2', midia_url: null, tipo: 'texto', conteudo: 'oi', metadata: {}, created_at: new Date() },
+      {
+        id: 'm2',
+        midia_url: null,
+        tipo: 'texto',
+        conteudo: 'oi',
+        metadata: {},
+        created_at: new Date(),
+      },
       {
         id: 'm3',
         midia_url: '/tmp/b.pdf',
@@ -408,9 +414,8 @@ describe('conversation_attachment_lookup — scope + opaque attachment ids', () 
         created_at: new Date('2026-05-02T00:00:00Z'),
       },
     ]);
-    const { conversationAttachmentLookupTool } = await import(
-      '@/tools/conversation-attachment-lookup.js'
-    );
+    const { conversationAttachmentLookupTool } =
+      await import('@/tools/conversation-attachment-lookup.js');
     const out = await conversationAttachmentLookupTool.handler({ limit: 100 } as never, ctx);
     // ALS-scoped read of the CURRENT conversation only.
     expect(recentInConversationMock).toHaveBeenCalledWith('c1', 100);
@@ -440,9 +445,8 @@ describe('conversation_attachment_lookup — scope + opaque attachment ids', () 
         created_at: new Date(),
       },
     ]);
-    const { conversationAttachmentLookupTool } = await import(
-      '@/tools/conversation-attachment-lookup.js'
-    );
+    const { conversationAttachmentLookupTool } =
+      await import('@/tools/conversation-attachment-lookup.js');
     // Caption hint matches.
     const byCaption = await conversationAttachmentLookupTool.handler(
       { limit: 100, attachment_hints: ['aluguel'] } as never,
@@ -470,9 +474,8 @@ describe('conversation_attachment_lookup — scope + opaque attachment ids', () 
 
   it('warns and ignores a divergent conversation_id (no scope escape)', async () => {
     recentInConversationMock.mockResolvedValueOnce([]);
-    const { conversationAttachmentLookupTool } = await import(
-      '@/tools/conversation-attachment-lookup.js'
-    );
+    const { conversationAttachmentLookupTool } =
+      await import('@/tools/conversation-attachment-lookup.js');
     // Parse through the schema (as the dispatcher does) so `limit` defaults to 100.
     const args = conversationAttachmentLookupTool.input_schema.parse({
       conversation_id: 'other-convo',
@@ -485,12 +488,25 @@ describe('conversation_attachment_lookup — scope + opaque attachment ids', () 
 
   it('filters by attachment_type', async () => {
     recentInConversationMock.mockResolvedValueOnce([
-      { id: 'm1', midia_url: '/a.jpg', tipo: 'imagem', conteudo: null, metadata: { media_sha256: 's1' }, created_at: new Date() },
-      { id: 'm2', midia_url: '/a.ogg', tipo: 'audio', conteudo: null, metadata: { media_sha256: 's2' }, created_at: new Date() },
+      {
+        id: 'm1',
+        midia_url: '/a.jpg',
+        tipo: 'imagem',
+        conteudo: null,
+        metadata: { media_sha256: 's1' },
+        created_at: new Date(),
+      },
+      {
+        id: 'm2',
+        midia_url: '/a.ogg',
+        tipo: 'audio',
+        conteudo: null,
+        metadata: { media_sha256: 's2' },
+        created_at: new Date(),
+      },
     ]);
-    const { conversationAttachmentLookupTool } = await import(
-      '@/tools/conversation-attachment-lookup.js'
-    );
+    const { conversationAttachmentLookupTool } =
+      await import('@/tools/conversation-attachment-lookup.js');
     const out = await conversationAttachmentLookupTool.handler(
       { attachment_type: 'audio' } as never,
       ctx,
@@ -599,7 +615,12 @@ describe('bank_account_validate — local structural validation + shared checksu
 
     // A genuinely valid CPF passes the checksum → typed cpf, no doc warning.
     const ok = await bankAccountValidateTool.handler(
-      { method: 'pix', pix_key: '11144477735', pix_key_type: 'cpf', holder_document: '111.444.777-35' } as never,
+      {
+        method: 'pix',
+        pix_key: '11144477735',
+        pix_key_type: 'cpf',
+        holder_document: '111.444.777-35',
+      } as never,
       ctx,
     );
     expect(ok.normalized?.inferred_document_type).toBe('cpf');
@@ -634,9 +655,8 @@ describe('bank_account_validate — local structural validation + shared checksu
 // ===========================================================================
 describe('conversation_summary_generate — wraps the shared summarizer', () => {
   it('declares a read-only contract and maps to the boleto shape', async () => {
-    const { conversationSummaryGenerateTool } = await import(
-      '@/tools/conversation-summary-generate.js'
-    );
+    const { conversationSummaryGenerateTool } =
+      await import('@/tools/conversation-summary-generate.js');
     expect(conversationSummaryGenerateTool.side_effect).toBe('none');
     expect(conversationSummaryGenerateTool.operation_type).toBe('read');
     expect(conversationSummaryGenerateTool.audit_action).toBe('conversation_summary_generated');
@@ -655,9 +675,8 @@ describe('conversation_summary_generate — wraps the shared summarizer', () => 
         pending_actions: ['confirmar pagamento'],
       }),
     });
-    const { conversationSummaryGenerateTool } = await import(
-      '@/tools/conversation-summary-generate.js'
-    );
+    const { conversationSummaryGenerateTool } =
+      await import('@/tools/conversation-summary-generate.js');
     const out = await conversationSummaryGenerateTool.handler({ limit: 50 } as never, ctx);
     expect(recentInConversationMock).toHaveBeenCalledWith('c1', 50);
     expect(callLLMMock).toHaveBeenCalledTimes(1);
@@ -672,9 +691,8 @@ describe('conversation_summary_generate — wraps the shared summarizer', () => 
 
   it('uses caller-provided history (role/content) without hitting the DB', async () => {
     callLLMMock.mockResolvedValueOnce({ content: JSON.stringify({ summary: 's' }) });
-    const { conversationSummaryGenerateTool } = await import(
-      '@/tools/conversation-summary-generate.js'
-    );
+    const { conversationSummaryGenerateTool } =
+      await import('@/tools/conversation-summary-generate.js');
     const out = await conversationSummaryGenerateTool.handler(
       { history: [{ role: 'user', content: 'oi' }] } as never,
       ctx,

@@ -26,7 +26,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const { auditMock } = vi.hoisted(() => ({ auditMock: vi.fn(async () => undefined) }));
 const { grantState } = vi.hoisted(() => ({
   grantState: {
-    grant: { granted_packs: [] as string[], granted_tools: [] as string[], denied_tools: [] as string[] },
+    grant: {
+      granted_packs: [] as string[],
+      granted_tools: [] as string[],
+      denied_tools: [] as string[],
+    },
   },
 }));
 const { constitutionalMock } = vi.hoisted(() => ({ constitutionalMock: vi.fn(() => null) }));
@@ -154,7 +158,11 @@ describe('dispatcher — boleto write tools compose with the guard (issue #416)'
     // guard) but reports it executed NOTHING — no faked `ok: true`.
     const a = await dispatchTool({ tool: 'boleto_cancel', args: cancelArgs, ctx: fakeCtx });
     expect(a).toMatchObject({ executed: false, status: 'stub_not_executed' });
-    const b = await dispatchTool({ tool: 'company_campaign_remove', args: removeArgs, ctx: fakeCtx });
+    const b = await dispatchTool({
+      tool: 'company_campaign_remove',
+      args: removeArgs,
+      ctx: fakeCtx,
+    });
     expect(b).toMatchObject({ executed: false, status: 'stub_not_executed' });
     // The dispatcher consulted canAct (the real granular action keys gate exec).
     expect(canActMock).toHaveBeenCalled();

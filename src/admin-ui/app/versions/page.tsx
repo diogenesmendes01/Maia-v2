@@ -4,12 +4,7 @@ import * as React from 'react';
 import { useSession } from 'next-auth/react';
 import { trpc } from '../../trpc/client.js';
 import { PageHeader } from '../../components/ui/page-header.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-  Alert,
-} from '../../components/ui/states.js';
+import { LoadingState, ErrorState, EmptyState, Alert } from '../../components/ui/states.js';
 import { IconGitBranch } from '../../components/ui/icons.js';
 import VersionsTable, { type VersionItem } from './_components/versions-table.js';
 import RollbackModal from './_components/rollback-modal.js';

@@ -15,10 +15,7 @@ import {
   type BackupManifest,
 } from '../../../src/ops/backup/manifest.js';
 import { resolveBackupProfile, type BackupConfigInput } from '../../../src/ops/backup/profile.js';
-import {
-  signTombstone,
-  type TombstoneRecord,
-} from '../../../src/ops/retention/tombstones.js';
+import { signTombstone, type TombstoneRecord } from '../../../src/ops/retention/tombstones.js';
 import { TypedError } from '../../../src/lib/utils.js';
 
 /**
@@ -119,7 +116,10 @@ function manifest(over: Partial<BackupManifest> = {}): BackupManifest {
   };
 }
 
-function candidate(over: Partial<DrillCandidate> = {}, m: BackupManifest = manifest()): DrillCandidate {
+function candidate(
+  over: Partial<DrillCandidate> = {},
+  m: BackupManifest = manifest(),
+): DrillCandidate {
   return {
     backup_id: BACKUP_ID,
     artifact_ref: 'maia-2026-07-28T03-00-00-111122224333.dump',
@@ -474,18 +474,13 @@ describe('restore drill — `passed` is PROVEN clean, not assumed clean (#541)',
 
     expect(result.status).toBe('failed');
     expect(result.failure_code).toBe('cleanup_failed');
-    expect(result.cleanup.residue).toEqual([
-      { kind: 'drill_database', reason: 'still_present' },
-    ]);
+    expect(result.cleanup.residue).toEqual([{ kind: 'drill_database', reason: 'still_present' }]);
     // The removal was attempted and reported fine — only the proof caught it.
     expect(h.droppedDatabases).toEqual(h.createdDatabases);
   });
 
   it('fails when the DECRYPTED plaintext survives the removal', async () => {
-    const h = harness(
-      {},
-      { host: { filesLeft: (p) => p.endsWith('.plain') } },
-    );
+    const h = harness({}, { host: { filesLeft: (p) => p.endsWith('.plain') } });
     const result = await runRestoreDrill(h.ports, prodProfile());
 
     expect(result.status).toBe('failed');
@@ -796,7 +791,10 @@ describe('restore drill — fail-closed selection', () => {
 
   it('skips — with a code — only when backups are disabled by configuration', async () => {
     const h = harness();
-    const result = await runRestoreDrill(h.ports, resolveBackupProfile(cfg({ BACKUP_ENABLED: false })));
+    const result = await runRestoreDrill(
+      h.ports,
+      resolveBackupProfile(cfg({ BACKUP_ENABLED: false })),
+    );
     expect(result.status).toBe('skipped');
     expect(result.failure_code).toBe('backups_disabled');
     // `readReadinessFacts` ignores skipped rows, so readiness keeps saying
@@ -819,7 +817,12 @@ describe('restore drill — the manifest is the contract', () => {
   it('refuses a manifest VERSION this build does not understand (v1 under v2 semantics)', async () => {
     // A v1 manifest's `remote_checksum_verified` could be true because the
     // uploader's own metadata stamp came back from HEAD.
-    const legacy = { manifest: { ...manifest(), manifest_version: 1 }, signature: 'x', signature_alg: 'HMAC-SHA256', signature_key_version: 1 };
+    const legacy = {
+      manifest: { ...manifest(), manifest_version: 1 },
+      signature: 'x',
+      signature_alg: 'HMAC-SHA256',
+      signature_key_version: 1,
+    };
     const h = harness({}, { candidates: { offsite: candidate({ signed_manifest: legacy }) } });
     const result = await runRestoreDrill(h.ports, prodProfile());
     expect(result.failure_code).toBe('manifest_version_unsupported');
@@ -1071,11 +1074,18 @@ describe('restore drill — the anti-resurrection gate is exercised, not describ
   it('reports release_without_replay=true only when the ledger has nothing newer', async () => {
     const h = harness(
       {},
-      { tombstones: [tombstone({ id: 'ts-old', effective_at: new Date('2026-07-01T00:00:00.000Z') })] },
+      {
+        tombstones: [
+          tombstone({ id: 'ts-old', effective_at: new Date('2026-07-01T00:00:00.000Z') }),
+        ],
+      },
     );
     const result = await runRestoreDrill(h.ports, prodProfile());
     expect(result.tombstones_pending).toBe(0);
-    expect(result.probes.reconciliation).toMatchObject({ release_without_replay: true, release_reason: 'ok' });
+    expect(result.probes.reconciliation).toMatchObject({
+      release_without_replay: true,
+      release_reason: 'ok',
+    });
   });
 
   it('FAILS the drill when the ledger cannot be read (unreadable ≠ empty)', async () => {
@@ -1245,7 +1255,9 @@ describe('drillFailureCode', () => {
   });
 
   it('never echoes an unrecognised code', () => {
-    expect(drillFailureCode(new TypedError('postgres://user:pw@host/db', '', {}))).toBe('unexpected');
+    expect(drillFailureCode(new TypedError('postgres://user:pw@host/db', '', {}))).toBe(
+      'unexpected',
+    );
     expect(drillFailureCode(new Error('boom'))).toBe('unexpected');
     expect(drillFailureCode(null)).toBe('unexpected');
   });

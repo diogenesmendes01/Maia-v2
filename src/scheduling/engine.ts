@@ -27,13 +27,7 @@ import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import { pessoasRepo, conversasRepo, pendingQuestionsRepo } from '@/db/repositories.js';
-import {
-  seriesRepo,
-  occurrencesRepo,
-  tasksRepo,
-  outboxRepo,
-  advanceWithTx,
-} from './repos.js';
+import { seriesRepo, occurrencesRepo, tasksRepo, outboxRepo, advanceWithTx } from './repos.js';
 import { computeNext } from './rrule.js';
 import {
   parseRRule as parseRRuleExtended,
@@ -342,9 +336,7 @@ async function advanceRecurringOutreach(
     nome: destinatario.nome,
     mes_anterior: previousMonthLabel(new Date()),
   });
-  const text = occ.correlation_token
-    ? appendCorrelationFooter(body, occ.correlation_token)
-    : body;
+  const text = occ.correlation_token ? appendCorrelationFooter(body, occ.correlation_token) : body;
 
   // Transactional: task in_progress + occurrence awaiting_third_party +
   // outbox enqueue commit together.
@@ -726,10 +718,7 @@ export async function resolvePaymentOccurrence(
         }
       } catch (err) {
         dispatch_threw = (err as Error).message;
-        logger.warn(
-          { err: dispatch_threw, occurrence_id },
-          'payment_due.dispatch_threw',
-        );
+        logger.warn({ err: dispatch_threw, occurrence_id }, 'payment_due.dispatch_threw');
       }
     }
     const dispatchHasError =
@@ -743,7 +732,7 @@ export async function resolvePaymentOccurrence(
       // as `failed` with the reason and let the operator decide. Do NOT
       // schedule the next cycle (the series stays alive; the operator
       // can resume or cancel via cancel_reminder).
-      const reason = dispatch_threw ?? ((dispatch_result as { error: string }).error);
+      const reason = dispatch_threw ?? (dispatch_result as { error: string }).error;
       if (execTask) {
         await tasksRepo.setStatus(execTask.id, 'failed', {
           decision: 'sim',
@@ -871,8 +860,7 @@ export async function runSeriesNextScheduler(): Promise<{ scheduled: number }> {
       });
       const tasks: Array<{ ordem: number; kind: TaskKind }> =
         s.tipo === 'recurring_payment' ? paymentTaskBlueprint() : outreachTaskBlueprint();
-      const correlation_token =
-        s.tipo === 'recurring_outreach' ? newCorrelationToken() : undefined;
+      const correlation_token = s.tipo === 'recurring_outreach' ? newCorrelationToken() : undefined;
       const result = await seriesRepo.insertNextOccurrenceIfActive({
         series_id: s.id,
         expected_version: s.version,
@@ -891,10 +879,7 @@ export async function runSeriesNextScheduler(): Promise<{ scheduled: number }> {
         });
       }
     } catch (err) {
-      logger.warn(
-        { err: (err as Error).message, series_id: s.id },
-        'scheduling.backfill_failed',
-      );
+      logger.warn({ err: (err as Error).message, series_id: s.id }, 'scheduling.backfill_failed');
     }
   }
   return { scheduled };

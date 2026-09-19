@@ -83,16 +83,11 @@ export async function runConfidenceRecompute(): Promise<void> {
   let totalSkills = 0;
 
   for (const { tenant_id, agent_id } of tenants) {
-    const stats = await runWithTenantContext({ tenant_id, agent_id }, () =>
-      recomputeForTenant(),
-    );
+    const stats = await runWithTenantContext({ tenant_id, agent_id }, () => recomputeForTenant());
     totalUpdated += stats.updated;
     totalDomains += stats.domains;
     totalSkills += stats.skills;
-    logger.info(
-      { tenant_id, agent_id, ...stats },
-      'confidence_recompute.tenant_done',
-    );
+    logger.info({ tenant_id, agent_id, ...stats }, 'confidence_recompute.tenant_done');
   }
 
   logger.info(

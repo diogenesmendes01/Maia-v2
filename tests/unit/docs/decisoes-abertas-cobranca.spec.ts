@@ -230,7 +230,10 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     // são percentual, decimal e fração em palavras — nos dois sentidos de
     // leitura, porque o número tanto precede quanto segue o substantivo.
     padroes: [
-      { re: /holdout_fraction\s*"?\s*[:=]\s*"?\d/u, porque: 'campo do envelope com valor numérico' },
+      {
+        re: /holdout_fraction\s*"?\s*[:=]\s*"?\d/u,
+        porque: 'campo do envelope com valor numérico',
+      },
       {
         re: /\b\d{1,3}(?:[.,]\d+)?\s*(?:%|por cento)[^.\n]{0,70}\b(?:holdout|controle|tratamento)\b/iu,
         porque: 'percentual na vizinhança de holdout/controle/tratamento',
@@ -269,14 +272,23 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     rotulo: 'unidade experimental do holdout',
     pergunta: 'Q6(b)',
     padroes: [
-      { re: /holdout_unit\s*"?\s*[:=]\s*"?[A-Za-z_]/u, porque: 'campo do envelope com unidade concreta' },
+      {
+        re: /holdout_unit\s*"?\s*[:=]\s*"?[A-Za-z_]/u,
+        porque: 'campo do envelope com unidade concreta',
+      },
       {
         // Bordas Unicode, não `\b`: ver o comentário em VERBOS_ASSERTIVOS abaixo.
         re: /\bunidade experimental\b[^.\n]{0,30}(?<![\p{L}])(?:é|precisa ser|deve ser|será|passa a ser)(?![\p{L}])/iu,
         porque: 'unidade afirmada no indicativo',
       },
-      { re: /\bunidade experimental por devedor\b/iu, porque: 'unidade afirmada como mitigação vigente' },
-      { re: /\bunidade (?:de sorteio|do holdout)\s+[ée]\b/iu, porque: 'unidade afirmada no indicativo' },
+      {
+        re: /\bunidade experimental por devedor\b/iu,
+        porque: 'unidade afirmada como mitigação vigente',
+      },
+      {
+        re: /\bunidade (?:de sorteio|do holdout)\s+[ée]\b/iu,
+        porque: 'unidade afirmada no indicativo',
+      },
       {
         re: /\bitens de um mesmo devedor caem no mesmo bra[çc]o\b/iu,
         porque: 'critério de aceite que fixa a unidade',
@@ -329,12 +341,21 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     rotulo: 'janela de contato (horário, dias, feriados, fuso)',
     pergunta: 'Q5 / Q8',
     padroes: [
-      { re: /"(?:inicio|início|fim)"\s*:\s*"?\d{1,2}:\d{2}/u, porque: 'horário concreto no envelope' },
+      {
+        re: /"(?:inicio|início|fim)"\s*:\s*"?\d{1,2}:\d{2}/u,
+        porque: 'horário concreto no envelope',
+      },
       { re: /"tz"\s*:\s*"[A-Za-z]+\/[A-Za-z_]+"/u, porque: 'fuso concreto no envelope' },
       { re: /"dias"\s*:\s*\[/u, porque: 'lista concreta de dias no envelope' },
-      { re: /"respeita_feriados"\s*:\s*(?:true|false)/u, porque: 'política de feriado concreta no envelope' },
+      {
+        re: /"respeita_feriados"\s*:\s*(?:true|false)/u,
+        porque: 'política de feriado concreta no envelope',
+      },
       { re: /\bAm[ée]rica\/Sao_Paulo\b/u, porque: 'fuso concreto' },
-      { re: /\b\d{1,2}:\d{2}\s*(?:[àa]s|at[ée]|[-–])\s*\d{1,2}:\d{2}\b/u, porque: 'faixa de horário concreta' },
+      {
+        re: /\b\d{1,2}:\d{2}\s*(?:[àa]s|at[ée]|[-–])\s*\d{1,2}:\d{2}\b/u,
+        porque: 'faixa de horário concreta',
+      },
       {
         re: /\bjanela de contato\b[^.\n]{0,40}\b\d{1,2}\s*h(?:oras)?\b/iu,
         porque: 'janela de contato concreta em prosa',
@@ -360,7 +381,10 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     pergunta: 'Q7 / §9.1',
     padroes: [
       { re: /attribution_window_days\s*"?\s*[:=]\s*"?\d/u, porque: 'janela concreta no envelope' },
-      { re: /\bjanela de atribui[çc][ãa]o\b[^.\n]{0,40}\b\d+\s*dias?\b/iu, porque: 'janela concreta em prosa' },
+      {
+        re: /\bjanela de atribui[çc][ãa]o\b[^.\n]{0,40}\b\d+\s*dias?\b/iu,
+        porque: 'janela concreta em prosa',
+      },
       { re: /\batribui[çc][ãa]o\b[^.\n]{0,30}\d+\s*dias?\b/iu, porque: 'janela concreta em prosa' },
     ],
   },
@@ -369,7 +393,10 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     rotulo: 'superfície em que o humano atende a fila de exceções',
     pergunta: 'Q11',
     padroes: [
-      { re: /\bfila de exce[çc][õo]es no console\b/iu, porque: 'superfície afirmada no indicativo' },
+      {
+        re: /\bfila de exce[çc][õo]es no console\b/iu,
+        porque: 'superfície afirmada no indicativo',
+      },
       {
         re: /\bfila\s+(?:de exce[çc][õo]es\s+)?(?:do piloto\s+)?(?:[ée]|fica|vive|mora|est[áa])\s+(?:a\s+)?(?:no|do)\s+console\b/iu,
         porque: 'superfície afirmada no indicativo',
@@ -387,7 +414,10 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     rotulo: 'snapshot datado por ciclo como fonte da métrica',
     pergunta: 'Q1 / Q7',
     padroes: [
-      { re: /\bsnapshot\b[^.\n]{0,40}\b(?:por|a cada)\s+ciclo\b/iu, porque: 'mecanismo afirmado como decidido' },
+      {
+        re: /\bsnapshot\b[^.\n]{0,40}\b(?:por|a cada)\s+ciclo\b/iu,
+        porque: 'mecanismo afirmado como decidido',
+      },
       { re: /\bsnapshot datado\b/iu, porque: 'mecanismo afirmado como decidido' },
       { re: /\bsnapshot imut[áa]vel\b/iu, porque: 'mecanismo afirmado como decidido' },
     ],
@@ -397,16 +427,31 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     rotulo: 'resposta ao inbound do devedor (inclusive fora da janela)',
     pergunta: 'Q10',
     padroes: [
-      { re: /\bo agente\b[^.\n]{0,40}\bn[ãa]o responde\b/iu, porque: 'regra vigente sobre decisão aberta' },
+      {
+        re: /\bo agente\b[^.\n]{0,40}\bn[ãa]o responde\b/iu,
+        porque: 'regra vigente sobre decisão aberta',
+      },
       { re: /\bnunca responde ao devedor\b/iu, porque: 'regra vigente sobre decisão aberta' },
       { re: /\bnenhuma resposta aut[ôo]noma\b/iu, porque: 'regra vigente sobre decisão aberta' },
-      { re: /\bn[ãa]o existe resposta aut[ôo]noma\b/iu, porque: 'regra vigente sobre decisão aberta' },
+      {
+        re: /\bn[ãa]o existe resposta aut[ôo]noma\b/iu,
+        porque: 'regra vigente sobre decisão aberta',
+      },
       { re: /\bsem resposta aut[ôo]noma\b/iu, porque: 'regra vigente sobre decisão aberta' },
-      { re: /\bzero\b[^.\n]{0,24}\benvio aut[ôo]nomo\b/iu, porque: 'critério de aceite sobre decisão aberta' },
+      {
+        re: /\bzero\b[^.\n]{0,24}\benvio aut[ôo]nomo\b/iu,
+        porque: 'critério de aceite sobre decisão aberta',
+      },
       { re: /§\s*8\.2\s+prevale/iu, porque: 'resolução afirmada da Q10' },
       { re: /\bprevalece sobre a Q10\b/iu, porque: 'resolução afirmada da Q10' },
-      { re: /\bregra vigente\b/iu, porque: 'o texto declara regra vigente para uma decisão aberta' },
-      { re: /\bInbound do devedor\b[^.\n]{0,24}\bsai do loop\b/iu, porque: 'regra vigente sobre decisão aberta' },
+      {
+        re: /\bregra vigente\b/iu,
+        porque: 'o texto declara regra vigente para uma decisão aberta',
+      },
+      {
+        re: /\bInbound do devedor\b[^.\n]{0,24}\bsai do loop\b/iu,
+        porque: 'regra vigente sobre decisão aberta',
+      },
       { re: /\bem nenhum hor[áa]rio\b/iu, porque: 'regra vigente sobre decisão aberta' },
       { re: /\bem qualquer hor[áa]rio\b/iu, porque: 'critério de aceite sobre decisão aberta' },
     ],
@@ -416,8 +461,14 @@ const ITENS_ABERTOS: readonly ItemAberto[] = [
     rotulo: 'classe de aprovação e TTL do mandato',
     pergunta: 'Q9',
     padroes: [
-      { re: /approval_class\s*=\s*'?two_distinct_owners/iu, porque: 'classe concreta afirmada como decidida' },
-      { re: /\bDois owners distintos aprovam\b/iu, porque: 'classe concreta afirmada como decidida' },
+      {
+        re: /approval_class\s*=\s*'?two_distinct_owners/iu,
+        porque: 'classe concreta afirmada como decidida',
+      },
+      {
+        re: /\bDois owners distintos aprovam\b/iu,
+        porque: 'classe concreta afirmada como decidida',
+      },
       {
         re: /\bclasse de aprova[çc][ãa]o\b[^.\n]{0,24}[ée]\s+`?two_distinct_owners/iu,
         porque: 'classe concreta afirmada como decidida',
@@ -508,7 +559,10 @@ const RETORICA_PROIBIDA: readonly Padrao[] = [
     re: /\bA spec \*{0,2}prop[õo]e\*{0,2}\b/u,
     porque: 'a spec não propõe resposta para decisão aberta — ela lista opções',
   },
-  { re: /^\s*>?\s*\*\*Proposta[.:]?\*\*/u, porque: 'bloco "Proposta" marca uma opção como preferida' },
+  {
+    re: /^\s*>?\s*\*\*Proposta[.:]?\*\*/u,
+    porque: 'bloco "Proposta" marca uma opção como preferida',
+  },
   { re: /\bRESOLVIDA COMO PROPOSTA\b/u, porque: 'estado "proposta" é decisão sem assinatura' },
 ];
 
@@ -560,7 +614,9 @@ describe('decisões abertas do piloto de cobrança (#469)', () => {
   describe('cada decisão aberta tem bloco, e o bloco tem os dois campos vazios', () => {
     it('todo item da lista tem pelo menos um bloco DECISÃO ABERTA', () => {
       const presentes = new Set(todosOsBlocos().map((b) => b.id));
-      const faltando = ITENS_ABERTOS.filter((i) => !presentes.has(i.da)).map((i) => `${i.da} (${i.rotulo})`);
+      const faltando = ITENS_ABERTOS.filter((i) => !presentes.has(i.da)).map(
+        (i) => `${i.da} (${i.rotulo})`,
+      );
       expect(
         faltando,
         '\nSumiram blocos "> **DECISÃO ABERTA — …**" de itens que continuam abertos.\n' +
@@ -585,7 +641,11 @@ describe('decisões abertas do piloto de cobrança (#469)', () => {
         if (!at) problemas.push(`${local} — falta o campo \`decided_at:\``);
         if (!by || !at) continue;
 
-        const limpar = (v: string): string => v.replaceAll('`', '').replace(/^[\s—–-]+/u, '').trim();
+        const limpar = (v: string): string =>
+          v
+            .replaceAll('`', '')
+            .replace(/^[\s—–-]+/u, '')
+            .trim();
         const valorBy = limpar(by[1] ?? '');
         const valorAt = limpar(at[1] ?? '');
 
@@ -630,7 +690,8 @@ describe('decisões abertas do piloto de cobrança (#469)', () => {
 
       for (const fatia of ['3', '4', '5']) {
         const linha = conteudo.linhas.find(
-          (l) => l.texto.startsWith('|') && new RegExp(`\\*\\*Fatia ${fatia}\\b`, 'u').test(l.texto),
+          (l) =>
+            l.texto.startsWith('|') && new RegExp(`\\*\\*Fatia ${fatia}\\b`, 'u').test(l.texto),
         );
         if (!linha) {
           faltas.push(`§13 não tem linha para a Fatia ${fatia}`);
@@ -638,7 +699,9 @@ describe('decisões abertas do piloto de cobrança (#469)', () => {
         }
         for (const q of BLOQUEANTES) {
           if (!new RegExp(`\\b${q}\\b`, 'u').test(linha.texto)) {
-            faltas.push(`§13, Fatia ${fatia} (linha ${linha.numero}) não nomeia ${q} como pré-condição`);
+            faltas.push(
+              `§13, Fatia ${fatia} (linha ${linha.numero}) não nomeia ${q} como pré-condição`,
+            );
           }
         }
       }

@@ -74,12 +74,7 @@ import { logger } from '@/lib/logger.js';
 import { tryGetCurrentContext } from '@/db/tenant-context.js';
 import { tryGetCorrelation } from './correlation.js';
 import { counter } from './metrics.js';
-import {
-  METRIC,
-  SPAN_PARENT,
-  type SpanName,
-  type SpanStatus,
-} from './taxonomy.js';
+import { METRIC, SPAN_PARENT, type SpanName, type SpanStatus } from './taxonomy.js';
 import {
   sanitizeSpanAttributes,
   type SpanAttributes,
@@ -228,10 +223,7 @@ const SYSTEM_ATTRIBUTION: SpanAttribution = Object.freeze({
 });
 
 function isSystemAttribution(a: SpanAttribution): boolean {
-  return (
-    a.tenant_id === SYSTEM_ATTRIBUTION.tenant_id &&
-    a.agent_id === SYSTEM_ATTRIBUTION.agent_id
-  );
+  return a.tenant_id === SYSTEM_ATTRIBUTION.tenant_id && a.agent_id === SYSTEM_ATTRIBUTION.agent_id;
 }
 
 function sameAttribution(a: SpanAttribution, b: SpanAttribution): boolean {
@@ -284,9 +276,7 @@ function readAmbientAttribution(): SpanAttribution | null {
  * per-span objects created inside `spanStorage.run`, so two jobs running
  * different tenants never touch the same object.
  */
-export function publishSpanAttribution(
-  attribution: SpanAttribution | null | undefined,
-): void {
+export function publishSpanAttribution(attribution: SpanAttribution | null | undefined): void {
   if (!attribution) return;
   if (isSystemAttribution(attribution)) return;
   for (let span = spanStorage.getStore() ?? null; span !== null; span = span.parent) {
@@ -450,12 +440,7 @@ export async function withSpan<T>(
       return result;
     } catch (err) {
       safely(() =>
-        emit(
-          active,
-          options.statusOnError ?? 'error',
-          options.attributes ?? {},
-          Date.now(),
-        ),
+        emit(active, options.statusOnError ?? 'error', options.attributes ?? {}, Date.now()),
       );
       throw err;
     } finally {
@@ -525,8 +510,6 @@ function safely(fn: () => void): void {
     logger.debug({ err }, 'observability.span_emit_failed');
   }
 }
-
-
 
 /** Test-only: drop any span left open by a failed spec. */
 export function _resetTracerForTests(): void {

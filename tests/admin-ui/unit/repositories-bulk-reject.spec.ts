@@ -70,11 +70,23 @@ function makeBulkRejectRunner(proposals: MockProposal[]) {
     const skipped: string[] = [];
     for (const id of ids) {
       const proposal = state[id];
-      if (!proposal) { skipped.push(id); continue; }
-      if (proposal.risk !== 'low') { skipped.push(id); continue; }
-      if (proposal.locks.length > 0) { skipped.push(id); continue; }
+      if (!proposal) {
+        skipped.push(id);
+        continue;
+      }
+      if (proposal.risk !== 'low') {
+        skipped.push(id);
+        continue;
+      }
+      if (proposal.locks.length > 0) {
+        skipped.push(id);
+        continue;
+      }
       const result = decideAtomically(id);
-      if (!result.ok) { skipped.push(id); continue; }
+      if (!result.ok) {
+        skipped.push(id);
+        continue;
+      }
       rejected += 1;
     }
     return { rejected_count: rejected, skipped_ids: skipped };
@@ -143,7 +155,13 @@ describe('bulkReject — stale-row fix (round-2)', () => {
 
   it('skips proposals with architecture locks', async () => {
     const { bulkReject, state } = makeBulkRejectRunner([
-      { id: 'id-7', risk: 'low', status: 'submitted', locks: ['tool_blast_radius'], type: 'capability_proposal' },
+      {
+        id: 'id-7',
+        risk: 'low',
+        status: 'submitted',
+        locks: ['tool_blast_radius'],
+        type: 'capability_proposal',
+      },
     ]);
     const result = await bulkReject(['id-7']);
     expect(result.rejected_count).toBe(0);
@@ -156,7 +174,13 @@ describe('bulkReject — stale-row fix (round-2)', () => {
       { id: 'ok-1', risk: 'low', status: 'submitted', locks: [], type: 'capability_proposal' },
       { id: 'ok-2', risk: 'low', status: 'submitted', locks: [], type: 'capability_proposal' },
       { id: 'stale-1', risk: 'low', status: 'approved', locks: [], type: 'capability_proposal' },
-      { id: 'high-risk', risk: 'high', status: 'submitted', locks: [], type: 'capability_proposal' },
+      {
+        id: 'high-risk',
+        risk: 'high',
+        status: 'submitted',
+        locks: [],
+        type: 'capability_proposal',
+      },
     ]);
     const result = await bulkReject(['ok-1', 'ok-2', 'stale-1', 'high-risk']);
     expect(result.rejected_count).toBe(2);

@@ -55,11 +55,7 @@ function makePolicy(): ChannelPolicy {
   } as ChannelPolicy;
 }
 
-function makeInput(
-  text: string,
-  available: Role[],
-  current?: Role,
-): RoleSelectorInput {
+function makeInput(text: string, available: Role[], current?: Role): RoleSelectorInput {
   return {
     inbound_text: text,
     current_role: current ?? available[0]!,
@@ -132,9 +128,7 @@ describe('deterministicSuggester', () => {
     // Texto bate em "financeiro" (boleto), mas só temos default disponível.
     const def = makeRole('default', 'role-default');
 
-    const r = await deterministicSuggester.suggest(
-      makeInput('preciso do boleto urgente', [def]),
-    );
+    const r = await deterministicSuggester.suggest(makeInput('preciso do boleto urgente', [def]));
 
     expect(r).toBeNull();
   });
@@ -146,11 +140,7 @@ describe('deterministicSuggester', () => {
     const financeiro = makeRole('financeiro', 'role-fin');
     const available = [def, suporte, comercial, financeiro];
 
-    const inputs = [
-      'tenho um erro grave',
-      'qual o orçamento?',
-      'me envie o pix',
-    ];
+    const inputs = ['tenho um erro grave', 'qual o orçamento?', 'me envie o pix'];
 
     for (const text of inputs) {
       const r = await deterministicSuggester.suggest(makeInput(text, available));

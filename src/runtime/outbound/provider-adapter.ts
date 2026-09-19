@@ -65,10 +65,7 @@ import { readFile } from 'node:fs/promises';
 import type { LineOutput } from '@/gateway/line-output.js';
 import type { MediaRef, OutboundPayload, OutboundProviderChannel } from './contract.js';
 import { resolveOutboundMediaPath } from './media-store.js';
-import {
-  shouldPassIdempotencyKey,
-  type ProviderAttemptObservation,
-} from './delivery-contract.js';
+import { shouldPassIdempotencyKey, type ProviderAttemptObservation } from './delivery-contract.js';
 
 export type ProviderCallTarget = {
   line: LineOutput;

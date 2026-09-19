@@ -188,7 +188,11 @@ d('#506 — o aviso proativo é comprometido no ledger (Postgres real)', () => {
     // CONTROLE, no MESMO passe: chave diferente PRECISA criar linha. Sem ele,
     // "só uma linha" ficaria verde com o enqueue quebrado.
     const controle = await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT }, () =>
-      enqueueProactiveNotice({ jid: 'j@s.whatsapp.net', text: 'três', dedupe_key: 'sonda506:outra' }),
+      enqueueProactiveNotice({
+        jid: 'j@s.whatsapp.net',
+        text: 'três',
+        dedupe_key: 'sonda506:outra',
+      }),
     );
 
     expect(primeiro).toBe('enqueued');
@@ -203,10 +207,18 @@ d('#506 — o aviso proativo é comprometido no ledger (Postgres real)', () => {
 
   it('o aviso de um agente não aparece no ledger do agente vizinho', async () => {
     await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT }, () =>
-      enqueueProactiveNotice({ jid: 'a@s.whatsapp.net', text: 'do agente A', dedupe_key: 'sonda506:iso:a' }),
+      enqueueProactiveNotice({
+        jid: 'a@s.whatsapp.net',
+        text: 'do agente A',
+        dedupe_key: 'sonda506:iso:a',
+      }),
     );
     await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT_VIZINHO }, () =>
-      enqueueProactiveNotice({ jid: 'v@s.whatsapp.net', text: 'do vizinho', dedupe_key: 'sonda506:iso:v' }),
+      enqueueProactiveNotice({
+        jid: 'v@s.whatsapp.net',
+        text: 'do vizinho',
+        dedupe_key: 'sonda506:iso:v',
+      }),
     );
 
     const doAgente = await linhas(AGENT);

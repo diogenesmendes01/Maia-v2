@@ -202,7 +202,9 @@ describe(`${EXEMPLO} — o arquivo que o recurso de migration separado recebe (#
       (m) => m[1] as string,
     );
     const intrusas = exclusivasDeOutros.filter((n) => atribuidas.includes(n));
-    expect(intrusas, `${EXEMPLO} traz linha de atribuição para: ${intrusas.join(', ')}`).toEqual([]);
+    expect(intrusas, `${EXEMPLO} traz linha de atribuição para: ${intrusas.join(', ')}`).toEqual(
+      [],
+    );
   });
 
   it('declara TODA variável obrigatória no profile production', () => {

@@ -57,7 +57,10 @@ describe('pending-gate — snapshot path', () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-1',
       pergunta: 'Confirma?',
-      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim' },
+        { key: 'nao', label: 'Não' },
+      ],
       acao_proposta: { tool: 'register_transaction', args: { valor: 50 } },
     });
     callLLM.mockResolvedValueOnce({
@@ -86,7 +89,10 @@ describe('pending-gate — resolve path', () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-1',
       pergunta: 'Confirma?',
-      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim' },
+        { key: 'nao', label: 'Não' },
+      ],
       acao_proposta: { tool: 'register_transaction', args: { valor: 50 } },
     });
     callLLM.mockResolvedValueOnce({
@@ -118,7 +124,10 @@ describe('pending-gate — resolve path', () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-2',
       pergunta: 'Confirma?',
-      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim' },
+        { key: 'nao', label: 'Não' },
+      ],
       acao_proposta: {},
     });
     callLLM.mockResolvedValueOnce({
@@ -146,7 +155,10 @@ describe('pending-gate — resolve path', () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-cancel',
       pergunta: 'Confirma?',
-      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim' },
+        { key: 'nao', label: 'Não' },
+      ],
       acao_proposta: {},
     });
     callLLM.mockResolvedValueOnce({
@@ -176,7 +188,10 @@ describe('pending-gate — resolve path', () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-3',
       pergunta: 'Confirma?',
-      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim' },
+        { key: 'nao', label: 'Não' },
+      ],
       acao_proposta: {},
     });
     callLLM.mockResolvedValueOnce({
@@ -199,7 +214,10 @@ describe('pending-gate — resolve path', () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-4',
       pergunta: 'Confirma?',
-      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim' },
+        { key: 'nao', label: 'Não' },
+      ],
       acao_proposta: {},
     });
     callLLM.mockResolvedValueOnce({
@@ -225,7 +243,10 @@ describe('pending-gate — races de cancelamento e topic change', () => {
     findActiveSnapshot.mockResolvedValueOnce({
       id: 'pq-race',
       pergunta: 'Confirma?',
-      opcoes_validas: [{ key: 'sim', label: 'Sim' }, { key: 'nao', label: 'Não' }],
+      opcoes_validas: [
+        { key: 'sim', label: 'Sim' },
+        { key: 'nao', label: 'Não' },
+      ],
       acao_proposta: {},
     });
     callLLM.mockResolvedValueOnce({

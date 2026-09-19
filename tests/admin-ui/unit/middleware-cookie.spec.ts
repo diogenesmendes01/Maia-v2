@@ -221,9 +221,7 @@ describe('hasSessionCookie — pass / fail behavior', () => {
     // Plausible after stale cleanup or partial cookie injection. Auth.js
     // cannot reconstruct without `.0`, so the middleware must not let it
     // through.
-    expect(
-      hasSessionCookie([c('__Secure-authjs.session-token.1', FIXTURE_JWT)]),
-    ).toBe(false);
+    expect(hasSessionCookie([c('__Secure-authjs.session-token.1', FIXTURE_JWT)])).toBe(false);
   });
 
   it('fails for a gapped chunk set `.0` + `.2` (missing `.1`)', () => {
@@ -251,9 +249,7 @@ describe('hasSessionCookie — pass / fail behavior', () => {
 
   it('fails when only `.0` is present and its value is empty', () => {
     // Sign-out / cleared-session single-chunk variant.
-    expect(
-      hasSessionCookie([c('__Secure-authjs.session-token.0', '')]),
-    ).toBe(false);
+    expect(hasSessionCookie([c('__Secure-authjs.session-token.0', '')])).toBe(false);
   });
 
   it('passes for a contiguous chunk set `.0` + `.1` + `.2` (happy path)', () => {
@@ -275,9 +271,7 @@ describe('hasSessionCookie — pass / fail behavior', () => {
     // `.1+` expired/were cleared. Either way Auth.js cannot reconstruct, and
     // letting it through would render the protected app shell with `auth()`
     // returning null — the exact failure mode the gate exists to prevent.
-    expect(
-      hasSessionCookie([c('__Secure-authjs.session-token.0', FIXTURE_JWT)]),
-    ).toBe(false);
+    expect(hasSessionCookie([c('__Secure-authjs.session-token.0', FIXTURE_JWT)])).toBe(false);
   });
 
   it('fails for `.0` non-empty + `.1` empty (chunked form needs both populated)', () => {

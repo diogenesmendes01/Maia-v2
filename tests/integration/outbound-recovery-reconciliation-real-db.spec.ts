@@ -37,10 +37,7 @@ import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 
 import { runWithTenantContext } from '@/db/tenant-context.js';
-import {
-  buildOutboundArtifact,
-  type OutboundPayload,
-} from '@/runtime/outbound/contract.js';
+import { buildOutboundArtifact, type OutboundPayload } from '@/runtime/outbound/contract.js';
 import { outboundDeliveryRepo } from '@/db/repositories/outbound-delivery-repo.js';
 import { outboundRecoveryRepo } from '@/db/repositories/outbound-recovery-repo.js';
 import { __resetDeliveryWorkerIdForTest } from '@/runtime/outbound/delivery-contract.js';
@@ -55,8 +52,7 @@ import { agentTurnJobId } from '@/runtime/turns/job.js';
 import { _resetForTests, renderPrometheus } from '@/lib/metrics.js';
 
 const SHOULD_RUN =
-  !!process.env.TEST_DB_URL &&
-  process.env.DATABASE_URL === process.env.TEST_DB_URL;
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 const TENANT = 't633';
@@ -132,8 +128,7 @@ async function criarLinha(opts: {
       [TENANT, AGENT, conversaId],
     );
     const inbound_id = m.rows[0]!.id;
-    const turnHasClaim =
-      opts.turn_lease_s !== undefined && opts.turn_lease_s !== null;
+    const turnHasClaim = opts.turn_lease_s !== undefined && opts.turn_lease_s !== null;
     const t = await c.query<{ id: string }>(
       `INSERT INTO agent_turns
          (tenant_id, agent_id, representative_message_id, conversa_id, status,
@@ -335,15 +330,9 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
   afterAll(async () => {
     const c = await pool.connect();
     try {
-      await c.query(`DELETE FROM audit_log WHERE conversa_id = $1`, [
-        conversaId,
-      ]);
-      await c.query(`DELETE FROM outbound_messages WHERE tenant_id = $1`, [
-        TENANT,
-      ]);
-      await c.query(`DELETE FROM agent_turn_inputs WHERE tenant_id = $1`, [
-        TENANT,
-      ]);
+      await c.query(`DELETE FROM audit_log WHERE conversa_id = $1`, [conversaId]);
+      await c.query(`DELETE FROM outbound_messages WHERE tenant_id = $1`, [TENANT]);
+      await c.query(`DELETE FROM agent_turn_inputs WHERE tenant_id = $1`, [TENANT]);
       await c.query(`DELETE FROM agent_turns WHERE tenant_id = $1`, [TENANT]);
       await c.query(`DELETE FROM mensagens WHERE tenant_id = $1`, [TENANT]);
       await c.query(`DELETE FROM conversas WHERE tenant_id = $1`, [TENANT]);
@@ -373,20 +362,14 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
     _resetForTests();
     const c = await pool.connect();
     try {
-      await c.query(`DELETE FROM audit_log WHERE conversa_id = $1`, [
+      await c.query(`DELETE FROM audit_log WHERE conversa_id = $1`, [conversaId]);
+      await c.query(`DELETE FROM outbound_messages WHERE tenant_id = $1`, [TENANT]);
+      await c.query(`DELETE FROM agent_turn_inputs WHERE tenant_id = $1`, [TENANT]);
+      await c.query(`DELETE FROM agent_turns WHERE tenant_id = $1`, [TENANT]);
+      await c.query(`DELETE FROM mensagens WHERE tenant_id = $1 AND conversa_id = $2`, [
+        TENANT,
         conversaId,
       ]);
-      await c.query(`DELETE FROM outbound_messages WHERE tenant_id = $1`, [
-        TENANT,
-      ]);
-      await c.query(`DELETE FROM agent_turn_inputs WHERE tenant_id = $1`, [
-        TENANT,
-      ]);
-      await c.query(`DELETE FROM agent_turns WHERE tenant_id = $1`, [TENANT]);
-      await c.query(
-        `DELETE FROM mensagens WHERE tenant_id = $1 AND conversa_id = $2`,
-        [TENANT, conversaId],
-      );
     } finally {
       c.release();
     }
@@ -489,9 +472,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
     expect(tokenAntigo).toBeTruthy();
 
     // A varredura enxerga a linha (é o predicado do índice novo da 131).
-    const candidatos = await comoEscopo(() =>
-      outboundRecoveryRepo.listDeliverable(50),
-    );
+    const candidatos = await comoEscopo(() => outboundRecoveryRepo.listDeliverable(50));
     expect(candidatos.map((c) => c.outbound_id)).toContain(f.outbound_id);
 
     // O SUCESSOR reivindica — pelo claim atômico de PRODUÇÃO.
@@ -879,9 +860,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
     } finally {
       c.release();
     }
-    const d1 = await comoEscopo(() =>
-      outboundRecoveryRepo.countTurnOutboundDivergence(),
-    );
+    const d1 = await comoEscopo(() => outboundRecoveryRepo.countTurnOutboundDivergence());
     expect(d1.turn_pending_without_outbound).toBe(1);
     expect(d1.outbound_without_live_turn).toBe(0);
   });
@@ -892,9 +871,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
       turn_status: 'completed',
       turn_outcome: 'reply_delivered',
     });
-    const d2 = await comoEscopo(() =>
-      outboundRecoveryRepo.countTurnOutboundDivergence(),
-    );
+    const d2 = await comoEscopo(() => outboundRecoveryRepo.countTurnOutboundDivergence());
     expect(d2.outbound_without_live_turn).toBe(1);
     expect(d2.turn_pending_without_outbound).toBe(0);
   });
@@ -1027,15 +1004,9 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
       delivery_outcome: 'accepted_confirmed',
     });
 
-    const candidates = await comoEscopo(() =>
-      outboundRecoveryRepo.listFinalizableTurns(50),
-    );
-    expect(candidates.map((candidate) => candidate.turn_id)).not.toContain(
-      viva.turn_id,
-    );
-    expect(candidates.map((candidate) => candidate.turn_id)).not.toContain(
-      semLease.turn_id,
-    );
+    const candidates = await comoEscopo(() => outboundRecoveryRepo.listFinalizableTurns(50));
+    expect(candidates.map((candidate) => candidate.turn_id)).not.toContain(viva.turn_id);
+    expect(candidates.map((candidate) => candidate.turn_id)).not.toContain(semLease.turn_id);
 
     await comoEscopo(() => runOutboundRecoveryForScope(SCOPE));
     expect((await turno(viva.turn_id)).status).toBe('outbound_pending');
@@ -1053,22 +1024,15 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
       status: 'delivered',
     });
 
-    const before = await comoEscopo(() =>
-      outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id),
-    );
+    const before = await comoEscopo(() => outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id));
     expect(before).toEqual({
       finalized: false,
       reason: 'artifacts_unresolved',
     });
     expect((await turno(f.turn_id)).status).toBe('outbound_pending');
 
-    await pool.query(
-      `UPDATE outbound_messages SET status = 'completed' WHERE id = $1`,
-      [second],
-    );
-    const after = await comoEscopo(() =>
-      outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id),
-    );
+    await pool.query(`UPDATE outbound_messages SET status = 'completed' WHERE id = $1`, [second]);
+    const after = await comoEscopo(() => outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id));
     expect(after.finalized).toBe(true);
     expect((await turno(f.turn_id)).status).toBe('completed');
   });
@@ -1082,9 +1046,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
 
     const results = await comoEscopo(() =>
       Promise.all(
-        Array.from({ length: 10 }, () =>
-          outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id),
-        ),
+        Array.from({ length: 10 }, () => outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id)),
       ),
     );
     expect(results.filter((result) => result.finalized)).toHaveLength(1);
@@ -1103,9 +1065,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
       delivery_outcome: 'accepted_confirmed',
       turn_lease_s: -30,
     });
-    const result = await comoEscopo(() =>
-      outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id),
-    );
+    const result = await comoEscopo(() => outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id));
     expect(result.finalized).toBe(true);
     expect((await turno(f.turn_id)).outcome).toBe('fallback_delivered');
   });
@@ -1117,17 +1077,11 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
       turn_lease_s: -30,
       idade_s: 300,
     });
-    const result = await comoEscopo(() =>
-      outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id),
-    );
+    const result = await comoEscopo(() => outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id));
     expect(result).toEqual({ finalized: false, reason: 'no_success' });
 
-    expect(await outboundRecoveryRepo.listScopesWithWork()).toContainEqual(
-      SCOPE,
-    );
-    expect(
-      await comoEscopo(() => outboundRecoveryRepo.listFinalizableTurns(1)),
-    ).toEqual([]);
+    expect(await outboundRecoveryRepo.listScopesWithWork()).toContainEqual(SCOPE);
+    expect(await comoEscopo(() => outboundRecoveryRepo.listFinalizableTurns(1))).toEqual([]);
     const stats = await comoEscopo(() => runOutboundRecoveryForScope(SCOPE));
     expect(stats.no_success_pending).toBe(1);
     expect(await renderPrometheus()).toMatch(
@@ -1170,9 +1124,9 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
       idade_s: 300,
     });
 
-    expect(
-      await comoEscopo(() => outboundRecoveryRepo.listFinalizableTurns(1)),
-    ).toEqual([{ turn_id: successful.turn_id }]);
+    expect(await comoEscopo(() => outboundRecoveryRepo.listFinalizableTurns(1))).toEqual([
+      { turn_id: successful.turn_id },
+    ]);
 
     const stats = await comoEscopo(() => runOutboundRecoveryForScope(SCOPE));
     expect(stats.reconciled.turn_finalized).toBe(1);
@@ -1190,9 +1144,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
     });
     await adicionarParte(f, { sequence: 1, status: 'cancelled' });
 
-    const result = await comoEscopo(() =>
-      outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id),
-    );
+    const result = await comoEscopo(() => outboundRecoveryRepo.finalizeResolvedTurnTx(f.turn_id));
     expect(result.finalized).toBe(true);
     expect((await turno(f.turn_id)).outcome).toBe('fallback_delivered');
     const audit = await pool.query<{ metadata: Record<string, unknown> }>(
@@ -1261,9 +1213,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
         promoted_by_turn_id: f.turn_id,
       });
       expect(promoted.rows[0]!.promoted_at).not.toBeNull();
-      expect(
-        await agentQueue.getJob(agentTurnJobId(successorId)),
-      ).toBeDefined();
+      expect(await agentQueue.getJob(agentTurnJobId(successorId))).toBeDefined();
 
       const audit = await pool.query<{ metadata: Record<string, unknown> }>(
         `SELECT metadata FROM audit_log
@@ -1295,9 +1245,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
       turn_outcome: 'reply_delivered',
     });
     await criarLinha({ status: 'retryable', idade_s: 600 });
-    const idade = await comoEscopo(() =>
-      outboundRecoveryRepo.oldestPendingAgeSeconds(),
-    );
+    const idade = await comoEscopo(() => outboundRecoveryRepo.oldestPendingAgeSeconds());
     // A `completed` de 10.000s não conta; a `retryable` de 600s conta.
     expect(idade).toBeGreaterThanOrEqual(600);
     expect(idade).toBeLessThan(1_000);
@@ -1311,9 +1259,7 @@ d('#633 — recuperação e reconciliação do outbox (Postgres real)', () => {
       turn_status: 'dead_letter',
       turn_outcome: 'retry_exhausted',
     });
-    const idade = await comoEscopo(() =>
-      outboundRecoveryRepo.oldestPendingAgeSeconds(),
-    );
+    const idade = await comoEscopo(() => outboundRecoveryRepo.oldestPendingAgeSeconds());
     expect(idade).toBe(0);
   });
 });

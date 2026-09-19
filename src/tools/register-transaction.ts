@@ -16,7 +16,9 @@ const inputSchema = z.object({
   entidade_id: z
     .string()
     .uuid()
-    .describe('UUID opaco da entidade dona da conta. Nunca invente: use um id já visto no contexto.'),
+    .describe(
+      'UUID opaco da entidade dona da conta. Nunca invente: use um id já visto no contexto.',
+    ),
   conta_id: z
     .string()
     .uuid()
@@ -98,10 +100,11 @@ export const registerTransactionTool: Tool<typeof inputSchema, typeof outputSche
   // branch (the `withTx` that returns `{ transacao_id, saldo_apos }`). The
   // duplicate-suspected EARLY RETURN exits before any tx, so it self-audited
   // nothing — the dispatcher must still fire its fallback audit() there.
-  auditedInTx: (result) =>
-    'transacao_id' in result && typeof result.transacao_id === 'string',
+  auditedInTx: (result) => 'transacao_id' in result && typeof result.transacao_id === 'string',
   extractAlvoId: (result) =>
-    'transacao_id' in result && typeof result.transacao_id === 'string' ? result.transacao_id : null,
+    'transacao_id' in result && typeof result.transacao_id === 'string'
+      ? result.transacao_id
+      : null,
   handler: async (args, ctx) => {
     const conta = await contasRepo.byId(args.conta_id);
     if (!conta) throw new TypedError('conta_not_found', 'conta não existe');

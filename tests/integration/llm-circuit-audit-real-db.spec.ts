@@ -97,9 +97,8 @@ if (SHOULD_RUN) {
 d('disjuntor → audit_log (Postgres real)', () => {
   /** Leva o disjuntor de `closed` a `open` pelo caminho de verdade. */
   async function openCircuit(): Promise<void> {
-    const { acquireCircuit, releaseCircuit, circuitState, _internal } = await import(
-      '@/lib/llm/circuit-breaker.js'
-    );
+    const { acquireCircuit, releaseCircuit, circuitState, _internal } =
+      await import('@/lib/llm/circuit-breaker.js');
     const { drainCircuitAudits } = await import('@/lib/llm/circuit-audit.js');
     _internal.reset();
     _internal.setMode('enforce');
@@ -115,9 +114,8 @@ d('disjuntor → audit_log (Postgres real)', () => {
 
   /** Fecha o disjuntor com uma sonda bem sucedida. */
   async function closeCircuit(): Promise<void> {
-    const { acquireCircuit, releaseCircuit, circuitState, _internal } = await import(
-      '@/lib/llm/circuit-breaker.js'
-    );
+    const { acquireCircuit, releaseCircuit, circuitState, _internal } =
+      await import('@/lib/llm/circuit-breaker.js');
     const { drainCircuitAudits } = await import('@/lib/llm/circuit-audit.js');
     const key = { provider: 'anthropic', workload: 'reasoner' } as const;
     const entry = _internal.circuits.get(JSON.stringify([key.provider, key.workload]))!;
@@ -161,10 +159,7 @@ d('disjuntor → audit_log (Postgres real)', () => {
   it('o par open → closed fica registrado na ordem', async () => {
     await openCircuit();
     await closeCircuit();
-    expect((await rows()).map((r) => r.acao)).toEqual([
-      'llm_circuit_opened',
-      'llm_circuit_closed',
-    ]);
+    expect((await rows()).map((r) => r.acao)).toEqual(['llm_circuit_opened', 'llm_circuit_closed']);
   });
 
   it('`half_open` NÃO audita — auditá-lo quebraria o casamento open/closed', async () => {
@@ -207,9 +202,8 @@ d('audit-watcher encontra o par (Postgres real)', () => {
   }
 
   it('detecta o caso "stuck": aberto há mais de 5 min sem `closed`', async () => {
-    const { acquireCircuit, releaseCircuit, _internal } = await import(
-      '@/lib/llm/circuit-breaker.js'
-    );
+    const { acquireCircuit, releaseCircuit, _internal } =
+      await import('@/lib/llm/circuit-breaker.js');
     const { drainCircuitAudits } = await import('@/lib/llm/circuit-audit.js');
     _internal.reset();
     _internal.setMode('enforce');
@@ -226,9 +220,8 @@ d('audit-watcher encontra o par (Postgres real)', () => {
   });
 
   it('um `closed` posterior desarma a regra', async () => {
-    const { acquireCircuit, releaseCircuit, circuitState, _internal } = await import(
-      '@/lib/llm/circuit-breaker.js'
-    );
+    const { acquireCircuit, releaseCircuit, circuitState, _internal } =
+      await import('@/lib/llm/circuit-breaker.js');
     const { drainCircuitAudits } = await import('@/lib/llm/circuit-audit.js');
     _internal.reset();
     _internal.setMode('enforce');
@@ -291,9 +284,8 @@ d('correlação do watcher por circuito e réplica (Postgres real)', () => {
 
   /** Abre o disjuntor de `workload` pelo caminho real (tempestade terminal). */
   async function open(workload: 'reasoner' | 'summarizer'): Promise<void> {
-    const { acquireCircuit, releaseCircuit, circuitState, _internal } = await import(
-      '@/lib/llm/circuit-breaker.js'
-    );
+    const { acquireCircuit, releaseCircuit, circuitState, _internal } =
+      await import('@/lib/llm/circuit-breaker.js');
     const key = { provider: 'anthropic', workload } as const;
     for (let i = 0; i < _internal.MIN_SAMPLES; i++) {
       releaseCircuit(acquireCircuit(key), 'terminal_fault');
@@ -303,9 +295,8 @@ d('correlação do watcher por circuito e réplica (Postgres real)', () => {
 
   /** Fecha o disjuntor de `workload` com uma sonda bem sucedida. */
   async function close(workload: 'reasoner' | 'summarizer'): Promise<void> {
-    const { acquireCircuit, releaseCircuit, circuitState, _internal } = await import(
-      '@/lib/llm/circuit-breaker.js'
-    );
+    const { acquireCircuit, releaseCircuit, circuitState, _internal } =
+      await import('@/lib/llm/circuit-breaker.js');
     const key = { provider: 'anthropic', workload } as const;
     const entry = _internal.circuits.get(JSON.stringify([key.provider, key.workload]))!;
     entry.opened_at -= _internal.OPEN_MS + 1;
@@ -315,9 +306,11 @@ d('correlação do watcher por circuito e réplica (Postgres real)', () => {
 
   it('o produtor grava a identidade da réplica em `metadata.replica`', async () => {
     const { _internal } = await import('@/lib/llm/circuit-breaker.js');
-    const { drainCircuitAudits, REPLICA_METADATA_KEY, _internal: auditInternal } = await import(
-      '@/lib/llm/circuit-audit.js'
-    );
+    const {
+      drainCircuitAudits,
+      REPLICA_METADATA_KEY,
+      _internal: auditInternal,
+    } = await import('@/lib/llm/circuit-audit.js');
     _internal.reset();
     _internal.setMode('enforce');
     await open('reasoner');
@@ -362,9 +355,7 @@ d('correlação do watcher por circuito e réplica (Postgres real)', () => {
 
   it('réplica: o `closed` de uma réplica não fecha o `opened` de outra', async () => {
     const { _internal } = await import('@/lib/llm/circuit-breaker.js');
-    const { drainCircuitAudits, REPLICA_METADATA_KEY } = await import(
-      '@/lib/llm/circuit-audit.js'
-    );
+    const { drainCircuitAudits, REPLICA_METADATA_KEY } = await import('@/lib/llm/circuit-audit.js');
     _internal.reset();
     _internal.setMode('enforce');
 
@@ -426,9 +417,8 @@ d('kill switch → audit_log (Postgres real)', () => {
   const ACTOR = `sre:audit-real-db-${process.pid}`;
 
   it('override aplicado e recusado viram linhas com ator e motivo', async () => {
-    const { applyCircuitOverride, _internal: modeInternal } = await import(
-      '@/lib/llm/circuit-mode.js'
-    );
+    const { applyCircuitOverride, _internal: modeInternal } =
+      await import('@/lib/llm/circuit-mode.js');
     const { drainCircuitAudits } = await import('@/lib/llm/circuit-audit.js');
     modeInternal.reset();
 
@@ -438,8 +428,7 @@ d('kill switch → audit_log (Postgres real)', () => {
     modeInternal.reset();
 
     const found = (await rows()).filter(
-      (r) =>
-        r.metadata.actor === ACTOR || String(r.metadata.reason ?? '').includes(ACTOR),
+      (r) => r.metadata.actor === ACTOR || String(r.metadata.reason ?? '').includes(ACTOR),
     );
     // NAO se afirma ORDEM aqui, e a razao e CONCORRENCIA, nao empate de relogio.
     //

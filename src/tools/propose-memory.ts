@@ -9,22 +9,12 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/index.js';
-import {
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import type { KnowledgeScope } from '@/control-plane/knowledge-state-machine/types.js';
 
 const inputSchema = z.object({
   memory_type: z.enum(['operational', 'preference', 'personal', 'sensitive']),
-  scope_type: z.enum([
-    'interlocutor',
-    'role',
-    'channel',
-    'conversation',
-    'agent',
-    'tenant',
-  ]),
+  scope_type: z.enum(['interlocutor', 'role', 'channel', 'conversation', 'agent', 'tenant']),
   subject_id: z.string().optional(),
   conteudo: z.string().min(1).max(2000),
   sensibilidade: z.enum(['low', 'medium', 'high']).default('low'),
@@ -79,9 +69,7 @@ export const proposeMemoryTool: Tool<typeof inputSchema, typeof outputSchema> = 
       agent_id: getCurrentAgent(),
       kind: 'memory',
       scope,
-      ...(args.subject_id !== undefined
-        ? { scope_value: args.subject_id }
-        : {}),
+      ...(args.subject_id !== undefined ? { scope_value: args.subject_id } : {}),
       key: args.memory_type,
       content: {
         memory_type: args.memory_type,
@@ -95,8 +83,7 @@ export const proposeMemoryTool: Tool<typeof inputSchema, typeof outputSchema> = 
       source: 'tool:propose_memory',
       // memory_type='sensitive' lifts the sensitivity hint regardless
       // of the caller-provided one — preserves the §2.6 invariant.
-      sensitivity_hint:
-        args.memory_type === 'sensitive' ? 'high' : args.sensibilidade,
+      sensitivity_hint: args.memory_type === 'sensitive' ? 'high' : args.sensibilidade,
       ...(args.ttl_days !== undefined ? { ttl_days: args.ttl_days } : {}),
       // Codex round-2 finding 2: persist native memory_entry columns so
       // findRelevant (which matches scope_type ∈
@@ -107,18 +94,15 @@ export const proposeMemoryTool: Tool<typeof inputSchema, typeof outputSchema> = 
         memory_scope_type: args.scope_type,
         memory_subject_id: args.subject_id ?? null,
         memory_interlocutor_id:
-          args.scope_type === 'interlocutor' ? args.subject_id ?? null : null,
-        memory_conversa_id:
-          args.scope_type === 'conversation' ? args.subject_id ?? null : null,
-        memory_sensitivity:
-          args.memory_type === 'sensitive' ? 'high' : args.sensibilidade,
+          args.scope_type === 'interlocutor' ? (args.subject_id ?? null) : null,
+        memory_conversa_id: args.scope_type === 'conversation' ? (args.subject_id ?? null) : null,
+        memory_sensitivity: args.memory_type === 'sensitive' ? 'high' : args.sensibilidade,
         memory_proactive_use: false,
         memory_mention_allowed: false,
       },
     });
 
-    const initial_status =
-      result.initial_status === 'ephemeral' ? 'ephemeral' : 'pending_review';
+    const initial_status = result.initial_status === 'ephemeral' ? 'ephemeral' : 'pending_review';
 
     return {
       proposal_id: result.proposal_id,

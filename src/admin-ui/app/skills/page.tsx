@@ -29,20 +29,8 @@ import { Button } from '../../components/ui/button.js';
 import { StatusBadge } from '../../components/ui/badge.js';
 import { Field, Select } from '../../components/ui/field.js';
 import { Tabs } from '../../components/ui/tabs.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../components/ui/table.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-  Alert,
-} from '../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState, Alert } from '../../components/ui/states.js';
 import { IconZap, IconPlus } from '../../components/ui/icons.js';
 
 type SkillStatus = 'active' | 'proposed' | 'deprecated' | 'rolled_back';
@@ -86,10 +74,7 @@ export default function SkillsPage() {
     enabled: role === 'founder',
   });
 
-  const agentsQuery = trpc.agents.list.useQuery(
-    { tenantId },
-    { enabled: tenantId !== '' },
-  );
+  const agentsQuery = trpc.agents.list.useQuery({ tenantId }, { enabled: tenantId !== '' });
 
   const listQuery = trpc.skills.list.useQuery(
     { tenantId, agentId, status: tab },
@@ -136,10 +121,7 @@ export default function SkillsPage() {
       <div className="mb-5 flex flex-wrap items-end gap-4">
         {role === 'founder' ? (
           <Field label="Tenant" className="w-56">
-            <Select
-              value={tenantId}
-              onChange={(e) => onTenantChange(e.target.value)}
-            >
+            <Select value={tenantId} onChange={(e) => onTenantChange(e.target.value)}>
               <option value="">Selecione…</option>
               {(tenantsQuery.data?.items ?? []).map((t) => (
                 <option key={t.id} value={t.id}>
@@ -190,10 +172,7 @@ export default function SkillsPage() {
       ) : listQuery.isLoading ? (
         <LoadingState label="Carregando skills…" />
       ) : listQuery.error ? (
-        <ErrorState
-          message={listQuery.error.message}
-          onRetry={() => void listQuery.refetch()}
-        />
+        <ErrorState message={listQuery.error.message} onRetry={() => void listQuery.refetch()} />
       ) : skills.length === 0 ? (
         <EmptyState
           icon={<IconZap size={36} />}
@@ -203,9 +182,8 @@ export default function SkillsPage() {
         <div className="space-y-3">
           {listTruncated && (
             <Alert tone="warning" title="Lista truncada">
-              Mostrando as primeiras {skills.length} skills. Há mais do que isso
-              para o filtro atual — refine por agente ou status para ver o
-              restante.
+              Mostrando as primeiras {skills.length} skills. Há mais do que isso para o filtro atual
+              — refine por agente ou status para ver o restante.
             </Alert>
           )}
           <TableShell>
@@ -220,11 +198,7 @@ export default function SkillsPage() {
               </THead>
               <tbody>
                 {skills.map((s) => (
-                  <Tr
-                    key={s.id}
-                    onClick={() => setSelectedId(s.id)}
-                    className="cursor-pointer"
-                  >
+                  <Tr key={s.id} onClick={() => setSelectedId(s.id)} className="cursor-pointer">
                     <Td>
                       <code className="font-mono text-xs">{s.skill_descriptor}</code>
                     </Td>

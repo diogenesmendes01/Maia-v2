@@ -64,7 +64,9 @@ describe('generate_report — schema validation', () => {
   it('rejects extrato with missing entidade_id', async () => {
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const parsed = generateReportTool.input_schema.safeParse({
-      tipo: 'extrato', date_from: '2026-04-01', date_to: '2026-04-30',
+      tipo: 'extrato',
+      date_from: '2026-04-01',
+      date_to: '2026-04-30',
     });
     expect(parsed.success).toBe(false);
   });
@@ -72,21 +74,22 @@ describe('generate_report — schema validation', () => {
   it('rejects comparativo with only 1 entidade_ids', async () => {
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const parsed = generateReportTool.input_schema.safeParse({
-      tipo: 'comparativo', entidade_ids: ['00000000-0000-0000-0000-000000000001'],
-      date_from: '2026-04-01', date_to: '2026-04-30',
+      tipo: 'comparativo',
+      entidade_ids: ['00000000-0000-0000-0000-000000000001'],
+      date_from: '2026-04-01',
+      date_to: '2026-04-30',
     });
     expect(parsed.success).toBe(false);
   });
 
   it('rejects comparativo with > 8 entidade_ids', async () => {
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
-    const ids = Array.from({ length: 9 }, (_, i) =>
-      `00000000-0000-0000-0000-00000000000${i + 1}`,
-    );
+    const ids = Array.from({ length: 9 }, (_, i) => `00000000-0000-0000-0000-00000000000${i + 1}`);
     const parsed = generateReportTool.input_schema.safeParse({
       tipo: 'comparativo',
       entidade_ids: ids,
-      date_from: '2026-04-01', date_to: '2026-04-30',
+      date_from: '2026-04-01',
+      date_to: '2026-04-30',
     });
     expect(parsed.success).toBe(false);
   });
@@ -103,7 +106,12 @@ describe('generate_report — extrato handler', () => {
     const eOther = '00000000-0000-0000-0000-000000000099';
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const out = await generateReportTool.handler(
-      { tipo: 'extrato', entidade_id: eOther, date_from: '2026-04-01', date_to: '2026-04-30' } as never,
+      {
+        tipo: 'extrato',
+        entidade_id: eOther,
+        date_from: '2026-04-01',
+        date_to: '2026-04-30',
+      } as never,
       ctx,
     );
     expect(out).toEqual(expect.objectContaining({ error: 'forbidden' }));
@@ -116,16 +124,39 @@ describe('generate_report — extrato handler', () => {
     const ctxWithE = { ...ctx, scope: { entidades: [eUuid], byEntity: new Map() } };
     entidadeById.mockResolvedValue({ id: eUuid, nome: 'Empresa Teste' });
     byScope.mockResolvedValue([
-      { data_competencia: '2026-04-05', natureza: 'receita', valor: '1500.00', descricao: 'X', categoria_id: 'cat1' },
-      { data_competencia: '2026-04-10', natureza: 'despesa', valor: '300.00', descricao: 'Y', categoria_id: null },
+      {
+        data_competencia: '2026-04-05',
+        natureza: 'receita',
+        valor: '1500.00',
+        descricao: 'X',
+        categoria_id: 'cat1',
+      },
+      {
+        data_competencia: '2026-04-10',
+        natureza: 'despesa',
+        valor: '300.00',
+        descricao: 'Y',
+        categoria_id: null,
+      },
     ]);
     categoriasByIds.mockResolvedValue([{ id: 'cat1', nome: 'Vendas' }]);
 
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const out = (await generateReportTool.handler(
-      { tipo: 'extrato', entidade_id: eUuid, date_from: '2026-04-01', date_to: '2026-04-30' } as never,
+      {
+        tipo: 'extrato',
+        entidade_id: eUuid,
+        date_from: '2026-04-01',
+        date_to: '2026-04-30',
+      } as never,
       ctxWithE,
-    )) as { path: string; fileName: string; mimetype: string; tipo: string; summary: { totals: { receita: number; despesa: number; lucro: number } } };
+    )) as {
+      path: string;
+      fileName: string;
+      mimetype: string;
+      tipo: string;
+      summary: { totals: { receita: number; despesa: number; lucro: number } };
+    };
 
     expect(out.mimetype).toBe('application/pdf');
     expect(out.tipo).toBe('extrato');
@@ -147,7 +178,12 @@ describe('generate_report — comparativo handler', () => {
     const eY = '00000000-0000-0000-0000-0000000000bb';
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const out = await generateReportTool.handler(
-      { tipo: 'comparativo', entidade_ids: [eX, eY], date_from: '2026-04-01', date_to: '2026-04-30' } as never,
+      {
+        tipo: 'comparativo',
+        entidade_ids: [eX, eY],
+        date_from: '2026-04-01',
+        date_to: '2026-04-30',
+      } as never,
       ctx,
     );
     expect(out).toEqual(expect.objectContaining({ error: 'forbidden' }));
@@ -159,7 +195,12 @@ describe('generate_report — comparativo handler', () => {
     const ctxOne = { ...ctx, scope: { entidades: [e1], byEntity: new Map() } };
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const out = await generateReportTool.handler(
-      { tipo: 'comparativo', entidade_ids: [e1, eOther], date_from: '2026-04-01', date_to: '2026-04-30' } as never,
+      {
+        tipo: 'comparativo',
+        entidade_ids: [e1, eOther],
+        date_from: '2026-04-01',
+        date_to: '2026-04-30',
+      } as never,
       ctxOne,
     );
     expect(out).toEqual(expect.objectContaining({ error: 'comparativo_needs_two' }));
@@ -169,7 +210,8 @@ describe('generate_report — comparativo handler', () => {
   // this test runs unskipped.
   it('happy path: 2 entidades produces valid PDF', async () => {
     entidadesByIds.mockResolvedValue([
-      { id: 'e1', nome: 'A' }, { id: 'e2', nome: 'B' },
+      { id: 'e1', nome: 'A' },
+      { id: 'e2', nome: 'B' },
     ]);
     byScope
       .mockResolvedValueOnce([{ natureza: 'receita', valor: '1000.00' }])
@@ -180,9 +222,18 @@ describe('generate_report — comparativo handler', () => {
     ]);
     const { generateReportTool } = await import('../../src/tools/generate-report.js');
     const out = (await generateReportTool.handler(
-      { tipo: 'comparativo', entidade_ids: ['e1','e2'], date_from: '2026-04-01', date_to: '2026-04-30' } as never,
+      {
+        tipo: 'comparativo',
+        entidade_ids: ['e1', 'e2'],
+        date_from: '2026-04-01',
+        date_to: '2026-04-30',
+      } as never,
       ctx,
-    )) as { path: string; tipo: string; summary: { totals: { receita: number; despesa: number; lucro: number } } };
+    )) as {
+      path: string;
+      tipo: string;
+      summary: { totals: { receita: number; despesa: number; lucro: number } };
+    };
     expect(out.tipo).toBe('comparativo');
     expect(out.summary.totals).toEqual({ receita: 1000, despesa: 200, lucro: 800 });
     const buf = await readFile(out.path);

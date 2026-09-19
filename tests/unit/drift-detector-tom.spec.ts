@@ -56,7 +56,10 @@ function makeProfile() {
   });
 }
 
-function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {
+function makeAgentMsg(
+  text: string,
+  id = 'm-' + Math.random().toString(36).slice(2),
+): DriftRecentMessage {
   return {
     id,
     from: 'agent',
@@ -128,9 +131,7 @@ describe('tomDetector', () => {
   it('sem mensagens do agente → retorna null sem chamar Anthropic', async () => {
     const out = await tomDetector.detect({
       profile_active: makeProfile(),
-      recent_messages: [
-        { id: 'u1', from: 'user', text: 'oi', created_at: new Date() },
-      ],
+      recent_messages: [{ id: 'u1', from: 'user', text: 'oi', created_at: new Date() }],
     });
 
     expect(out).toBeNull();
@@ -151,9 +152,7 @@ describe('tomDetector', () => {
   });
 
   it('drift_detected=true sem severity_hint/examples/reasoning → defaults aplicados', async () => {
-    messagesCreateMock.mockResolvedValueOnce(
-      makeAnthropicReply({ drift_detected: true }),
-    );
+    messagesCreateMock.mockResolvedValueOnce(makeAnthropicReply({ drift_detected: true }));
 
     const out = await tomDetector.detect({
       profile_active: makeProfile(),
@@ -226,8 +225,7 @@ describe('tomDetector', () => {
     const calls = messagesCreateMock.mock.calls;
     expect(calls.length).toBe(1);
     const prompt = String(
-      (calls[0]?.[0] as { messages?: Array<{ content?: string }> })?.messages?.[0]?.content ??
-        '',
+      (calls[0]?.[0] as { messages?: Array<{ content?: string }> })?.messages?.[0]?.content ?? '',
     );
     // identity_block synthesized from role_descriptor; voice from voice.tone.
     expect(prompt).toContain('Você é a Maia (canonical-only).');

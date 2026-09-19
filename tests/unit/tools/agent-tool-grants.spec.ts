@@ -29,7 +29,11 @@ const BASELINE = [...BASELINE_CORE_PACK.tools].sort();
 
 describe('Runtime Tool Filter — agent grant ∩ skill scope (#408)', () => {
   it('(a) an agent WITHOUT a domain pack sees only baseline tools', () => {
-    const grant: AgentToolGrant = { granted_packs: ['baseline.core'], granted_tools: [], denied_tools: [] };
+    const grant: AgentToolGrant = {
+      granted_packs: ['baseline.core'],
+      granted_tools: [],
+      denied_tools: [],
+    };
     const res = computeAgentVisibleTools(grant);
     expect([...res.visible].sort()).toEqual(BASELINE);
     // #433 — the 3 new gap tools ARE part of the baseline floor…

@@ -29,10 +29,7 @@ vi.mock('../../src/db/client.js', () => ({
 }));
 
 import { pessoasRepo } from '../../src/db/repositories.js';
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '../../src/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '../../src/db/tenant-context.js';
 
 function chainable(values: unknown): unknown {
   const c: Record<string, unknown> = {};
@@ -75,15 +72,11 @@ describe('pessoasRepo — tenant scoping (PR #75 #C2)', () => {
   });
 
   it('findById OUTSIDE tenant context throws MissingTenantContextError', async () => {
-    await expect(pessoasRepo.findById('some-id')).rejects.toBeInstanceOf(
-      MissingTenantContextError,
-    );
+    await expect(pessoasRepo.findById('some-id')).rejects.toBeInstanceOf(MissingTenantContextError);
   });
 
   it('list OUTSIDE tenant context throws MissingTenantContextError', async () => {
-    await expect(pessoasRepo.list()).rejects.toBeInstanceOf(
-      MissingTenantContextError,
-    );
+    await expect(pessoasRepo.list()).rejects.toBeInstanceOf(MissingTenantContextError);
   });
 
   it('create OUTSIDE tenant context throws MissingTenantContextError', async () => {
@@ -109,22 +102,19 @@ describe('pessoasRepo — tenant scoping (PR #75 #C2)', () => {
       inserted = v;
       return chain;
     };
-    chain.returning = () =>
-      Promise.resolve([{ id: 'p1', tenant_id: 't-a', agent_id: 'agent-a' }]);
+    chain.returning = () => Promise.resolve([{ id: 'p1', tenant_id: 't-a', agent_id: 'agent-a' }]);
     dbInsert.mockReturnValueOnce(chain);
 
-    await runWithTenantContext(
-      { tenant_id: 't-a', agent_id: 'agent-a' },
-      () =>
-        pessoasRepo.create({
-          nome: 'X',
-          telefone_whatsapp: '+5511999990002',
-          email: null,
-          cpf: null,
-          status: 'ativa',
-          preferencias: {},
-          metadata: {},
-        } as Parameters<typeof pessoasRepo.create>[0]),
+    await runWithTenantContext({ tenant_id: 't-a', agent_id: 'agent-a' }, () =>
+      pessoasRepo.create({
+        nome: 'X',
+        telefone_whatsapp: '+5511999990002',
+        email: null,
+        cpf: null,
+        status: 'ativa',
+        preferencias: {},
+        metadata: {},
+      } as Parameters<typeof pessoasRepo.create>[0]),
     );
 
     expect(inserted).not.toBeNull();

@@ -147,9 +147,7 @@ describe('a trava: nenhuma política periódica ativa sem homologação escrita'
       ],
       dryRunDefault: contractDryRunDefault,
     });
-    expect(violations.map((v) => v.code)).toContain(
-      'new_activation_without_written_homologation',
-    );
+    expect(violations.map((v) => v.code)).toContain('new_activation_without_written_homologation');
   });
 
   it('aceita uma política ativa COM homologação escrita — a trava não é um bloqueio permanente', () => {

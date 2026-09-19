@@ -119,9 +119,7 @@ d('baseline skills seed (migration 075) — real DB', () => {
       [TENANT, [...BASELINE_DESCRIPTORS]],
     );
 
-    expect(rows.map((r) => r.skill_descriptor).sort()).toEqual(
-      [...BASELINE_DESCRIPTORS].sort(),
-    );
+    expect(rows.map((r) => r.skill_descriptor).sort()).toEqual([...BASELINE_DESCRIPTORS].sort());
     for (const r of rows) {
       expect(r.agent_id, `${r.skill_descriptor} must be tenant-wide`).toBeNull();
       // Migration 080 deprecates the 5 converted skills (they become tool_mediated v2);
@@ -134,7 +132,10 @@ d('baseline skills seed (migration 075) — real DB', () => {
       // allowed_tools references ONLY baseline tools.
       expect(r.allowed_tools.length).toBeGreaterThan(0);
       for (const t of r.allowed_tools) {
-        expect(BASELINE_TOOLS.has(t), `${r.skill_descriptor} allowed_tool ${t} must be a baseline tool`).toBe(true);
+        expect(
+          BASELINE_TOOLS.has(t),
+          `${r.skill_descriptor} allowed_tool ${t} must be a baseline tool`,
+        ).toBe(true);
       }
     }
   });

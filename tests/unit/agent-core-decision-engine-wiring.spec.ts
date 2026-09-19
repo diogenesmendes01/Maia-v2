@@ -11,14 +11,7 @@
  * Strategy: no DB, no network. Engine singleton injected via
  * `_overrideDecisionEngineSingleton`.
  */
-import {
-  afterEach,
-  beforeEach,
-  describe,
-  expect,
-  it,
-  vi,
-} from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   runDecisionEngineForTurn,
   DecisionEngineFailClosedError,
@@ -83,7 +76,9 @@ function mkPacket(overrides?: Partial<DecisionPacket>): DecisionPacket {
 /** Inject a fake engine whose `run` returns the given result. */
 function injectEngine(result: DecisionEngineResult | (() => Promise<DecisionEngineResult>)) {
   const runFn = typeof result === 'function' ? result : async () => result;
-  const fakeEngine = { run: vi.fn((_input: { base: BaseContextPacket }) => runFn()) } as ReturnType<typeof import('@/runtime/decision/index.js').getDecisionEngine>;
+  const fakeEngine = { run: vi.fn((_input: { base: BaseContextPacket }) => runFn()) } as ReturnType<
+    typeof import('@/runtime/decision/index.js').getDecisionEngine
+  >;
   _overrideDecisionEngineSingleton(fakeEngine);
   return fakeEngine;
 }
@@ -164,9 +159,21 @@ describe('P11 — agent/core.ts × Decision Engine wiring (always-on)', () => {
   // --------------------------------------------------------------------------
   it('T6 (tool_reductions): applyToolReductions removes blocked tools from toolSet; LLM called without set_reminder', () => {
     const toolSet = [
-      { name: 'query_balance', description: 'Query balance', input_schema: { type: 'object' as const, additionalProperties: true } },
-      { name: 'set_reminder', description: 'Set reminder', input_schema: { type: 'object' as const, additionalProperties: true } },
-      { name: 'register_transaction', description: 'Register', input_schema: { type: 'object' as const, additionalProperties: true } },
+      {
+        name: 'query_balance',
+        description: 'Query balance',
+        input_schema: { type: 'object' as const, additionalProperties: true },
+      },
+      {
+        name: 'set_reminder',
+        description: 'Set reminder',
+        input_schema: { type: 'object' as const, additionalProperties: true },
+      },
+      {
+        name: 'register_transaction',
+        description: 'Register',
+        input_schema: { type: 'object' as const, additionalProperties: true },
+      },
     ];
 
     const toolPermissions = {
@@ -207,7 +214,10 @@ describe('P11 — agent/core.ts × Decision Engine wiring (always-on)', () => {
     } as unknown as import('@/db/schema.js').Mensagem;
 
     const conversa = { id: 'conv_001' } as import('@/db/schema.js').Conversa;
-    const pessoa = { id: 'p_001', telefone_whatsapp: '+5511999999999' } as import('@/db/schema.js').Pessoa;
+    const pessoa = {
+      id: 'p_001',
+      telefone_whatsapp: '+5511999999999',
+    } as import('@/db/schema.js').Pessoa;
 
     const packet = buildBaseContextPacketFromTurn({
       inbound,

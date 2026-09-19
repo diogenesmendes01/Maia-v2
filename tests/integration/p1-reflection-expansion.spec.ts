@@ -9,13 +9,14 @@ vi.mock('@/lib/claude.js', () => ({
 
 // Mock repos that Persister calls — verify routing without touching DB
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
-    factsRepo: { ...actual.factsRepo, upsert: vi.fn(async () => ({ id: 'fact-id' } as any)) },
-    rulesRepo: { ...actual.rulesRepo, create: vi.fn(async () => ({ id: 'rule-id' } as any)) },
+    factsRepo: { ...actual.factsRepo, upsert: vi.fn(async () => ({ id: 'fact-id' }) as any) },
+    rulesRepo: { ...actual.rulesRepo, create: vi.fn(async () => ({ id: 'rule-id' }) as any) },
     cognitiveCandidatesRepo: {
-      create: vi.fn(async () => ({ id: 'cand-id' } as any)),
+      create: vi.fn(async () => ({ id: 'cand-id' }) as any),
       listPending: vi.fn(async () => []),
       markConsumed: vi.fn(async () => {}),
     },
@@ -51,7 +52,9 @@ describe('P1 reflection expansion — 4 triggers integration', () => {
   it('SUCCESS_EXPLICIT → fato → routes through KSM (always-on)', async () => {
     (callLLM as any)
       .mockResolvedValueOnce({ content: 'cliente prefere comunicação direta' }) // reflector
-      .mockResolvedValueOnce({ content: JSON.stringify({ type: 'fato', content: 'X', scope: 'agent' }) }); // classifier
+      .mockResolvedValueOnce({
+        content: JSON.stringify({ type: 'fato', content: 'X', scope: 'agent' }),
+      }); // classifier
 
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const event = {

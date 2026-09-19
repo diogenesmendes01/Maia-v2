@@ -22,7 +22,9 @@ beforeEach(() => {
   fetchMock.mockReset();
 });
 
-async function loadWithConfig(cfg: Record<string, unknown>): Promise<typeof import('../../src/lib/embeddings.js')> {
+async function loadWithConfig(
+  cfg: Record<string, unknown>,
+): Promise<typeof import('../../src/lib/embeddings.js')> {
   vi.resetModules();
   vi.doMock('../../src/config/env.js', () => ({ config: cfg }));
   return await import('../../src/lib/embeddings.js');
@@ -114,7 +116,9 @@ describe('embeddings — provider factory', () => {
     expect(out).toEqual([[0.1, 0.2, 0.3, 0.4]]);
     const [url, init] = fetchMock.mock.calls[0]!;
     expect(url).toBe('https://api.cohere.com/v1/embed');
-    expect((init as { headers: Record<string, string> }).headers.authorization).toBe('Bearer co-key');
+    expect((init as { headers: Record<string, string> }).headers.authorization).toBe(
+      'Bearer co-key',
+    );
   });
 
   it('throws on missing API key for the configured provider', async () => {

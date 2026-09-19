@@ -152,7 +152,7 @@ describe('Issue #345 — rollbackWorkflow mutates ONLY the current tenant/agent 
     expect(step('tenant-A', 'agent-Z').concluido_em).toBeNull();
   });
 
-  it("the workflow_steps UPDATE predicate binds tenant_id AND agent_id (not id alone)", async () => {
+  it('the workflow_steps UPDATE predicate binds tenant_id AND agent_id (not id alone)', async () => {
     const { rollbackWorkflow } = await import('@/workflows/engine.js');
     await runWithTenantContext(A, () => rollbackWorkflow('wf', 'test reason'));
 

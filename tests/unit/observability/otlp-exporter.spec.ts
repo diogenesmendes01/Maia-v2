@@ -71,9 +71,9 @@ describe('issue #535 — OTLP encoding', () => {
       resource: { attributes: { key: string; value: { stringValue: string } }[] };
       scopeSpans: { spans: Record<string, unknown>[] }[];
     };
-    expect(
-      rs.resource.attributes.find((a) => a.key === 'service.name')?.value.stringValue,
-    ).toBe('maia-runtime');
+    expect(rs.resource.attributes.find((a) => a.key === 'service.name')?.value.stringValue).toBe(
+      'maia-runtime',
+    );
     expect(rs.scopeSpans[0]!.spans).toHaveLength(1);
   });
 
@@ -220,9 +220,7 @@ describe('issue #535 — delivery', () => {
     exporter.enqueue(span());
     exporter.enqueue(span());
     await exporter.flush();
-    expect(await renderPrometheus()).toMatch(
-      /maia_otlp_spans_exported_total\{status="ok"\} 2/,
-    );
+    expect(await renderPrometheus()).toMatch(/maia_otlp_spans_exported_total\{status="ok"\} 2/);
   });
 
   it('serialises concurrent flushes so a batch is never sent twice', async () => {

@@ -184,7 +184,10 @@ d('boleto proposta role + skills seed (migration 079) — real DB', () => {
 
   it('re-running migration 079 is IDEMPOTENT (no duplicate role or skill rows)', async () => {
     const raw = await readFile(
-      new URL('../../migrations/079_boleto_proposta_attendant_role_and_skills.sql', import.meta.url),
+      new URL(
+        '../../migrations/079_boleto_proposta_attendant_role_and_skills.sql',
+        import.meta.url,
+      ),
       'utf8',
     );
     // Re-apply the forward body re-targeted to the live single-tenant home

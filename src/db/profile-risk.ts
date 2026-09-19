@@ -18,10 +18,7 @@
  *    `schema_version` fora do PROFILE_SCHEMA_COMPAT (e não idêntico),
  *    predecessor ausente/ilegível, ou valor fora do shape esperado ⇒ `high`.
  */
-import {
-  PROFILE_SCHEMA_COMPAT,
-  parseKnownProfileSchemaVersion,
-} from './schema.js';
+import { PROFILE_SCHEMA_COMPAT, parseKnownProfileSchemaVersion } from './schema.js';
 
 export type ProfileRiskLevel = 'low' | 'medium' | 'high';
 

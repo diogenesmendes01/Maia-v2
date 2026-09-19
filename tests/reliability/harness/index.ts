@@ -54,7 +54,13 @@ export type { AcaoLocal, OpcoesDeAlcance } from './failpoint-client.js';
 export { EventuallyTimeoutError, estavelDurante, eventually } from './eventually.js';
 export type { EventuallyOptions } from './eventually.js';
 
-export { REDACTED, chaveSensivel, jsonSanitizado, sanitizarTexto, sanitizarValor } from './sanitize.js';
+export {
+  REDACTED,
+  chaveSensivel,
+  jsonSanitizado,
+  sanitizarTexto,
+  sanitizarValor,
+} from './sanitize.js';
 
 export { ArtifactCollector, diretorioPadraoDeArtefatos } from './artifacts.js';
 export type { CabecalhoDeArtefato, EventoDeTimeline, SaidaDeProcesso } from './artifacts.js';
@@ -82,7 +88,12 @@ export {
   resolverAlvoDaSuite,
   suiteSlug,
 } from './environment.js';
-export type { AlvoDestrutivo, EstadoDoAmbiente, OpcoesDoAmbiente, SeedDeTenant } from './environment.js';
+export type {
+  AlvoDestrutivo,
+  EstadoDoAmbiente,
+  OpcoesDoAmbiente,
+  SeedDeTenant,
+} from './environment.js';
 
 export { SEED_ENV, SeededRandom, ordemDeFaults, seedDaRodada } from './seeded-faults.js';
 

@@ -111,9 +111,7 @@ vi.mock('@/control-plane/knowledge-state-machine/state-machine.js', async () => 
 });
 
 vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
-  const drizzle = await vi.importActual<typeof import('drizzle-orm')>(
-    'drizzle-orm',
-  );
+  const drizzle = await vi.importActual<typeof import('drizzle-orm')>('drizzle-orm');
   return {
     knowledgeRepos: {
       async listEligible(args: {
@@ -146,9 +144,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
 // Stub the cognitive_module_log audit write so we don't touch the DB.
 // We do NOT assert on this — the audit-tenant spec covers attribution.
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -172,9 +169,9 @@ vi.mock('@/lib/logger.js', () => ({
 }));
 
 vi.mock('@/config/feature-flags.js', async () => {
-  const actual = await vi.importActual<
-    typeof import('@/config/feature-flags.js')
-  >('@/config/feature-flags.js');
+  const actual = await vi.importActual<typeof import('@/config/feature-flags.js')>(
+    '@/config/feature-flags.js',
+  );
   return {
     ...actual,
     FEATURE_KNOWLEDGE_STATE_MACHINE_V1: true,
@@ -247,8 +244,7 @@ describe('issue #255 — error identity preserved across runCognitiveModule boun
     const skipped = debugCalls.find(
       (c) => c[1] === 'knowledge_state_promoter.skipped_illegal_transition',
     );
-    expect(skipped, 'outer catch must reach the IllegalTransitionError branch')
-      .toBeDefined();
+    expect(skipped, 'outer catch must reach the IllegalTransitionError branch').toBeDefined();
 
     // The `err` payload (first arg) MUST be the actual
     // IllegalTransitionError instance — proves identity preservation,
@@ -308,8 +304,7 @@ describe('issue #255 — error identity preserved across runCognitiveModule boun
     const failed = loggerMock.error.mock.calls.find(
       (c) => c[1] === 'knowledge_state_promoter.transition_failed',
     );
-    expect(failed, 'real failure must surface via transition_failed log')
-      .toBeDefined();
+    expect(failed, 'real failure must surface via transition_failed log').toBeDefined();
     const failurePayload = failed![0] as { err: unknown };
     // The err is the exact same Error object the mock threw.
     expect(failurePayload.err).toBe(realFailure);
@@ -353,8 +348,7 @@ describe('issue #255 — error identity preserved across runCognitiveModule boun
         c[1] === 'knowledge_state_promoter.skipped_illegal_transition' &&
         (c[0] as { id: string }).id === 'race-row',
     );
-    expect(skipped, 'race row must be classified as benign skip')
-      .toBeDefined();
+    expect(skipped, 'race row must be classified as benign skip').toBeDefined();
 
     // The real failure row landed in the transition_failed branch.
     const failed = loggerMock.error.mock.calls.find(
@@ -362,8 +356,7 @@ describe('issue #255 — error identity preserved across runCognitiveModule boun
         c[1] === 'knowledge_state_promoter.transition_failed' &&
         (c[0] as { id: string }).id === 'real-failure-row',
     );
-    expect(failed, 'real-failure row must be classified as a real failure')
-      .toBeDefined();
+    expect(failed, 'real-failure row must be classified as a real failure').toBeDefined();
 
     // The race row did NOT log as transition_failed.
     const raceLoggedAsFailure = loggerMock.error.mock.calls.find(

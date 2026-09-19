@@ -22,12 +22,7 @@
 
 import { and, eq, lte, sql, type SQL } from 'drizzle-orm';
 import { db } from '@/db/client.js';
-import {
-  agent_facts,
-  behavioral_hint,
-  learned_rules,
-  memory_entry,
-} from '@/db/schema.js';
+import { agent_facts, behavioral_hint, learned_rules, memory_entry } from '@/db/schema.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { TypedError } from '@/lib/utils.js';
 import type {
@@ -87,9 +82,7 @@ export class KnowledgeConflictError extends Error {
     public readonly id: string,
     public readonly expected_previous_status: KnowledgeLifecycleStatus,
   ) {
-    super(
-      `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
-    );
+    super(`knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`);
     this.name = 'KnowledgeConflictError';
   }
 }
@@ -98,9 +91,7 @@ type AnyRow = Record<string, unknown>;
 
 function normaliseRow(raw: AnyRow): KnowledgeRow {
   const lifecycleTransitionsRaw = raw['lifecycle_transitions'];
-  const transitions: KnowledgeTransitionRecord[] = Array.isArray(
-    lifecycleTransitionsRaw,
-  )
+  const transitions: KnowledgeTransitionRecord[] = Array.isArray(lifecycleTransitionsRaw)
     ? (lifecycleTransitionsRaw as KnowledgeTransitionRecord[])
     : [];
   const updatedAt = raw['updated_at'];
@@ -117,19 +108,13 @@ function normaliseRow(raw: AnyRow): KnowledgeRow {
         ? (raw['evidence_count'] as number)
         : Number(raw['evidence_count'] ?? 0),
     confidence:
-      confidenceRaw === undefined || confidenceRaw === null
-        ? undefined
-        : Number(confidenceRaw),
+      confidenceRaw === undefined || confidenceRaw === null ? undefined : Number(confidenceRaw),
     updated_at:
       updatedAt instanceof Date
         ? updatedAt
         : new Date(String(updatedAt ?? raw['created_at'] ?? Date.now())),
     last_recall_at:
-      lastRecall instanceof Date
-        ? lastRecall
-        : lastRecall
-          ? new Date(String(lastRecall))
-          : null,
+      lastRecall instanceof Date ? lastRecall : lastRecall ? new Date(String(lastRecall)) : null,
   };
 }
 
@@ -186,8 +171,7 @@ export const knowledgeRepos = {
         const tipo = native.rule_tipo ?? 'classificacao';
         const contexto = native.rule_contexto ?? input.content_text.slice(0, 4000);
         const acao =
-          native.rule_acao ??
-          (typeof input.content === 'string' ? input.content : input.key);
+          native.rule_acao ?? (typeof input.content === 'string' ? input.content : input.key);
         const rows = await db
           .insert(learned_rules)
           .values({
@@ -214,8 +198,7 @@ export const knowledgeRepos = {
         // interlocutor/role/channel/conversation. The previous facade
         // wrote scope_type=<generic kind scope> (e.g. 'user', 'session')
         // which findRelevant never looks for.
-        const ttlDays =
-          input.ttl_days ?? (input.lifecycle_status === 'ephemeral' ? 30 : 90);
+        const ttlDays = input.ttl_days ?? (input.lifecycle_status === 'ephemeral' ? 30 : 90);
         const expiresAt = new Date(Date.now() + ttlDays * 86_400_000);
         const scopeType =
           native.memory_scope_type ??
@@ -263,8 +246,7 @@ export const knowledgeRepos = {
         // (`user`, `session`, etc.), which the prompt-builder lookup
         // can't match. Prefer `native.hint_scope_type` and fall back to
         // a sensible mapping from the generic scope.
-        const ttlDays =
-          input.ttl_days ?? (input.lifecycle_status === 'ephemeral' ? 14 : 60);
+        const ttlDays = input.ttl_days ?? (input.lifecycle_status === 'ephemeral' ? 14 : 60);
         const expiresAt = new Date(Date.now() + ttlDays * 86_400_000);
         const scopeType =
           native.hint_scope_type ??
@@ -304,10 +286,7 @@ export const knowledgeRepos = {
     }
   },
 
-  async findById(
-    kind: KnowledgeKind,
-    id: string,
-  ): Promise<KnowledgeRow | null> {
+  async findById(kind: KnowledgeKind, id: string): Promise<KnowledgeRow | null> {
     switch (kind) {
       case 'fact': {
         // Issue #254 — cross-tenant guard. `agent_facts` reads via the
@@ -439,11 +418,7 @@ export const knowledgeRepos = {
    * second write wins blindly — so a revoke can be lost and a terminal
    * row "resurrected". See Codex review #104 (critical).
    */
-  async update(
-    kind: KnowledgeKind,
-    id: string,
-    updates: UpdateInput,
-  ): Promise<void> {
+  async update(kind: KnowledgeKind, id: string, updates: UpdateInput): Promise<void> {
     const set: Record<string, unknown> = { updated_at: new Date() };
     if (updates.lifecycle_status !== undefined) {
       set['lifecycle_status'] = updates.lifecycle_status;
@@ -773,9 +748,7 @@ export const knowledgeRepos = {
             agent_id: agent_facts.agent_id,
           })
           .from(agent_facts)
-          .where(
-            and(eq(agent_facts.lifecycle_status, fromVal), args.extraFilter),
-          )
+          .where(and(eq(agent_facts.lifecycle_status, fromVal), args.extraFilter))
           .limit(limit)) as Array<{
           id: string;
           tenant_id: string;
@@ -790,9 +763,7 @@ export const knowledgeRepos = {
             agent_id: learned_rules.agent_id,
           })
           .from(learned_rules)
-          .where(
-            and(eq(learned_rules.lifecycle_status, fromVal), args.extraFilter),
-          )
+          .where(and(eq(learned_rules.lifecycle_status, fromVal), args.extraFilter))
           .limit(limit)) as Array<{
           id: string;
           tenant_id: string;
@@ -807,9 +778,7 @@ export const knowledgeRepos = {
             agent_id: memory_entry.agent_id,
           })
           .from(memory_entry)
-          .where(
-            and(eq(memory_entry.lifecycle_status, fromVal), args.extraFilter),
-          )
+          .where(and(eq(memory_entry.lifecycle_status, fromVal), args.extraFilter))
           .limit(limit)) as Array<{
           id: string;
           tenant_id: string;
@@ -825,9 +794,7 @@ export const knowledgeRepos = {
             agent_id: behavioral_hint.agent_id,
           })
           .from(behavioral_hint)
-          .where(
-            and(eq(behavioral_hint.lifecycle_status, fromVal), args.extraFilter),
-          )
+          .where(and(eq(behavioral_hint.lifecycle_status, fromVal), args.extraFilter))
           .limit(limit)) as Array<{
           id: string;
           tenant_id: string;

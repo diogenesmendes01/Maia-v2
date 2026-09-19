@@ -150,9 +150,7 @@ vi.mock('@/lib/claude.js', async (importOriginal) => {
         // SEMPRE uma tool use: assim o laço nunca sai pelo ramo de texto final
         // e vai até o teto de iterações, que é onde o rastro pós-recusa fica
         // visível.
-        tool_uses: [
-          { id: `tu-${llm.calls}`, tool: llm.toolFor(llm.calls), args: currentArgs() },
-        ],
+        tool_uses: [{ id: `tu-${llm.calls}`, tool: llm.toolFor(llm.calls), args: currentArgs() }],
         stop_reason: 'tool_use',
         usage: { input_tokens: 10, output_tokens: 5 },
         model: 'dublê',
@@ -435,9 +433,8 @@ d('#504 — a recusa turn_ownership_lost encerra o ReAct sem gravar mais nada', 
   }, 60_000);
 
   it('BARREIRA: perdida a posse na última iteração, nenhuma gravação posterior', async () => {
-    const { runWithTurnExecution, TurnOwnershipLostError } = await import(
-      '@/runtime/turns/execution-context.js'
-    );
+    const { runWithTurnExecution, TurnOwnershipLostError } =
+      await import('@/runtime/turns/execution-context.js');
     const inbound = await mkInbound();
     const chave = `llr504-barreira-${randomUUID().slice(0, 8)}`;
     createdFacts.push(chave);

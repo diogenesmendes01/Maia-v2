@@ -80,60 +80,57 @@ export const toolRequestsRouter = router({
    */
   list: protectedProcedure.input(EscopoInput).query(async ({ input, ctx }) => {
     const tenantId = resolveTenantId(ctx, input.tenantId);
-    return runWithTenantContext(
-      { tenant_id: tenantId, agent_id: input.agentId },
-      async () => {
-        const agregados = await ctx.repos.toolRequestAggregatesRepo.listarDoEscopo();
-        const aceites = await ctx.repos.toolRequestIssuesRepo.listarDoEscopo();
-        const porAgregado = new Map(aceites.map((a) => [a.aggregate_id, a]));
+    return runWithTenantContext({ tenant_id: tenantId, agent_id: input.agentId }, async () => {
+      const agregados = await ctx.repos.toolRequestAggregatesRepo.listarDoEscopo();
+      const aceites = await ctx.repos.toolRequestIssuesRepo.listarDoEscopo();
+      const porAgregado = new Map(aceites.map((a) => [a.aggregate_id, a]));
 
-        const items = agregados.map((ag) => {
-          const aceite = porAgregado.get(ag.id) ?? null;
-          return {
-            aggregate_id: ag.id,
-            proposed_tool_name: ag.proposed_tool_name,
-            nomes_propostos: (ag.nomes_propostos as string[]) ?? [],
-            // O CONTADOR. Materializado pelo backend a partir dos membros
-            // ativos — o front não conta nada.
-            member_count: ag.member_count,
-            total_occurrences: ag.total_occurrences,
-            contract_state: ag.contract_state,
-            // `null` exatamente quando `contract_state = 'divergent'` (CHECK da
-            // migração 129). O front mostra os conflitos nesse caso; ele não
-            // inventa um contrato de consenso.
-            merged_contract_draft: ag.merged_contract_draft,
-            contract_conflicts: ag.contract_conflicts,
-            metrica: ag.metrica,
-            limiar: ag.limiar,
-            assinatura_version: ag.assinatura_version,
-            first_member_at: ag.first_member_at,
-            last_member_at: ag.last_member_at,
-            representative_proposal_id: ag.representative_proposal_id,
-            aceite: aceite
-              ? {
-                  status: aceite.status,
-                  issue_number: aceite.issue_number,
-                  issue_url: aceite.issue_url,
-                  repo_slug: aceite.repo_slug,
-                  adopted: aceite.adopted,
-                  accepted_by: aceite.accepted_by,
-                  accepted_at: aceite.accepted_at,
-                  attempts: aceite.attempts,
-                  last_error: aceite.last_error,
-                }
-              : null,
-          };
-        });
-
+      const items = agregados.map((ag) => {
+        const aceite = porAgregado.get(ag.id) ?? null;
         return {
-          items,
-          // O destino, para que o dono veja para onde a issue vai ANTES de
-          // aceitar. `null` = integração não configurada, e o botão diz isso em
-          // vez de falhar depois do clique.
-          repo_slug: getEnv().MAIA_TOOL_REQUEST_ISSUE_REPO ?? null,
+          aggregate_id: ag.id,
+          proposed_tool_name: ag.proposed_tool_name,
+          nomes_propostos: (ag.nomes_propostos as string[]) ?? [],
+          // O CONTADOR. Materializado pelo backend a partir dos membros
+          // ativos — o front não conta nada.
+          member_count: ag.member_count,
+          total_occurrences: ag.total_occurrences,
+          contract_state: ag.contract_state,
+          // `null` exatamente quando `contract_state = 'divergent'` (CHECK da
+          // migração 129). O front mostra os conflitos nesse caso; ele não
+          // inventa um contrato de consenso.
+          merged_contract_draft: ag.merged_contract_draft,
+          contract_conflicts: ag.contract_conflicts,
+          metrica: ag.metrica,
+          limiar: ag.limiar,
+          assinatura_version: ag.assinatura_version,
+          first_member_at: ag.first_member_at,
+          last_member_at: ag.last_member_at,
+          representative_proposal_id: ag.representative_proposal_id,
+          aceite: aceite
+            ? {
+                status: aceite.status,
+                issue_number: aceite.issue_number,
+                issue_url: aceite.issue_url,
+                repo_slug: aceite.repo_slug,
+                adopted: aceite.adopted,
+                accepted_by: aceite.accepted_by,
+                accepted_at: aceite.accepted_at,
+                attempts: aceite.attempts,
+                last_error: aceite.last_error,
+              }
+            : null,
         };
-      },
-    );
+      });
+
+      return {
+        items,
+        // O destino, para que o dono veja para onde a issue vai ANTES de
+        // aceitar. `null` = integração não configurada, e o botão diz isso em
+        // vez de falhar depois do clique.
+        repo_slug: getEnv().MAIA_TOOL_REQUEST_ISSUE_REPO ?? null,
+      };
+    });
   }),
 
   /**
@@ -147,35 +144,32 @@ export const toolRequestsRouter = router({
    */
   detail: protectedProcedure.input(AgregadoInput).query(async ({ input, ctx }) => {
     const tenantId = resolveTenantId(ctx, input.tenantId);
-    return runWithTenantContext(
-      { tenant_id: tenantId, agent_id: input.agentId },
-      async () => {
-        const agregado = await ctx.repos.toolRequestAggregatesRepo.findById(input.aggregateId);
-        if (!agregado) throw new TRPCError({ code: 'NOT_FOUND', message: 'Pedido não encontrado' });
-        const membros = await ctx.repos.toolRequestAggregatesRepo.membrosAtivos(agregado.id);
-        const avisos = await ctx.repos.toolRequestNotificationsRepo.listarDoEscopo(20);
-        return {
-          aggregate_id: agregado.id,
-          membros: membros.map((m) => ({
-            member_id: m.id,
-            gap_id: m.gap_id,
-            is_representative: m.is_representative,
-            intent: m.intent,
-            occurrences: m.occurrences,
-            similaridade: m.similaridade,
-            joined_at: m.joined_at,
-            original_spec: m.original_spec,
+    return runWithTenantContext({ tenant_id: tenantId, agent_id: input.agentId }, async () => {
+      const agregado = await ctx.repos.toolRequestAggregatesRepo.findById(input.aggregateId);
+      if (!agregado) throw new TRPCError({ code: 'NOT_FOUND', message: 'Pedido não encontrado' });
+      const membros = await ctx.repos.toolRequestAggregatesRepo.membrosAtivos(agregado.id);
+      const avisos = await ctx.repos.toolRequestNotificationsRepo.listarDoEscopo(20);
+      return {
+        aggregate_id: agregado.id,
+        membros: membros.map((m) => ({
+          member_id: m.id,
+          gap_id: m.gap_id,
+          is_representative: m.is_representative,
+          intent: m.intent,
+          occurrences: m.occurrences,
+          similaridade: m.similaridade,
+          joined_at: m.joined_at,
+          original_spec: m.original_spec,
+        })),
+        avisos: avisos
+          .filter((a) => a.aggregate_id === agregado.id)
+          .map((a) => ({
+            tool_name: a.tool_name,
+            notified_at: a.notified_at,
+            evidencia: a.evidencia,
           })),
-          avisos: avisos
-            .filter((a) => a.aggregate_id === agregado.id)
-            .map((a) => ({
-              tool_name: a.tool_name,
-              notified_at: a.notified_at,
-              evidencia: a.evidencia,
-            })),
-        };
-      },
-    );
+      };
+    });
   }),
 
   /**

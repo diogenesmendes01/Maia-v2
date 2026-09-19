@@ -48,36 +48,38 @@ type OutboxRow = {
 const outbox: OutboxRow[] = [];
 const dedupSet = new Set<string>();
 
-const outboxEnqueueMock = vi.fn(async (input: {
-  occurrence_id?: string | null;
-  task_id?: string | null;
-  kind: 'whatsapp_text';
-  payload: { jid: string; text: string };
-  dedup_key?: string | null;
-}) => {
-  if (input.dedup_key && dedupSet.has(input.dedup_key)) return null;
-  if (input.dedup_key) dedupSet.add(input.dedup_key);
-  const row: OutboxRow = {
-    id: `ob-${outbox.length + 1}`,
-    task_id: input.task_id ?? null,
-    occurrence_id: input.occurrence_id ?? null,
-    channel_id: null,
-    kind: input.kind,
-    payload: input.payload,
-    status: 'pending',
-    attempts: 0,
-    max_attempts: 5,
-    next_attempt_at: new Date(),
-    dedup_key: input.dedup_key ?? null,
-    sent_at: null,
-    last_error: null,
-    claimed_by: null,
-    claimed_at: null,
-    created_at: new Date(),
-  };
-  outbox.push(row);
-  return row;
-});
+const outboxEnqueueMock = vi.fn(
+  async (input: {
+    occurrence_id?: string | null;
+    task_id?: string | null;
+    kind: 'whatsapp_text';
+    payload: { jid: string; text: string };
+    dedup_key?: string | null;
+  }) => {
+    if (input.dedup_key && dedupSet.has(input.dedup_key)) return null;
+    if (input.dedup_key) dedupSet.add(input.dedup_key);
+    const row: OutboxRow = {
+      id: `ob-${outbox.length + 1}`,
+      task_id: input.task_id ?? null,
+      occurrence_id: input.occurrence_id ?? null,
+      channel_id: null,
+      kind: input.kind,
+      payload: input.payload,
+      status: 'pending',
+      attempts: 0,
+      max_attempts: 5,
+      next_attempt_at: new Date(),
+      dedup_key: input.dedup_key ?? null,
+      sent_at: null,
+      last_error: null,
+      claimed_by: null,
+      claimed_at: null,
+      created_at: new Date(),
+    };
+    outbox.push(row);
+    return row;
+  },
+);
 const outboxClaimDueMock = vi.fn(async (_w: string, limit: number) => {
   const due = outbox.filter((r) => r.status === 'pending').slice(0, limit);
   for (const r of due) {
@@ -341,9 +343,7 @@ describe('Requirement 1 — outbox never loses a message', () => {
       status: 'claimed',
       contexto_snapshot: { texto: 'Dedup', canal: 'whatsapp' },
     };
-    claimDueMock
-      .mockResolvedValueOnce([occ])
-      .mockResolvedValueOnce([occ]); // same row, re-claimed after lease reaper
+    claimDueMock.mockResolvedValueOnce([occ]).mockResolvedValueOnce([occ]); // same row, re-claimed after lease reaper
     findSeriesByIdMock.mockResolvedValue({
       id: 's-3',
       tipo: 'one_shot_reminder',

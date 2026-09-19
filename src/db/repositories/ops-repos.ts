@@ -52,11 +52,7 @@ export const backupEvidenceStore: BackupEvidenceStore = {
       .where(eq(backup_runs.id, id));
   },
 
-  async saveManifest(
-    runId: string,
-    signed: SignedManifest,
-    manifestSha256: string,
-  ): Promise<void> {
+  async saveManifest(runId: string, signed: SignedManifest, manifestSha256: string): Promise<void> {
     await db.insert(backup_manifests).values({
       backup_run_id: runId,
       manifest_version: signed.manifest.manifest_version,

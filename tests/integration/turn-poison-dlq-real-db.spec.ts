@@ -123,7 +123,10 @@ async function setStatus(turn_id: string, status: string): Promise<void> {
 /** Uma `stream_key` do formato real (v1 + hash), longa o bastante para não colidir. */
 const streamKey = (): string => `v1:${randomUUID().replace(/-/g, '').repeat(2)}`;
 
-async function blocosAtivos(tenant: string, agent: string): Promise<Array<Record<string, unknown>>> {
+async function blocosAtivos(
+  tenant: string,
+  agent: string,
+): Promise<Array<Record<string, unknown>>> {
   const r = await pool.query(
     `SELECT * FROM agent_stream_blocks
       WHERE tenant_id = $1 AND agent_id = $2 AND unblocked_at IS NULL
@@ -181,16 +184,14 @@ d('#629 — poison, DLQ e replay (DB real)', () => {
     seq: number;
   }): Promise<string> {
     const mensagem_id = await mkInbound(args.tenant, args.agent);
-    const turn = await runWithTenantContext(
-      { tenant_id: args.tenant, agent_id: args.agent },
-      () =>
-        repos().agentTurnsRepo.ensureTurnForMessage({
-          id: mensagem_id,
-          tenant_id: args.tenant,
-          agent_id: args.agent,
-          conversa_id: null,
-          channel_id: null,
-        }),
+    const turn = await runWithTenantContext({ tenant_id: args.tenant, agent_id: args.agent }, () =>
+      repos().agentTurnsRepo.ensureTurnForMessage({
+        id: mensagem_id,
+        tenant_id: args.tenant,
+        agent_id: args.agent,
+        conversa_id: null,
+        channel_id: null,
+      }),
     );
     await pool.query(
       `UPDATE agent_turns
@@ -291,9 +292,9 @@ d('#629 — poison, DLQ e replay (DB real)', () => {
 
     // A DECISÃO é contada, e `release` não é "nada aconteceu": é a escolha de
     // deixar a conversa seguir depois de um turno ter morrido.
-    expect(await contador('maia_stream_poison_total', 'category="model",disposition="release"')).toBe(
-      1,
-    );
+    expect(
+      await contador('maia_stream_poison_total', 'category="model",disposition="release"'),
+    ).toBe(1);
     expect(
       await contador('maia_stream_poison_total', 'category="model",disposition="block_stream"'),
     ).toBe(0);
@@ -432,9 +433,7 @@ d('#629 — poison, DLQ e replay (DB real)', () => {
     const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2 });
 
     const h1 = await executar(m1);
-    await inA(() =>
-      turns().deadLetterTurn(h1 as never, { code: 'x', outcome: 'unsafe_to_retry' }),
-    );
+    await inA(() => turns().deadLetterTurn(h1 as never, { code: 'x', outcome: 'unsafe_to_retry' }));
     // O segundo só consegue rodar porque o teste o executa à força — em
     // produção o claim dele seria recusado. É exatamente o caso que o índice
     // único parcial existe para cobrir: duas conclusões terminais simultâneas
@@ -454,9 +453,7 @@ d('#629 — poison, DLQ e replay (DB real)', () => {
       conversa_id: null,
       lease: null,
     };
-    await inA(() =>
-      turns().deadLetterTurn(h2 as never, { code: 'y', outcome: 'unsafe_to_retry' }),
-    );
+    await inA(() => turns().deadLetterTurn(h2 as never, { code: 'y', outcome: 'unsafe_to_retry' }));
 
     // UMA linha ativa. O `ON CONFLICT DO NOTHING` sobre o índice único parcial
     // é o que garante isso NO BANCO — não a ordem em que os callers rodam.
@@ -516,10 +513,7 @@ d('#629 — poison, DLQ e replay (DB real)', () => {
 
     // A interdição saiu, e o histórico FICOU com autor e justificativa.
     expect(await blocosAtivos(T_A, A_A)).toEqual([]);
-    const hist = await pool.query(
-      `SELECT * FROM agent_stream_blocks WHERE tenant_id = $1`,
-      [T_A],
-    );
+    const hist = await pool.query(`SELECT * FROM agent_stream_blocks WHERE tenant_id = $1`, [T_A]);
     expect(hist.rows).toHaveLength(1);
     expect(hist.rows[0]!.unblocked_by).toBe('operador-teste');
     expect(hist.rows[0]!.unblock_reason).toBe('efeito conciliado à mão');

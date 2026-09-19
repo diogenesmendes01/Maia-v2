@@ -69,7 +69,10 @@ export function hashesMatch(a: string, b: string): boolean {
 
 /** `true` quando o marcador monotonico de bootstrap concluido existe. */
 export async function isBootstrapCompleted(): Promise<boolean> {
-  const linhas = await db.select({ s: bootstrap_completions.singleton }).from(bootstrap_completions).limit(1);
+  const linhas = await db
+    .select({ s: bootstrap_completions.singleton })
+    .from(bootstrap_completions)
+    .limit(1);
   return linhas.length > 0;
 }
 
@@ -228,9 +231,7 @@ export async function redeemBootstrapCredential(input: {
     const consumida = await tx
       .update(bootstrap_credentials)
       .set({ consumed_at: sql`now()` as unknown as Date })
-      .where(
-        and(eq(bootstrap_credentials.id, cred.id), isNull(bootstrap_credentials.consumed_at)),
-      )
+      .where(and(eq(bootstrap_credentials.id, cred.id), isNull(bootstrap_credentials.consumed_at)))
       .returning({ id: bootstrap_credentials.id });
 
     if (consumida.length !== 1) {

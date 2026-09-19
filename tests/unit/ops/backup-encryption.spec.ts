@@ -157,9 +157,7 @@ describe('key rotation', () => {
     writeFileSync(src, Buffer.from('x'));
     await encryptFile(src, enc, keyring('k2'));
     const shrunk = parseBackupKeyring(JSON.stringify({ k1: K1 }), 'k1');
-    await expect(decryptFile(enc, tmp('g.out'), shrunk)).rejects.toThrow(
-      /not in the keyring/,
-    );
+    await expect(decryptFile(enc, tmp('g.out'), shrunk)).rejects.toThrow(/not in the keyring/);
   });
 });
 

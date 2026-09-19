@@ -34,7 +34,10 @@ export type ToolExecutionSummary = {
   occurred_at: string;
 };
 
-type Summarizer = (args: unknown, result: unknown) => {
+type Summarizer = (
+  args: unknown,
+  result: unknown,
+) => {
   result_summary: string;
   result_keys?: ResultKeys;
 };

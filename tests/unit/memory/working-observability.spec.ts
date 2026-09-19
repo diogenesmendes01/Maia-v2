@@ -147,12 +147,8 @@ vi.mock('@/lib/logger.js', () => ({
   },
 }));
 
-const {
-  pushMessage,
-  readRecent,
-  recordLegacyRead,
-  _resetWriteDeadlinesForTests,
-} = await import('@/memory/working.js');
+const { pushMessage, readRecent, recordLegacyRead, _resetWriteDeadlinesForTests } =
+  await import('@/memory/working.js');
 const { _resetForTests, renderPrometheus } = await import('@/lib/metrics.js');
 
 // Stable tenant/agent IDs for the spec. Real UUIDs (not "tenant-1") so the
@@ -161,10 +157,7 @@ const TENANT_A = '11111111-1111-1111-1111-111111111111';
 const AGENT_A = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
 
 function asTenantA<T>(fn: () => Promise<T>): Promise<T> {
-  return runWithTenantContext(
-    { tenant_id: TENANT_A, agent_id: AGENT_A },
-    fn,
-  );
+  return runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, fn);
 }
 
 function workingKey(conversa_id: string): string {
@@ -195,13 +188,9 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).toContain(
-        'working_memory_read_latency_ms_count{hit="1",key_type="messages"} 1',
-      );
+      expect(out).toContain('working_memory_read_latency_ms_count{hit="1",key_type="messages"} 1');
       // The sum is observed in milliseconds and is non-negative.
-      expect(out).toMatch(
-        /working_memory_read_latency_ms_sum\{hit="1",key_type="messages"\} \d+/,
-      );
+      expect(out).toMatch(/working_memory_read_latency_ms_sum\{hit="1",key_type="messages"\} \d+/);
     });
 
     it('read miss emits latency with hit="0"', async () => {
@@ -211,9 +200,7 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).toContain(
-        'working_memory_read_latency_ms_count{hit="0",key_type="messages"} 1',
-      );
+      expect(out).toContain('working_memory_read_latency_ms_count{hit="0",key_type="messages"} 1');
       // The bucket layout must include +Inf for the hit="0" series too.
       expect(out).toContain(
         'working_memory_read_latency_ms_bucket{hit="0",key_type="messages",le="+Inf"} 1',
@@ -230,12 +217,8 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).toContain(
-        'working_memory_read_latency_ms_count{hit="1",key_type="messages"} 1',
-      );
-      expect(out).toContain(
-        'working_memory_read_latency_ms_count{hit="0",key_type="messages"} 3',
-      );
+      expect(out).toContain('working_memory_read_latency_ms_count{hit="1",key_type="messages"} 1');
+      expect(out).toContain('working_memory_read_latency_ms_count{hit="0",key_type="messages"} 3');
     });
   });
 
@@ -253,9 +236,7 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).toContain(
-        'working_memory_ttl_miss_total{key_type="messages"} 1',
-      );
+      expect(out).toContain('working_memory_ttl_miss_total{key_type="messages"} 1');
     });
 
     it('read miss WITHOUT a prior write does NOT count as a TTL miss', async () => {
@@ -266,13 +247,9 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).not.toContain(
-        'working_memory_ttl_miss_total{key_type="messages"}',
-      );
+      expect(out).not.toContain('working_memory_ttl_miss_total{key_type="messages"}');
       // The latency histogram still fires (hit="0").
-      expect(out).toContain(
-        'working_memory_read_latency_ms_count{hit="0",key_type="messages"} 1',
-      );
+      expect(out).toContain('working_memory_read_latency_ms_count{hit="0",key_type="messages"} 1');
     });
 
     it('successful read after a write does NOT count as a TTL miss', async () => {
@@ -282,9 +259,7 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).not.toContain(
-        'working_memory_ttl_miss_total{key_type="messages"}',
-      );
+      expect(out).not.toContain('working_memory_ttl_miss_total{key_type="messages"}');
     });
 
     it('a still-evicted key re-counts on each empty read while its marker is alive (#317 B3)', async () => {
@@ -303,9 +278,7 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).toContain(
-        'working_memory_ttl_miss_total{key_type="messages"} 2',
-      );
+      expect(out).toContain('working_memory_ttl_miss_total{key_type="messages"} 2');
     });
 
     it('marker natural-expiry: empty read with NO live marker is NOT a miss (#317 N1)', async () => {
@@ -322,9 +295,7 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).not.toContain(
-        'working_memory_ttl_miss_total{key_type="messages"}',
-      );
+      expect(out).not.toContain('working_memory_ttl_miss_total{key_type="messages"}');
     });
 
     it('push→hit→evict→miss is visible: the marker survives a hit (#317 B3)', async () => {
@@ -340,12 +311,8 @@ describe('working memory observability (#286)', () => {
       // Exactly one miss (one read after the eviction). If a successful read had
       // deleted the marker (the #304 bug this fixes), the post-hit eviction would
       // be invisible and this would be absent.
-      expect(out).toContain(
-        'working_memory_ttl_miss_total{key_type="messages"} 1',
-      );
-      expect(out).toContain(
-        'working_memory_read_latency_ms_count{hit="1",key_type="messages"} 1',
-      );
+      expect(out).toContain('working_memory_ttl_miss_total{key_type="messages"} 1');
+      expect(out).toContain('working_memory_read_latency_ms_count{hit="1",key_type="messages"} 1');
     });
   });
 
@@ -357,20 +324,14 @@ describe('working memory observability (#286)', () => {
         stub.failLrange.add(workingKey('conv-redis-down'));
 
         // The Redis failure propagates — readRecent rethrows it.
-        await expect(readRecent('conv-redis-down')).rejects.toThrow(
-          /redis lrange failed/,
-        );
+        await expect(readRecent('conv-redis-down')).rejects.toThrow(/redis lrange failed/);
       });
 
       const out = await renderPrometheus();
       // Recorded under the SEPARATE error metric…
-      expect(out).toContain(
-        'working_memory_redis_error_total{key_type="messages",op="lrange"} 1',
-      );
+      expect(out).toContain('working_memory_redis_error_total{key_type="messages",op="lrange"} 1');
       // …and NOT folded into the TTL-miss counter (the #304 finally-block bug).
-      expect(out).not.toContain(
-        'working_memory_ttl_miss_total{key_type="messages"}',
-      );
+      expect(out).not.toContain('working_memory_ttl_miss_total{key_type="messages"}');
       // No latency sample either — a thrown read has no meaningful hit/miss.
       expect(out).not.toContain('working_memory_read_latency_ms_count');
     });
@@ -385,21 +346,20 @@ describe('working memory observability (#286)', () => {
       // different-payload collision.
       await asTenantA(async () => {
         // Seed a foreign payload + a marker whose value is NOT our fingerprint.
-        await stub.rpush(workingKey('conv-collision'), JSON.stringify({ role: 'user', text: 'foreign' }));
+        await stub.rpush(
+          workingKey('conv-collision'),
+          JSON.stringify({ role: 'user', text: 'foreign' }),
+        );
         await stub.set(markerKey('conv-collision'), 'fingerprint-from-another-scope');
 
         await readRecent('conv-collision');
       });
 
       const out = await renderPrometheus();
-      expect(out).toContain(
-        'working_memory_key_collision_total{key_type="messages"} 1',
-      );
+      expect(out).toContain('working_memory_key_collision_total{key_type="messages"} 1');
       // A collision is explained by the foreign scope, so it must NOT also be
       // counted as a TTL miss even when the (foreign) read is empty.
-      expect(out).not.toContain(
-        'working_memory_ttl_miss_total{key_type="messages"}',
-      );
+      expect(out).not.toContain('working_memory_ttl_miss_total{key_type="messages"}');
     });
 
     it('a normal write→read round-trip does NOT trip the collision counter', async () => {
@@ -420,12 +380,8 @@ describe('working memory observability (#286)', () => {
       });
 
       const out = await renderPrometheus();
-      expect(out).toContain(
-        'working_memory_key_collision_total{key_type="messages"} 1',
-      );
-      expect(out).not.toContain(
-        'working_memory_ttl_miss_total{key_type="messages"}',
-      );
+      expect(out).toContain('working_memory_key_collision_total{key_type="messages"} 1');
+      expect(out).not.toContain('working_memory_ttl_miss_total{key_type="messages"}');
     });
   });
 
@@ -451,9 +407,7 @@ describe('working memory observability (#286)', () => {
 
       const out = await renderPrometheus();
       // Detection survived the (simulated) worker boundary purely via Redis.
-      expect(out).toContain(
-        'working_memory_ttl_miss_total{key_type="messages"} 1',
-      );
+      expect(out).toContain('working_memory_ttl_miss_total{key_type="messages"} 1');
     });
   });
 
@@ -468,9 +422,7 @@ describe('working memory observability (#286)', () => {
       recordLegacyRead('messages');
 
       return renderPrometheus().then((out) => {
-        expect(out).toContain(
-          'working_memory_legacy_read_total{key_type="messages"} 1',
-        );
+        expect(out).toContain('working_memory_legacy_read_total{key_type="messages"} 1');
       });
     });
 
@@ -480,12 +432,8 @@ describe('working memory observability (#286)', () => {
       recordLegacyRead('messages');
 
       return renderPrometheus().then((out) => {
-        expect(out).toContain(
-          'working_memory_legacy_read_total{key_type="rate"} 2',
-        );
-        expect(out).toContain(
-          'working_memory_legacy_read_total{key_type="messages"} 1',
-        );
+        expect(out).toContain('working_memory_legacy_read_total{key_type="rate"} 2');
+        expect(out).toContain('working_memory_legacy_read_total{key_type="messages"} 1');
       });
     });
 
@@ -525,9 +473,7 @@ describe('working memory observability (#286)', () => {
       // Defense-in-depth assertion: if anyone ever adds a `tenant_id="..."` /
       // `conversa_id="..."` label to one of these metrics by accident, this
       // catches it before it ships and explodes Prometheus.
-      const workingMemoryLines = out
-        .split('\n')
-        .filter((l) => l.startsWith('working_memory_'));
+      const workingMemoryLines = out.split('\n').filter((l) => l.startsWith('working_memory_'));
       expect(workingMemoryLines.length).toBeGreaterThan(0);
       for (const line of workingMemoryLines) {
         expect(line).not.toMatch(/tenant_id=/);

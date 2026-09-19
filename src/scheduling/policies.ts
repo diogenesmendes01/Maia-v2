@@ -47,7 +47,11 @@ export function decideMissedRun(
   }
 }
 
-export function isOverdue(scheduled_for: Date, staleness_hours: number, now: Date = new Date()): boolean {
+export function isOverdue(
+  scheduled_for: Date,
+  staleness_hours: number,
+  now: Date = new Date(),
+): boolean {
   return now.getTime() - scheduled_for.getTime() > staleness_hours * 3600_000;
 }
 

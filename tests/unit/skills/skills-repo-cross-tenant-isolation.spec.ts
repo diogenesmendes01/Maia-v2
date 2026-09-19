@@ -107,12 +107,10 @@ vi.mock('drizzle-orm', () => {
     },
   });
   const and = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
+    __pred: (row: Row) => conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
   });
   const or = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
+    __pred: (row: Row) => conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
   });
   // desc() applied to a plain column ref → sort key (descending).
   const desc = (col: unknown): SortKey => {
@@ -125,10 +123,7 @@ vi.mock('drizzle-orm', () => {
           if (typeof v === 'number') return v;
           if (v instanceof Date) return v.getTime();
           // string fallback: lex by char code (good enough for descriptors).
-          return Array.from(String(v)).reduce(
-            (acc, ch) => acc + ch.charCodeAt(0) / 1e6,
-            0,
-          );
+          return Array.from(String(v)).reduce((acc, ch) => acc + ch.charCodeAt(0) / 1e6, 0);
         },
         __dir: 'desc',
       };
@@ -218,10 +213,7 @@ class SelectBuilder {
             if (v == null) return -Infinity;
             if (typeof v === 'number') return v;
             if (v instanceof Date) return v.getTime();
-            return Array.from(String(v)).reduce(
-              (acc, ch) => acc + ch.charCodeAt(0) / 1e6,
-              0,
-            );
+            return Array.from(String(v)).reduce((acc, ch) => acc + ch.charCodeAt(0) / 1e6, 0);
           },
           __dir: 'asc',
         });
@@ -284,8 +276,7 @@ function makeDbHandle() {
 
 vi.mock('@/db/client.js', () => {
   const db = makeDbHandle();
-  const withTx = async (fn: (tx: unknown) => Promise<unknown>) =>
-    fn(makeDbHandle());
+  const withTx = async (fn: (tx: unknown) => Promise<unknown>) => fn(makeDbHandle());
   return { db, withTx };
 });
 
@@ -337,21 +328,59 @@ function baseRow(over: Row): Row {
 function seedTwoTenants() {
   // tenant-A: own agent skill + tenant-wide skill (shared INSIDE tenant-A).
   tableOf(skillsTable).push(
-    baseRow({ id: 's_A_owned',  tenant_id: 'tenant-A', agent_id: 'agent-A', skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
-    baseRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null,      skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+    baseRow({
+      id: 's_A_owned',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
+    baseRow({
+      id: 's_A_shared',
+      tenant_id: 'tenant-A',
+      agent_id: null,
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
   );
   // tenant-B: own agent skill + tenant-wide skill (shared INSIDE tenant-B).
   // The `s_B_shared` row is the canonical leak risk — it is tenant-wide for
   // tenant-B, but MUST NEVER appear under a tenant-A query.
   tableOf(skillsTable).push(
-    baseRow({ id: 's_B_owned',  tenant_id: 'tenant-B', agent_id: 'agent-B', skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
-    baseRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null,      skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+    baseRow({
+      id: 's_B_owned',
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
+    baseRow({
+      id: 's_B_shared',
+      tenant_id: 'tenant-B',
+      agent_id: null,
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
   );
   // A few extra differently-named/typed rows so listAll/listSummaries surface
   // > 1 row per tenant and the cross-tenant absence is a stronger signal.
   tableOf(skillsTable).push(
-    baseRow({ id: 's_A_extra', tenant_id: 'tenant-A', agent_id: 'agent-A', skill_descriptor: 'a.extra', category: 'classify', version: 2 }),
-    baseRow({ id: 's_B_extra', tenant_id: 'tenant-B', agent_id: 'agent-B', skill_descriptor: 'b.extra', category: 'classify', version: 2 }),
+    baseRow({
+      id: 's_A_extra',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      skill_descriptor: 'a.extra',
+      category: 'classify',
+      version: 2,
+    }),
+    baseRow({
+      id: 's_B_extra',
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+      skill_descriptor: 'b.extra',
+      category: 'classify',
+      version: 2,
+    }),
   );
 }
 
@@ -362,16 +391,54 @@ function seedTwoTenants() {
 // would surface the leak as a tenant-B row sliding in front of tenant-A's.
 function seedTwoTenantsReverse() {
   tableOf(skillsTable).push(
-    baseRow({ id: 's_B_owned',  tenant_id: 'tenant-B', agent_id: 'agent-B', skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
-    baseRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null,      skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+    baseRow({
+      id: 's_B_owned',
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
+    baseRow({
+      id: 's_B_shared',
+      tenant_id: 'tenant-B',
+      agent_id: null,
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
   );
   tableOf(skillsTable).push(
-    baseRow({ id: 's_A_owned',  tenant_id: 'tenant-A', agent_id: 'agent-A', skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
-    baseRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null,      skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+    baseRow({
+      id: 's_A_owned',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
+    baseRow({
+      id: 's_A_shared',
+      tenant_id: 'tenant-A',
+      agent_id: null,
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
   );
   tableOf(skillsTable).push(
-    baseRow({ id: 's_B_extra', tenant_id: 'tenant-B', agent_id: 'agent-B', skill_descriptor: 'b.extra', category: 'classify', version: 2 }),
-    baseRow({ id: 's_A_extra', tenant_id: 'tenant-A', agent_id: 'agent-A', skill_descriptor: 'a.extra', category: 'classify', version: 2 }),
+    baseRow({
+      id: 's_B_extra',
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+      skill_descriptor: 'b.extra',
+      category: 'classify',
+      version: 2,
+    }),
+    baseRow({
+      id: 's_A_extra',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      skill_descriptor: 'a.extra',
+      category: 'classify',
+      version: 2,
+    }),
   );
 }
 
@@ -405,10 +472,22 @@ function seedTwoTenantsReverse() {
 function seedTenantWideOnlyBFirst() {
   // B's tenant-wide row goes FIRST so it sorts ahead of A's in insertion order.
   tableOf(skillsTable).push(
-    baseRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+    baseRow({
+      id: 's_B_shared',
+      tenant_id: 'tenant-B',
+      agent_id: null,
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
   );
   tableOf(skillsTable).push(
-    baseRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+    baseRow({
+      id: 's_A_shared',
+      tenant_id: 'tenant-A',
+      agent_id: null,
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
   );
 }
 
@@ -419,10 +498,22 @@ function seedTenantWideOnlyBFirst() {
 // the tenant-B direction (item 4 / symmetry).
 function seedTenantWideOnlyAFirst() {
   tableOf(skillsTable).push(
-    baseRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+    baseRow({
+      id: 's_A_shared',
+      tenant_id: 'tenant-A',
+      agent_id: null,
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
   );
   tableOf(skillsTable).push(
-    baseRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated' }),
+    baseRow({
+      id: 's_B_shared',
+      tenant_id: 'tenant-B',
+      agent_id: null,
+      skill_descriptor: 'shared.descr',
+      category: 'tool_mediated',
+    }),
   );
 }
 
@@ -438,9 +529,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listByCategory: tenant-A query never returns tenant-B rows (incl. tenant-B `agent_id IS NULL`)', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.listByCategory('tool_mediated'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.listByCategory('tool_mediated'),
     );
     const ids = idsOf(got);
     expect(ids.sort()).toEqual(['s_A_owned', 's_A_shared'].sort());
@@ -451,9 +541,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listByCategory: symmetric — tenant-B query never returns tenant-A rows', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => skillsRepo.listByCategory('tool_mediated'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      skillsRepo.listByCategory('tool_mediated'),
     );
     const ids = idsOf(got);
     expect(ids.sort()).toEqual(['s_B_owned', 's_B_shared'].sort());
@@ -471,16 +560,33 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it("listByCategory: status='active' filter — inactive tenant-A rows are excluded (regression for fake fidelity)", async () => {
     tableOf(skillsTable).push(
       // active tenant-A skill — should surface
-      baseRow({ id: 's_A_active', tenant_id: 'tenant-A', agent_id: 'agent-A', category: 'tool_mediated', status: 'active' }),
+      baseRow({
+        id: 's_A_active',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        category: 'tool_mediated',
+        status: 'active',
+      }),
       // deprecated tenant-A skill — MUST NOT surface
-      baseRow({ id: 's_A_deprecated', tenant_id: 'tenant-A', agent_id: 'agent-A', category: 'tool_mediated', status: 'deprecated' }),
+      baseRow({
+        id: 's_A_deprecated',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        category: 'tool_mediated',
+        status: 'deprecated',
+      }),
       // proposed tenant-A skill — MUST NOT surface
-      baseRow({ id: 's_A_proposed', tenant_id: 'tenant-A', agent_id: 'agent-A', category: 'tool_mediated', status: 'proposed' }),
+      baseRow({
+        id: 's_A_proposed',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        category: 'tool_mediated',
+        status: 'proposed',
+      }),
     );
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.listByCategory('tool_mediated'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.listByCategory('tool_mediated'),
     );
     const ids = idsOf(got);
     expect(ids).toContain('s_A_active');
@@ -492,9 +598,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listAll: tenant-A sees only tenant-A rows across all categories', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.listAll(),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.listAll(),
     );
     const ids = idsOf(got);
     expect(ids.sort()).toEqual(['s_A_extra', 's_A_owned', 's_A_shared'].sort());
@@ -506,9 +611,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listAll: symmetric — tenant-B sees only tenant-B rows', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => skillsRepo.listAll(),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      skillsRepo.listAll(),
     );
     const ids = idsOf(got);
     expect(ids.sort()).toEqual(['s_B_extra', 's_B_owned', 's_B_shared'].sort());
@@ -521,9 +625,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listSummaries: tenant-A summary list is tenant-A-only', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.listSummaries(),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.listSummaries(),
     );
     const ids = idsOf(got);
     expect(ids.sort()).toEqual(['s_A_extra', 's_A_owned', 's_A_shared'].sort());
@@ -535,9 +638,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listSummaries: symmetric — tenant-B summary list is tenant-B-only', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => skillsRepo.listSummaries(),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      skillsRepo.listSummaries(),
     );
     const ids = idsOf(got);
     expect(ids.sort()).toEqual(['s_B_extra', 's_B_owned', 's_B_shared'].sort());
@@ -552,9 +654,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listSummariesPage: every row in tenant-A page belongs to tenant-A (per-row tenant_id check)', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const page = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.listSummariesPage(),
+    const page = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.listSummariesPage(),
     );
     const ids = idsOf(page.items);
     expect(ids.sort()).toEqual(['s_A_extra', 's_A_owned', 's_A_shared'].sort());
@@ -569,9 +670,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listSummariesPage: symmetric — every row in tenant-B page belongs to tenant-B', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const page = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => skillsRepo.listSummariesPage(),
+    const page = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      skillsRepo.listSummariesPage(),
     );
     const ids = idsOf(page.items);
     expect(ids.sort()).toEqual(['s_B_extra', 's_B_owned', 's_B_shared'].sort());
@@ -606,10 +706,10 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
         }),
       );
     }
-    const { skillsRepo, SKILLS_LIST_MAX_LIMIT } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const page = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.listSummariesPage(),
+    const { skillsRepo, SKILLS_LIST_MAX_LIMIT } =
+      await import('@/control-plane/skill-registry/skills-repo.js');
+    const page = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.listSummariesPage(),
     );
     expect(page.items.length).toBe(SKILLS_LIST_MAX_LIMIT);
     // hasMore=true here because tenant-A alone has 220 > 200. Useful sanity.
@@ -641,10 +741,10 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
         }),
       );
     }
-    const { skillsRepo, SKILLS_LIST_MAX_LIMIT } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const page = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => skillsRepo.listSummariesPage(),
+    const { skillsRepo, SKILLS_LIST_MAX_LIMIT } =
+      await import('@/control-plane/skill-registry/skills-repo.js');
+    const page = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      skillsRepo.listSummariesPage(),
     );
     expect(page.items.length).toBe(SKILLS_LIST_MAX_LIMIT);
     expect(page.hasMore).toBe(true);
@@ -669,13 +769,11 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     expect(leakedOwned).toBeNull();
     expect(leakedShared).toBeNull(); // tenant-WIDE ≠ cross-tenant
     // Sanity: tenant-A own rows still resolve under tenant-A scope.
-    const ownA = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.getById('s_A_owned'),
+    const ownA = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.getById('s_A_owned'),
     );
-    const sharedA = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.getById('s_A_shared'),
+    const sharedA = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.getById('s_A_shared'),
     );
     expect(ownA?.id).toBe('s_A_owned');
     expect(sharedA?.id).toBe('s_A_shared');
@@ -704,15 +802,13 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   // ---------------------------------------------------------------------
   describe('item 3 — adversarial seed order for singleton (limit 1) queries', () => {
     for (const seedName of ['A-first', 'B-first'] as const) {
-      const doSeed =
-        seedName === 'A-first' ? seedTwoTenants : seedTwoTenantsReverse;
+      const doSeed = seedName === 'A-first' ? seedTwoTenants : seedTwoTenantsReverse;
 
       it(`getByDescriptor with seed order [${seedName}]: tenant-A returns ONLY tenant-A row`, async () => {
         doSeed();
         const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-        const got = await runWithTenantContext(
-          { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-          () => skillsRepo.getByDescriptor('shared.descr'),
+        const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+          skillsRepo.getByDescriptor('shared.descr'),
         );
         expect(got).not.toBeNull();
         expect(['s_A_owned', 's_A_shared']).toContain(got!.id);
@@ -724,9 +820,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
       it(`getByDescriptor with seed order [${seedName}]: symmetric — tenant-B returns ONLY tenant-B row`, async () => {
         doSeed();
         const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-        const got = await runWithTenantContext(
-          { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-          () => skillsRepo.getByDescriptor('shared.descr'),
+        const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+          skillsRepo.getByDescriptor('shared.descr'),
         );
         expect(got).not.toBeNull();
         expect(['s_B_owned', 's_B_shared']).toContain(got!.id);
@@ -737,9 +832,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
       it(`findActive with seed order [${seedName}]: tenant-A returns ONLY tenant-A row`, async () => {
         doSeed();
         const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-        const got = await runWithTenantContext(
-          { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-          () => skillsRepo.findActive('shared.descr'),
+        const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+          skillsRepo.findActive('shared.descr'),
         );
         expect(got).not.toBeNull();
         expect(['s_A_owned', 's_A_shared']).toContain(got!.id);
@@ -750,9 +844,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
       it(`findActive with seed order [${seedName}]: symmetric — tenant-B returns ONLY tenant-B row`, async () => {
         doSeed();
         const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-        const got = await runWithTenantContext(
-          { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-          () => skillsRepo.findActive('shared.descr'),
+        const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+          skillsRepo.findActive('shared.descr'),
         );
         expect(got).not.toBeNull();
         expect(['s_B_owned', 's_B_shared']).toContain(got!.id);
@@ -782,9 +875,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
       // tenant. The assertion below catches that.
       seedTenantWideOnlyBFirst();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-        () => skillsRepo.findActive('shared.descr'),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+        skillsRepo.findActive('shared.descr'),
       );
       expect(got).not.toBeNull();
       expect(got!.id).toBe('s_A_shared');
@@ -797,9 +889,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
       // wrong tenant. With the guard in place, only s_B_shared matches.
       seedTenantWideOnlyAFirst();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-        () => skillsRepo.findActive('shared.descr'),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+        skillsRepo.findActive('shared.descr'),
       );
       expect(got).not.toBeNull();
       expect(got!.id).toBe('s_B_shared');
@@ -815,9 +906,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('findActive(d, null) with TENANT-WIDE-ONLY seed [B-first]: tenant-A returns s_A_shared (explicit-null branch)', async () => {
       seedTenantWideOnlyBFirst();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-        () => skillsRepo.findActive('shared.descr', null),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+        skillsRepo.findActive('shared.descr', null),
       );
       expect(got).not.toBeNull();
       expect(got!.id).toBe('s_A_shared');
@@ -827,9 +917,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('findActive(d, null) with TENANT-WIDE-ONLY seed [A-first]: symmetric — tenant-B returns s_B_shared (explicit-null branch)', async () => {
       seedTenantWideOnlyAFirst();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-        () => skillsRepo.findActive('shared.descr', null),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+        skillsRepo.findActive('shared.descr', null),
       );
       expect(got).not.toBeNull();
       expect(got!.id).toBe('s_B_shared');
@@ -851,9 +940,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('item 5 — findActive (default) prefers agent-scoped over tenant-wide via NULLS-LAST ORDER BY', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.findActive('shared.descr'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.findActive('shared.descr'),
     );
     expect(got?.id).toBe('s_A_owned'); // agent-scoped wins over tenant-wide
   });
@@ -861,9 +949,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('item 5 — findActive (default) on tenant-B prefers tenant-B agent-scoped', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => skillsRepo.findActive('shared.descr'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      skillsRepo.findActive('shared.descr'),
     );
     expect(got?.id).toBe('s_B_owned');
   });
@@ -874,9 +961,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
     // Both tenants own a skill at 'shared.descr'. The query resolves under
     // tenant-A — it must pick a tenant-A row, NEVER s_B_owned or s_B_shared.
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.getByDescriptor('shared.descr'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.getByDescriptor('shared.descr'),
     );
     expect(got).not.toBeNull();
     expect(['s_A_owned', 's_A_shared']).toContain(got!.id);
@@ -886,9 +972,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('getByDescriptor: symmetric — tenant-B never picks up a tenant-A row for a shared descriptor', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => skillsRepo.getByDescriptor('shared.descr'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      skillsRepo.getByDescriptor('shared.descr'),
     );
     expect(got).not.toBeNull();
     expect(['s_B_owned', 's_B_shared']).toContain(got!.id);
@@ -899,9 +984,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('findActive: tenant-A on a descriptor present in BOTH tenants returns ONLY a tenant-A row', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.findActive('shared.descr'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.findActive('shared.descr'),
     );
     expect(got).not.toBeNull();
     expect(['s_A_owned', 's_A_shared']).toContain(got!.id);
@@ -911,9 +995,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('findActive: explicit tenant-wide (agent_id=null) on tenant-A scope still returns ONLY tenant-A null-owner rows', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.findActive('shared.descr', null),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.findActive('shared.descr', null),
     );
     expect(got?.id).toBe('s_A_shared');
     // s_B_shared is also agent_id=null but belongs to tenant-B; MUST NOT leak.
@@ -924,9 +1007,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listVersions: tenant-A version history of a shared descriptor never includes tenant-B versions', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => skillsRepo.listVersions('shared.descr'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      skillsRepo.listVersions('shared.descr'),
     );
     const ids = idsOf(got);
     // Versions for tenant-A only: s_A_owned and s_A_shared share the same
@@ -939,9 +1021,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
   it('listVersions: symmetric — tenant-B version history never includes tenant-A versions', async () => {
     seedTwoTenants();
     const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-    const got = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => skillsRepo.listVersions('shared.descr'),
+    const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      skillsRepo.listVersions('shared.descr'),
     );
     const ids = idsOf(got);
     expect(ids.sort()).toEqual(['s_B_owned', 's_B_shared'].sort());
@@ -959,9 +1040,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('findActive(descriptor, agentId): explicit tenant-A agent — returns only tenant-A own row, never tenant-B', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-        () => skillsRepo.findActive('shared.descr', 'agent-A'),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+        skillsRepo.findActive('shared.descr', 'agent-A'),
       );
       expect(got?.id).toBe('s_A_owned'); // exact agent_id match
       expect(got?.tenant_id).toBe('tenant-A');
@@ -970,9 +1050,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('findActive(descriptor, agentId): explicit tenant-B agent — returns only tenant-B own row, never tenant-A', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-        () => skillsRepo.findActive('shared.descr', 'agent-B'),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+        skillsRepo.findActive('shared.descr', 'agent-B'),
       );
       expect(got?.id).toBe('s_B_owned');
       expect(got?.tenant_id).toBe('tenant-B');
@@ -988,9 +1067,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
       // belongs to a different tenant in our seed). MUST throw, not return
       // tenant-B's row.
       await expect(
-        runWithTenantContext(
-          { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-          () => skillsRepo.findActive('shared.descr', 'agent-B'),
+        runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+          skillsRepo.findActive('shared.descr', 'agent-B'),
         ),
       ).rejects.toThrow(/agent_scope_violation/);
     });
@@ -1000,9 +1078,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('listVersions(descriptor, explicit agentId): tenant-A asks for agent-A — returns only s_A_owned, excludes tenant-wide AND tenant-B', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-        () => skillsRepo.listVersions('shared.descr', 'agent-A'),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+        skillsRepo.listVersions('shared.descr', 'agent-A'),
       );
       const ids = idsOf(got);
       // ONLY the agent-scoped tenant-A version — tenant-wide s_A_shared is
@@ -1017,9 +1094,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('listVersions(descriptor, explicit agentId): symmetric — tenant-B asks for agent-B — returns only s_B_owned, excludes tenant-wide AND tenant-A', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-        () => skillsRepo.listVersions('shared.descr', 'agent-B'),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+        skillsRepo.listVersions('shared.descr', 'agent-B'),
       );
       const ids = idsOf(got);
       // ONLY the agent-scoped tenant-B version — tenant-wide s_B_shared is
@@ -1031,9 +1107,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('listVersions(descriptor, agentId: null): tenant-A asks for tenant-wide — returns only s_A_shared, excludes tenant-B tenant-wide', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-        () => skillsRepo.listVersions('shared.descr', null),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+        skillsRepo.listVersions('shared.descr', null),
       );
       const ids = idsOf(got);
       // ONLY the tenant-wide tenant-A version. tenant-B's tenant-wide row
@@ -1045,9 +1120,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('listVersions(descriptor, agentId: null): symmetric — tenant-B asks for tenant-wide — returns only s_B_shared', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-        () => skillsRepo.listVersions('shared.descr', null),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+        skillsRepo.listVersions('shared.descr', null),
       );
       const ids = idsOf(got);
       expect(ids).toEqual(['s_B_shared']);
@@ -1059,9 +1133,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('getByDescriptor(descriptor, version=1): tenant-A explicit version — returns only tenant-A row, never tenant-B', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-        () => skillsRepo.getByDescriptor('shared.descr', 1),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+        skillsRepo.getByDescriptor('shared.descr', 1),
       );
       expect(got).not.toBeNull();
       expect(got!.tenant_id).toBe('tenant-A');
@@ -1071,9 +1144,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('getByDescriptor(descriptor, version=1): symmetric — tenant-B explicit version — returns only tenant-B row, never tenant-A', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-        () => skillsRepo.getByDescriptor('shared.descr', 1),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+        skillsRepo.getByDescriptor('shared.descr', 1),
       );
       expect(got).not.toBeNull();
       expect(got!.tenant_id).toBe('tenant-B');
@@ -1083,9 +1155,8 @@ describe('skillsRepo — cross-tenant isolation (issue #218)', () => {
     it('getByDescriptor(descriptor, version=99): version mismatch — returns null even though tenant-B has version 1', async () => {
       seedTwoTenants();
       const { skillsRepo } = await import('@/control-plane/skill-registry/skills-repo.js');
-      const got = await runWithTenantContext(
-        { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-        () => skillsRepo.getByDescriptor('shared.descr', 99),
+      const got = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+        skillsRepo.getByDescriptor('shared.descr', 99),
       );
       // tenant-A has no version 99; tenant-B has none either. But a missing
       // tenant_id filter combined with a missing version filter would surface

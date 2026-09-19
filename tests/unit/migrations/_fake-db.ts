@@ -176,7 +176,9 @@ export class FakeDb {
       return { rows: this.entries() };
     }
     if (t.startsWith('SELECT id, applied_at FROM schema_migrations')) {
-      return { rows: [...this.ledger.values()].map((r) => ({ id: r.id, applied_at: r.applied_at })) };
+      return {
+        rows: [...this.ledger.values()].map((r) => ({ id: r.id, applied_at: r.applied_at })),
+      };
     }
     if (t.includes("SET status = 'dirty'") && t.includes("WHERE status = 'running'")) {
       const promoted: { id: string }[] = [];
@@ -213,7 +215,12 @@ export class FakeDb {
       return { rows: [] };
     }
     if (t.startsWith('UPDATE schema_migrations') && t.includes('repair_reason')) {
-      const [id, checksum, reason, runnerVersion] = values as [string, string | null, string, string];
+      const [id, checksum, reason, runnerVersion] = values as [
+        string,
+        string | null,
+        string,
+        string,
+      ];
       const row = this.ledger.get(id);
       if (row && ['dirty', 'failed', 'running'].includes(row.status)) {
         row.status = 'applied';
@@ -260,7 +267,12 @@ export class FakeDb {
     const existing = this.ledger.get(id);
 
     if (text.includes("VALUES ($1, 'running'")) {
-      const [, checksum, appVersion, runnerVersion] = values as [string, string, string | null, string];
+      const [, checksum, appVersion, runnerVersion] = values as [
+        string,
+        string,
+        string | null,
+        string,
+      ];
       this.ledger.set(id, {
         ...(existing ?? blankRow(id)),
         status: 'running',

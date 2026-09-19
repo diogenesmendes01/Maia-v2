@@ -78,13 +78,61 @@ const NON_COMMITTAL_INTENT_LABELS: ReadonlySet<string> = new Set([
  */
 const STOPWORDS: ReadonlySet<string> = new Set([
   // English
-  'the', 'a', 'an', 'to', 'of', 'for', 'and', 'or', 'when', 'use', 'used',
-  'this', 'skill', 'user', 'about', 'with', 'on', 'in', 'is', 'are', 'be',
-  'request', 'intent', 'query', 'asks', 'ask', 'wants', 'want',
+  'the',
+  'a',
+  'an',
+  'to',
+  'of',
+  'for',
+  'and',
+  'or',
+  'when',
+  'use',
+  'used',
+  'this',
+  'skill',
+  'user',
+  'about',
+  'with',
+  'on',
+  'in',
+  'is',
+  'are',
+  'be',
+  'request',
+  'intent',
+  'query',
+  'asks',
+  'ask',
+  'wants',
+  'want',
   // Portuguese (Maia is pt-BR first)
-  'o', 'os', 'a', 'as', 'de', 'do', 'da', 'para', 'e', 'ou', 'quando',
-  'usar', 'usado', 'esta', 'este', 'usuario', 'usuário', 'sobre', 'com',
-  'em', 'no', 'na', 'pedido', 'pergunta', 'quer', 'solicita',
+  'o',
+  'os',
+  'a',
+  'as',
+  'de',
+  'do',
+  'da',
+  'para',
+  'e',
+  'ou',
+  'quando',
+  'usar',
+  'usado',
+  'esta',
+  'este',
+  'usuario',
+  'usuário',
+  'sobre',
+  'com',
+  'em',
+  'no',
+  'na',
+  'pedido',
+  'pergunta',
+  'quer',
+  'solicita',
 ]);
 
 /**
@@ -114,29 +162,20 @@ function intentTokens(label: string): string[] {
  *
  * Exported for unit testing of the boundary behaviour.
  */
-export function scoreSkillMatch(
-  skill: Skill,
-  intent: DecisionPacket['intent'],
-): number {
+export function scoreSkillMatch(skill: Skill, intent: DecisionPacket['intent']): number {
   const label = (intent.label ?? '').trim().toLowerCase();
   if (NON_COMMITTAL_INTENT_LABELS.has(label)) return 0;
 
   // 1. Explicit contract: applicable_to_intent membership is the strongest,
   //    most intentional signal a skill author can give. Exact (case-insensitive).
-  const applicable = (skill.applicable_to_intent ?? []).map((i) =>
-    i.trim().toLowerCase(),
-  );
+  const applicable = (skill.applicable_to_intent ?? []).map((i) => i.trim().toLowerCase());
   if (applicable.includes(label)) return 1;
 
   // 2. Token overlap between the intent and the skill's free-text guidance.
   const iTokens = intentTokens(label);
   if (iTokens.length === 0) return 0;
 
-  const haystack = [
-    skill.when_to_use ?? '',
-    skill.id ?? '',
-    ...applicable,
-  ].join(' ');
+  const haystack = [skill.when_to_use ?? '', skill.id ?? '', ...applicable].join(' ');
   const hTokens = new Set(tokenize(haystack));
   if (hTokens.size === 0) return 0;
 

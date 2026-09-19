@@ -37,74 +37,63 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
       public readonly id: string,
       public readonly expected_previous_status: KnowledgeLifecycleStatus,
     ) {
-      super(
-        `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
-      );
+      super(`knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`);
       this.name = 'KnowledgeConflictError';
     }
   }
   return {
-  KnowledgeConflictError,
-  knowledgeRepos: {
-    async create(input: {
-      kind: KnowledgeKind;
-      lifecycle_status: KnowledgeLifecycleStatus;
-      lifecycle_transitions: KnowledgeTransitionRecord[];
-      evidence_count: number;
-      tenant_id: string;
-      agent_id: string;
-    }): Promise<string> {
-      const id = `mock-id-${Math.random().toString(36).slice(2, 10)}`;
-      seedStore(input.kind, {
-        id,
-        tenant_id: input.tenant_id,
-        agent_id: input.agent_id,
-        lifecycle_status: input.lifecycle_status,
-        lifecycle_transitions: input.lifecycle_transitions,
-        evidence_count: input.evidence_count,
-        updated_at: new Date(),
-      });
-      return id;
-    },
-    async findById(
-      kind: KnowledgeKind,
-      id: string,
-    ): Promise<KnowledgeRow | null> {
-      return storeByKind.get(kind)?.get(id) ?? null;
-    },
-    async update(
-      kind: KnowledgeKind,
-      id: string,
-      updates: {
-        lifecycle_status?: KnowledgeLifecycleStatus;
-        lifecycle_transitions?: KnowledgeTransitionRecord[];
-        evidence_count?: number;
-        expected_previous_status?: KnowledgeLifecycleStatus;
-      },
-    ): Promise<void> {
-      const row = storeByKind.get(kind)?.get(id);
-      if (!row) return;
-      // Optimistic concurrency: simulate the conditional UPDATE so the
-      // state-machine's KnowledgeConflictError path is exercised.
-      if (
-        updates.expected_previous_status !== undefined &&
-        row.lifecycle_status !== updates.expected_previous_status
-      ) {
-        throw new KnowledgeConflictError(
-          kind,
+    KnowledgeConflictError,
+    knowledgeRepos: {
+      async create(input: {
+        kind: KnowledgeKind;
+        lifecycle_status: KnowledgeLifecycleStatus;
+        lifecycle_transitions: KnowledgeTransitionRecord[];
+        evidence_count: number;
+        tenant_id: string;
+        agent_id: string;
+      }): Promise<string> {
+        const id = `mock-id-${Math.random().toString(36).slice(2, 10)}`;
+        seedStore(input.kind, {
           id,
-          updates.expected_previous_status,
-        );
-      }
-      if (updates.lifecycle_status !== undefined)
-        row.lifecycle_status = updates.lifecycle_status;
-      if (updates.lifecycle_transitions !== undefined)
-        row.lifecycle_transitions = updates.lifecycle_transitions;
-      if (updates.evidence_count !== undefined)
-        row.evidence_count = updates.evidence_count;
-      row.updated_at = new Date();
+          tenant_id: input.tenant_id,
+          agent_id: input.agent_id,
+          lifecycle_status: input.lifecycle_status,
+          lifecycle_transitions: input.lifecycle_transitions,
+          evidence_count: input.evidence_count,
+          updated_at: new Date(),
+        });
+        return id;
+      },
+      async findById(kind: KnowledgeKind, id: string): Promise<KnowledgeRow | null> {
+        return storeByKind.get(kind)?.get(id) ?? null;
+      },
+      async update(
+        kind: KnowledgeKind,
+        id: string,
+        updates: {
+          lifecycle_status?: KnowledgeLifecycleStatus;
+          lifecycle_transitions?: KnowledgeTransitionRecord[];
+          evidence_count?: number;
+          expected_previous_status?: KnowledgeLifecycleStatus;
+        },
+      ): Promise<void> {
+        const row = storeByKind.get(kind)?.get(id);
+        if (!row) return;
+        // Optimistic concurrency: simulate the conditional UPDATE so the
+        // state-machine's KnowledgeConflictError path is exercised.
+        if (
+          updates.expected_previous_status !== undefined &&
+          row.lifecycle_status !== updates.expected_previous_status
+        ) {
+          throw new KnowledgeConflictError(kind, id, updates.expected_previous_status);
+        }
+        if (updates.lifecycle_status !== undefined) row.lifecycle_status = updates.lifecycle_status;
+        if (updates.lifecycle_transitions !== undefined)
+          row.lifecycle_transitions = updates.lifecycle_transitions;
+        if (updates.evidence_count !== undefined) row.evidence_count = updates.evidence_count;
+        row.updated_at = new Date();
+      },
     },
-  },
   };
 });
 
@@ -112,9 +101,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
 // expected in unit tests, the runner still returns the inner function's
 // result via the audit-failed catch path.
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {

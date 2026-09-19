@@ -2,10 +2,7 @@ import { auditRepo } from '@/db/repositories.js';
 import type { AuditAction } from './audit-actions.js';
 import { logger } from '@/lib/logger.js';
 import { incCounter } from '@/lib/metrics.js';
-import {
-  runWithSystemContext,
-  tryGetCurrentContext,
-} from '@/db/tenant-context.js';
+import { runWithSystemContext, tryGetCurrentContext } from '@/db/tenant-context.js';
 
 /**
  * Audit writer used across the entire system. Originally `auditRepo.write`

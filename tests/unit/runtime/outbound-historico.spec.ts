@@ -163,13 +163,9 @@ describe('#635 — a projeção do artefato no histórico', () => {
     for (const status of MULTIPART_RESOLVED_STATUSES) {
       expect(multipartArtifactResolved(status), status).toBe(true);
     }
-    expect([...MULTIPART_RESOLVED_STATUSES].sort()).toEqual([
-      'cancelled',
-      'dead_letter',
-      'delivered',
-      'failed_terminal',
-      'completed',
-    ].sort());
+    expect([...MULTIPART_RESOLVED_STATUSES].sort()).toEqual(
+      ['cancelled', 'dead_letter', 'delivered', 'failed_terminal', 'completed'].sort(),
+    );
   });
 
   it('um estado DESCONHECIDO bloqueia — a lista é de inclusão', () => {

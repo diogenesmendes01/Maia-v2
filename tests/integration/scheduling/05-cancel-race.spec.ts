@@ -41,7 +41,8 @@ const txSelectChain = {
   from: vi.fn().mockReturnThis(),
   where: vi.fn().mockReturnThis(),
   limit: vi.fn(async () => {
-    if (state.status === 'active') return [{ id: state.series_id, status: state.status, version: state.version }];
+    if (state.status === 'active')
+      return [{ id: state.series_id, status: state.status, version: state.version }];
     return [];
   }),
 };
@@ -86,7 +87,8 @@ const txUpdateChain = {
       // simplicity, return the series row first, then occurrences. The
       // repo calls update twice in cancelAtomic.
       const callCount = txUpdateChain.returning.mock.calls.length;
-      if (callCount === 1) return [{ id: state.series_id, status: 'cancelled', version: state.version }];
+      if (callCount === 1)
+        return [{ id: state.series_id, status: 'cancelled', version: state.version }];
       return cancelled;
     }
     return [];
@@ -111,9 +113,7 @@ beforeEach(() => {
   state.series_id = 's-race';
   state.status = 'active';
   state.version = 1;
-  state.occurrences = [
-    { id: 'occ-existing', scheduled_for: new Date(), status: 'pending' },
-  ];
+  state.occurrences = [{ id: 'occ-existing', scheduled_for: new Date(), status: 'pending' }];
   vi.clearAllMocks();
   txSelectChain.from.mockReturnThis();
   txSelectChain.where.mockReturnThis();

@@ -219,15 +219,13 @@ describe('SkillRunner — AbortSignal plumbing (issue #220)', () => {
     });
 
     const externalController = new AbortController();
-    const promise = runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () =>
-        runSkill({
-          skill_descriptor: 'abort_check',
-          input: {},
-          triggered_by: 'user_message',
-          signal: externalController.signal,
-        }),
+    const promise = runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () =>
+      runSkill({
+        skill_descriptor: 'abort_check',
+        input: {},
+        triggered_by: 'user_message',
+        signal: externalController.signal,
+      }),
     );
 
     // Give the runner a tick to enter the mode handler and capture the signal,

@@ -72,9 +72,7 @@ describe('P9b — Early PEP', () => {
     });
     expect((result as BlockDecision).decision).toBe('block');
     expect((result as BlockDecision).severity).toBe('critical');
-    expect((result as BlockDecision).rule_descriptor).toBe(
-      'tenant.lockdown.emergency',
-    );
+    expect((result as BlockDecision).rule_descriptor).toBe('tenant.lockdown.emergency');
   });
 
   it('continues if no early policies apply', async () => {
@@ -111,10 +109,7 @@ describe('P9b — Early PEP', () => {
     expect(evaluator.evaluate).toHaveBeenCalledTimes(1);
     // Round-2 finding 4: policyRepo.getBody now accepts an options object
     // for AbortSignal propagation, so we use an additional matcher.
-    expect(policyRepo.getBody).toHaveBeenCalledWith(
-      'p_early',
-      expect.any(Object),
-    );
+    expect(policyRepo.getBody).toHaveBeenCalledWith('p_early', expect.any(Object));
   });
 
   it('returns block if a policy evaluator returns block', async () => {
@@ -189,9 +184,7 @@ describe('P9b — Early PEP', () => {
 
     expect('warnings' in result).toBe(true);
     expect((result as ContinueDecision).warnings).toHaveLength(2);
-    expect((result as ContinueDecision).warnings[0]?.reason).toContain(
-      'concern A',
-    );
+    expect((result as ContinueDecision).warnings[0]?.reason).toContain('concern A');
   });
 
   it('checks cached body via getBodySync when policy has no applies_to_peps', async () => {

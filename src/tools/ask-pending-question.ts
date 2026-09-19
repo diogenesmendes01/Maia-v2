@@ -15,9 +15,7 @@ const inputSchema = z.object({
     .array(z.object({ key: z.string().min(1).max(40), label: z.string().min(1).max(80) }))
     .min(2)
     .max(12),
-  acao_proposta: z
-    .object({ tool: z.string(), args: z.record(z.unknown()) })
-    .optional(),
+  acao_proposta: z.object({ tool: z.string(), args: z.record(z.unknown()) }).optional(),
   ttl_minutes: z.number().int().positive().max(1440).optional(),
 });
 

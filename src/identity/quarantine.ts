@@ -54,7 +54,10 @@ export async function handleQuarantineFirstContact(input: {
     return;
   }
 
-  const existing = await pendingQuestionsRepo.findOpenByPessoaAndType(owner.id, 'identity_confirmation');
+  const existing = await pendingQuestionsRepo.findOpenByPessoaAndType(
+    owner.id,
+    'identity_confirmation',
+  );
   if (existing) {
     // A confirmation is already open (possibly for a different contact). Sending
     // a second one would make the owner's next reply ambiguous — we can't tell
@@ -81,7 +84,9 @@ export async function handleQuarantineFirstContact(input: {
       jidFromPhone(tel),
       HOLDING_MESSAGE.replace('{OWNER_NAME}', config.OWNER_NOME),
       inbound.channel_id,
-    ).catch((err) => logger.warn({ err: (err as Error).message }, 'quarantine.holding_send_failed'));
+    ).catch((err) =>
+      logger.warn({ err: (err as Error).message }, 'quarantine.holding_send_failed'),
+    );
   }
 
   // Persist a pending question keyed to the OWNER (so dispatch by phone works).
@@ -113,7 +118,9 @@ export async function handleQuarantineFirstContact(input: {
       jidFromPhone(owner.telefone_whatsapp),
       `${pessoa.nome} (${maskPhone(pessoa.telefone_whatsapp)}) mandou primeira mensagem. Responde "sim" para liberar ou "bloqueia" para bloquear.`,
       ownerConv?.channel_id ?? null,
-    ).catch((err) => logger.warn({ err: (err as Error).message }, 'quarantine.owner_prompt_failed'));
+    ).catch((err) =>
+      logger.warn({ err: (err as Error).message }, 'quarantine.owner_prompt_failed'),
+    );
   }
 }
 

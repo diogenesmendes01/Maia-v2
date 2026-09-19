@@ -274,10 +274,9 @@ describe('kill switch — releitura na reconexão', () => {
     redisMock.get.mockResolvedValue(null);
     await reconnect(sub);
 
-    expect(
-      effectiveMode(),
-      'override stale sobreviveu ao `clear` que esta réplica não ouviu',
-    ).toBe(modeInternal.baselineMode());
+    expect(effectiveMode(), 'override stale sobreviveu ao `clear` que esta réplica não ouviu').toBe(
+      modeInternal.baselineMode(),
+    );
     expect(currentOverride()).toBeNull();
 
     // …e isto é CONVERGÊNCIA, não divergência. O par com o teste do
@@ -287,10 +286,9 @@ describe('kill switch — releitura na reconexão', () => {
     // é o plantonista desligando o disjuntor — e transformá-lo em
     // `resync_failed` faria a série gritar em toda operação normal. Alarme que
     // toca sempre e alarme que nunca toca acabam no mesmo lugar: ninguém olha.
-    expect(
-      resyncReasons(),
-      'a limpeza convergente foi publicada como falha de resync',
-    ).toEqual(['resynced']);
+    expect(resyncReasons(), 'a limpeza convergente foi publicada como falha de resync').toEqual([
+      'resynced',
+    ]);
   });
 
   it('chave ausente E sem override local é no-op — mas ainda é um evento contado', async () => {
@@ -421,9 +419,7 @@ describe('kill switch — releitura na reconexão', () => {
     redisMock.get.mockResolvedValue(overridePayload('off'));
     await reconnect(sub);
 
-    const call = audit.mock.calls.find(
-      (c) => (c[1] as { source?: string }).source === 'resynced',
-    );
+    const call = audit.mock.calls.find((c) => (c[1] as { source?: string }).source === 'resynced');
     expect(call, 'a mudança de postura da releitura não deixou procedência na trilha').toBeTruthy();
     expect(call![0]).toBe('llm_circuit_mode_override_applied');
     expect(call![1]).toMatchObject({ mode: 'off', actor: ACTOR });
@@ -481,9 +477,7 @@ describe('kill switch — releitura na reconexão', () => {
 
     // A CAUSA continua distinguível na trilha durável — `resync_failed` é o
     // balde do alerta, `rejected` + `source: resynced` é o porquê.
-    const call = audit.mock.calls.find(
-      (c) => (c[1] as { source?: string }).source === 'resynced',
-    );
+    const call = audit.mock.calls.find((c) => (c[1] as { source?: string }).source === 'resynced');
     expect(call, 'a recusa da releitura não deixou rastro na trilha').toBeTruthy();
     expect(call![0]).toBe('llm_circuit_mode_override_rejected');
   });
@@ -858,9 +852,7 @@ describe('kill switch — releitura na reconexão', () => {
         // ele resolve, não sobrou orçamento nenhum.
         sub.subscribe.mockImplementation(
           () =>
-            new Promise((resolve) =>
-              setTimeout(() => resolve(2), RESYNC_RETRY.attemptTimeoutMs),
-            ),
+            new Promise((resolve) => setTimeout(() => resolve(2), RESYNC_RETRY.attemptTimeoutMs)),
         );
         // Se o `GET` for disparado, ele rejeita — e é a rejeição que não teria
         // handler no caminho defeituoso.
@@ -1125,17 +1117,20 @@ describe('kill switch — releitura na reconexão', () => {
         const linha = info.mock.calls.find(
           (c) => c[1] === 'llm_gateway.circuit_override_resync_cancelled',
         );
-        expect(linha, 'o cancelamento não emitiu evento nenhum em INFO — voltou o silêncio').toBeDefined();
+        expect(
+          linha,
+          'o cancelamento não emitiu evento nenhum em INFO — voltou o silêncio',
+        ).toBeDefined();
 
         const record = linha![0] as Record<string, unknown>;
         expect(
           record.cancel_reason,
           'a linha não diz POR QUE foi cancelado: `outcome` sozinho não distingue drain de deadline',
         ).toBe('subscriber_stopped');
-        expect(
-          record.channels,
-          'a linha não identifica o subscriber que foi fechado',
-        ).toEqual([LLM_SETTINGS_INVALIDATION_CHANNEL, LLM_CIRCUIT_OVERRIDE_CHANNEL]);
+        expect(record.channels, 'a linha não identifica o subscriber que foi fechado').toEqual([
+          LLM_SETTINGS_INVALIDATION_CHANNEL,
+          LLM_CIRCUIT_OVERRIDE_CHANNEL,
+        ]);
         expect(record.outcome).toBe('cancelled');
 
         const serializada = JSON.stringify(record);
@@ -1199,10 +1194,9 @@ describe('kill switch — releitura na reconexão', () => {
         ).not.toContain('llm_gateway.circuit_override_resync_failed');
 
         const infoMsgs = info.mock.calls.map((c) => c[1]);
-        expect(
-          infoMsgs,
-          'o drain não deixou rastro com nome próprio',
-        ).toContain('llm_gateway.circuit_override_resync_cancelled');
+        expect(infoMsgs, 'o drain não deixou rastro com nome próprio').toContain(
+          'llm_gateway.circuit_override_resync_cancelled',
+        );
 
         // NÍVEL, e não só presença (decisão 16): o cancelamento é operação
         // NORMAL — o subscriber parou. WARN aqui devolve o ruído de deploy que
@@ -1269,7 +1263,8 @@ describe('rename de `resync_aborted` para `resync_cancelled` (decisão 15)', () 
     }
     expect(
       offenders,
-      'o rename ficou pela metade — o dashboard passa a somar duas séries: ' + offenders.join(' | '),
+      'o rename ficou pela metade — o dashboard passa a somar duas séries: ' +
+        offenders.join(' | '),
     ).toEqual([]);
   });
 });

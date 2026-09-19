@@ -303,17 +303,22 @@ export const rulesRepo = {
         confianca: sql`LEAST(1.00, confianca + 0.10)`,
         updated_at: new Date(),
       })
-      .where(and(
-        eq(learned_rules.id, id),
-        eq(learned_rules.tenant_id, tenant_id),
-        eq(learned_rules.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(learned_rules.id, id),
+          eq(learned_rules.tenant_id, tenant_id),
+          eq(learned_rules.agent_id, agent_id),
+        ),
+      )
       .returning({ id: learned_rules.id });
     if (rows.length === 0) {
       // Loud failure — see INVARIANT block above. Either the id doesn't exist
       // OR it belongs to a different tenant/agent; both surface as the same
       // typed error so callers can't probe foreign-tenant existence.
-      throw new TypedError('rule_not_in_scope', `rule ${id} not found in current tenant/agent scope`);
+      throw new TypedError(
+        'rule_not_in_scope',
+        `rule ${id} not found in current tenant/agent scope`,
+      );
     }
   },
   async incrementErro(id: string): Promise<void> {
@@ -326,21 +331,23 @@ export const rulesRepo = {
         confianca: sql`GREATEST(0.00, confianca - 0.20)`,
         updated_at: new Date(),
       })
-      .where(and(
-        eq(learned_rules.id, id),
-        eq(learned_rules.tenant_id, tenant_id),
-        eq(learned_rules.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(learned_rules.id, id),
+          eq(learned_rules.tenant_id, tenant_id),
+          eq(learned_rules.agent_id, agent_id),
+        ),
+      )
       .returning({ id: learned_rules.id });
     if (rows.length === 0) {
       // Loud failure — see INVARIANT block above.
-      throw new TypedError('rule_not_in_scope', `rule ${id} not found in current tenant/agent scope`);
+      throw new TypedError(
+        'rule_not_in_scope',
+        `rule ${id} not found in current tenant/agent scope`,
+      );
     }
   },
-  async setStatus(
-    id: string,
-    update: { ativa?: boolean; confianca?: number },
-  ): Promise<void> {
+  async setStatus(id: string, update: { ativa?: boolean; confianca?: number }): Promise<void> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const set: Record<string, unknown> = { updated_at: new Date() };
@@ -349,15 +356,20 @@ export const rulesRepo = {
     const rows = await db
       .update(learned_rules)
       .set(set)
-      .where(and(
-        eq(learned_rules.id, id),
-        eq(learned_rules.tenant_id, tenant_id),
-        eq(learned_rules.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(learned_rules.id, id),
+          eq(learned_rules.tenant_id, tenant_id),
+          eq(learned_rules.agent_id, agent_id),
+        ),
+      )
       .returning({ id: learned_rules.id });
     if (rows.length === 0) {
       // Loud failure — see INVARIANT block above.
-      throw new TypedError('rule_not_in_scope', `rule ${id} not found in current tenant/agent scope`);
+      throw new TypedError(
+        'rule_not_in_scope',
+        `rule ${id} not found in current tenant/agent scope`,
+      );
     }
   },
 };
@@ -388,7 +400,16 @@ export const cognitiveModuleLogRepo = {
 
 export const cognitiveCandidatesRepo = {
   async create(
-    input: Omit<CognitiveCandidate, 'id' | 'created_at' | 'tenant_id' | 'agent_id' | 'status' | 'consumed_by_phase' | 'consumed_at'>,
+    input: Omit<
+      CognitiveCandidate,
+      | 'id'
+      | 'created_at'
+      | 'tenant_id'
+      | 'agent_id'
+      | 'status'
+      | 'consumed_by_phase'
+      | 'consumed_at'
+    >,
   ): Promise<CognitiveCandidate> {
     const guarded = applyTenantGuard(input);
     const [row] = await db.insert(cognitive_candidates).values(guarded).returning();
@@ -554,10 +575,7 @@ export const memoryEntryRepo = {
     }
     if (opts.channel_id) {
       orConds.push(
-        and(
-          eq(memory_entry.scope_type, 'channel'),
-          eq(memory_entry.subject_id, opts.channel_id),
-        ),
+        and(eq(memory_entry.scope_type, 'channel'), eq(memory_entry.subject_id, opts.channel_id)),
       );
     }
     if (opts.conversa_id) {
@@ -706,10 +724,7 @@ export const behavioralHintRepo = {
       .select()
       .from(behavioral_hint)
       .where(
-        and(
-          ...conds,
-          or(isNull(behavioral_hint.expires_at), gt(behavioral_hint.expires_at, now)),
-        ),
+        and(...conds, or(isNull(behavioral_hint.expires_at), gt(behavioral_hint.expires_at, now))),
       );
   },
 

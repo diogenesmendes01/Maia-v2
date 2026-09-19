@@ -33,8 +33,8 @@ import type { HolidayDescriptorPayload } from '../holiday-descriptor.js';
 function requiresEntityLink(payload: HolidayDescriptorPayload): boolean {
   return Boolean(
     payload.entidade_id &&
-      payload.entidade_id !== 'global' &&
-      (payload.type === 'entity_custom' || payload.type === 'holding_recess'),
+    payload.entidade_id !== 'global' &&
+    (payload.type === 'entity_custom' || payload.type === 'holding_recess'),
   );
 }
 
@@ -46,7 +46,9 @@ export async function approveHoliday(
 
   const payload = proposal.proposed_spec as unknown as HolidayDescriptorPayload;
   if (!payload || !payload.name || !payload.month || !payload.day || !payload.type) {
-    throw new Error(`approveHoliday: missing fields in proposal.proposed_spec: ${JSON.stringify(payload)}`);
+    throw new Error(
+      `approveHoliday: missing fields in proposal.proposed_spec: ${JSON.stringify(payload)}`,
+    );
   }
 
   // Codex review #105 round-2 (high): caminho idempotente reconcilia link.

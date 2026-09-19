@@ -253,10 +253,10 @@ export async function runArtifactRetention(
  */
 export function assertConclusive(outcome: RetentionOutcome): void {
   if (outcome.status !== 'completed') {
-    throw new TypedError(
-      'retention_not_conclusive',
-      `retention pass ended ${outcome.status}`,
-      { status: outcome.status, failed: outcome.failed, error_code: outcome.error_code },
-    );
+    throw new TypedError('retention_not_conclusive', `retention pass ended ${outcome.status}`, {
+      status: outcome.status,
+      failed: outcome.failed,
+      error_code: outcome.error_code,
+    });
   }
 }

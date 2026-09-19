@@ -222,9 +222,8 @@ describe('BaseContextBuilder — issue #282 fail-loud default resolver', () => {
   });
 
   it('__testOnlyPassthroughResolver is available for tests that need the legacy behaviour', async () => {
-    const { __testOnlyPassthroughResolver } = await import(
-      '@/runtime/context-packet/test-fixtures.js'
-    );
+    const { __testOnlyPassthroughResolver } =
+      await import('@/runtime/context-packet/test-fixtures.js');
     const noFlags: FeatureFlagsPort = {
       async snapshot() {
         return {};

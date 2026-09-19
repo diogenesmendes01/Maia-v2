@@ -32,7 +32,9 @@ let throwForTuple = new Set<string>();
 function captureCtx(bucket: Pair[]): Pair {
   const ctx = tryGetCurrentContext();
   if (!ctx) {
-    throw new Error('scheduling engine inner ran OUTSIDE tenant context — repos would throw in prod');
+    throw new Error(
+      'scheduling engine inner ran OUTSIDE tenant context — repos would throw in prod',
+    );
   }
   bucket.push({ tenant_id: ctx.tenant_id, agent_id: ctx.agent_id });
   const key = `${ctx.tenant_id}|${ctx.agent_id}`;
@@ -42,7 +44,14 @@ function captureCtx(bucket: Pair[]): Pair {
 
 const runSchedulingTickMock = vi.fn(async () => {
   captureCtx(tickContexts);
-  return { reclaimed: 0, claimed: 1, advanced: 1, skipped: 0, timed_out: 0, in_progress_advanced: 0 };
+  return {
+    reclaimed: 0,
+    claimed: 1,
+    advanced: 1,
+    skipped: 0,
+    timed_out: 0,
+    in_progress_advanced: 0,
+  };
 });
 const runSeriesNextSchedulerMock = vi.fn(async () => {
   captureCtx(seriesContexts);

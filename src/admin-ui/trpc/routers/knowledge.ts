@@ -37,16 +37,14 @@ const ListRulesInput = TenantAgentInput.extend({
 });
 
 export const knowledgeRouter = router({
-  listMemoryNeedsReview: protectedProcedure
-    .input(ListMemoryInput)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      const items = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: input.agentId },
-        async () => ctx.repos.memoryEntryRepo.listNeedsReview(input.limit),
-      );
-      return { items };
-    }),
+  listMemoryNeedsReview: protectedProcedure.input(ListMemoryInput).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const items = await runWithTenantContext(
+      { tenant_id: tenantId, agent_id: input.agentId },
+      async () => ctx.repos.memoryEntryRepo.listNeedsReview(input.limit),
+    );
+    return { items };
+  }),
 
   listFacts: protectedProcedure.input(ListFactsInput).query(async ({ input, ctx }) => {
     const tenantId = resolveTenantId(ctx, input.tenantId);

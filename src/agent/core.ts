@@ -21,22 +21,14 @@ import {
 } from '@/governance/approval-requests.js';
 import { checkRateLimit, formatPoliteReply } from '@/gateway/rate-limit.js';
 import { resolveIdentity } from '@/identity/resolver.js';
-import {
-  handleQuarantineFirstContact,
-  handleOwnerIdentityReply,
-} from '@/identity/quarantine.js';
+import { handleQuarantineFirstContact, handleOwnerIdentityReply } from '@/identity/quarantine.js';
 import { config } from '@/config/env.js';
 import { clearDebounceState as clearDebounceStateRaw } from '@/gateway/debouncer.js';
 import { buildPrompt } from './prompt-builder.js';
 import { hashScope } from './scope-hash.js';
 import { logger } from '@/lib/logger.js';
 import { TypedError } from '@/lib/utils.js';
-import type {
-  AgentAudienceProfile,
-  Mensagem,
-  ProcedureExecution,
-  Role,
-} from '@/db/schema.js';
+import type { AgentAudienceProfile, Mensagem, ProcedureExecution, Role } from '@/db/schema.js';
 import { resolveChannel } from '@/gateway/channel-resolver.js';
 import { audit } from '@/governance/audit.js';
 import { lifecycle } from '@/runtime/lifecycle/controller.js';
@@ -52,11 +44,7 @@ import type { TypingHandle } from '@/gateway/presence.js';
 // procedure-selector node output below).
 import { type SelectorDecision } from '@/cognition/procedure-selector.js';
 import * as procedureEngine from '@/procedures/engine.js';
-import {
-  sendOutbound,
-  safeDispatchOutput,
-  OutboundDeliveryError,
-} from './output-dispatch.js';
+import { sendOutbound, safeDispatchOutput, OutboundDeliveryError } from './output-dispatch.js';
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
@@ -96,10 +84,7 @@ import { db } from '@/db/client.js';
 import { mensagens } from '@/db/schema.js';
 import { eq } from 'drizzle-orm';
 import { runNodes } from '@/cognitive-graph/orchestrator.js';
-import {
-  buildPreturnNodes,
-  type PreturnContext,
-} from '@/cognitive-graph/preturn-graph.js';
+import { buildPreturnNodes, type PreturnContext } from '@/cognitive-graph/preturn-graph.js';
 import { buildPostturnNodes } from '@/cognitive-graph/postturn-graph.js';
 // P9b — Decision Engine hot-path wiring
 import {
@@ -271,14 +256,11 @@ async function aggregateUnprocessedTexts(
       (m.created_at?.getTime() ?? 0) <= targetMs &&
       (m.conversa_id === null || m.conversa_id === target.conversa_id),
   );
-  if (textSiblings.length === 0)
-    return { text: targetText, merged_ids: [], preclosed: false };
+  if (textSiblings.length === 0) return { text: targetText, merged_ids: [], preclosed: false };
 
   // Chronological order: oldest sibling first, target last.
   const parts = textSiblings.map((m) => m.conteudo ?? '');
-  const merged = [...parts, targetText]
-    .filter((s) => s.length > 0)
-    .join(AGGREGATE_SEPARATOR);
+  const merged = [...parts, targetText].filter((s) => s.length > 0).join(AGGREGATE_SEPARATOR);
   return {
     text: merged,
     merged_ids: textSiblings.map((m) => m.id),
@@ -309,10 +291,7 @@ function scheduleTypingDebounce(
         handle = line.startTyping(jid, mensagem_id);
       })
       .catch((err) =>
-        logger.debug(
-          { err: (err as Error).message },
-          'agent.typing_line_unresolved',
-        ),
+        logger.debug({ err: (err as Error).message }, 'agent.typing_line_unresolved'),
       );
   }, TYPING_DEBOUNCE_MS);
   return () => {
@@ -382,15 +361,12 @@ async function probeMessageForChannel(mensagem_id: string): Promise<{
   // to resolve" → caller keeps legacy default/default (inner returns early).
   if (rows.length === 0) return null;
   const md = (rows[0]!.metadata ?? {}) as Record<string, unknown>;
-  const tel =
-    typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
+  const tel = typeof md['telefone'] === 'string' ? (md['telefone'] as string) : null;
   if (!tel) return null;
   // §1.1 (spec roteamento v4) — a LINHA que recebeu (carimbada pelo ingress).
   // Rows antigas não a têm ⇒ null ⇒ resolução legada (shadow sem comparação).
   const botLine =
-    typeof md['bot_line_external_id'] === 'string'
-      ? (md['bot_line_external_id'] as string)
-      : null;
+    typeof md['bot_line_external_id'] === 'string' ? (md['bot_line_external_id'] as string) : null;
   return {
     channel_type: 'whatsapp',
     external_id: tel,
@@ -576,11 +552,10 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
             },
           });
           logger.error({ mensagem_id }, 'agent.cross_tenant_adoption_conflict');
-          throw new TypedError(
-            'channel_resolution_failed',
-            'cross_tenant_adoption_conflict',
-            { mensagem_id, resolver_path: 'adoption_conflict' },
-          );
+          throw new TypedError('channel_resolution_failed', 'cross_tenant_adoption_conflict', {
+            mensagem_id,
+            resolver_path: 'adoption_conflict',
+          });
         }
         // owner == resolved → idempotent re-run (we adopted it earlier).
         logger.debug({ mensagem_id }, 'agent.adoption_noop_already_owned');
@@ -610,9 +585,8 @@ export async function runAgentForMensagem(mensagem_id: string): Promise<void> {
     agent_id: resolved.agent_id,
   });
 
-  await runWithTenantContext(
-    { tenant_id: resolved.tenant_id, agent_id: resolved.agent_id },
-    () => runAgentForMensagemInner(mensagem_id, resolved.channel_id),
+  await runWithTenantContext({ tenant_id: resolved.tenant_id, agent_id: resolved.agent_id }, () =>
+    runAgentForMensagemInner(mensagem_id, resolved.channel_id),
   );
 }
 
@@ -653,10 +627,7 @@ async function runAgentForMensagemInner(
       return;
     }
     if (turn.status === 'outbound_pending') {
-      logger.debug(
-        { mensagem_id, turn_id: turn.turn_id },
-        'agent.turn_outbound_pending_skip',
-      );
+      logger.debug({ mensagem_id, turn_id: turn.turn_id }, 'agent.turn_outbound_pending_skip');
       return;
     }
   } else if (inbound.processada_em) {
@@ -748,9 +719,7 @@ async function runAgentForMensagemInner(
       );
     }
     return await runWithTurnExecution(execCtx, () =>
-      comEscopoDeSaida(() =>
-        runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
-      ),
+      comEscopoDeSaida(() => runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn })),
     );
   } catch (err) {
     if (err instanceof TurnOwnershipLostError) {
@@ -804,10 +773,7 @@ async function runAgentTurnPipeline(params: {
    *
    * Fora de um turno reivindicado é no-op e o comportamento é o de #503.
    */
-  const stampProcessed = async (
-    id: string,
-    tokens: number | null,
-  ): Promise<void> => {
+  const stampProcessed = async (id: string, tokens: number | null): Promise<void> => {
     if (turnOwnershipLost()) {
       logger.warn(
         { mensagem_id: id, turn_id: turn?.turn_id ?? null },
@@ -819,9 +785,7 @@ async function runAgentTurnPipeline(params: {
   };
 
   if (!inbound.conversa_id) {
-    const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as
-      | string
-      | undefined;
+    const tel = (inbound.metadata as Record<string, unknown>)?.['telefone'] as string | undefined;
     if (!tel) {
       // #503 — sem telefone não há identidade a resolver: o inbound é
       // inaproveitável. Antes esta saída era um `return` mudo e o turno ficava
@@ -830,10 +794,7 @@ async function runAgentTurnPipeline(params: {
       logger.warn({ mensagem_id }, 'agent.inbound_without_telefone');
       await concludeTurn(turn, 'identity_unknown', { mensagem_id: inbound.id });
       await stampProcessed(inbound.id, 0).catch((err) =>
-        logger.warn(
-          { err: (err as Error).message, mensagem_id },
-          'agent.mark_processed_failed',
-        ),
+        logger.warn({ err: (err as Error).message, mensagem_id }, 'agent.mark_processed_failed'),
       );
       return;
     }
@@ -852,10 +813,7 @@ async function runAgentTurnPipeline(params: {
       return;
     }
     if (resolved.kind === 'blocked') {
-      logger.info(
-        { pessoa_id: resolved.pessoa.id, reason: resolved.reason },
-        'agent.blocked_drop',
-      );
+      logger.info({ pessoa_id: resolved.pessoa.id, reason: resolved.reason }, 'agent.blocked_drop');
       await concludeTurn(turn, 'identity_blocked', {
         pessoa_id: resolved.pessoa.id,
         mensagem_id: inbound.id,
@@ -1000,12 +958,10 @@ async function runAgentTurnPipeline(params: {
     (binding): binding is { source: string; channel_id: string } =>
       typeof binding.channel_id === 'string' && binding.channel_id.length > 0,
   );
-  const effectiveChannelId =
-    channel_id ?? inbound.channel_id ?? c.channel_id ?? null;
+  const effectiveChannelId = channel_id ?? inbound.channel_id ?? c.channel_id ?? null;
 
   if (pessoa.status !== 'ativa') {
-    const outcome =
-      pessoa.status === 'quarentena' ? 'quarantined' : 'identity_blocked';
+    const outcome = pessoa.status === 'quarentena' ? 'quarantined' : 'identity_blocked';
     logger.info(
       { pessoa_id: pessoa.id, pessoa_status: pessoa.status },
       'agent.existing_identity_blocked',
@@ -1034,10 +990,7 @@ async function runAgentTurnPipeline(params: {
       metadata: {
         error_code: 'channel_scope_mismatch',
         channel_bindings: Object.fromEntries(
-          channelBindings.map((binding) => [
-            binding.source,
-            binding.channel_id,
-          ]),
+          channelBindings.map((binding) => [binding.source, binding.channel_id]),
         ),
         resolver_path: 'turn_policy_gate',
       },
@@ -1205,10 +1158,8 @@ async function runAgentTurnPipeline(params: {
   // polite reply per hour, then 60s of silence after each warning.
   const decision = await checkRateLimit(pessoa);
   if (decision.kind !== 'allow') {
-    let rateLimitOutcome:
-      | 'fallback_delivered'
-      | 'reply_delivery_unknown'
-      | 'rate_limited_silent' = 'rate_limited_silent';
+    let rateLimitOutcome: 'fallback_delivered' | 'reply_delivery_unknown' | 'rate_limited_silent' =
+      'rate_limited_silent';
     if (decision.kind === 'warn') {
       await audit({
         acao: 'rate_limit_exceeded',
@@ -1225,26 +1176,17 @@ async function runAgentTurnPipeline(params: {
       // a recusa como se fosse conteúdo do agente, e nenhuma consulta
       // conseguia separar as duas.
       try {
-        const providerMessageId = await sendOutbound(
-          pessoa.id,
-          c.id,
-          reply,
-          inbound.id,
-          {
-            channel_id: effectiveChannelId,
-            fallback_reason: 'policy_refusal',
-          },
-        );
+        const providerMessageId = await sendOutbound(pessoa.id, c.id, reply, inbound.id, {
+          channel_id: effectiveChannelId,
+          fallback_reason: 'policy_refusal',
+        });
         if (providerMessageId === null) {
           // A resolução sem id ocorre nos atalhos de dedupe/artefato já
           // tentado. Ela impede um novo envio, mas não confirma entrega. Se o
           // commit durável já moveu o turno, recovery continua sendo o dono;
           // sem essa barreira, terminalizamos com a ambiguidade explícita.
           if (turn?.status === 'outbound_pending') {
-            throw new OutboundDeliveryError(
-              true,
-              'rate_limit_delivery_unconfirmed_after_commit',
-            );
+            throw new OutboundDeliveryError(true, 'rate_limit_delivery_unconfirmed_after_commit');
           }
           rateLimitOutcome = 'reply_delivery_unknown';
         } else {
@@ -1252,8 +1194,7 @@ async function runAgentTurnPipeline(params: {
         }
       } catch (err) {
         const committed = turn?.status === 'outbound_pending';
-        const deliveryUnknown =
-          err instanceof OutboundDeliveryError && err.delivered;
+        const deliveryUnknown = err instanceof OutboundDeliveryError && err.delivered;
         logger.warn(
           {
             err: (err as Error).message,
@@ -1296,19 +1237,10 @@ async function runAgentTurnPipeline(params: {
         approver: pessoa,
         decision: approvalReply.decision,
       });
-      await sendOutbound(
-        pessoa.id,
-        c.id,
-        formatDecisionOutcome(outcome),
-        inbound.id,
-        {
-          channel_id: effectiveChannelId,
-        },
-      ).catch((err) =>
-        logger.warn(
-          { err: (err as Error).message },
-          'agent.approval_reply_send_failed',
-        ),
+      await sendOutbound(pessoa.id, c.id, formatDecisionOutcome(outcome), inbound.id, {
+        channel_id: effectiveChannelId,
+      }).catch((err) =>
+        logger.warn({ err: (err as Error).message }, 'agent.approval_reply_send_failed'),
       );
       await concludeTurn(turn, 'pending_action_resolved', {
         pessoa_id: pessoa.id,
@@ -1405,12 +1337,9 @@ async function runAgentTurnPipeline(params: {
   assertTurnOwnership('scheduling_inbound_hook');
   if (inbound.tipo === 'texto' && inbound.conteudo) {
     try {
-      const { captureInboundForOutreach } =
-        await import('@/scheduling/disambiguation.js');
+      const { captureInboundForOutreach } = await import('@/scheduling/disambiguation.js');
       const ownerId = config.OWNER_TELEFONE_WHATSAPP;
-      const owner = await (
-        await import('@/db/repositories.js')
-      ).pessoasRepo.findByPhone(ownerId);
+      const owner = await (await import('@/db/repositories.js')).pessoasRepo.findByPhone(ownerId);
       if (owner) {
         // Issue #507 (achado da rodada 2, MESMO PADRÃO) — o guard acima roda
         // ANTES de dois `import()` dinâmicos e de um round-trip ao banco
@@ -1495,9 +1424,7 @@ async function runAgentTurnPipeline(params: {
     // que `SPAN_PARENT` declara. Sem ele os dois se penduravam em `turn` e a
     // waterfall não mostrava que rodam em PARALELO — que é a única coisa sobre
     // esta etapa que um operador lendo um turno lento precisa saber.
-    const result = await instrumentPreturnGraph(nodes.length, () =>
-      runNodes(nodes, ctx),
-    );
+    const result = await instrumentPreturnGraph(nodes.length, () => runNodes(nodes, ctx));
 
     // Issue #507 (achado 2 da revisão do dono) — GUARD DE BOUNDARY, antes de
     // CONSUMIR o resultado. Tudo o que vem abaixo é write:
@@ -1508,8 +1435,7 @@ async function runAgentTurnPipeline(params: {
     assertTurnOwnership('preturn_graph');
 
     // Side effects POST-graph — procedure-selector decision + start/switch.
-    const selectorOutput = result.nodes['procedure-selector']
-      ?.output as SelectorDecision | null;
+    const selectorOutput = result.nodes['procedure-selector']?.output as SelectorDecision | null;
     if (selectorOutput) {
       await procedureSelectorDecisionsRepo
         .record({
@@ -1547,24 +1473,17 @@ async function runAgentTurnPipeline(params: {
       // cada uma leva a conferência imediatamente antes de si, e não uma só no
       // topo do bloco.
       try {
-        if (
-          selectorOutput.decision === 'start' &&
-          selectorOutput.selected_procedure_id
-        ) {
-          const def = await procedureDefinitionsRepo.findById(
-            selectorOutput.selected_procedure_id,
-          );
+        if (selectorOutput.decision === 'start' && selectorOutput.selected_procedure_id) {
+          const def = await procedureDefinitionsRepo.findById(selectorOutput.selected_procedure_id);
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
             assertTurnOwnership('preturn_graph');
-            const { execution: started } = await procedureEngine.startExecution(
-              {
-                definition_id: def.id,
-                definition_version: def.version_number,
-                conversa_id: c.id,
-                first_step_id: steps[0]?.id ?? null,
-              },
-            );
+            const { execution: started } = await procedureEngine.startExecution({
+              definition_id: def.id,
+              definition_version: def.version_number,
+              conversa_id: c.id,
+              first_step_id: steps[0]?.id ?? null,
+            });
             activeExecution = started;
           }
         } else if (
@@ -1577,20 +1496,16 @@ async function runAgentTurnPipeline(params: {
             execution_id: activeExecution.id,
             reason: 'switched_by_selector',
           });
-          const def = await procedureDefinitionsRepo.findById(
-            selectorOutput.selected_procedure_id,
-          );
+          const def = await procedureDefinitionsRepo.findById(selectorOutput.selected_procedure_id);
           if (def) {
             const steps = def.steps as unknown as Array<{ id: string }>;
             assertTurnOwnership('preturn_graph');
-            const { execution: started } = await procedureEngine.startExecution(
-              {
-                definition_id: def.id,
-                definition_version: def.version_number,
-                conversa_id: c.id,
-                first_step_id: steps[0]?.id ?? null,
-              },
-            );
+            const { execution: started } = await procedureEngine.startExecution({
+              definition_id: def.id,
+              definition_version: def.version_number,
+              conversa_id: c.id,
+              first_step_id: steps[0]?.id ?? null,
+            });
             activeExecution = started;
           }
         }
@@ -1599,10 +1514,7 @@ async function runAgentTurnPipeline(params: {
         // derrubar o turno; a recusa por perda de posse não é falha dele e
         // tem de atravessar até o handler do escopo da tentativa.
         if (err instanceof TurnOwnershipLostError) throw err;
-        logger.warn(
-          { err: (err as Error).message, conversa_id: c.id },
-          'procedure.start_failed',
-        );
+        logger.warn({ err: (err as Error).message, conversa_id: c.id }, 'procedure.start_failed');
       }
     }
 
@@ -1624,12 +1536,10 @@ async function runAgentTurnPipeline(params: {
       ) {
         const announceMode = role_inputs.policy.announce_mode;
         const affectsUser =
-          roleResult.decided_role.display_name !==
-            role_inputs.current_role.display_name &&
+          roleResult.decided_role.display_name !== role_inputs.current_role.display_name &&
           !!(roleResult.decided_role.prompt_addendum ?? '').trim();
         const shouldAnnounce =
-          announceMode === 'always' ||
-          (announceMode === 'affects_user' && affectsUser);
+          announceMode === 'always' || (announceMode === 'affects_user' && affectsUser);
         if (shouldAnnounce) {
           roleAnnouncement = `_(Mudando para o modo ${roleResult.decided_role.display_name}.)_`;
         }
@@ -1647,10 +1557,7 @@ async function runAgentTurnPipeline(params: {
     // engolir `TurnOwnershipLostError` aqui devolveria o pipeline ao fluxo
     // normal — exatamente o defeito do achado 1, um andar abaixo.
     if (err instanceof TurnOwnershipLostError) throw err;
-    logger.warn(
-      { err: (err as Error).message, conversa_id: c.id },
-      'preturn.graph_failed',
-    );
+    logger.warn({ err: (err as Error).message, conversa_id: c.id }, 'preturn.graph_failed');
     roleDefaultAudit = { reason: 'preturn_graph_failed' };
   }
 
@@ -1734,8 +1641,7 @@ async function runAgentTurnPipeline(params: {
     } catch (deliveryError) {
       const committed = turn?.status === 'outbound_pending';
       const deliveryUnknown =
-        deliveryError instanceof OutboundDeliveryError &&
-        deliveryError.delivered;
+        deliveryError instanceof OutboundDeliveryError && deliveryError.delivered;
       logger.warn(
         {
           err: (deliveryError as Error).message,
@@ -1858,8 +1764,7 @@ async function runAgentTurnPipeline(params: {
     }
 
     if (err instanceof DecisionEngineFailClosedError) {
-      const failMsg =
-        'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
+      const failMsg = 'Sistema indisponível temporariamente. Tente novamente em alguns instantes.';
       await finishStatusFallback({
         message: failMsg,
         reason: 'internal_error',
@@ -1891,8 +1796,7 @@ async function runAgentTurnPipeline(params: {
     if (block) {
       // 'block' or 'escalate' from a PEP → reply to user and skip LLM.
       // Never expose internal policy text (effect.message) to the user.
-      const blockMsg =
-        'Esta ação requer aprovação adicional antes de prosseguir.';
+      const blockMsg = 'Esta ação requer aprovação adicional antes de prosseguir.';
       await audit({
         acao: 'decision_engine_policy_refused',
         pessoa_id: pessoa.id,
@@ -1916,8 +1820,7 @@ async function runAgentTurnPipeline(params: {
     // efetivamente proposta. Prometer "o responsável será notificado" aqui
     // era mentira operacional (audit P0 cap. 3).
     if (packet.action_mode === 'escalate') {
-      const escalateMsg =
-        'Esta ação requer aprovação adicional antes de prosseguir.';
+      const escalateMsg = 'Esta ação requer aprovação adicional antes de prosseguir.';
       await audit({
         acao: 'decision_engine_policy_refused',
         pessoa_id: pessoa.id,
@@ -1948,14 +1851,9 @@ async function runAgentTurnPipeline(params: {
     // only before the live handle crosses the durable outbound barrier.
     if (packet.action_mode === 'execute_skill') {
       const replyJid =
-        typeof (inbound.metadata as Record<string, unknown> | null)?.[
-          'remote_jid'
-        ] === 'string' &&
-        ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string)
-          .length > 0
-          ? ((inbound.metadata as Record<string, unknown>)[
-              'remote_jid'
-            ] as string)
+        typeof (inbound.metadata as Record<string, unknown> | null)?.['remote_jid'] === 'string' &&
+        ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string).length > 0
+          ? ((inbound.metadata as Record<string, unknown>)['remote_jid'] as string)
           : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
       const routedAgentId = packet.routing.agent_id;
       const pinned =
@@ -1963,8 +1861,7 @@ async function runAgentTurnPipeline(params: {
         packet.routing.selected_skill_version !== undefined &&
         packet.routing.selected_skill_id !== undefined
           ? {
-              selected_skill_descriptor:
-                packet.routing.selected_skill_descriptor,
+              selected_skill_descriptor: packet.routing.selected_skill_descriptor,
               selected_skill_version: packet.routing.selected_skill_version,
               selected_skill_id: packet.routing.selected_skill_id,
             }
@@ -2074,10 +1971,7 @@ async function runAgentTurnPipeline(params: {
         await clearDebounceState(pessoa.telefone_whatsapp);
         return;
       }
-      if (
-        outcome.reason === 'dispatch_send_failed' &&
-        turn?.status === 'outbound_pending'
-      ) {
+      if (outcome.reason === 'dispatch_send_failed' && turn?.status === 'outbound_pending') {
         logger.error(
           {
             turn_id: turn.turn_id,
@@ -2086,10 +1980,7 @@ async function runAgentTurnPipeline(params: {
           },
           'skill.dispatch_failed_after_commit_stopping_fallthrough',
         );
-        throw new OutboundDeliveryError(
-          false,
-          'skill_dispatch_failed_after_outbound_commit',
-        );
+        throw new OutboundDeliveryError(false, 'skill_dispatch_failed_after_outbound_commit');
       }
       // Not handled → fall through to the normal LLM/ReAct turn below. Cases:
       // identity mismatch / !ok / no reply (no side effects ran), OR
@@ -2126,18 +2017,12 @@ async function runAgentTurnPipeline(params: {
   // Use the JID the inbound message arrived on so replies stay on the same
   // thread — critical when WhatsApp routes via `@lid` (privacy IDs) instead
   // of the raw `phone@s.whatsapp.net` form. Falls back to phone-derived JID.
-  const inboundRemoteJid = (
-    inbound.metadata as Record<string, unknown> | null
-  )?.['remote_jid'];
+  const inboundRemoteJid = (inbound.metadata as Record<string, unknown> | null)?.['remote_jid'];
   const jid =
     typeof inboundRemoteJid === 'string' && inboundRemoteJid.length > 0
       ? inboundRemoteJid
       : pessoa.telefone_whatsapp.replace('+', '') + '@s.whatsapp.net';
-  const stopTyping = scheduleTypingDebounce(
-    jid,
-    inbound.id,
-    effectiveChannelId,
-  );
+  const stopTyping = scheduleTypingDebounce(jid, inbound.id, effectiveChannelId);
   let totalTokens: number;
   let reactOutboundText: string;
   let reactToolsCalled: Array<{ name: string; result: unknown }>;
@@ -2298,9 +2183,7 @@ async function runAgentTurnPipeline(params: {
   );
 }
 /** Resolve the governed channel role without collapsing policy failures. */
-async function resolveRoleInputs(
-  channel_id: string | null,
-): Promise<RoleInputsResolution> {
+async function resolveRoleInputs(channel_id: string | null): Promise<RoleInputsResolution> {
   if (!channel_id) return { kind: 'blocked', reason: 'channel_unresolved' };
 
   // Repository errors intentionally escape. The caller distinguishes an
@@ -2313,8 +2196,7 @@ async function resolveRoleInputs(
     rolesRepo.listActive(),
     rolesRepo.getById(policy.default_role_id),
   ]);
-  if (!currentRole)
-    return { kind: 'blocked', reason: 'channel_default_role_missing' };
+  if (!currentRole) return { kind: 'blocked', reason: 'channel_default_role_missing' };
   if (!currentRole.active) {
     return { kind: 'blocked', reason: 'channel_default_role_inactive' };
   }
@@ -2329,10 +2211,7 @@ async function resolveRoleInputs(
   ) {
     return { kind: 'blocked', reason: 'channel_role_allowlist_invalid' };
   }
-  if (
-    configuredRoleIds.length > 0 &&
-    !configuredRoleIds.includes(currentRole.id)
-  ) {
+  if (configuredRoleIds.length > 0 && !configuredRoleIds.includes(currentRole.id)) {
     return { kind: 'blocked', reason: 'channel_default_role_not_allowed' };
   }
 

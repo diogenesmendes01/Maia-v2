@@ -36,15 +36,17 @@ describe('decideTurnAction — resposta entregue', () => {
   });
 
   it('persistência ambígua NUNCA reenvia: reply_delivery_unknown', () => {
-    expect(
-      decideTurnAction(delivery({ dispatched: true, persistUnknown: true })),
-    ).toEqual({ kind: 'complete', outcome: 'reply_delivery_unknown' });
+    expect(decideTurnAction(delivery({ dispatched: true, persistUnknown: true }))).toEqual({
+      kind: 'complete',
+      outcome: 'reply_delivery_unknown',
+    });
   });
 
   it('entregue + efeito colateral continua completed (não vira dead letter)', () => {
-    expect(
-      decideTurnAction(delivery({ dispatched: true, sideEffectsCommitted: true })),
-    ).toEqual({ kind: 'complete', outcome: 'reply_delivered' });
+    expect(decideTurnAction(delivery({ dispatched: true, sideEffectsCommitted: true }))).toEqual({
+      kind: 'complete',
+      outcome: 'reply_delivered',
+    });
   });
 });
 
@@ -52,7 +54,10 @@ describe('decideTurnAction — falha SEM efeito irreversível é retry', () => {
   it.each(['reasoner_failed', 'outbound_failure'] as const)(
     '%s sem side effect → retry (cenários A e B da issue)',
     (exitReason) => {
-      expect(decideTurnAction(delivery({ exitReason }))).toEqual({ kind: 'retry', code: exitReason });
+      expect(decideTurnAction(delivery({ exitReason }))).toEqual({
+        kind: 'retry',
+        code: exitReason,
+      });
     },
   );
 });
@@ -112,7 +117,9 @@ describe('decideTurnAction — matriz completa', () => {
             expect(['complete', 'retry', 'dead_letter']).toContain(action.kind);
             // A invariante que protege o usuário de efeito duplicado.
             if (action.kind === 'retry') {
-              expect(sideEffectsCommitted, 'retry com side effect committed é proibido').toBe(false);
+              expect(sideEffectsCommitted, 'retry com side effect committed é proibido').toBe(
+                false,
+              );
             }
             // Nada que não chegou ao usuário pode ser `reply_delivered`.
             if (action.kind === 'complete' && action.outcome === 'reply_delivered') {

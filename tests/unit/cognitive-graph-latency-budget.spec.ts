@@ -14,13 +14,17 @@ describe('P7 — latency budget helpers', () => {
   });
 
   it('assertWithinBudget aceita baseline undefined → skip ok=true', () => {
-    expect(assertWithinBudget({ observed_p95_ms: 5000, baseline_p95_ms: undefined, budget_percent: 20 })).toEqual({ ok: true, skipped: true, budget_ms: undefined });
+    expect(
+      assertWithinBudget({ observed_p95_ms: 5000, baseline_p95_ms: undefined, budget_percent: 20 }),
+    ).toEqual({ ok: true, skipped: true, budget_ms: undefined });
   });
 
   it('assertWithinBudget calcula budget = baseline * (1 + percent/100)', () => {
-    expect(assertWithinBudget({ observed_p95_ms: 1100, baseline_p95_ms: 1000, budget_percent: 20 }))
-      .toEqual({ ok: true, skipped: false, budget_ms: 1200 });
-    expect(assertWithinBudget({ observed_p95_ms: 1300, baseline_p95_ms: 1000, budget_percent: 20 }))
-      .toEqual({ ok: false, skipped: false, budget_ms: 1200 });
+    expect(
+      assertWithinBudget({ observed_p95_ms: 1100, baseline_p95_ms: 1000, budget_percent: 20 }),
+    ).toEqual({ ok: true, skipped: false, budget_ms: 1200 });
+    expect(
+      assertWithinBudget({ observed_p95_ms: 1300, baseline_p95_ms: 1000, budget_percent: 20 }),
+    ).toEqual({ ok: false, skipped: false, budget_ms: 1200 });
   });
 });

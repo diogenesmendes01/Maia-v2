@@ -265,12 +265,16 @@ async function loadIdentity(): Promise<IdentitySnapshot> {
  * convenience costume. `agent` is the one scope with a legitimately null
  * subject.
  */
-function hintScopes(req: TurnContextRequest): Array<{ scope_type: string; subject_id?: string | null }> {
+function hintScopes(
+  req: TurnContextRequest,
+): Array<{ scope_type: string; subject_id?: string | null }> {
   return [
     { scope_type: 'interlocutor', subject_id: req.pessoa_id },
     { scope_type: 'conversation', subject_id: req.conversa_id },
     ...(req.current_role_id ? [{ scope_type: 'role', subject_id: req.current_role_id }] : []),
-    ...(req.current_channel_id ? [{ scope_type: 'channel', subject_id: req.current_channel_id }] : []),
+    ...(req.current_channel_id
+      ? [{ scope_type: 'channel', subject_id: req.current_channel_id }]
+      : []),
     { scope_type: 'agent', subject_id: null },
   ].filter((sq) => sq.scope_type === 'agent' || !!sq.subject_id);
 }
@@ -401,9 +405,7 @@ async function optional<T>(
  * them was the defect the review of PR #554 removed.
  */
 export async function loadTurnContext(req: TurnContextRequest): Promise<TurnContextSnapshot> {
-  return instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, () =>
-    loadTurnContextInner(req),
-  );
+  return instrumentContextLoad(CONTEXT_LOAD_STAGE.TURN_CONTEXT, () => loadTurnContextInner(req));
 }
 
 async function loadTurnContextInner(req: TurnContextRequest): Promise<TurnContextSnapshot> {
@@ -525,9 +527,7 @@ async function loadTurnContextInner(req: TurnContextRequest): Promise<TurnContex
   const [memories, hints, capabilities, gaps, procedure] = await optionalPromise;
 
   const entities = entityRows.map((r) => r.entidade);
-  const entityStates = entityRows
-    .map((r) => r.state)
-    .filter((s): s is EntityState => s !== null);
+  const entityStates = entityRows.map((r) => r.state).filter((s): s is EntityState => s !== null);
 
   recordSectionStatus('identity', 'loaded');
   recordSectionStatus('history', history.length === 0 ? 'empty' : 'loaded');

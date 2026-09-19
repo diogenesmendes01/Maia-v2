@@ -92,9 +92,7 @@ describe('stageUnroutedInbound — sem janela de perda Postgres→BullMQ', () =>
       line_external_id: '+5511900001111',
       whatsapp_message_id: 'WID-1',
     });
-    expect(auditMock).toHaveBeenCalledWith(
-      expect.objectContaining({ acao: 'inbound_staged' }),
-    );
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({ acao: 'inbound_staged' }));
   });
 
   it('CONFLITO (retry do evento) devolve a MESMA row e RE-ARMA o job mesmo assim', async () => {
@@ -150,9 +148,7 @@ describe('processUnroutedReplay — handoff idempotente', () => {
   it('ainda sem rota (dropped) ⇒ lança para o BullMQ reagendar; row segue pending', async () => {
     repoMock.findById.mockResolvedValueOnce(sealedRow());
     ingressMock.mockResolvedValueOnce('dropped');
-    await expect(processUnroutedReplay('u-1')).rejects.toThrow(
-      'unrouted_replay_not_delivered',
-    );
+    await expect(processUnroutedReplay('u-1')).rejects.toThrow('unrouted_replay_not_delivered');
     expect(repoMock.markHandedOff).not.toHaveBeenCalled();
   });
 
@@ -163,9 +159,7 @@ describe('processUnroutedReplay — handoff idempotente', () => {
   });
 
   it('row vencida ⇒ no-op (o sweeper expira e audita)', async () => {
-    repoMock.findById.mockResolvedValueOnce(
-      sealedRow({ expires_at: new Date(Date.now() - 1000) }),
-    );
+    repoMock.findById.mockResolvedValueOnce(sealedRow({ expires_at: new Date(Date.now() - 1000) }));
     await processUnroutedReplay('u-1');
     expect(ingressMock).not.toHaveBeenCalled();
   });

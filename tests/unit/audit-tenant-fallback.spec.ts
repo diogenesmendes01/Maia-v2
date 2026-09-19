@@ -70,9 +70,8 @@ describe('audit() — tenant context fallback (PR #75 #3)', () => {
       observedTenant = getCurrentTenant();
     });
 
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      () => audit({ acao: 'transacao_criada', metadata: {} }),
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, () =>
+      audit({ acao: 'transacao_criada', metadata: {} }),
     );
 
     expect(observedTenant).toBe('default');

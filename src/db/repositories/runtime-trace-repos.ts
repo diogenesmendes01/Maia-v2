@@ -24,10 +24,7 @@
  */
 import { and, desc, eq, gte, lte, sql, inArray } from 'drizzle-orm';
 import { db } from '@/db/client.js';
-import {
-  runtime_trace_envelopes,
-  runtime_trace_bodies,
-} from '@/db/schema.js';
+import { runtime_trace_envelopes, runtime_trace_bodies } from '@/db/schema.js';
 import { assertNotDefaultLiteral } from '@/db/tenant-context.js';
 import {
   verifyEnvelopeIntegrity,
@@ -253,9 +250,7 @@ export const runtimeTraceRepo = {
     if (cursor) {
       // Composite keyset — matches the (tenant_id, created_at DESC,
       // trace_id DESC) index from migration 100.
-      conditions.push(
-        sql`(${t.created_at}, ${t.trace_id}) < (${cursor.ts}, ${cursor.id}::uuid)`,
-      );
+      conditions.push(sql`(${t.created_at}, ${t.trace_id}) < (${cursor.ts}, ${cursor.id}::uuid)`);
     }
 
     const rows = await db

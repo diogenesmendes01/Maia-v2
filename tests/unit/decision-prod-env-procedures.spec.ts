@@ -34,7 +34,8 @@ vi.mock('@/db/client.js', async () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureExecutionsRepo: {
@@ -53,14 +54,16 @@ import { createProductionDecisionEngineEnv } from '@/runtime/decision/prod-env.j
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeExecution(overrides: Partial<{
-  id: string;
-  definition_id: string;
-  status: string;
-  last_activity_at: Date;
-  tenant_id: string;
-  agent_id: string;
-}> = {}) {
+function makeExecution(
+  overrides: Partial<{
+    id: string;
+    definition_id: string;
+    status: string;
+    last_activity_at: Date;
+    tenant_id: string;
+    agent_id: string;
+  }> = {},
+) {
   return {
     id: overrides.id ?? 'exec-001',
     definition_id: overrides.definition_id ?? 'def-001',
@@ -118,9 +121,8 @@ describe('ProceduresRepoAdapter — Camada 3 stub #4/4 acceptance gate', () => {
     mockFindById.mockResolvedValue(makeExecution());
     mockDefinitionsFindById.mockResolvedValue(makeDefinition('transfer'));
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-1' },
-      () => adapter.findExecution('exec-001'),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-1' }, () =>
+      adapter.findExecution('exec-001'),
     );
 
     expect(result).not.toBeNull();
@@ -139,9 +141,8 @@ describe('ProceduresRepoAdapter — Camada 3 stub #4/4 acceptance gate', () => {
   it('T2 — returns null when no active execution exists', async () => {
     mockFindById.mockResolvedValue(null);
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-1' },
-      () => adapter.findExecution('exec-missing'),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-1' }, () =>
+      adapter.findExecution('exec-missing'),
     );
 
     expect(result).toBeNull();
@@ -160,9 +161,8 @@ describe('ProceduresRepoAdapter — Camada 3 stub #4/4 acceptance gate', () => {
     mockFindById.mockResolvedValue(makeExecution());
     mockDefinitionsFindById.mockResolvedValue(makeDefinition(null));
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-1' },
-      () => adapter.findExecution('exec-001'),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-1' }, () =>
+      adapter.findExecution('exec-001'),
     );
 
     expect(result).not.toBeNull();
@@ -185,9 +185,8 @@ describe('ProceduresRepoAdapter — Camada 3 stub #4/4 acceptance gate', () => {
     // (tenant context is set to tenant-B but the row belongs to tenant-A)
     mockFindById.mockResolvedValue(null);
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-1' },
-      () => adapter.findExecution('exec-001'),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-1' }, () =>
+      adapter.findExecution('exec-001'),
     );
 
     expect(result).toBeNull();

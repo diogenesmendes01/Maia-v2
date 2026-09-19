@@ -55,21 +55,14 @@
 import { GapLevel } from '@/types/enums.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
-import {
-  capabilityGapObservationsRepo,
-  capabilityProposalsRepo,
-} from '@/db/repositories.js';
+import { capabilityGapObservationsRepo, capabilityProposalsRepo } from '@/db/repositories.js';
 import type { AgentCapabilityGap, AgentCapabilityGapObservation } from '@/db/schema.js';
 // LEITURA. Ver "O GUARDRAIL" no cabeçalho: nada neste arquivo escreve aqui.
 import { REGISTRY } from '@/tools/_registry.js';
 import { encontrarToolExistente, esbocarNomeDeTool } from './existing-tool.js';
 import { construirRascunhoDeContrato } from './contract-draft.js';
 import { decidirAgregacao, juntarAoAgregado } from './aggregation.js';
-import {
-  ASSINATURA_VERSION,
-  LIMIAR_SIMILARIDADE,
-  METRICA_SIMILARIDADE,
-} from './similarity.js';
+import { ASSINATURA_VERSION, LIMIAR_SIMILARIDADE, METRICA_SIMILARIDADE } from './similarity.js';
 import { toolRequestAggregatesRepo } from '@/db/repositories.js';
 import type { EstadoDoContrato } from './draft-merge.js';
 import {
@@ -200,10 +193,7 @@ export async function proposeToolRequestForGap(args: {
   // 4 · A evidência. Sem ocorrência registrada não há situação, não há janela e
   //     não há de onde derivar o contrato — o pedido seria a descrição genérica
   //     que a issue existe para substituir.
-  const observacoes = await capabilityGapObservationsRepo.listForGap(
-    gap.id,
-    MAX_OBSERVACOES,
-  );
+  const observacoes = await capabilityGapObservationsRepo.listForGap(gap.id, MAX_OBSERVACOES);
   if (observacoes.length === 0) {
     return { ok: false, reason: 'sem_ocorrencias' };
   }
@@ -244,10 +234,7 @@ export async function proposeToolRequestForGap(args: {
   //     não sabe abrir seria transformar um erro de programação em dívida.
   const validado = ToolRequestSpecSchema.safeParse(spec);
   if (!validado.success) {
-    logger.warn(
-      { gap_id: gap.id, erro: validado.error.message },
-      'tool_request.spec_invalido',
-    );
+    logger.warn({ gap_id: gap.id, erro: validado.error.message }, 'tool_request.spec_invalido');
     return { ok: false, reason: 'spec_invalido', detail: validado.error.message };
   }
 
@@ -377,10 +364,7 @@ export async function proposeToolRequestForGap(args: {
       member_id = criado.membro.id;
       contract_state = 'single';
     } else {
-      logger.warn(
-        { gap_id: gap.id },
-        'tool_request.sem_assinatura_para_agregar',
-      );
+      logger.warn({ gap_id: gap.id }, 'tool_request.sem_assinatura_para_agregar');
     }
 
     // Invariante #4 — decisão de governança auditada. O que a linha registra é

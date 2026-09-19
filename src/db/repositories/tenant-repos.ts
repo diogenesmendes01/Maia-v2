@@ -150,10 +150,7 @@ export const tenantsRepo = {
       actor_id: string;
       actor_role: string;
     };
-  }): Promise<
-    | { ok: true; tenant: Tenant }
-    | { ok: false; reason: 'duplicate_id' }
-  > {
+  }): Promise<{ ok: true; tenant: Tenant } | { ok: false; reason: 'duplicate_id' }> {
     try {
       return await withTx(async (tx) => {
         // (1) Insert tenant row.

@@ -184,7 +184,12 @@ export const syntheticProbeRepo = {
   async completeRun(
     scope: ProbeScope,
     runId: string,
-    input: { outcome: ProbeOutcome; latency_ms: number | null; detail?: unknown; terminal: boolean },
+    input: {
+      outcome: ProbeOutcome;
+      latency_ms: number | null;
+      detail?: unknown;
+      terminal: boolean;
+    },
   ): Promise<void> {
     await db
       .update(synthetic_probe_runs)
@@ -234,7 +239,10 @@ export const syntheticProbeRepo = {
   async closeOrphanRun(scope: ProbeScope, runId: string): Promise<void> {
     await db
       .update(synthetic_probe_runs)
-      .set({ outcome: sql`COALESCE(${synthetic_probe_runs.outcome}, 'error')`, terminal_at: sql`now()` })
+      .set({
+        outcome: sql`COALESCE(${synthetic_probe_runs.outcome}, 'error')`,
+        terminal_at: sql`now()`,
+      })
       .where(
         and(
           eq(synthetic_probe_runs.id, runId),
@@ -276,7 +284,12 @@ export const syntheticProbeRepo = {
     const rows = await db
       .select()
       .from(synthetic_probe_state)
-      .where(and(eq(synthetic_probe_state.tenant_id, tenant_id), eq(synthetic_probe_state.agent_id, agent_id)))
+      .where(
+        and(
+          eq(synthetic_probe_state.tenant_id, tenant_id),
+          eq(synthetic_probe_state.agent_id, agent_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -305,7 +318,12 @@ export const syntheticProbeRepo = {
     await db
       .update(synthetic_probe_state)
       .set({ lease_until: null, updated_at: sql`now()` })
-      .where(and(eq(synthetic_probe_state.tenant_id, tenant_id), eq(synthetic_probe_state.agent_id, agent_id)));
+      .where(
+        and(
+          eq(synthetic_probe_state.tenant_id, tenant_id),
+          eq(synthetic_probe_state.agent_id, agent_id),
+        ),
+      );
   },
 
   /**
@@ -440,7 +458,12 @@ export const syntheticProbeRepo = {
         first_attempt_at: synthetic_probe_state.first_attempt_at,
       })
       .from(synthetic_probe_state)
-      .where(and(eq(synthetic_probe_state.tenant_id, tenant_id), eq(synthetic_probe_state.agent_id, agent_id)))
+      .where(
+        and(
+          eq(synthetic_probe_state.tenant_id, tenant_id),
+          eq(synthetic_probe_state.agent_id, agent_id),
+        ),
+      )
       .limit(1);
     const anchor = rows[0]?.last_ok_at ?? rows[0]?.first_attempt_at;
     if (!anchor) return 0;

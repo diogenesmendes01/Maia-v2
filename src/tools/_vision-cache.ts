@@ -93,12 +93,7 @@ const KEY_PREFIX = 'maia:vision:v3:';
  * concat (sha256 hex and tool names are encoding-invariant), so the `v3`
  * prefix is unchanged — no bump needed.
  */
-function buildKey(
-  tenant_id: string,
-  agent_id: string,
-  tool: string,
-  file_sha256: string,
-): string {
+function buildKey(tenant_id: string, agent_id: string, tool: string, file_sha256: string): string {
   return buildCacheKey(KEY_PREFIX, tenant_id, agent_id, tool, file_sha256);
 }
 

@@ -7,10 +7,7 @@
  *
  * Budget target: <10ms.
  */
-import type {
-  AgentSelector,
-  ChannelPoliciesReader,
-} from './types.js';
+import type { AgentSelector, ChannelPoliciesReader } from './types.js';
 import type { BaseContextPacket } from '../context-packet/types.js';
 
 export interface AgentSelectorDeps {
@@ -29,10 +26,7 @@ export class AgentSelectorImpl implements AgentSelector {
     // ChannelPoliciesReader.getForChannel does not yet accept a signal; the
     // engine-level deadline still guards against hangs. Once P0 surfaces a
     // signal-aware port we forward `_options.signal` here.
-    const policy = await this.deps.channelPolicies.getForChannel(
-      base.tenant_id,
-      base.channel.id,
-    );
+    const policy = await this.deps.channelPolicies.getForChannel(base.tenant_id, base.channel.id);
     return { agent_id: policy.default_agent_id };
   }
 }

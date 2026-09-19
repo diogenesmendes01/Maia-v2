@@ -38,9 +38,7 @@ import type {
 import { RESOLVER_FAILURE_DEFAULT } from './types.js';
 
 export interface PolicyDescriptorResolver {
-  resolveDescriptors(
-    input: PolicyDescriptorResolverInput,
-  ): Promise<PolicyDescriptorResolverOutput>;
+  resolveDescriptors(input: PolicyDescriptorResolverInput): Promise<PolicyDescriptorResolverOutput>;
 }
 
 /**
@@ -49,10 +47,7 @@ export interface PolicyDescriptorResolver {
  *   - rule.scope set: every set key in rule.scope must equal the same key
  *     in input.scope. Missing keys in input.scope -> no match.
  */
-export function matchesScope(
-  ruleScope: PolicyRuleScope,
-  inputScope?: PolicyRuleScope,
-): boolean {
+export function matchesScope(ruleScope: PolicyRuleScope, inputScope?: PolicyRuleScope): boolean {
   const ruleKeys = Object.entries(ruleScope).filter(
     ([, v]) => v !== undefined && v !== null && v !== '',
   );
@@ -206,16 +201,16 @@ export class PolicyDescriptorResolverImpl implements PolicyDescriptorResolver {
  * touching one constant + sweeping tests, never grepping for strings.
  */
 export function hasBlockingFailure(output: PolicyDescriptorResolverOutput): boolean {
-  return output.failures.some(
-    (f) => f.reason === 'db_error' || f.reason === 'tenant_mismatch',
-  );
+  return output.failures.some((f) => f.reason === 'db_error' || f.reason === 'tenant_mismatch');
 }
 
 /**
  * Singleton: hot-path resolver wired to the singleton repo + cache.
  */
-export const policyDescriptorResolver: PolicyDescriptorResolver =
-  new PolicyDescriptorResolverImpl(policyRulesRepo, policyResolverCache);
+export const policyDescriptorResolver: PolicyDescriptorResolver = new PolicyDescriptorResolverImpl(
+  policyRulesRepo,
+  policyResolverCache,
+);
 
 /**
  * Factory for tests: pass mocks of the repo / cache.

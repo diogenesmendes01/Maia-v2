@@ -80,8 +80,8 @@ type RawModel = {
 
 function parseRawModel(raw: RawModel): OpenRouterModel | null {
   if (!raw.id || typeof raw.id !== 'string') return null;
-  const supports_tools = Array.isArray(raw.supported_parameters)
-    && raw.supported_parameters.includes('tools');
+  const supports_tools =
+    Array.isArray(raw.supported_parameters) && raw.supported_parameters.includes('tools');
   if (!supports_tools) return null;
   // Pricing in OpenRouter /models is per-token (e.g. '0.00000125' = $1.25/M).
   const promptPerToken = parseFloat(raw.pricing?.prompt ?? '0');

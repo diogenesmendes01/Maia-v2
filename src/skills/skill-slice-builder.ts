@@ -79,10 +79,7 @@ export async function buildSkillSlice(ctx: BuildSliceCtx): Promise<SkillSlice> {
       const row = await skillsRepo.getById(id);
       if (row) candidates.push(toSummary(row));
     } catch (err) {
-      logger.warn(
-        { err: (err as Error).message, id },
-        'p9a.slice.candidate_lookup_failed',
-      );
+      logger.warn({ err: (err as Error).message, id }, 'p9a.slice.candidate_lookup_failed');
     }
   }
 

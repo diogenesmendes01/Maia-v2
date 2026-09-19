@@ -40,16 +40,12 @@ function makeCtx(
     repos: {
       agentsRepo: {
         async findById(_id: string) {
-          return opts?.agent === undefined
-            ? { id: 'agent-a', tenant_id: 'tenant-A' }
-            : opts.agent;
+          return opts?.agent === undefined ? { id: 'agent-a', tenant_id: 'tenant-A' } : opts.agent;
         },
       },
       operationalProfileVersionsRepo: {
         async getById(_id: string) {
-          return opts?.version === undefined
-            ? { id: 'pv-1', status: 'proposed' }
-            : opts.version;
+          return opts?.version === undefined ? { id: 'pv-1', status: 'proposed' } : opts.version;
         },
       },
       playgroundRepo: {
@@ -120,9 +116,9 @@ describe('playgroundRouter.createSession', () => {
   it('rejects viewer/analyst (role gate)', async () => {
     const { ctx } = makeCtx('viewer');
     const caller = playgroundRouter.createCaller(ctx);
-    await expect(
-      caller.createSession({ agentId: 'agent-a' }),
-    ).rejects.toThrowError(/FORBIDDEN|not allowed/);
+    await expect(caller.createSession({ agentId: 'agent-a' })).rejects.toThrowError(
+      /FORBIDDEN|not allowed/,
+    );
   });
 
   it('rejects agent from another tenant as NOT_FOUND (no existence leak)', async () => {

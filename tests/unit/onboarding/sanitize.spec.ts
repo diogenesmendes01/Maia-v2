@@ -139,7 +139,9 @@ describe('achado 5 — a denylist de chave não fecha texto livre; o schema tipa
   });
 
   it('projeta SÓ os campos aprovados, montados um a um', () => {
-    expect(projectRunMetadata({ source: 'cli', intent: 'migration', ticket_ref: 'OPS-42' })).toEqual({
+    expect(
+      projectRunMetadata({ source: 'cli', intent: 'migration', ticket_ref: 'OPS-42' }),
+    ).toEqual({
       source: 'cli',
       intent: 'migration',
       ticket_ref: 'OPS-42',

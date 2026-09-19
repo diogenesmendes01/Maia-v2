@@ -23,9 +23,8 @@ const { createGapMock, rollbackMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     capabilityGapsRepo: { create: createGapMock },
@@ -179,7 +178,11 @@ describe('revertCapability — round-2 finding 2: skill revert atomicity', () =>
     if (!result.ok) throw new Error('expected ok');
     expect(result.technical_gap_id).toBe('gap-skill-tech-1');
     expect(rollbackMock).toHaveBeenCalledTimes(1);
-    expect(rollbackMock).toHaveBeenCalledWith('skill-id-ok', 'scenario falhou', 'capability-revert');
+    expect(rollbackMock).toHaveBeenCalledWith(
+      'skill-id-ok',
+      'scenario falhou',
+      'capability-revert',
+    );
     expect(createGapMock).toHaveBeenCalledTimes(1);
   });
 });

@@ -114,9 +114,7 @@ export async function detectAndProposeSkill(args: {
  * status='success'; descarta module_names que já são "skill:..." (já
  * são skills); mantém apenas grupos com ≥ MIN_PATTERN_OCCURRENCES.
  */
-export async function scanForSkillPatterns(args: {
-  window_days: number;
-}): Promise<SkillPattern[]> {
+export async function scanForSkillPatterns(args: { window_days: number }): Promise<SkillPattern[]> {
   const tenant_id = getCurrentTenant();
   const agent_id = getCurrentAgent();
   const cutoff = new Date(Date.now() - args.window_days * 24 * 60 * 60 * 1000);

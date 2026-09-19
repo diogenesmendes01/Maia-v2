@@ -193,9 +193,7 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
     const facts = await readReadinessFacts();
     expectOursIsTheNewestTerminal(facts.last_restore_drill_at, terminalAt);
     expect(facts.open_restore_drill_started_at).toBeInstanceOf(Date);
-    expect(facts.open_restore_drill_started_at!.getTime()).toBeGreaterThan(
-      Date.now() - 5 * 60_000,
-    );
+    expect(facts.open_restore_drill_started_at!.getTime()).toBeGreaterThan(Date.now() - 5 * 60_000);
 
     // …and the worker wakes up well past the abandonment cutoff.
     const now = new Date(Date.now() + abandonedDrillAfterMs(profile()) + HOURS);
@@ -313,9 +311,7 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
     const facts = await readReadinessFacts();
     // Same guard as above: the block must come from the crashed row, not from
     // the terminal one the old filter would have returned.
-    expect(facts.open_restore_drill_started_at!.getTime()).toBeGreaterThan(
-      Date.now() - 5 * 60_000,
-    );
+    expect(facts.open_restore_drill_started_at!.getTime()).toBeGreaterThan(Date.now() - 5 * 60_000);
 
     const now = new Date(Date.now() + abandonedDrillAfterMs(profile()) + HOURS);
     const h = harness(now);
@@ -407,10 +403,7 @@ d('restore drill — the crash window (issue #536, review da #553)', () => {
 
     // And the decisor, fed that snapshot, starts nothing.
     const h = harness(new Date(Date.now() + abandonedDrillAfterMs(profile()) + HOURS));
-    const res = await runRestoreDrillTick(
-      { ...h.ports, readFacts: async () => facts! },
-      profile(),
-    );
+    const res = await runRestoreDrillTick({ ...h.ports, readFacts: async () => facts! }, profile());
     expect(h.drills()).toBe(0);
     expect(res.decision.reason).toBe('abandoned_drill_blocks');
 

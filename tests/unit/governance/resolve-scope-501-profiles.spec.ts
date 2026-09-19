@@ -91,7 +91,10 @@ const pessoa = { id: 'p-738', status: 'ativa' } as unknown as Pessoa;
  * distintos (round-robin quando `perfis < n`).
  */
 function semear(n: number, perfis: number): { entidade_ids: string[]; profile_ids: string[] } {
-  const profile_ids = Array.from({ length: perfis }, (_, i) => `prof-${String(i).padStart(4, '0')}`);
+  const profile_ids = Array.from(
+    { length: perfis },
+    (_, i) => `prof-${String(i).padStart(4, '0')}`,
+  );
   h.profiles = new Map(
     profile_ids.map((id) => [
       id,

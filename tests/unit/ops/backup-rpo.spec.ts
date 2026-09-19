@@ -150,7 +150,11 @@ describe('restore drill — the only proof a backup is restorable', () => {
   it('FAILs in production when no drill has ever run', () => {
     const res = evaluateBackupReadiness(
       input(
-        { last_restore_drill_at: null, last_restore_drill_result: null, last_restore_drill_duration_ms: null },
+        {
+          last_restore_drill_at: null,
+          last_restore_drill_result: null,
+          last_restore_drill_duration_ms: null,
+        },
         prodCfg(),
       ),
     );
@@ -178,9 +182,24 @@ describe('restore drill — the only proof a backup is restorable', () => {
 
 describe('consecutive failures and encryption posture', () => {
   it('escalates WARN → FAIL as failures accumulate', () => {
-    expect(check(evaluateBackupReadiness(input({ consecutive_failures: 0 })), 'backup_consecutive_failures').level).toBe('OK');
-    expect(check(evaluateBackupReadiness(input({ consecutive_failures: 1 })), 'backup_consecutive_failures').level).toBe('WARN');
-    expect(check(evaluateBackupReadiness(input({ consecutive_failures: 3 })), 'backup_consecutive_failures').level).toBe('FAIL');
+    expect(
+      check(
+        evaluateBackupReadiness(input({ consecutive_failures: 0 })),
+        'backup_consecutive_failures',
+      ).level,
+    ).toBe('OK');
+    expect(
+      check(
+        evaluateBackupReadiness(input({ consecutive_failures: 1 })),
+        'backup_consecutive_failures',
+      ).level,
+    ).toBe('WARN');
+    expect(
+      check(
+        evaluateBackupReadiness(input({ consecutive_failures: 3 })),
+        'backup_consecutive_failures',
+      ).level,
+    ).toBe('FAIL');
   });
 
   it('FAILs when encryption is required but no key is usable', () => {

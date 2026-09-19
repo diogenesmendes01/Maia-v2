@@ -84,8 +84,7 @@ async function selectRoleInner(input: RoleSelectorInput): Promise<RoleSelectorRe
   const baseCount = input.conversa_id
     ? await roleSelectorDecisionsRepo.countSwitchesInConversation(input.conversa_id)
     : 0;
-  const newSwitchCount =
-    decision.action === RoleDecisionAction.SWITCH ? baseCount + 1 : baseCount;
+  const newSwitchCount = decision.action === RoleDecisionAction.SWITCH ? baseCount + 1 : baseCount;
 
   // Issue #507 (achado 2 da revisão do dono) — LIMITE DE EFEITO.
   //

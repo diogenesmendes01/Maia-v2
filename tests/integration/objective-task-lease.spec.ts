@@ -68,11 +68,7 @@ d('objective_tasks — lease, fencing e reaper (#469 fatia A, migração 138)', 
    * desenho, então specs vizinhas podem estar à frente na ordem por
    * `created_at`; as claims alheias são devolvidas para não as sequestrar.
    */
-  async function claimMine(
-    taskId: string,
-    worker: string,
-    leaseSeconds: number,
-  ): Promise<string> {
+  async function claimMine(taskId: string, worker: string, leaseSeconds: number): Promise<string> {
     const { objectivesRepo } = await loadRepos();
     const parked: Array<{ id: string; tenant_id: string; agent_id: string; token: string }> = [];
     try {
@@ -188,9 +184,7 @@ d('objective_tasks — lease, fencing e reaper (#469 fatia A, migração 138)', 
     const c = await pool.connect();
     try {
       await c.query(`DELETE FROM objective_tasks WHERE tenant_id = ANY($1)`, [[tenantA, tenantB]]);
-      await c.query(`DELETE FROM agent_objectives WHERE tenant_id = ANY($1)`, [
-        [tenantA, tenantB],
-      ]);
+      await c.query(`DELETE FROM agent_objectives WHERE tenant_id = ANY($1)`, [[tenantA, tenantB]]);
       await c.query(`DELETE FROM agents WHERE tenant_id = ANY($1)`, [[tenantA, tenantB]]);
       await c.query(`DELETE FROM tenants WHERE id = ANY($1)`, [[tenantA, tenantB]]);
     } finally {

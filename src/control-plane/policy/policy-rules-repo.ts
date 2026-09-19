@@ -165,10 +165,7 @@ async function publishLifecycle(evt: PolicyLifecycleEvent): Promise<void> {
   try {
     await redis.publish(channel, JSON.stringify(evt));
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, evt, channel },
-      'policy_rules_repo.publish_failed',
-    );
+    logger.warn({ err: (err as Error).message, evt, channel }, 'policy_rules_repo.publish_failed');
   }
 }
 
@@ -196,9 +193,7 @@ export interface DualApprovalEvidence {
   context?: Record<string, unknown>;
 }
 
-export function isValidDualApprovalEvidence(
-  ev: unknown,
-): ev is DualApprovalEvidence {
+export function isValidDualApprovalEvidence(ev: unknown): ev is DualApprovalEvidence {
   if (!ev || typeof ev !== 'object') return false;
   const e = ev as Record<string, unknown>;
   if (!Array.isArray(e.approvers) || !Array.isArray(e.approved_at)) return false;
@@ -252,10 +247,7 @@ export interface PolicyRulesRepo {
 
   listActiveForTenant(): Promise<PolicyRule[]>;
 
-  listVersions(args: {
-    descriptor: string;
-    agent_id?: string | null;
-  }): Promise<PolicyRule[]>;
+  listVersions(args: { descriptor: string; agent_id?: string | null }): Promise<PolicyRule[]>;
 
   getById(id: string): Promise<PolicyRule | null>;
 
@@ -292,23 +284,16 @@ export interface PolicyRulesRepo {
     id: string;
     deprecated_by: string;
   }): Promise<
-    | { ok: true; updated: PolicyRule }
-    | { ok: false; reason: 'not_found' | 'invalid_transition' }
+    { ok: true; updated: PolicyRule } | { ok: false; reason: 'not_found' | 'invalid_transition' }
   >;
 
   rollback(args: {
     id: string;
     rolled_back_by: string;
     rollback_reason: string;
-  }): Promise<
-    | { ok: true; updated: PolicyRule }
-    | { ok: false; reason: 'not_found' | 'terminal' }
-  >;
+  }): Promise<{ ok: true; updated: PolicyRule } | { ok: false; reason: 'not_found' | 'terminal' }>;
 
-  nextVersion(args: {
-    descriptor: string;
-    agent_id?: string | null;
-  }): Promise<number>;
+  nextVersion(args: { descriptor: string; agent_id?: string | null }): Promise<number>;
 }
 
 export const policyRulesRepo: PolicyRulesRepo = {
@@ -394,12 +379,7 @@ export const policyRulesRepo: PolicyRulesRepo = {
     const rows = await db
       .select()
       .from(policy_rules)
-      .where(
-        and(
-          eq(policy_rules.tenant_id, tenant_id),
-          eq(policy_rules.status, 'active'),
-        ),
-      )
+      .where(and(eq(policy_rules.tenant_id, tenant_id), eq(policy_rules.status, 'active')))
       .orderBy(asc(policy_rules.rule_descriptor));
     return rows.map(rowToDomain);
   },
@@ -428,9 +408,7 @@ export const policyRulesRepo: PolicyRulesRepo = {
     const [row] = await db
       .select()
       .from(policy_rules)
-      .where(
-        and(eq(policy_rules.id, id), eq(policy_rules.tenant_id, tenant_id)),
-      )
+      .where(and(eq(policy_rules.id, id), eq(policy_rules.tenant_id, tenant_id)))
       .limit(1);
     return row ? rowToDomain(row) : null;
   },
@@ -494,9 +472,7 @@ export const policyRulesRepo: PolicyRulesRepo = {
     const [row] = await db
       .select()
       .from(policy_rules)
-      .where(
-        and(eq(policy_rules.id, args.id), eq(policy_rules.tenant_id, tenant_id)),
-      )
+      .where(and(eq(policy_rules.id, args.id), eq(policy_rules.tenant_id, tenant_id)))
       .limit(1);
     if (!row) return { ok: false, reason: 'not_found' };
     if (row.status !== 'proposed') {
@@ -548,12 +524,7 @@ export const policyRulesRepo: PolicyRulesRepo = {
         const [check] = await db
           .select()
           .from(policy_rules)
-          .where(
-            and(
-              eq(policy_rules.id, args.id),
-              eq(policy_rules.tenant_id, tenant_id),
-            ),
-          )
+          .where(and(eq(policy_rules.id, args.id), eq(policy_rules.tenant_id, tenant_id)))
           .limit(1);
         if (!check) return { ok: false, reason: 'not_found' };
         return { ok: false, reason: 'invalid_transition' };
@@ -606,12 +577,7 @@ export const policyRulesRepo: PolicyRulesRepo = {
       const [check] = await db
         .select()
         .from(policy_rules)
-        .where(
-          and(
-            eq(policy_rules.id, args.id),
-            eq(policy_rules.tenant_id, tenant_id),
-          ),
-        )
+        .where(and(eq(policy_rules.id, args.id), eq(policy_rules.tenant_id, tenant_id)))
         .limit(1);
       if (!check) return { ok: false, reason: 'not_found' };
       return { ok: false, reason: 'invalid_transition' };
@@ -659,12 +625,7 @@ export const policyRulesRepo: PolicyRulesRepo = {
       const [check] = await db
         .select()
         .from(policy_rules)
-        .where(
-          and(
-            eq(policy_rules.id, args.id),
-            eq(policy_rules.tenant_id, tenant_id),
-          ),
-        )
+        .where(and(eq(policy_rules.id, args.id), eq(policy_rules.tenant_id, tenant_id)))
         .limit(1);
       if (!check) return { ok: false, reason: 'not_found' };
       return { ok: false, reason: 'terminal' };

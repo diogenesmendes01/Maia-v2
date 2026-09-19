@@ -40,13 +40,11 @@ describe('audit() — rate-limit counter carries tenant_id/agent_id labels (#271
   });
 
   it('rate_limit_exceeded emit inside a tenant context labels the counter with that tenant+agent', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-1' },
-      () =>
-        audit({
-          acao: 'rate_limit_exceeded',
-          metadata: { count: 41, threshold: 30 },
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-1' }, () =>
+      audit({
+        acao: 'rate_limit_exceeded',
+        metadata: { count: 41, threshold: 30 },
+      }),
     );
 
     const out = await renderPrometheus();
@@ -54,22 +52,16 @@ describe('audit() — rate-limit counter carries tenant_id/agent_id labels (#271
       'maia_audit_events_total{action="rate_limit_exceeded",agent_id="agent-1",tenant_id="tenant-A"} 1',
     );
     // Confirm: no "blind" (tenant_id-less) sample is emitted as a side effect.
-    expect(out).not.toMatch(
-      /maia_audit_events_total\{action="rate_limit_exceeded"\} \d+/,
-    );
+    expect(out).not.toMatch(/maia_audit_events_total\{action="rate_limit_exceeded"\} \d+/);
   });
 
   it('two tenants emit SEPARATE counter samples (no cross-tenant aggregation)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-1' },
-      async () => {
-        await audit({ acao: 'rate_limit_exceeded' });
-        await audit({ acao: 'rate_limit_exceeded' });
-      },
-    );
-    await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-2' },
-      () => audit({ acao: 'rate_limit_exceeded' }),
+    await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-1' }, async () => {
+      await audit({ acao: 'rate_limit_exceeded' });
+      await audit({ acao: 'rate_limit_exceeded' });
+    });
+    await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-2' }, () =>
+      audit({ acao: 'rate_limit_exceeded' }),
     );
 
     const out = await renderPrometheus();
@@ -84,13 +76,11 @@ describe('audit() — rate-limit counter carries tenant_id/agent_id labels (#271
   it('symmetry: tenant-B → tenant-A order produces the same per-tenant attribution', async () => {
     // The success-path counter is a `Map<labelKey, number>` — order of writes
     // must not collapse different tenants onto a shared key.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-2' },
-      () => audit({ acao: 'rate_limit_exceeded' }),
+    await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-2' }, () =>
+      audit({ acao: 'rate_limit_exceeded' }),
     );
-    await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-1' },
-      () => audit({ acao: 'rate_limit_exceeded' }),
+    await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-1' }, () =>
+      audit({ acao: 'rate_limit_exceeded' }),
     );
 
     const out = await renderPrometheus();
@@ -117,13 +107,11 @@ describe('audit() — rate-limit counter carries tenant_id/agent_id labels (#271
   it('different agents inside the same tenant produce separate samples', async () => {
     // tenant_id alone is not sufficient — multi-agent tenants need per-agent
     // attribution (spec 17 + tenant-isolation principle).
-    await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-1' },
-      () => audit({ acao: 'rate_limit_exceeded' }),
+    await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-1' }, () =>
+      audit({ acao: 'rate_limit_exceeded' }),
     );
-    await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-2' },
-      () => audit({ acao: 'rate_limit_exceeded' }),
+    await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-2' }, () =>
+      audit({ acao: 'rate_limit_exceeded' }),
     );
 
     const out = await renderPrometheus();

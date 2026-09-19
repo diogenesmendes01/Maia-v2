@@ -129,7 +129,10 @@ function assertMutated(
   }
 }
 
-export type CreateSeriesInput = Omit<SeriesInsert, 'id' | 'created_at' | 'updated_at' | 'version' | 'tenant_id' | 'agent_id'> & {
+export type CreateSeriesInput = Omit<
+  SeriesInsert,
+  'id' | 'created_at' | 'updated_at' | 'version' | 'tenant_id' | 'agent_id'
+> & {
   initial_occurrence: {
     scheduled_for: Date;
     contexto_snapshot: SeriesContexto;
@@ -712,7 +715,11 @@ export const occurrencesRepo = {
    * Returns the IDs so the caller can audit the recovery, but the caller
    * should NOT process them directly — they're back in the pending queue.
    */
-  async reclaimExpiredLeases(_worker_id: string, ttl_seconds: number, limit: number): Promise<string[]> {
+  async reclaimExpiredLeases(
+    _worker_id: string,
+    ttl_seconds: number,
+    limit: number,
+  ): Promise<string[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db.execute<{ id: string }>(sql`
@@ -982,7 +989,10 @@ export const occurrencesRepo = {
       .orderBy(desc(occurrencesTable.scheduled_for));
   },
 
-  async hasOpenForDestinatario(series_id: string, destinatario_pessoa_id: string): Promise<boolean> {
+  async hasOpenForDestinatario(
+    series_id: string,
+    destinatario_pessoa_id: string,
+  ): Promise<boolean> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
@@ -1075,11 +1085,7 @@ export const tasksRepo = {
     const agent_id = getCurrentAgent();
     const update: Record<string, unknown> = { status };
     if (status === 'in_progress') update.started_at = new Date();
-    if (
-      status === 'completed' ||
-      status === 'skipped' ||
-      status === 'failed'
-    ) {
+    if (status === 'completed' || status === 'skipped' || status === 'failed') {
       update.completed_at = new Date();
     }
     if (result_patch) {
@@ -1103,7 +1109,12 @@ export const tasksRepo = {
 };
 
 export const outboxRepo = {
-  async enqueue(input: Omit<OutboxMessageInsert, 'id' | 'created_at' | 'status' | 'attempts' | 'next_attempt_at' | 'tenant_id' | 'agent_id'>): Promise<OutboxMessage | null> {
+  async enqueue(
+    input: Omit<
+      OutboxMessageInsert,
+      'id' | 'created_at' | 'status' | 'attempts' | 'next_attempt_at' | 'tenant_id' | 'agent_id'
+    >,
+  ): Promise<OutboxMessage | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     try {
@@ -1186,7 +1197,11 @@ export const outboxRepo = {
       );
   },
 
-  async reclaimExpiredLeases(_worker_id: string, ttl_seconds: number, limit: number): Promise<string[]> {
+  async reclaimExpiredLeases(
+    _worker_id: string,
+    ttl_seconds: number,
+    limit: number,
+  ): Promise<string[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db.execute<{ id: string }>(sql`

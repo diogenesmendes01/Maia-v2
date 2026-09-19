@@ -104,8 +104,11 @@ describe('o call site real: a execução de privacidade nunca purga o ledger', (
   it('uma exclusão aprovada purga outras classes e NUNCA emite purge para privacy.tombstone', async () => {
     const purges: PurgeJob[] = [];
     const subject = {
-      subject_ref: resolveSubjectRef(SCOPE, { kind: 'phone_e164' as const, value: '+5511999990000' }, SECRET)
-        .subject_ref,
+      subject_ref: resolveSubjectRef(
+        SCOPE,
+        { kind: 'phone_e164' as const, value: '+5511999990000' },
+        SECRET,
+      ).subject_ref,
       identifier: { kind: 'phone_e164' as const, value: '+5511999990000' },
     };
     const out = await executePrivacyRequest(approvedDeletion(), subject, ports(purges));

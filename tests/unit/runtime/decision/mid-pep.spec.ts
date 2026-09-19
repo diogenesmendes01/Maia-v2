@@ -185,14 +185,10 @@ describe('P9b — Mid PEP', () => {
     const pep = new MidPepImpl(deps);
     const r = await pep.evaluate(
       mkInput({
-        resolved_policies: [
-          { policy_id: 'p_dual', descriptor: 'd', applies_to_peps: ['mid'] },
-        ],
+        resolved_policies: [{ policy_id: 'p_dual', descriptor: 'd', applies_to_peps: ['mid'] }],
       }),
     );
-    expect((r as RequireDualApprovalDecision).approval_class).toBe(
-      'owner_plus_technical',
-    );
+    expect((r as RequireDualApprovalDecision).approval_class).toBe('owner_plus_technical');
   });
 
   it('accumulates warn_in_trace and reduce_tool_set as warnings', async () => {
@@ -268,10 +264,7 @@ describe('P9b — Mid PEP', () => {
     expect(cont.tool_reductions).toBeDefined();
     expect(cont.tool_reductions).toHaveLength(1);
     expect(cont.tool_reductions?.[0]?.policy_id).toBe('p_reduce');
-    expect(cont.tool_reductions?.[0]?.removed_tools).toEqual([
-      'transfer_money',
-      'delete_account',
-    ]);
+    expect(cont.tool_reductions?.[0]?.removed_tools).toEqual(['transfer_money', 'delete_account']);
     // Audit warning still recorded for trace visibility
     expect(cont.warnings).toHaveLength(1);
     expect(cont.warnings[0]?.reason).toContain('transfer_money');
@@ -300,16 +293,11 @@ describe('P9b — Mid PEP', () => {
     const pep = new MidPepImpl(deps);
     const r = await pep.evaluate(
       mkInput({
-        resolved_policies: [
-          { policy_id: 'p', descriptor: 'd', applies_to_peps: ['mid'] },
-        ],
+        resolved_policies: [{ policy_id: 'p', descriptor: 'd', applies_to_peps: ['mid'] }],
       }),
     );
     const cont = r as ContinueDecision;
-    expect(cont.tool_reductions?.[0]?.removed_tools).toEqual([
-      'valid',
-      'also_valid',
-    ]);
+    expect(cont.tool_reductions?.[0]?.removed_tools).toEqual(['valid', 'also_valid']);
   });
 
   it('Codex #103 — no tool_reductions key when no reduce_tool_set verdicts fired', async () => {
@@ -332,9 +320,7 @@ describe('P9b — Mid PEP', () => {
     const pep = new MidPepImpl(deps);
     const r = await pep.evaluate(
       mkInput({
-        resolved_policies: [
-          { policy_id: 'p', descriptor: 'd', applies_to_peps: ['mid'] },
-        ],
+        resolved_policies: [{ policy_id: 'p', descriptor: 'd', applies_to_peps: ['mid'] }],
       }),
     );
     const cont = r as ContinueDecision;
@@ -401,7 +387,9 @@ describe('P9b — Mid PEP', () => {
     expect(block.decision).toBe('escalate');
     expect(block.policy_id).toBe('human_confirmation_policy');
     // issue #446: effect.message must NOT leak to user_facing_message.
-    expect(block.user_facing_message).toBe('Esta ação requer aprovação adicional antes de prosseguir.');
+    expect(block.user_facing_message).toBe(
+      'Esta ação requer aprovação adicional antes de prosseguir.',
+    );
     // It is NOT a dual-approval decision.
     expect((r as RequireDualApprovalDecision).approval_class).toBeUndefined();
   });

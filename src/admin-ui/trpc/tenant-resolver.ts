@@ -21,10 +21,7 @@ export interface TenantResolverCtx {
   userRole: string;
 }
 
-export function resolveTenantId(
-  ctx: TenantResolverCtx,
-  inputTenantId?: string,
-): string {
+export function resolveTenantId(ctx: TenantResolverCtx, inputTenantId?: string): string {
   if (!inputTenantId) return ctx.tenantId;
   if (ctx.userRole === 'founder') return inputTenantId;
   if (inputTenantId !== ctx.tenantId) {

@@ -91,10 +91,7 @@ function seedRow(kind: KnowledgeKind, row: KnowledgeRow): void {
   storeByKind.get(kind)!.set(row.id, row);
 }
 
-function listByStatus(
-  kind: KnowledgeKind,
-  status: KnowledgeLifecycleStatus,
-): KnowledgeRow[] {
+function listByStatus(kind: KnowledgeKind, status: KnowledgeLifecycleStatus): KnowledgeRow[] {
   const rows = storeByKind.get(kind);
   if (!rows) return [];
   return [...rows.values()].filter((r) => r.lifecycle_status === status);
@@ -105,9 +102,7 @@ function listByStatus(
 // ---------------------------------------------------------------------------
 
 vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
-  const drizzle = await vi.importActual<typeof import('drizzle-orm')>(
-    'drizzle-orm',
-  );
+  const drizzle = await vi.importActual<typeof import('drizzle-orm')>('drizzle-orm');
 
   class KnowledgeConflictError extends Error {
     constructor(
@@ -115,9 +110,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
       public readonly id: string,
       public readonly expected_previous_status: KnowledgeLifecycleStatus,
     ) {
-      super(
-        `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
-      );
+      super(`knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`);
       this.name = 'KnowledgeConflictError';
     }
   }
@@ -125,10 +118,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
   return {
     KnowledgeConflictError,
     knowledgeRepos: {
-      async findById(
-        kind: KnowledgeKind,
-        id: string,
-      ): Promise<KnowledgeRow | null> {
+      async findById(kind: KnowledgeKind, id: string): Promise<KnowledgeRow | null> {
         return storeByKind.get(kind)?.get(id) ?? null;
       },
       async update(
@@ -156,18 +146,12 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
           updates.expected_previous_status !== undefined &&
           row.lifecycle_status !== updates.expected_previous_status
         ) {
-          throw new KnowledgeConflictError(
-            kind,
-            id,
-            updates.expected_previous_status,
-          );
+          throw new KnowledgeConflictError(kind, id, updates.expected_previous_status);
         }
-        if (updates.lifecycle_status !== undefined)
-          row.lifecycle_status = updates.lifecycle_status;
+        if (updates.lifecycle_status !== undefined) row.lifecycle_status = updates.lifecycle_status;
         if (updates.lifecycle_transitions !== undefined)
           row.lifecycle_transitions = updates.lifecycle_transitions;
-        if (updates.evidence_count !== undefined)
-          row.evidence_count = updates.evidence_count;
+        if (updates.evidence_count !== undefined) row.evidence_count = updates.evidence_count;
         row.updated_at = new Date();
       },
       async listEligible(args: {
@@ -193,30 +177,31 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
-      record: vi.fn(async (entry: {
-        tenant_id: string;
-        agent_id: string;
-        module_name: string;
-        status: string;
-      }) => {
-        // Capture what tenant_id/agent_id the runner WROTE INTO the
-        // row, not what `applyTenantGuard` would have rewritten. The
-        // runner currently passes ctx?.tenant_id ?? 'default' — so this
-        // is the same value the production code would persist if we
-        // didn't mock the repo.
-        auditCalls.push({
-          tenant_id: entry.tenant_id,
-          agent_id: entry.agent_id,
-          module_name: entry.module_name,
-          status: entry.status,
-        });
-      }),
+      record: vi.fn(
+        async (entry: {
+          tenant_id: string;
+          agent_id: string;
+          module_name: string;
+          status: string;
+        }) => {
+          // Capture what tenant_id/agent_id the runner WROTE INTO the
+          // row, not what `applyTenantGuard` would have rewritten. The
+          // runner currently passes ctx?.tenant_id ?? 'default' — so this
+          // is the same value the production code would persist if we
+          // didn't mock the repo.
+          auditCalls.push({
+            tenant_id: entry.tenant_id,
+            agent_id: entry.agent_id,
+            module_name: entry.module_name,
+            status: entry.status,
+          });
+        },
+      ),
       recentByModule: vi.fn(async () => []),
     },
   };
@@ -232,9 +217,9 @@ vi.mock('@/lib/logger.js', () => ({
 }));
 
 vi.mock('@/config/feature-flags.js', async () => {
-  const actual = await vi.importActual<
-    typeof import('@/config/feature-flags.js')
-  >('@/config/feature-flags.js');
+  const actual = await vi.importActual<typeof import('@/config/feature-flags.js')>(
+    '@/config/feature-flags.js',
+  );
   return {
     ...actual,
     FEATURE_KNOWLEDGE_STATE_MACHINE_V1: true,
@@ -295,7 +280,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe('issue #255 — knowledge-state-promoter audit per-row tenant context', () => {
-  it('multi-tenant eligible set: each tenant\'s transitions produce audit records with THAT tenant_id+agent_id', async () => {
+  it("multi-tenant eligible set: each tenant's transitions produce audit records with THAT tenant_id+agent_id", async () => {
     // Seed two tenants worth of ephemeral rows. After the worker runs,
     // every audit row must be tagged with the row's own
     // (tenant_id, agent_id) — NEVER ('default','default').

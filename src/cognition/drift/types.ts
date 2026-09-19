@@ -22,16 +22,16 @@ export type DriftRecentMessage = {
 export type DriftDetectionInput = {
   profile_active: AgentOperationalProfileVersion;
   recent_messages: DriftRecentMessage[];
-  capabilities?: unknown;     // for escopo (cluster 3)
+  capabilities?: unknown; // for escopo (cluster 3)
   self_model_skills?: unknown; // for confianca (cluster 2)
   recent_procedures?: unknown; // for procedimento (cluster 3)
 };
 
 export type DriftEvidence = {
   drift_type: DriftType;
-  detected_by: string;       // module name
+  detected_by: string; // module name
   payload: Record<string, unknown>;
-  evidence_summary: string;  // human-readable, <200 chars
+  evidence_summary: string; // human-readable, <200 chars
 };
 
 export interface DriftDetector {

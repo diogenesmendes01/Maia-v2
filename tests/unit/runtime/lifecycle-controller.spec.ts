@@ -83,7 +83,15 @@ describe('component registry', () => {
     // HTTP is not a worker concern — it must never appear in the missing set.
     expect(r.missing).not.toContain('http');
 
-    for (const c of ['config', 'db', 'schema', 'redis', 'redis_memory', 'queue', 'agent_worker'] as const) {
+    for (const c of [
+      'config',
+      'db',
+      'schema',
+      'redis',
+      'redis_memory',
+      'queue',
+      'agent_worker',
+    ] as const) {
       lifecycle.setComponent(c, 'ready');
     }
     r = lifecycle.requiredComponentsStarted();

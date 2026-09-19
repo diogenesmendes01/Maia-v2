@@ -7,7 +7,7 @@ import {
   contrapartes,
   categorias,
   entity_states,
-  } from '../schema.js';
+} from '../schema.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
 import type { Entidade, Conta, Transacao, Contraparte, Categoria, EntityState } from '../schema.js';
@@ -166,7 +166,9 @@ export const entidadesRepo = {
       return { entidade: r.entidade, state };
     });
   },
-  async create(input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Entidade> {
+  async create(
+    input: Omit<Entidade, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>,
+  ): Promise<Entidade> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(entidades).values(guarded).returning();
     return rows[0]!;
@@ -242,7 +244,9 @@ export const contasRepo = {
       .from(contas_bancarias)
       .where(inArray(contas_bancarias.entidade_id, scope.entidades));
   },
-  async create(input: Omit<Conta, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Conta> {
+  async create(
+    input: Omit<Conta, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>,
+  ): Promise<Conta> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(contas_bancarias).values(guarded).returning();
     return rows[0]!;
@@ -363,7 +367,9 @@ export const transacoesRepo = {
       .limit(filter?.limit ?? 50)
       .offset(filter?.offset ?? 0);
   },
-  async create(input: Omit<Transacao, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Transacao> {
+  async create(
+    input: Omit<Transacao, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>,
+  ): Promise<Transacao> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(transacoes).values(guarded).returning();
     return rows[0]!;
@@ -567,7 +573,13 @@ export const categoriasRepo = {
     const rows = await db
       .select()
       .from(categorias)
-      .where(and(eq(categorias.nome, nome), eq(categorias.natureza, natureza), isNull(categorias.entidade_id)))
+      .where(
+        and(
+          eq(categorias.nome, nome),
+          eq(categorias.natureza, natureza),
+          isNull(categorias.entidade_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -576,16 +588,15 @@ export const categoriasRepo = {
 export const contrapartesRepo = {
   async byScope(scope: EntityScope): Promise<Contraparte[]> {
     if (scope.entidades.length === 0) throw new EmptyScopeError();
-    return db
-      .select()
-      .from(contrapartes)
-      .where(inArray(contrapartes.entidade_id, scope.entidades));
+    return db.select().from(contrapartes).where(inArray(contrapartes.entidade_id, scope.entidades));
   },
   async byId(id: string): Promise<Contraparte | null> {
     const rows = await db.select().from(contrapartes).where(eq(contrapartes.id, id)).limit(1);
     return rows[0] ?? null;
   },
-  async create(input: Omit<Contraparte, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Contraparte> {
+  async create(
+    input: Omit<Contraparte, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>,
+  ): Promise<Contraparte> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(contrapartes).values(guarded).returning();
     return rows[0]!;
@@ -787,7 +798,12 @@ export const entityStatesRepo = {
     // validates them for the INSERT path; here we strip them from the SET so a
     // (future) caller that passes `tenant_id` in `input` cannot re-stamp the
     // running tenant's own row onto another tenant via the UPDATE branch.
-    const { tenant_id: _t, agent_id: _a, entidade_id: _e, ...updatable } = input as Record<string, unknown>;
+    const {
+      tenant_id: _t,
+      agent_id: _a,
+      entidade_id: _e,
+      ...updatable
+    } = input as Record<string, unknown>;
     void _t;
     void _a;
     void _e;
@@ -797,10 +813,7 @@ export const entityStatesRepo = {
       .onConflictDoUpdate({
         target: entity_states.entidade_id,
         set: { ...updatable, updated_at: new Date() },
-        where: and(
-          eq(entity_states.tenant_id, tenant_id),
-          eq(entity_states.agent_id, agent_id),
-        ),
+        where: and(eq(entity_states.tenant_id, tenant_id), eq(entity_states.agent_id, agent_id)),
       })
       .returning();
     if (rows.length !== 1) {

@@ -95,7 +95,7 @@ export const generateReportTool: Tool<typeof inputSchema, typeof outputSchema> =
         // valor vem como string (numeric pg) — toDecimal valida + converte.
         valor: toDecimal(t.valor).toNumber(),
         descricao: t.descricao ?? '',
-        categoriaNome: t.categoria_id ? catNameById.get(t.categoria_id) ?? null : null,
+        categoriaNome: t.categoria_id ? (catNameById.get(t.categoria_id) ?? null) : null,
       }));
 
       try {
@@ -160,12 +160,8 @@ export const generateReportTool: Tool<typeof inputSchema, typeof outputSchema> =
       if (!ent) continue;
       const txns = perEntityTxns[i]!;
       // Soma exata em Decimal; converte pra number só no boundary do output.
-      const receita = sumDecimal(
-        txns.filter((t) => t.natureza === 'receita').map((t) => t.valor),
-      );
-      const despesa = sumDecimal(
-        txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor),
-      );
+      const receita = sumDecimal(txns.filter((t) => t.natureza === 'receita').map((t) => t.valor));
+      const despesa = sumDecimal(txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor));
       const contas = contasByEntId.get(id) ?? [];
       const caixa_final = sumDecimal(contas.map((c) => c.saldo_atual));
       rows.push({

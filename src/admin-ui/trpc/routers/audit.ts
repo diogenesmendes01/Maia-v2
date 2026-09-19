@@ -23,16 +23,14 @@ const ListAuditSchema = z.object({
 });
 
 export const auditRouter = router({
-  listAuditEntries: protectedProcedure
-    .input(ListAuditSchema)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      const items = await ctx.repos.adminAuditLogRepo.list({
-        tenantId,
-        actorId: input.actorId,
-        resourceType: input.resourceType,
-        limit: input.limit,
-      });
-      return { items };
-    }),
+  listAuditEntries: protectedProcedure.input(ListAuditSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const items = await ctx.repos.adminAuditLogRepo.list({
+      tenantId,
+      actorId: input.actorId,
+      resourceType: input.resourceType,
+      limit: input.limit,
+    });
+    return { items };
+  }),
 });

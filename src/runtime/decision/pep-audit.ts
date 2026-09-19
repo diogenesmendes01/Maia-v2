@@ -7,16 +7,8 @@
  * One accumulator per request (stateful). Decision Engine creates a fresh
  * instance per `run()` call.
  */
-import type {
-  BlockDecision,
-  ContinueDecision,
-  RequireDualApprovalDecision,
-} from './types.js';
-import type {
-  DecisionPacket,
-  PepKind,
-  PolicyDecision,
-} from '../context-packet/types.js';
+import type { BlockDecision, ContinueDecision, RequireDualApprovalDecision } from './types.js';
+import type { DecisionPacket, PepKind, PolicyDecision } from '../context-packet/types.js';
 
 type PolicyDecisionEntry = DecisionPacket['policy_decisions'][number];
 
@@ -38,13 +30,7 @@ export class PepAudit {
   }
 
   recordFromDualApproval(a: RequireDualApprovalDecision): void {
-    this.record(
-      a.pep,
-      a.policy_id,
-      a.rule_descriptor,
-      'require_dual_approval',
-      a.reason,
-    );
+    this.record(a.pep, a.policy_id, a.rule_descriptor, 'require_dual_approval', a.reason);
   }
 
   recordWarnings(pep: PepKind, warnings: ContinueDecision['warnings']): void {

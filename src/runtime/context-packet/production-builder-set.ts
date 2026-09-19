@@ -179,26 +179,17 @@ export function getProductionBuilderSet(): ProductionBuilderSet {
       realIdentityPort,
       cache,
     ) as unknown as SliceBuilderSet['identity'],
-    user: new UserSliceBuilder(
-      stubUserPort,
-      cache,
-    ) as unknown as SliceBuilderSet['user'],
+    user: new UserSliceBuilder(stubUserPort, cache) as unknown as SliceBuilderSet['user'],
     knowledge: new KnowledgeSliceBuilder(
       stubKnowledgeRepo,
       cache,
     ) as unknown as SliceBuilderSet['knowledge'],
-    soul: new SoulSliceBuilder(
-      soulBiasesRepoPort,
-      cache,
-    ) as unknown as SliceBuilderSet['soul'],
+    soul: new SoulSliceBuilder(soulBiasesRepoPort, cache) as unknown as SliceBuilderSet['soul'],
     policy: new PolicySliceBuilder(
       stubPolicyDescriptorResolver,
       cache,
     ) as unknown as SliceBuilderSet['policy'],
-    skill: new SkillSliceBuilder(
-      stubSkillRepo,
-      cache,
-    ) as unknown as SliceBuilderSet['skill'],
+    skill: new SkillSliceBuilder(stubSkillRepo, cache) as unknown as SliceBuilderSet['skill'],
     tool: new ToolPermissionSliceBuilder(
       stubToolRegistry,
       cache,

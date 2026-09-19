@@ -104,11 +104,7 @@ const PISOS: readonly PisoCorrigido[] = [
     projeto: '.',
     pkg: 'hono',
     piso: '4.13.5',
-    advisories: [
-      'GHSA-gqvv-2mrq-wpjv',
-      'GHSA-g6gw-c38x-mqfc',
-      'GHSA-crvj-82cr-hjcx',
-    ],
+    advisories: ['GHSA-gqvv-2mrq-wpjv', 'GHSA-g6gw-c38x-mqfc', 'GHSA-crvj-82cr-hjcx'],
     porque:
       'transitivo de `@modelcontextprotocol/sdk` e `@hono/node-server`, que aceitam ' +
       '`hono@^4`; 4.13.5 fecha traversal em `toSSG()`, exaustão no `parseBody()` e ' +

@@ -91,10 +91,7 @@ describe('redactPacket', () => {
   });
 
   it('handles missing optional slices gracefully', () => {
-    const out = redactPacket(
-      { trace_id: 't1', tenant_id: 'a', agent_id: 'b' },
-      'standard',
-    );
+    const out = redactPacket({ trace_id: 't1', tenant_id: 'a', agent_id: 'b' }, 'standard');
     expect(out.packet).not.toBeNull();
     expect(out.packet!.soul).toBeUndefined();
     expect(out.packet!.user_layer).toBeUndefined();
@@ -225,11 +222,11 @@ describe('redactPacket', () => {
           tenant_id: 'a',
           agent_id: 'b',
           decision_packet: {
-            decision: 'allow',        // allowed: kept
-            policy_id: 'p-123',       // allowed: kept
-            risk_score: 0.3,          // allowed: kept
+            decision: 'allow', // allowed: kept
+            policy_id: 'p-123', // allowed: kept
+            risk_score: 0.3, // allowed: kept
             reasoning: 'user CPF 123.456.789-01 verified', // NOT allowed: dropped
-            tool_args: { cpf: '123.456.789-01' },           // NOT allowed: dropped
+            tool_args: { cpf: '123.456.789-01' }, // NOT allowed: dropped
           },
         },
         'standard',

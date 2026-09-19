@@ -30,10 +30,7 @@ import type { MetricsClient } from './types.js';
 import { createProductionDecisionEngineEnv } from './prod-env.js';
 import { logger } from '@/lib/logger.js';
 import { traceTurnDecision } from '@/observability/turn-trace.js';
-import {
-  assertTurnOwnership,
-  getTurnExecutionContext,
-} from '@/runtime/turns/execution-context.js';
+import { assertTurnOwnership, getTurnExecutionContext } from '@/runtime/turns/execution-context.js';
 
 // ============================================================================
 // Shared types
@@ -71,9 +68,7 @@ export class DecisionEngineFailClosedError extends Error {
     public readonly tenant_id: string,
     public readonly trace_id: string,
   ) {
-    super(
-      `Decision Engine fail-closed: engine threw for tenant=${tenant_id} trace=${trace_id}`,
-    );
+    super(`Decision Engine fail-closed: engine threw for tenant=${tenant_id} trace=${trace_id}`);
     this.name = 'DecisionEngineFailClosedError';
   }
 }

@@ -226,9 +226,9 @@ describe('turn state machine — tabela COMPLETA de transições inválidas', ()
     }
     // E o replay de dead letter continua sendo o que era, sem ganhar destinos.
     expect(MANUAL_TRANSITIONS['dead_letter']).toEqual(['queued']);
-    expect(checkTurnTransition('dead_letter', 'ignored', 'operator_cancelled', { manual: true }).allowed).toBe(
-      false,
-    );
+    expect(
+      checkTurnTransition('dead_letter', 'ignored', 'operator_cancelled', { manual: true }).allowed,
+    ).toBe(false);
   });
 
   it('a compatibilidade estado/outcome continua valendo DENTRO da porta manual', () => {

@@ -93,10 +93,7 @@ import {
   withSpan,
 } from '../../../src/observability/tracer.js';
 import { sanitizeSpanAttributes } from '../../../src/observability/span-attributes.js';
-import {
-  _cardinalityFor,
-  _resetLabelGuardForTests,
-} from '../../../src/observability/labels.js';
+import { _cardinalityFor, _resetLabelGuardForTests } from '../../../src/observability/labels.js';
 import {
   CARDINALITY_OVERFLOW_VALUE,
   DEFAULT_LABEL_CARDINALITY_BUDGET,
@@ -269,9 +266,7 @@ function irreducibleSpanWork(): number {
 }
 
 async function seriesCount(prefix: string): Promise<number> {
-  return (await renderPrometheus())
-    .split('\n')
-    .filter((line) => line.startsWith(prefix)).length;
+  return (await renderPrometheus()).split('\n').filter((line) => line.startsWith(prefix)).length;
 }
 
 beforeEach(() => {
@@ -620,9 +615,22 @@ describe('issue #535 §4 — cardinality is bounded, not hoped for', () => {
       }));
       await instrumentPromptRender(async () => ({ messages: [1, 2, 3] }));
       await instrumentReactIteration(1, async () => null);
-      instrumentConstitutionalCheck('listar', () => null, () => 'ok');
-      instrumentPermissionCheck('listar', 1, () => null, () => 'allowed');
-      await instrumentIdempotencyClaim('listar', async () => ({}), () => 'reserved');
+      instrumentConstitutionalCheck(
+        'listar',
+        () => null,
+        () => 'ok',
+      );
+      instrumentPermissionCheck(
+        'listar',
+        1,
+        () => null,
+        () => 'allowed',
+      );
+      await instrumentIdempotencyClaim(
+        'listar',
+        async () => ({}),
+        () => 'reserved',
+      );
       await instrumentHandlerExecute('listar', async () => null);
       await instrumentOutboundCommit(
         async () => ({ committed: true }),

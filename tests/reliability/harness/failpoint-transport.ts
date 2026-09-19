@@ -441,7 +441,11 @@ export class FailpointServer {
       }
       const context = normalizarContexto(corpo.context);
       const { action } = this.registry.reached(nome, context);
-      this.artefatos?.evento('failpoint.reached', { failpoint: nome, context, action: action ?? 'release' });
+      this.artefatos?.evento('failpoint.reached', {
+        failpoint: nome,
+        context,
+        action: action ?? 'release',
+      });
 
       if (action === undefined || action === 'release') {
         responder(res, 200, { action: 'release' });
@@ -471,7 +475,10 @@ export class FailpointServer {
 
 function responder(res: ServerResponse, status: number, corpo: unknown): void {
   const texto = JSON.stringify(corpo);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(texto) });
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(texto),
+  });
   res.end(texto);
 }
 

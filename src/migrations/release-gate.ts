@@ -117,7 +117,9 @@ export interface ScrubReport {
   readonly withheldOther: number;
 }
 
-const MIGRATOR_NAMES: ReadonlySet<string> = new Set(entriesForService('migrator').map((s) => s.name));
+const MIGRATOR_NAMES: ReadonlySet<string> = new Set(
+  entriesForService('migrator').map((s) => s.name),
+);
 const CONTRACT_NAMES: ReadonlySet<string> = new Set(CONTRACT_ENTRIES.map((s) => s.name));
 const PASSTHROUGH_NAMES: ReadonlySet<string> = new Set(PROCESS_PASSTHROUGH);
 
@@ -172,7 +174,8 @@ export interface ReleaseGateDeps {
 
 /** Classe do erro — nunca a mensagem (a de `pg` embute a connection string). */
 function errorClass(err: unknown): string {
-  if (typeof (err as { code?: unknown } | null)?.code === 'string') return String((err as { code: string }).code);
+  if (typeof (err as { code?: unknown } | null)?.code === 'string')
+    return String((err as { code: string }).code);
   return err instanceof Error ? err.constructor.name : 'UnknownError';
 }
 

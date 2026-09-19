@@ -41,28 +41,32 @@ vi.mock('@/db/client.js', () => {
                 returning: () => {
                   if (myIdx === 0) {
                     // agents INSERT stub
-                    return Promise.resolve([{
-                      id: v['id'] ?? 'agent-1',
-                      tenant_id: v['tenant_id'] ?? 'tenant-1',
-                      nome: v['nome'] ?? 'Test Agent',
-                      status: v['status'] ?? 'active',
-                      metadata: {},
-                      created_at: new Date(),
-                      updated_at: new Date(),
-                    }]);
+                    return Promise.resolve([
+                      {
+                        id: v['id'] ?? 'agent-1',
+                        tenant_id: v['tenant_id'] ?? 'tenant-1',
+                        nome: v['nome'] ?? 'Test Agent',
+                        status: v['status'] ?? 'active',
+                        metadata: {},
+                        created_at: new Date(),
+                        updated_at: new Date(),
+                      },
+                    ]);
                   }
                   if (myIdx === 1) {
                     // agent_operational_profile_versions INSERT stub
-                    return Promise.resolve([{
-                      id: 'prof-1',
-                      tenant_id: v['tenant_id'],
-                      agent_id: v['agent_id'],
-                      version: 1,
-                      status: 'proposed',
-                      profile_body: v['profile_body'],
-                      proposed_by: v['proposed_by'],
-                      proposed_reason: v['proposed_reason'],
-                    }]);
+                    return Promise.resolve([
+                      {
+                        id: 'prof-1',
+                        tenant_id: v['tenant_id'],
+                        agent_id: v['agent_id'],
+                        version: 1,
+                        status: 'proposed',
+                        profile_body: v['profile_body'],
+                        proposed_by: v['proposed_by'],
+                        proposed_reason: v['proposed_reason'],
+                      },
+                    ]);
                   }
                   return Promise.resolve([{}]);
                 },
@@ -148,7 +152,7 @@ describe('calendar default pack — seed row', () => {
     const grantInsert = capturedInserts[2] as Record<string, unknown> | undefined;
     expect(grantInsert).toBeDefined();
     expect(grantInsert!['granted_packs']).toEqual([...BASE_AGENT_PACKS]);
-    expect((grantInsert!['granted_packs'] as string[])).toContain('domain.calendar');
+    expect(grantInsert!['granted_packs'] as string[]).toContain('domain.calendar');
 
     // capturedInserts[3] = the admin_audit_log INSERT — also asserts the
     // change_summary grant keys (renamed default_tool_packs → granted_packs
@@ -157,7 +161,7 @@ describe('calendar default pack — seed row', () => {
     expect(auditInsert).toBeDefined();
     const changeSummary = auditInsert!['change_summary'] as Record<string, unknown>;
     expect(changeSummary['granted_packs']).toEqual([...BASE_AGENT_PACKS]);
-    expect((changeSummary['granted_packs'] as string[])).toContain('domain.calendar');
+    expect(changeSummary['granted_packs'] as string[]).toContain('domain.calendar');
     expect(changeSummary['archetype']).toBeNull();
   });
 });

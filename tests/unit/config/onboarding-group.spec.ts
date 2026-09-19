@@ -25,9 +25,10 @@ const ONBOARDING = 'onboarding';
 describe('decisão 13 — grupo `onboarding`', () => {
   it('o grupo existe uma única vez em GROUP_ORDER, com título', () => {
     const hits = GROUP_ORDER.filter((g) => String(g.group) === ONBOARDING);
-    expect(hits.map((g) => g.group), 'GROUP_ORDER não declara o grupo `onboarding`').toHaveLength(
-      1,
-    );
+    expect(
+      hits.map((g) => g.group),
+      'GROUP_ORDER não declara o grupo `onboarding`',
+    ).toHaveLength(1);
     expect(hits[0]!.title.length).toBeGreaterThan(3);
   });
 

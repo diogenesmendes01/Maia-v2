@@ -54,9 +54,7 @@ export function assertSafeAuthDir(p: string): string {
   // Catches typos that resolve to /home/maia, /opt/data, etc.
   const segments = abs.split(nodePath.sep);
   if (!segments.some((s) => s.toLowerCase().includes('baileys'))) {
-    throw new Error(
-      `BAILEYS_AUTH_DIR must contain a "baileys" path segment (got ${abs})`,
-    );
+    throw new Error(`BAILEYS_AUTH_DIR must contain a "baileys" path segment (got ${abs})`);
   }
 
   return abs;

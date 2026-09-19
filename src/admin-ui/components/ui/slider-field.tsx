@@ -46,9 +46,7 @@ export function SliderField({
         onChange={(e) => onChange(Number(e.target.value))}
         className="h-1.5 w-full cursor-pointer appearance-none rounded-full bg-zinc-200 accent-brand-600 disabled:cursor-not-allowed"
       />
-      {hint && (
-        <p className="mt-1 text-xs leading-relaxed text-zinc-500">{hint}</p>
-      )}
+      {hint && <p className="mt-1 text-xs leading-relaxed text-zinc-500">{hint}</p>}
     </div>
   );
 }

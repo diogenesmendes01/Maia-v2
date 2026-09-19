@@ -42,8 +42,8 @@ export function ModelSelect({
         )}
         {items.map((m) => (
           <option key={m.id} value={m.id}>
-            {m.name} — in ${m.pricing.prompt_per_million}/M, out $
-            {m.pricing.completion_per_million}/M
+            {m.name} — in ${m.pricing.prompt_per_million}/M, out ${m.pricing.completion_per_million}
+            /M
           </option>
         ))}
       </Select>

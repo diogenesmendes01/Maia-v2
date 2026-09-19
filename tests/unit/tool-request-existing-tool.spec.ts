@@ -57,9 +57,9 @@ describe('#636 — casamento contra o REGISTRO REAL de tools', () => {
       }),
     ).toBe('query_balance');
     // Também com espaço no lugar do underscore — é como o LLM costuma escrever.
-    expect(
-      encontrarToolExistente({ texto: 'não consigo fazer query balance', catalogo }),
-    ).toBe('query_balance');
+    expect(encontrarToolExistente({ texto: 'não consigo fazer query balance', catalogo })).toBe(
+      'query_balance',
+    );
   });
 
   it('lacuna cujo nome esboçado JÁ é uma tool registrada também é coberta', () => {

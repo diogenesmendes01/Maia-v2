@@ -78,10 +78,7 @@ export async function reflectOnCorrection(input: {
         alvo_id: persistResult.id,
         metadata: { tipo: classified.tipo },
       });
-      logger.info(
-        { rule_id: persistResult.id, tipo: classified.tipo },
-        'reflection.rule_created',
-      );
+      logger.info({ rule_id: persistResult.id, tipo: classified.tipo }, 'reflection.rule_created');
     }
 
     // P2 Task 14: update self-model on user correction. Domain extraction is
@@ -91,10 +88,7 @@ export async function reflectOnCorrection(input: {
     try {
       await recordFailure({ domain: 'general', failure_mode: 'user_correction' });
     } catch (err) {
-      logger.warn(
-        { err: (err as Error).message },
-        'reflection.capability_tracker_failed',
-      );
+      logger.warn({ err: (err as Error).message }, 'reflection.capability_tracker_failed');
     }
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'reflection.failed');
@@ -110,7 +104,8 @@ export async function reflectOnWorkflowCompletion(input: {
   // Append to self_state.resumo_aprendizados
   await selfStateRepo.appendLearning(input.summary).catch(() => undefined);
   // Vectorize for recall
-  const escopo = input.scope_entidades.length > 0 ? `entidade:${input.scope_entidades[0]}` : 'global';
+  const escopo =
+    input.scope_entidades.length > 0 ? `entidade:${input.scope_entidades[0]}` : 'global';
   await writeMemory({
     conteudo: input.summary,
     tipo: 'reflexao',

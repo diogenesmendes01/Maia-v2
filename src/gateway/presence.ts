@@ -100,11 +100,7 @@ export function startTypingVia(
   return handle;
 }
 
-export function sendReaction(
-  remote_jid: string,
-  whatsapp_id: string,
-  emoji: '✅' | '❌',
-): void {
+export function sendReaction(remote_jid: string, whatsapp_id: string, emoji: '✅' | '❌'): void {
   if (!isBaileysConnected()) return;
   const sock = getSocket();
   if (!sock) return;
@@ -183,8 +179,9 @@ export async function sendPollVia(
         selectableCount: 1,
       },
     });
-    const secretBuf = (result?.message?.messageContextInfo as { messageSecret?: Uint8Array } | undefined)
-      ?.messageSecret;
+    const secretBuf = (
+      result?.message?.messageContextInfo as { messageSecret?: Uint8Array } | undefined
+    )?.messageSecret;
     const meId = sock.user?.id ? jidNormalizedUser(sock.user.id) : null;
     return {
       whatsapp_id: result?.key?.id ?? null,
@@ -222,7 +219,10 @@ function runStaleSweep(): void {
   for (const [id, entry] of handles) {
     if (entry.started_at < cutoff) {
       entry.handle.stop();
-      logger.warn({ mensagem_id: id, age_ms: Date.now() - entry.started_at }, 'presence.typing_stale_swept');
+      logger.warn(
+        { mensagem_id: id, age_ms: Date.now() - entry.started_at },
+        'presence.typing_stale_swept',
+      );
     }
   }
 }

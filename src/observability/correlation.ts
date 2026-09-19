@@ -32,13 +32,7 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { createHash, randomUUID } from 'node:crypto';
 
 /** Where the current attempt came from. Bounded, safe as a metric label. */
-export type CorrelationOrigin =
-  | 'ingress'
-  | 'queue'
-  | 'recovery'
-  | 'replay'
-  | 'probe'
-  | 'internal';
+export type CorrelationOrigin = 'ingress' | 'queue' | 'recovery' | 'replay' | 'probe' | 'internal';
 
 export interface CorrelationContext {
   /** Root id of the turn. Stable across every attempt and recovery. */
@@ -59,8 +53,7 @@ export interface CorrelationContext {
 
 const storage = new AsyncLocalStorage<CorrelationContext>();
 
-const UUID_RE =
-  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** Namespace separator for derived ids — keeps the derivation domain-scoped. */
 const TRACE_NAMESPACE = 'maia.trace.v1:';
@@ -79,7 +72,9 @@ const TRACE_NAMESPACE = 'maia.trace.v1:';
  */
 export function deriveTraceId(seed: string): string {
   if (UUID_RE.test(seed)) return seed.toLowerCase();
-  const h = createHash('sha256').update(TRACE_NAMESPACE + seed).digest();
+  const h = createHash('sha256')
+    .update(TRACE_NAMESPACE + seed)
+    .digest();
   // Force RFC-4122 version 5 + variant bits so the value is a well-formed UUID
   // and cannot collide with a v4 the runtime mints elsewhere.
   h[6] = (h[6]! & 0x0f) | 0x50;
@@ -109,9 +104,7 @@ export interface StartCorrelationInput {
  */
 export function buildCorrelation(input: StartCorrelationInput): CorrelationContext {
   const trace_id =
-    (input.trace_id && input.trace_id.trim().length > 0
-      ? input.trace_id.trim()
-      : null) ??
+    (input.trace_id && input.trace_id.trim().length > 0 ? input.trace_id.trim() : null) ??
     (input.seed ? deriveTraceId(input.seed) : null) ??
     randomUUID();
   return Object.freeze({
@@ -211,8 +204,7 @@ export function correlationForJob(
   received_at_ms?: number | null,
 ): CorrelationJobFields {
   const cur = tryGetCorrelation();
-  const trace_id =
-    cur && cur.turn_id === seed ? cur.trace_id : deriveTraceId(seed);
+  const trace_id = cur && cur.turn_id === seed ? cur.trace_id : deriveTraceId(seed);
   return {
     trace_id,
     enqueued_at_ms: Date.now(),

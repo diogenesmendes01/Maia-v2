@@ -98,9 +98,7 @@ vi.mock('@/db/client.js', () => {
             recorder.onConflict.where = spec.where;
             return {
               returning: vi.fn(async () =>
-                recorder.returnClaimedOnInsert
-                  ? recorder.returningRows
-                  : [],
+                recorder.returnClaimedOnInsert ? recorder.returningRows : [],
               ),
             };
           }),
@@ -110,9 +108,7 @@ vi.mock('@/db/client.js', () => {
     select: vi.fn(() => ({
       from: vi.fn(() => ({
         where: vi.fn(() => ({
-          limit: vi.fn(async () =>
-            recorder.selectMatch ? [recorder.selectMatch] : [],
-          ),
+          limit: vi.fn(async () => (recorder.selectMatch ? [recorder.selectMatch] : [])),
         })),
       })),
     })),
@@ -135,9 +131,7 @@ vi.mock('@/db/client.js', () => {
       select: vi.fn(() => ({
         from: vi.fn(() => ({
           where: vi.fn(() => ({
-            limit: vi.fn(async () =>
-              recorder.selectMatch ? [recorder.selectMatch] : [],
-            ),
+            limit: vi.fn(async () => (recorder.selectMatch ? [recorder.selectMatch] : [])),
           })),
         })),
       })),
@@ -234,7 +228,7 @@ describe('outboundMessagesRepo.upsertPending — race fix (#227 blocker 1)', () 
     expect(whereSql).not.toMatch(/IN\s*\(\s*'pending'/i);
   });
 
-  it("ON CONFLICT target is the composite (tenant_id, agent_id, idempotency_key)", async () => {
+  it('ON CONFLICT target is the composite (tenant_id, agent_id, idempotency_key)', async () => {
     await runWithTenantContext(tenantCtx, () =>
       outboundMessagesRepo.upsertPending({
         idempotency_key: 'k1',
@@ -311,7 +305,7 @@ describe('outboundMessagesRepo.upsertPending — race fix (#227 blocker 1)', () 
 });
 
 describe('outboundMessagesRepo.markFailed — CAS guard (#227 blocker 2)', () => {
-  it("WHERE clause guards against degrading terminal statuses (sent/unknown)", async () => {
+  it('WHERE clause guards against degrading terminal statuses (sent/unknown)', async () => {
     await runWithTenantContext(tenantCtx, () =>
       outboundMessagesRepo.markFailed('k1', 'transport_err', true),
     );
@@ -347,9 +341,7 @@ describe('outboundMessagesRepo.markFailed — CAS guard (#227 blocker 2)', () =>
 
 describe('outboundMessagesRepo.markSent — CAS guard (#227 blocker 2)', () => {
   it("UPDATE set carries status='sent' + provider_message_id + sent_at", async () => {
-    await runWithTenantContext(tenantCtx, () =>
-      outboundMessagesRepo.markSent('k1', 'wid_xyz'),
-    );
+    await runWithTenantContext(tenantCtx, () => outboundMessagesRepo.markSent('k1', 'wid_xyz'));
     expect(recorder.updateSets[0]).toMatchObject({
       status: 'sent',
       provider_message_id: 'wid_xyz',
@@ -358,9 +350,7 @@ describe('outboundMessagesRepo.markSent — CAS guard (#227 blocker 2)', () => {
   });
 
   it("WHERE clause includes status NOT IN ('sent','unknown') guard (defensive)", async () => {
-    await runWithTenantContext(tenantCtx, () =>
-      outboundMessagesRepo.markSent('k1', 'wid_xyz'),
-    );
+    await runWithTenantContext(tenantCtx, () => outboundMessagesRepo.markSent('k1', 'wid_xyz'));
     // Defensive symmetric guard with markFailed: a markSent on an already-'sent'
     // row would clobber the original provider_message_id. The CAS filter
     // restricts the UPDATE to non-terminal rows ('pending','failed').
@@ -372,15 +362,13 @@ describe('outboundMessagesRepo.markSent — CAS guard (#227 blocker 2)', () => {
 
 describe('outboundMessagesRepo — tenant/agent isolation (#227 blocker 3)', () => {
   it('upsertPending writes the current tenant/agent into VALUES', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'tenantA', agent_id: 'agentA' },
-      () =>
-        outboundMessagesRepo.upsertPending({
-          idempotency_key: 'shared_key',
-          conversa_id: 'c1',
-          in_reply_to: 'm1',
-          channel: 'text',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: 'agentA' }, () =>
+      outboundMessagesRepo.upsertPending({
+        idempotency_key: 'shared_key',
+        conversa_id: 'c1',
+        in_reply_to: 'm1',
+        channel: 'text',
+      }),
     );
     expect(recorder.insertedRows[0]).toMatchObject({
       tenant_id: 'tenantA',
@@ -446,8 +434,6 @@ describe('outboundMessagesRepo — tenant/agent isolation (#227 blocker 3)', () 
   });
 
   it('throws MissingTenantContext when called outside a tenant context', async () => {
-    await expect(
-      outboundMessagesRepo.markSent('k1', 'wid'),
-    ).rejects.toThrow(/Tenant context/);
+    await expect(outboundMessagesRepo.markSent('k1', 'wid')).rejects.toThrow(/Tenant context/);
   });
 });

@@ -110,12 +110,7 @@
  *   list does not necessarily drop the marker (and vice-versa), which is
  *   exactly what lets an empty-read-with-live-marker be recognised as a miss.
  */
-import {
-  redis,
-  isRedisConnected,
-  isRedisOomError,
-  recordRedisOomDegraded,
-} from '@/lib/redis.js';
+import { redis, isRedisConnected, isRedisOomError, recordRedisOomDegraded } from '@/lib/redis.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { buildCacheKey } from '@/lib/cache-key.js';
 import { incCounter, observeHistogram } from '@/lib/metrics.js';
@@ -252,9 +247,7 @@ function workingMarkerKey(conversa_id: string): string {
 function scopeFingerprint(conversa_id: string): string {
   const tenant_id = getCurrentTenant();
   const agent_id = getCurrentAgent();
-  return sha256(
-    [tenant_id, agent_id, conversa_id].map((s) => encodeURIComponent(s)).join('|'),
-  );
+  return sha256([tenant_id, agent_id, conversa_id].map((s) => encodeURIComponent(s)).join('|'));
 }
 
 function recordRedisError(op: WorkingMemoryRedisOp): void {

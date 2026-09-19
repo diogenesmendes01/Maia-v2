@@ -486,7 +486,8 @@ describe('achado 6 — a PromQL dos runbooks executa contra as séries reais', (
         const seen = observed.get(s.metric)?.values.get(s.key);
         if (!seen) continue;
         for (const v of s.values) {
-          if (!seen.has(v)) bad.push(`${b.file}: ${s.metric}{${s.key}="${v}"} — reais: ${[...seen].join(',')}`);
+          if (!seen.has(v))
+            bad.push(`${b.file}: ${s.metric}{${s.key}="${v}"} — reais: ${[...seen].join(',')}`);
         }
       }
     }
@@ -518,7 +519,10 @@ describe('achado 6b — o alerta de rate limit não pode voltar a ser letra mort
     // estiver entre as que a guarda de rótulos examina.
     expect(expr, 'o alerta sumiu do arquivo de regras').not.toBe('');
     const coberta = blocks.some(
-      (b) => b.file.endsWith('slo.rules.yml') && b.query.includes('MaiaLlmRateLimited') === false && b.query === expr,
+      (b) =>
+        b.file.endsWith('slo.rules.yml') &&
+        b.query.includes('MaiaLlmRateLimited') === false &&
+        b.query === expr,
     );
     expect(coberta, `expressão fora da guarda: ${expr}`).toBe(true);
   });

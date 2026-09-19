@@ -52,10 +52,7 @@ import {
 } from '../../../src/observability/tracer.js';
 import { runWithCorrelation } from '../../../src/observability/correlation.js';
 import { SPAN } from '../../../src/observability/taxonomy.js';
-import {
-  runWithSystemContext,
-  runWithTenantContext,
-} from '../../../src/db/tenant-context.js';
+import { runWithSystemContext, runWithTenantContext } from '../../../src/db/tenant-context.js';
 import { renderPrometheus, _resetForTests } from '../../../src/lib/metrics.js';
 
 const TRACE_A = '550e8400-e29b-41d4-a716-446655440000';

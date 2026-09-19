@@ -4,7 +4,8 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 const events: any[] = [];
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureExecutionsRepo: {
@@ -25,10 +26,7 @@ vi.mock('@/db/repositories.js', async () => {
   };
 });
 
-import {
-  recordHumanConfirmation,
-  getLatestHumanConfirmation,
-} from '@/procedures/engine.js';
+import { recordHumanConfirmation, getLatestHumanConfirmation } from '@/procedures/engine.js';
 
 describe('procedure engine — human confirmation', () => {
   beforeEach(() => {

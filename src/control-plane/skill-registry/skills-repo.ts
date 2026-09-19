@@ -187,9 +187,7 @@ function scopeClauseFor(agentId: string | null | undefined, ctxAgent: string): S
     return sql`agent_id IS NULL`;
   }
   if (agentId !== ctxAgent) {
-    throw new Error(
-      `agent_scope_violation: input agent ${agentId} vs context ${ctxAgent}`,
-    );
+    throw new Error(`agent_scope_violation: input agent ${agentId} vs context ${ctxAgent}`);
   }
   return eq(skills.agent_id, agentId);
 }
@@ -339,10 +337,7 @@ export interface SkillsRepo {
    * SKILLS_LIST_MAX_LIMIT, pois a lista de versões do drawer só mostra metadados
    * escalares. O contrato completo de uma versão continua atrás de getById.
    */
-  listVersions(
-    descriptor: string,
-    agentId?: string | null,
-  ): Promise<SkillVersionSummary[]>;
+  listVersions(descriptor: string, agentId?: string | null): Promise<SkillVersionSummary[]>;
 }
 
 /**
@@ -633,9 +628,7 @@ export const skillsRepo: SkillsRepo = {
           and(
             eq(skills.tenant_id, tenant_id),
             eq(skills.skill_descriptor, target.skill_descriptor),
-            target.agent_id === null
-              ? sql`agent_id IS NULL`
-              : eq(skills.agent_id, target.agent_id),
+            target.agent_id === null ? sql`agent_id IS NULL` : eq(skills.agent_id, target.agent_id),
             eq(skills.status, 'active'),
           ),
         );
@@ -663,11 +656,7 @@ export const skillsRepo: SkillsRepo = {
             : target.proposed_reason,
         })
         .where(
-          and(
-            eq(skills.tenant_id, tenant_id),
-            eq(skills.id, id),
-            eq(skills.status, 'proposed'),
-          ),
+          and(eq(skills.tenant_id, tenant_id), eq(skills.id, id), eq(skills.status, 'proposed')),
         )
         .returning();
       if (!updated) {
@@ -797,9 +786,7 @@ export const skillsRepo: SkillsRepo = {
           and(
             eq(skills.tenant_id, tenant_id),
             eq(skills.skill_descriptor, target.skill_descriptor),
-            target.agent_id === null
-              ? sql`agent_id IS NULL`
-              : eq(skills.agent_id, target.agent_id),
+            target.agent_id === null ? sql`agent_id IS NULL` : eq(skills.agent_id, target.agent_id),
             eq(skills.version, target.version - 1),
           ),
         )

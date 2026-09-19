@@ -65,7 +65,12 @@ describe('list_transactions tool', () => {
     expect(out.items[1]).toMatchObject({ id: 'tx-2', valor: 300.5, categoria_id: null });
     expect(byScope).toHaveBeenCalledWith(
       { pessoa_id: 'p1', entidades: [E1] },
-      expect.objectContaining({ date_from: '2026-04-01', date_to: '2026-04-30', limit: 50, offset: 0 }),
+      expect.objectContaining({
+        date_from: '2026-04-01',
+        date_to: '2026-04-30',
+        limit: 50,
+        offset: 0,
+      }),
     );
   });
 

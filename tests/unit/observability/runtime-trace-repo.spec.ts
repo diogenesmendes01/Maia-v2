@@ -76,7 +76,10 @@ describe('issue #514 — runtimeTraceRepo', () => {
   });
 
   describe('fail-closed tenant guard', () => {
-    it.each([['', 'empty'], ['   ', 'whitespace']])('rejects %s tenant (%s)', async (tenantId) => {
+    it.each([
+      ['', 'empty'],
+      ['   ', 'whitespace'],
+    ])('rejects %s tenant (%s)', async (tenantId) => {
       await expect(runtimeTraceRepo.list({ tenantId, limit: 10 })).rejects.toThrow(
         TraceTenantScopeError,
       );
@@ -97,9 +100,9 @@ describe('issue #514 — runtimeTraceRepo', () => {
     });
 
     it('guards `get` and `bodyStatusCounts` the same way', async () => {
-      await expect(
-        runtimeTraceRepo.get({ tenantId: '', traceId: TRACE_ID }),
-      ).rejects.toThrow(TraceTenantScopeError);
+      await expect(runtimeTraceRepo.get({ tenantId: '', traceId: TRACE_ID })).rejects.toThrow(
+        TraceTenantScopeError,
+      );
       await expect(runtimeTraceRepo.bodyStatusCounts({ tenantId: '' })).rejects.toThrow(
         TraceTenantScopeError,
       );
@@ -190,9 +193,7 @@ describe('issue #514 — runtimeTraceRepo', () => {
   describe('get', () => {
     it('returns null when the trace is not in this tenant', async () => {
       captured.rows = [];
-      expect(
-        await runtimeTraceRepo.get({ tenantId: 'tenant-A', traceId: TRACE_ID }),
-      ).toBeNull();
+      expect(await runtimeTraceRepo.get({ tenantId: 'tenant-A', traceId: TRACE_ID })).toBeNull();
     });
 
     it('never hands out an encrypted body', async () => {

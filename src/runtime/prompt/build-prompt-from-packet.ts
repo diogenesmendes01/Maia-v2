@@ -26,9 +26,7 @@ export interface PromptFromPacketResult {
   messages: Array<{ role: 'user' | 'assistant'; content: string }>;
 }
 
-export function buildPromptFromPacket(
-  packet: ExecutionContextPacket,
-): PromptFromPacketResult {
+export function buildPromptFromPacket(packet: ExecutionContextPacket): PromptFromPacketResult {
   const blocks: string[] = [];
 
   blocks.push(renderIdentity(packet.identity));
@@ -44,10 +42,7 @@ export function buildPromptFromPacket(
   if (packet.knowledge.facts.length > 0 || packet.knowledge.rules.length > 0) {
     blocks.push(renderKnowledge(packet.knowledge));
   }
-  if (
-    packet.skill.selected_skill ||
-    packet.skill.candidate_skills.length > 0
-  ) {
+  if (packet.skill.selected_skill || packet.skill.candidate_skills.length > 0) {
     blocks.push(renderSkill(packet.skill));
   }
   if (packet.tool.available_tools.length > 0) {
@@ -81,9 +76,7 @@ function renderIdentity(slice: IdentitySlice): string {
     lines.push(
       '- Modificadores de voz aprendidos: ' +
         slice.learned_voice_modifiers
-          .map(
-            (m) => `${m.aspect}: ${m.modifier} (força ${m.strength.toFixed(2)})`,
-          )
+          .map((m) => `${m.aspect}: ${m.modifier} (força ${m.strength.toFixed(2)})`)
           .join('; '),
     );
   }
@@ -123,9 +116,7 @@ function renderSoul(slice: SoulSlice): string {
   }
   const lines = ['## Vieses ativos (orientam, não bloqueiam)'];
   for (const b of slice.active_biases) {
-    lines.push(
-      `- ${b.principle} (força ${b.strength.toFixed(2)}, origem ${b.origin})`,
-    );
+    lines.push(`- ${b.principle} (força ${b.strength.toFixed(2)}, origem ${b.origin})`);
   }
   if (slice.total_active > slice.truncated_to) {
     lines.push('- (lista truncada)');
@@ -152,9 +143,7 @@ function renderUser(slice: UserSlice): string {
   if (slice.behavioral_hints.length > 0) {
     lines.push('## Instruções comportamentais ativas');
     for (const h of slice.behavioral_hints) {
-      lines.push(
-        `- ${h.aspect}: ${h.suggestion} (força ${h.strength.toFixed(2)})`,
-      );
+      lines.push(`- ${h.aspect}: ${h.suggestion} (força ${h.strength.toFixed(2)})`);
     }
   }
   return lines.join('\n');

@@ -162,7 +162,13 @@ describe('channelsRepo.findPrimaryCatchAllChannel — REAL discriminator (PR #41
 
   it('active non-primary tenant of the SAME channel_type → { multi_tenant:true, channel:null } (fail-closed)', async () => {
     dataset.rows = [
-      row({ id: 'ch-acme', tenant_id: 'tenant-acme', agent_id: 'agent-acme', channel_type: 'whatsapp', active: true }),
+      row({
+        id: 'ch-acme',
+        tenant_id: 'tenant-acme',
+        agent_id: 'agent-acme',
+        channel_type: 'whatsapp',
+        active: true,
+      }),
       row({ id: 'ch-primary', channel_type: 'whatsapp' }), // the seed also exists
     ];
     const { channelsRepo } = await import('@/db/repositories.js');
@@ -179,7 +185,13 @@ describe('channelsRepo.findPrimaryCatchAllChannel — REAL discriminator (PR #41
     // Inbound is whatsapp; the only real tenant owns a *telegram* channel; the
     // seeded primary/primary whatsapp catch-all also exists.
     dataset.rows = [
-      row({ id: 'ch-acme-tg', tenant_id: 'tenant-acme', agent_id: 'agent-acme', channel_type: 'telegram', active: true }),
+      row({
+        id: 'ch-acme-tg',
+        tenant_id: 'tenant-acme',
+        agent_id: 'agent-acme',
+        channel_type: 'telegram',
+        active: true,
+      }),
       row({ id: 'ch-primary-wa', channel_type: 'whatsapp' }),
     ];
     const { channelsRepo } = await import('@/db/repositories.js');
@@ -197,7 +209,13 @@ describe('channelsRepo.findPrimaryCatchAllChannel — REAL discriminator (PR #41
   // dataset, run through the OLD channel_type-scoped discriminator, LEAKS.
   it('🔴 CRITICAL (proof): the same cross-channel_type dataset LEAKS under the OLD channel_type-scoped discriminator', () => {
     const rows: Row[] = [
-      row({ id: 'ch-acme-tg', tenant_id: 'tenant-acme', agent_id: 'agent-acme', channel_type: 'telegram', active: true }),
+      row({
+        id: 'ch-acme-tg',
+        tenant_id: 'tenant-acme',
+        agent_id: 'agent-acme',
+        channel_type: 'telegram',
+        active: true,
+      }),
       row({ id: 'ch-primary-wa', channel_type: 'whatsapp' }),
     ];
     const inboundType = 'whatsapp';
@@ -205,12 +223,18 @@ describe('channelsRepo.findPrimaryCatchAllChannel — REAL discriminator (PR #41
     // OLD: discriminator filtered by channel_type (the bug).
     const oldScoped = rows.filter((r) => r.channel_type === inboundType);
     const oldHasReal = oldScoped.some((r) => r.active && r.tenant_id !== 'primary');
-    const oldFallback = oldScoped.find((r) => r.active && r.tenant_id === 'primary' && r.agent_id === 'primary') ?? null;
-    const oldOut = oldHasReal ? { multi_tenant: true, channel: null } : { multi_tenant: false, channel: oldFallback };
+    const oldFallback =
+      oldScoped.find((r) => r.active && r.tenant_id === 'primary' && r.agent_id === 'primary') ??
+      null;
+    const oldOut = oldHasReal
+      ? { multi_tenant: true, channel: null }
+      : { multi_tenant: false, channel: oldFallback };
 
     // NEW: GLOBAL discriminator (no channel_type filter).
     const newHasReal = rows.some((r) => r.active && r.tenant_id !== 'primary');
-    const newOut = newHasReal ? { multi_tenant: true, channel: null } : { multi_tenant: false, channel: null };
+    const newOut = newHasReal
+      ? { multi_tenant: true, channel: null }
+      : { multi_tenant: false, channel: null };
 
     // OLD leaks: it returns the primary catch-all to a deployment that HAS a
     // real (telegram) tenant.
@@ -224,7 +248,14 @@ describe('channelsRepo.findPrimaryCatchAllChannel — REAL discriminator (PR #41
     // Um canal is_synthetic ativo de tenant ≠ primary NÃO conta como tenant
     // real: ativar o canal de sonda nunca derruba o catch-all (review P1-A).
     dataset.rows = [
-      row({ id: 'ch-probe', tenant_id: '__probe__', agent_id: '__probe__', channel_type: 'whatsapp', active: true, is_synthetic: true }),
+      row({
+        id: 'ch-probe',
+        tenant_id: '__probe__',
+        agent_id: '__probe__',
+        channel_type: 'whatsapp',
+        active: true,
+        is_synthetic: true,
+      }),
       row({ id: 'ch-primary', channel_type: 'whatsapp' }),
     ];
     const { channelsRepo } = await import('@/db/repositories.js');
@@ -240,7 +271,13 @@ describe('channelsRepo.findPrimaryCatchAllChannel — REAL discriminator (PR #41
     // predicate excludes it), so we fall through to the catch-all — a
     // recently-offboarded tenant must not strand the bot.
     dataset.rows = [
-      row({ id: 'ch-old', tenant_id: 'tenant-gone', agent_id: 'agent-gone', channel_type: 'whatsapp', active: false }),
+      row({
+        id: 'ch-old',
+        tenant_id: 'tenant-gone',
+        agent_id: 'agent-gone',
+        channel_type: 'whatsapp',
+        active: false,
+      }),
       row({ id: 'ch-primary', channel_type: 'whatsapp' }),
     ];
     const { channelsRepo } = await import('@/db/repositories.js');
@@ -252,8 +289,20 @@ describe('channelsRepo.findPrimaryCatchAllChannel — REAL discriminator (PR #41
 
   it('2+ active non-primary tenants → still { multi_tenant:true } (existence probe; LIMIT 1)', async () => {
     dataset.rows = [
-      row({ id: 'ch-a', tenant_id: 'tenant-a', agent_id: 'agent-a', channel_type: 'sms', active: true }),
-      row({ id: 'ch-b', tenant_id: 'tenant-b', agent_id: 'agent-b', channel_type: 'whatsapp', active: true }),
+      row({
+        id: 'ch-a',
+        tenant_id: 'tenant-a',
+        agent_id: 'agent-a',
+        channel_type: 'sms',
+        active: true,
+      }),
+      row({
+        id: 'ch-b',
+        tenant_id: 'tenant-b',
+        agent_id: 'agent-b',
+        channel_type: 'whatsapp',
+        active: true,
+      }),
     ];
     const { channelsRepo } = await import('@/db/repositories.js');
     const out = await channelsRepo.findPrimaryCatchAllChannel({ channel_type: 'sms' });

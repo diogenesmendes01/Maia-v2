@@ -96,12 +96,10 @@ vi.mock('drizzle-orm', () => {
     },
   });
   const and = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
+    __pred: (row: Row) => conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
   });
   const or = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
+    __pred: (row: Row) => conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
   });
   const inArray = (col: unknown, vals: unknown[]): PredObj => ({
     __pred: (row: Row) => {
@@ -146,12 +144,7 @@ function makeTable(): any {
 // `src/control-plane/knowledge-state-machine/repos.ts` imports from
 // `@/db/schema.js`.
 vi.mock('@/db/schema.js', () => {
-  const tables = [
-    'agent_facts',
-    'behavioral_hint',
-    'learned_rules',
-    'memory_entry',
-  ];
+  const tables = ['agent_facts', 'behavioral_hint', 'learned_rules', 'memory_entry'];
   const out: Record<string, any> = {};
   for (const t of tables) out[t] = makeTable();
   return out;
@@ -230,9 +223,7 @@ class SelectBuilder {
     return this;
   }
   private exec(): Row[] {
-    const rows = tableOf(this._table)
-      .filter(this._pred)
-      .slice(0, this._limit);
+    const rows = tableOf(this._table).filter(this._pred).slice(0, this._limit);
     if (this._projection) {
       const keys = Object.keys(this._projection);
       return rows.map((r) => {
@@ -271,8 +262,7 @@ class InsertBuilder {
 
 function makeDbHandle() {
   return {
-    select: (projection?: Record<string, ColRef>) =>
-      new SelectBuilder(projection),
+    select: (projection?: Record<string, ColRef>) => new SelectBuilder(projection),
     insert: (table: unknown) => new InsertBuilder(table),
     update: (table: unknown) => new UpdateBuilder(table),
   };
@@ -280,8 +270,7 @@ function makeDbHandle() {
 
 vi.mock('@/db/client.js', () => {
   const db = makeDbHandle();
-  const withTx = async (fn: (tx: unknown) => Promise<unknown>) =>
-    fn(makeDbHandle());
+  const withTx = async (fn: (tx: unknown) => Promise<unknown>) => fn(makeDbHandle());
   return { db, withTx };
 });
 
@@ -409,9 +398,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
   describe('knowledgeRepos.findById (rule)', () => {
     it('SUCCESS — same-scope findById returns the row', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       const row = await runWithTenantContext(A_CTX, async () =>
         knowledgeRepos.findById('rule', 'rule_A_alpha'),
       );
@@ -422,9 +409,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('REJECTION — tenant-A context returns null for tenant-B rule', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       const row = await runWithTenantContext(A_CTX, async () =>
         knowledgeRepos.findById('rule', 'rule_B_gamma'),
       );
@@ -433,9 +418,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('SYMMETRY — tenant-B context returns null for tenant-A rule', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       const row = await runWithTenantContext(B_CTX, async () =>
         knowledgeRepos.findById('rule', 'rule_A_alpha'),
       );
@@ -444,9 +427,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('ADVERSARIAL SEED — B-first ordering does not change scope-miss behaviour', async () => {
       seedTwoTenantsReverse();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       const same = await runWithTenantContext(A_CTX, async () =>
         knowledgeRepos.findById('rule', 'rule_A_alpha'),
       );
@@ -465,9 +446,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
           agent_id: 'agent-OTHER',
         }),
       );
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       const row = await runWithTenantContext(A_CTX, async () =>
         knowledgeRepos.findById('rule', 'rule_A_other_agent'),
       );
@@ -478,9 +457,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
   describe('knowledgeRepos.update (rule)', () => {
     it('SUCCESS — same-scope update applies lifecycle_status change', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       await runWithTenantContext(A_CTX, async () => {
         await knowledgeRepos.update('rule', 'rule_A_alpha', {
           lifecycle_status: 'active',
@@ -491,9 +468,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('REJECTION — tenant-A context cannot update tenant-B rule (TypedError rule_not_in_scope)', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       const { TypedError } = await import('@/lib/utils.js');
       await runWithTenantContext(A_CTX, async () => {
         await expect(
@@ -513,9 +488,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('SYMMETRY — tenant-B context cannot update tenant-A rule', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       await runWithTenantContext(B_CTX, async () => {
         await expect(
           knowledgeRepos.update('rule', 'rule_A_alpha', {
@@ -528,9 +501,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('REJECTION — unknown id throws rule_not_in_scope', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       await runWithTenantContext(A_CTX, async () => {
         await expect(
           knowledgeRepos.update('rule', 'rule_does_not_exist', {
@@ -542,9 +513,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('ADVERSARIAL SEED — B-first does not change cross-tenant update rejection', async () => {
       seedTwoTenantsReverse();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       await runWithTenantContext(A_CTX, async () => {
         await expect(
           knowledgeRepos.update('rule', 'rule_B_gamma', {
@@ -563,9 +532,7 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('expected_previous_status — same-scope conditional update applies on match', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
       await runWithTenantContext(A_CTX, async () => {
         await knowledgeRepos.update('rule', 'rule_A_alpha', {
           lifecycle_status: 'ephemeral',
@@ -580,9 +547,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
       // must surface as rule_not_in_scope (telemetry-greppable), not as a
       // benign concurrency conflict. The repo disambiguates via re-read.
       seedTwoTenants();
-      const { knowledgeRepos, KnowledgeConflictError } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos, KnowledgeConflictError } =
+        await import('@/control-plane/knowledge-state-machine/repos.js');
       await runWithTenantContext(A_CTX, async () => {
         await expect(
           knowledgeRepos.update('rule', 'rule_B_gamma', {
@@ -608,9 +574,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
       // rule_not_in_scope) so the state-machine's catch translates to
       // IllegalTransitionError and the auto-promoter can treat it as benign.
       seedTwoTenants();
-      const { knowledgeRepos, KnowledgeConflictError } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
+      const { knowledgeRepos, KnowledgeConflictError } =
+        await import('@/control-plane/knowledge-state-machine/repos.js');
       await runWithTenantContext(A_CTX, async () => {
         // rule_A_alpha is in 'pending_review', not 'active'. Asking the
         // repo to flip pending_review→active under expected='active' must
@@ -630,9 +595,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
   describe('KnowledgeStateMachine.transition (rule) end-to-end', () => {
     it('SUCCESS — same-scope transition pending_review→active applies', async () => {
       seedTwoTenants();
-      const { KnowledgeStateMachine } = await import(
-        '@/control-plane/knowledge-state-machine/state-machine.js'
-      );
+      const { KnowledgeStateMachine } =
+        await import('@/control-plane/knowledge-state-machine/state-machine.js');
       await runWithTenantContext(A_CTX, async () => {
         const t = await KnowledgeStateMachine.transition({
           kind: 'rule',
@@ -654,9 +618,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
       // depth: out-of-scope rows are invisible to the state-machine
       // entirely.
       seedTwoTenants();
-      const { KnowledgeStateMachine } = await import(
-        '@/control-plane/knowledge-state-machine/state-machine.js'
-      );
+      const { KnowledgeStateMachine } =
+        await import('@/control-plane/knowledge-state-machine/state-machine.js');
       await runWithTenantContext(A_CTX, async () => {
         await expect(
           KnowledgeStateMachine.transition({
@@ -674,9 +637,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('SYMMETRY — tenant-B transition on tenant-A rule throws knowledge_not_found', async () => {
       seedTwoTenants();
-      const { KnowledgeStateMachine } = await import(
-        '@/control-plane/knowledge-state-machine/state-machine.js'
-      );
+      const { KnowledgeStateMachine } =
+        await import('@/control-plane/knowledge-state-machine/state-machine.js');
       await runWithTenantContext(B_CTX, async () => {
         await expect(
           KnowledgeStateMachine.transition({
@@ -693,9 +655,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('ADVERSARIAL SEED — B-first transitions still pin tenant-A only', async () => {
       seedTwoTenantsReverse();
-      const { KnowledgeStateMachine } = await import(
-        '@/control-plane/knowledge-state-machine/state-machine.js'
-      );
+      const { KnowledgeStateMachine } =
+        await import('@/control-plane/knowledge-state-machine/state-machine.js');
       await runWithTenantContext(A_CTX, async () => {
         await KnowledgeStateMachine.transition({
           kind: 'rule',
@@ -715,9 +676,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
   describe('KnowledgeStateMachine.revoke (rule) end-to-end', () => {
     it('SUCCESS — same-scope revoke moves rule to revoked', async () => {
       seedTwoTenants();
-      const { KnowledgeStateMachine } = await import(
-        '@/control-plane/knowledge-state-machine/state-machine.js'
-      );
+      const { KnowledgeStateMachine } =
+        await import('@/control-plane/knowledge-state-machine/state-machine.js');
       await runWithTenantContext(A_CTX, async () => {
         const r = await KnowledgeStateMachine.revoke({
           kind: 'rule',
@@ -733,9 +693,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('REJECTION — tenant-A revoke on tenant-B rule throws knowledge_not_found', async () => {
       seedTwoTenants();
-      const { KnowledgeStateMachine } = await import(
-        '@/control-plane/knowledge-state-machine/state-machine.js'
-      );
+      const { KnowledgeStateMachine } =
+        await import('@/control-plane/knowledge-state-machine/state-machine.js');
       await runWithTenantContext(A_CTX, async () => {
         await expect(
           KnowledgeStateMachine.revoke({
@@ -753,9 +712,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('SYMMETRY — tenant-B revoke on tenant-A rule throws knowledge_not_found', async () => {
       seedTwoTenants();
-      const { KnowledgeStateMachine } = await import(
-        '@/control-plane/knowledge-state-machine/state-machine.js'
-      );
+      const { KnowledgeStateMachine } =
+        await import('@/control-plane/knowledge-state-machine/state-machine.js');
       await runWithTenantContext(B_CTX, async () => {
         await expect(
           KnowledgeStateMachine.revoke({
@@ -771,9 +729,8 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
 
     it('ADVERSARIAL SEED — B-first revoke still scopes to tenant-A', async () => {
       seedTwoTenantsReverse();
-      const { KnowledgeStateMachine } = await import(
-        '@/control-plane/knowledge-state-machine/state-machine.js'
-      );
+      const { KnowledgeStateMachine } =
+        await import('@/control-plane/knowledge-state-machine/state-machine.js');
       await runWithTenantContext(A_CTX, async () => {
         await KnowledgeStateMachine.revoke({
           kind: 'rule',
@@ -790,25 +747,17 @@ describe('Issue #234 — KSM facade for kind:rule is tenant/agent-scoped', () =>
   describe('MissingTenantContextError — defensive check on the ALS guard', () => {
     it('findById(rule, ...) outside runWithTenantContext throws MissingTenantContextError', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
+      const { MissingTenantContextError } = await import('@/db/tenant-context.js');
+      await expect(knowledgeRepos.findById('rule', 'rule_A_alpha')).rejects.toBeInstanceOf(
+        MissingTenantContextError,
       );
-      const { MissingTenantContextError } = await import(
-        '@/db/tenant-context.js'
-      );
-      await expect(
-        knowledgeRepos.findById('rule', 'rule_A_alpha'),
-      ).rejects.toBeInstanceOf(MissingTenantContextError);
     });
 
     it('update(rule, ...) outside runWithTenantContext throws MissingTenantContextError', async () => {
       seedTwoTenants();
-      const { knowledgeRepos } = await import(
-        '@/control-plane/knowledge-state-machine/repos.js'
-      );
-      const { MissingTenantContextError } = await import(
-        '@/db/tenant-context.js'
-      );
+      const { knowledgeRepos } = await import('@/control-plane/knowledge-state-machine/repos.js');
+      const { MissingTenantContextError } = await import('@/db/tenant-context.js');
       await expect(
         knowledgeRepos.update('rule', 'rule_A_alpha', {
           lifecycle_status: 'active',

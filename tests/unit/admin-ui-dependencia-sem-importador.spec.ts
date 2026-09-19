@@ -173,8 +173,10 @@ describe('dependência de runtime do admin-ui sem importador (#605)', () => {
 
   it('toda justificativa traz um motivo não vazio', () => {
     for (const [pacote, motivo] of Object.entries(SEM_IMPORTADOR_JUSTIFICADO)) {
-      expect(motivo.trim().length, `\`${pacote}\` está na allowlist sem motivo escrito`)
-        .toBeGreaterThan(40);
+      expect(
+        motivo.trim().length,
+        `\`${pacote}\` está na allowlist sem motivo escrito`,
+      ).toBeGreaterThan(40);
     }
   });
 
@@ -192,9 +194,7 @@ describe('dependência de runtime do admin-ui sem importador (#605)', () => {
         '`dependencies` do console — apague a entrada',
     ).toEqual([]);
 
-    const jaImportadas = Object.keys(SEM_IMPORTADOR_JUSTIFICADO).filter((p) =>
-      importados.has(p),
-    );
+    const jaImportadas = Object.keys(SEM_IMPORTADOR_JUSTIFICADO).filter((p) => importados.has(p));
     expect(
       jaImportadas,
       'entrada em SEM_IMPORTADOR_JUSTIFICADO para pacote que AGORA tem importador — a ' +

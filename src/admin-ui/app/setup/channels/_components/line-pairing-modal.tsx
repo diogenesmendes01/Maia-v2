@@ -90,7 +90,6 @@ export default function LinePairingModal({
     return () => clearInterval(id);
   }, [isPairing]);
 
-
   // Toda transição relevante invalida a listagem do caller (o estado da
   // linha aparece na tabela).
   const lastState = React.useRef(state);
@@ -130,7 +129,8 @@ export default function LinePairingModal({
         tenantId,
         agentId,
         channelId,
-        comment: comment.trim().length >= 10 ? comment.trim() : 'Pareamento cancelado pelo operador',
+        comment:
+          comment.trim().length >= 10 ? comment.trim() : 'Pareamento cancelado pelo operador',
       });
       await status.refetch();
       onChanged();
@@ -152,9 +152,9 @@ export default function LinePairingModal({
       title={`Parear linha ${channelLabel}`}
       description={
         <>
-          Digitar o número não prova posse: a linha só é ativada quando o
-          WhatsApp <strong>desta</strong> linha confirmar o pareamento. Toda
-          operação é auditada com o seu usuário.
+          Digitar o número não prova posse: a linha só é ativada quando o WhatsApp{' '}
+          <strong>desta</strong> linha confirmar o pareamento. Toda operação é auditada com o seu
+          usuário.
         </>
       }
       footer={
@@ -197,9 +197,8 @@ export default function LinePairingModal({
 
         {isAborting && (
           <Alert tone="info">
-            Encerrando a sessão de pareamento. A linha volta a aceitar um novo
-            pareamento assim que o runtime confirmar — evita que a tentativa
-            antiga conclua sozinha e ative a linha.
+            Encerrando a sessão de pareamento. A linha volta a aceitar um novo pareamento assim que
+            o runtime confirmar — evita que a tentativa antiga conclua sozinha e ative a linha.
           </Alert>
         )}
 
@@ -306,9 +305,8 @@ export default function LinePairingModal({
 
         {state === 'verified_offline' && (
           <Alert tone="success" title="Posse provada">
-            A linha ainda NÃO roteia. O backend revalida a prontidão a cada minuto e ativa
-            sozinho assim que houver política com papel padrão ativo — não é preciso parear de
-            novo.
+            A linha ainda NÃO roteia. O backend revalida a prontidão a cada minuto e ativa sozinho
+            assim que houver política com papel padrão ativo — não é preciso parear de novo.
           </Alert>
         )}
 
@@ -320,8 +318,8 @@ export default function LinePairingModal({
 
         <p className="text-2xs leading-relaxed text-zinc-400">
           O QR e o código são credenciais de curta duração: qualquer pessoa que os leia consegue
-          conectar um aparelho a esta linha. Eles nunca aparecem em URL, log ou auditoria — e
-          somem da tela ao expirar.
+          conectar um aparelho a esta linha. Eles nunca aparecem em URL, log ou auditoria — e somem
+          da tela ao expirar.
         </p>
       </div>
     </Modal>

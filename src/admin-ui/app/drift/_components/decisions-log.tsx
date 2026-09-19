@@ -2,14 +2,7 @@
 
 import * as React from 'react';
 import { StatusBadge } from '../../../components/ui/badge.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../../components/ui/table.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../../components/ui/table.js';
 import { EmptyState } from '../../../components/ui/states.js';
 import { IconAlertTriangle } from '../../../components/ui/icons.js';
 
@@ -49,9 +42,7 @@ export default function DecisionsLog({ items }: { items: DriftItem[] }) {
                 <StatusBadge status={d.severity} />
               </Td>
               <Td className="capitalize">{d.decision ?? 'pendente'}</Td>
-              <Td className="text-zinc-600">
-                {new Date(d.detected_at).toLocaleString('pt-BR')}
-              </Td>
+              <Td className="text-zinc-600">{new Date(d.detected_at).toLocaleString('pt-BR')}</Td>
             </Tr>
           ))}
         </tbody>

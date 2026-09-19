@@ -1,11 +1,7 @@
 import nodePath from 'node:path';
 import { config } from '@/config/env.js';
 import { TypedError } from '@/lib/utils.js';
-import {
-  assertSafeAuthDir,
-  isReservedRootEntry,
-  type PathImpl,
-} from '@/setup/auth-dir-path.js';
+import { assertSafeAuthDir, isReservedRootEntry, type PathImpl } from '@/setup/auth-dir-path.js';
 
 /**
  * Guardas de path do `BAILEYS_AUTH_DIR` — raiz e layout multi-linha.

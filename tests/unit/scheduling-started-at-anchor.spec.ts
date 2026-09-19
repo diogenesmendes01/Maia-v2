@@ -68,7 +68,9 @@ describe('occurrencesRepo.setStatus — started_at anchor (Blocker 2 review 2)',
 
   it('status=awaiting_third_party sets started_at (CRITICAL — was the bug)', async () => {
     const { occurrencesRepo } = await import('../../src/scheduling/repos.js');
-    await runWithTenantContext(TENANT, () => occurrencesRepo.setStatus('occ-2', 'awaiting_third_party'));
+    await runWithTenantContext(TENANT, () =>
+      occurrencesRepo.setStatus('occ-2', 'awaiting_third_party'),
+    );
     expect(updateCalls[0]!.set).toHaveProperty('started_at');
     expect(updateCalls[0]!.set.started_at).toBeInstanceOf(Date);
   });

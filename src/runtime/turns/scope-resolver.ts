@@ -60,11 +60,7 @@ import { agentTurnsRepo } from '@/db/repositories/turn-repos.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
 import { counter } from '@/observability/metrics.js';
-import {
-  METRIC,
-  TURN_SCOPE_REJECTION_VALUES,
-  closedVocabulary,
-} from '@/observability/taxonomy.js';
+import { METRIC, TURN_SCOPE_REJECTION_VALUES, closedVocabulary } from '@/observability/taxonomy.js';
 
 /** Motivo da recusa. Vocabulário FECHADO — ver `TURN_SCOPE_REJECTION_VALUES`. */
 export type TurnScopeRejection =
@@ -196,10 +192,7 @@ export async function resolveTurnJobScope(turn_id: string): Promise<TurnJobScope
   // O PREDICADO CENTRAL. Ver o bloco 3 no topo do arquivo: a coluna não tem FK,
   // então esta igualdade é a única coisa entre um ponteiro cruzado e um turno
   // executado sob o escopo errado.
-  if (
-    row.message_tenant_id !== row.turn_tenant_id ||
-    row.message_agent_id !== row.turn_agent_id
-  ) {
+  if (row.message_tenant_id !== row.turn_tenant_id || row.message_agent_id !== row.turn_agent_id) {
     return refuse('scope_mismatch', normalized);
   }
 

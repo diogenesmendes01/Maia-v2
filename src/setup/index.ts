@@ -266,7 +266,13 @@ export async function registerSetupRoutes(app: FastifyInstance): Promise<void> {
         .send({ error: 'bootstrap_already_completed' });
     }
 
-    const obrigatorios = ['secret', 'tenant_id', 'tenant_nome', 'email', 'idempotency_key'] as const;
+    const obrigatorios = [
+      'secret',
+      'tenant_id',
+      'tenant_nome',
+      'email',
+      'idempotency_key',
+    ] as const;
     for (const campo of obrigatorios) {
       if (typeof body[campo] !== 'string' || (body[campo] as string).length === 0) {
         return reply.code(400).type('application/json').send({ error: 'campo_obrigatorio', campo });

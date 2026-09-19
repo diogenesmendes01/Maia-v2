@@ -202,9 +202,7 @@ export class TurnLease {
         attempt: this.claim.attempt,
         worker_id: this.claim.worker_id,
       },
-    }).catch((err) =>
-      logger.warn({ err: (err as Error).message }, 'turn.lease_lost_audit_failed'),
-    );
+    }).catch((err) => logger.warn({ err: (err as Error).message }, 'turn.lease_lost_audit_failed'));
   }
 
   #clearTimer(): void {
@@ -278,9 +276,9 @@ export class TurnLease {
  * o caminho NORMAL quando duas réplicas acordam com o mesmo job: transformar
  * isso em exceção encheria a DLQ de eventos saudáveis.
  */
-export async function acquireTurnLease(turn_id: string): Promise<
-  { lease: TurnLease; result: ClaimResult } | { lease: null; result: ClaimResult }
-> {
+export async function acquireTurnLease(
+  turn_id: string,
+): Promise<{ lease: TurnLease; result: ClaimResult } | { lease: null; result: ClaimResult }> {
   const ttl_ms = config.TURN_LEASE_TTL_MS;
   const heartbeat_ms = config.TURN_LEASE_HEARTBEAT_MS;
   const worker_id = turnWorkerId();

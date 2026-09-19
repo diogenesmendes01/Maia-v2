@@ -183,8 +183,7 @@ describe('buildToolSummary', () => {
         const t = typeof v;
         const okPrimitive = t === 'string' || t === 'number' || t === 'boolean';
         const okArray =
-          Array.isArray(v) &&
-          v.every((x) => typeof x === 'string' || typeof x === 'number');
+          Array.isArray(v) && v.every((x) => typeof x === 'string' || typeof x === 'number');
         expect(okPrimitive || okArray).toBe(true);
       }
     }

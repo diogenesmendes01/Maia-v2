@@ -84,9 +84,7 @@ const repoMock = {
     return store
       .filter(
         (r) =>
-          r.tenant_id === ctx.tenant_id &&
-          r.agent_id === ctx.agent_id &&
-          r.status === 'pending',
+          r.tenant_id === ctx.tenant_id && r.agent_id === ctx.agent_id && r.status === 'pending',
       )
       .slice(0, limit)
       .map((r) => ({
@@ -110,16 +108,14 @@ const repoMock = {
     row.status = 'sent';
     return true;
   }),
-  markEffectRetry: vi.fn(
-    async (input: { id: string; error: string; backoff_seconds: number }) => {
-      markRetryCalls.push(input);
-      const row = store.find((r) => r.id === input.id && r.status === 'pending');
-      if (!row) return null;
-      row.attempts += 1;
-      row.status = row.attempts >= row.max_attempts ? 'failed' : 'pending';
-      return row.status;
-    },
-  ),
+  markEffectRetry: vi.fn(async (input: { id: string; error: string; backoff_seconds: number }) => {
+    markRetryCalls.push(input);
+    const row = store.find((r) => r.id === input.id && r.status === 'pending');
+    if (!row) return null;
+    row.attempts += 1;
+    row.status = row.attempts >= row.max_attempts ? 'failed' : 'pending';
+    return row.status;
+  }),
   // Force-terminal (#326 note (b)): flip a pending row straight to 'failed'
   // WITHOUT touching the retry budget. CAS on status='pending'.
   markEffectFailed: vi.fn(async (input: { id: string; error: string }) => {
@@ -241,7 +237,12 @@ function seed(input: {
     effect_type: input.effect_type ?? 'whatsapp_text',
     effect_payload:
       input.effect_payload ??
-      ({ kind: 'whatsapp_text', jid: '5511999990000@s.whatsapp.net', text: 'olá', mensagem_id: 'm1' } as unknown),
+      ({
+        kind: 'whatsapp_text',
+        jid: '5511999990000@s.whatsapp.net',
+        text: 'olá',
+        mensagem_id: 'm1',
+      } as unknown),
     attempts: input.attempts ?? 0,
     max_attempts: input.max_attempts ?? 5,
     status: input.status ?? 'pending',
@@ -275,9 +276,7 @@ describe('idempotency_outbox_relayer — exactly-once dispatch', () => {
     seed({ ...A_CTX });
     sendOutboundTextMock.mockResolvedValueOnce('wa-id-123');
 
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
 
     // The gateway send fired EXACTLY once, with the jid + text and a #327
@@ -297,9 +296,7 @@ describe('idempotency_outbox_relayer — exactly-once dispatch', () => {
 
   it('a second relay pass does NOT re-dispatch an already-sent effect', async () => {
     seed({ ...A_CTX });
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     expect(sendOutboundTextMock).toHaveBeenCalledTimes(1);
 
@@ -312,16 +309,17 @@ describe('idempotency_outbox_relayer — exactly-once dispatch', () => {
 describe('idempotency_outbox_relayer — #327 provider-side dedup key', () => {
   it('passes the deterministic dedup key derived from the row identity on the send', async () => {
     const row = seed({ ...A_CTX });
-    const { deriveProviderDedupKey } = await import(
-      '@/governance/idempotency-effects.js'
-    );
+    const { deriveProviderDedupKey } = await import('@/governance/idempotency-effects.js');
     const expectedKey = deriveProviderDedupKey(
-      { kind: 'whatsapp_text', jid: '5511999990000@s.whatsapp.net', text: 'olá', mensagem_id: 'm1' },
+      {
+        kind: 'whatsapp_text',
+        jid: '5511999990000@s.whatsapp.net',
+        text: 'olá',
+        mensagem_id: 'm1',
+      },
       { tenant_id: row.tenant_id, agent_id: row.agent_id, idempotency_key: row.idempotency_key },
     );
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
 
     expect(sendOutboundTextMock).toHaveBeenCalledTimes(1);
@@ -375,9 +373,7 @@ describe('idempotency_outbox_relayer — #327 provider-side dedup key', () => {
       ];
     });
 
-    const { deriveProviderDedupKey } = await import(
-      '@/governance/idempotency-effects.js'
-    );
+    const { deriveProviderDedupKey } = await import('@/governance/idempotency-effects.js');
     const effect = {
       kind: 'whatsapp_text' as const,
       jid: '5511999990000@s.whatsapp.net',
@@ -393,9 +389,7 @@ describe('idempotency_outbox_relayer — #327 provider-side dedup key', () => {
     // below is meaningful (it can actually distinguish row-derived from ALS).
     expect(keyFromRow).not.toBe(keyFromAls);
 
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
 
     expect(sendOutboundTextMock).toHaveBeenCalledTimes(1);
@@ -420,9 +414,7 @@ describe('idempotency_outbox_relayer — #327 provider-side dedup key', () => {
       return false; // row remains 'pending' — as if the crash lost the write.
     });
 
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     // Row is still pending (the markEffectSent no-op'd).
     expect(store[0]!.status).toBe('pending');
@@ -445,9 +437,7 @@ describe('idempotency_outbox_relayer — #327 provider-side dedup key', () => {
     // into the hash so two tenants computing the same idempotency_key get
     // DIFFERENT provider ids — the key can never be a cross-tenant correlation
     // handle, and one tenant's send can never dedup another's.
-    const { deriveProviderDedupKey } = await import(
-      '@/governance/idempotency-effects.js'
-    );
+    const { deriveProviderDedupKey } = await import('@/governance/idempotency-effects.js');
     const effect = {
       kind: 'whatsapp_text' as const,
       jid: '5511999990000@s.whatsapp.net',
@@ -473,9 +463,7 @@ describe('idempotency_outbox_relayer — #327 provider-side dedup key', () => {
 describe('idempotency_outbox_relayer — single-flight advisory lock', () => {
   it('acquires the GLOBAL lock once and releases it on completion', async () => {
     seed({ ...A_CTX });
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     expect(poolStats.acquires).toBe(1);
     expect(poolStats.acquiredOk).toBe(1);
@@ -487,9 +475,7 @@ describe('idempotency_outbox_relayer — single-flight advisory lock', () => {
   it('SKIPS the whole pass when another instance holds the lock', async () => {
     seed({ ...A_CTX });
     lockHeldByOther = true;
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     expect(poolStats.acquiredOk).toBe(0);
     // No tenant enumeration, no dispatch.
@@ -504,9 +490,7 @@ describe('idempotency_outbox_relayer — single-flight advisory lock', () => {
   it('releases the lock even when the dispatcher enumeration throws', async () => {
     seed({ ...A_CTX });
     repoMock.listTenantsWithWork.mockRejectedValueOnce(new Error('synthetic'));
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await expect(runIdempotencyOutboxRelayer()).rejects.toThrow('synthetic');
     expect(poolStats.acquiredOk).toBe(1);
     expect(poolStats.unlocks).toBe(1); // released in finally
@@ -518,9 +502,7 @@ describe('idempotency_outbox_relayer — per-tenant fan-out + isolation', () => 
   it('claims under EACH routed (tenant, agent) context; no default leak', async () => {
     seed({ ...A_CTX });
     seed({ ...B_CTX });
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
 
     const ctxKeys = new Set(claimContexts.map((c) => `${c.tenant_id}|${c.agent_id}`));
@@ -532,9 +514,7 @@ describe('idempotency_outbox_relayer — per-tenant fan-out + isolation', () => 
   });
 
   it('empty store → no-op (no tenant context opened, no dispatch)', async () => {
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     expect(claimContexts).toHaveLength(0);
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
@@ -548,9 +528,7 @@ describe('idempotency_outbox_relayer — per-tenant fan-out + isolation', () => 
     repoMock.claimPendingEffects.mockImplementationOnce(async () => {
       throw new Error('tenant-A claim blew up');
     });
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await expect(runIdempotencyOutboxRelayer()).resolves.toBeUndefined();
     // tenant-B still dispatched despite tenant-A failing.
     const bRow = store.find((r) => r.tenant_id === 'tenant-B')!;
@@ -562,9 +540,7 @@ describe('idempotency_outbox_relayer — per-tenant fairness', () => {
   it('claims AT MOST OUTBOX_RELAYER_BATCH_PER_TENANT rows per pass', async () => {
     const OVER = BATCH_PER_TENANT + 25;
     for (let i = 0; i < OVER; i++) seed({ ...A_CTX });
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     // Only the batch cap was dispatched this pass; the rest stay pending.
     expect(sendOutboundTextMock).toHaveBeenCalledTimes(BATCH_PER_TENANT);
@@ -579,9 +555,7 @@ describe('idempotency_outbox_relayer — retry / failure', () => {
   it('records a retry (NOT sent) when the gateway throws a transient error', async () => {
     seed({ ...A_CTX, attempts: 0, max_attempts: 5 });
     sendOutboundTextMock.mockRejectedValueOnce(new Error('network blip'));
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     expect(markSentCalls).toHaveLength(0);
     expect(markRetryCalls).toHaveLength(1);
@@ -595,9 +569,7 @@ describe('idempotency_outbox_relayer — retry / failure', () => {
   it('a null gateway result (not connected) is a transient retry, not a send', async () => {
     seed({ ...A_CTX });
     sendOutboundTextMock.mockResolvedValueOnce(null);
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     expect(markSentCalls).toHaveLength(0);
     expect(markRetryCalls).toHaveLength(1);
@@ -607,9 +579,7 @@ describe('idempotency_outbox_relayer — retry / failure', () => {
   it('uses exponential backoff keyed on the row attempts', async () => {
     seed({ ...A_CTX, attempts: 3, max_attempts: 10 });
     sendOutboundTextMock.mockRejectedValueOnce(new Error('boom'));
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     // base(30) * 2^3 = 240.
     expect(markRetryCalls[0]!.backoff_seconds).toBe(240);
@@ -621,9 +591,7 @@ describe('idempotency_outbox_relayer — retry / failure', () => {
     const loggerMod = await import('@/lib/logger.js');
     const errorSpy = loggerMod.logger.error as ReturnType<typeof vi.fn>;
     errorSpy.mockClear();
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     expect(store[0]!.status).toBe('failed');
     const terminalLogs = errorSpy.mock.calls.filter(
@@ -650,9 +618,7 @@ describe('idempotency_outbox_relayer — invalid payload', () => {
     const loggerMod = await import('@/lib/logger.js');
     const errorSpy = loggerMod.logger.error as ReturnType<typeof vi.fn>;
     errorSpy.mockClear();
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     // NEVER dispatched.
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
@@ -682,9 +648,7 @@ describe('idempotency_outbox_relayer — retention reaches idle tenants (#326 bl
     seed({ ...A_CTX, status: 'sent', terminal_age_days: 90 });
     seed({ ...A_CTX, status: 'failed', terminal_age_days: 90 });
 
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
 
     // The tenant WAS enumerated (terminal-row arm), context opened, cleanup ran.
@@ -702,9 +666,7 @@ describe('idempotency_outbox_relayer — retention reaches idle tenants (#326 bl
     seed({ ...A_CTX, status: 'sent', terminal_age_days: 60 });
     seed({ ...B_CTX });
 
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
 
     const ctxKeys = new Set(claimContexts.map((c) => `${c.tenant_id}|${c.agent_id}`));
@@ -721,9 +683,7 @@ describe('idempotency_outbox_relayer — retention reaches idle tenants (#326 bl
     // the tenant is not enumerated (no wasted context / cleanup pass).
     seed({ ...A_CTX, status: 'sent', terminal_age_days: 0 });
 
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
 
     expect(claimContexts).toHaveLength(0);
@@ -734,9 +694,7 @@ describe('idempotency_outbox_relayer — retention reaches idle tenants (#326 bl
 
   it('passes the configured retention window to listTenantsWithWork', async () => {
     seed({ ...A_CTX });
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     expect(repoMock.listTenantsWithWork).toHaveBeenCalledWith(RETENTION_DAYS);
   });
@@ -747,9 +705,7 @@ describe('idempotency_outbox_relayer — metrics', () => {
     seed({ ...A_CTX });
     seed({ ...A_CTX });
     const metrics = await import('@/lib/metrics.js');
-    const { runIdempotencyOutboxRelayer } = await import(
-      '@/workers/idempotency-outbox-relayer.js'
-    );
+    const { runIdempotencyOutboxRelayer } = await import('@/workers/idempotency-outbox-relayer.js');
     await runIdempotencyOutboxRelayer();
     const prom = await metrics.renderPrometheus();
     expect(prom).toContain(

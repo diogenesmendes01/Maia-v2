@@ -1,13 +1,7 @@
 import * as React from 'react';
 import { cn } from './cn.js';
 
-export type BadgeTone =
-  | 'neutral'
-  | 'brand'
-  | 'success'
-  | 'warning'
-  | 'danger'
-  | 'info';
+export type BadgeTone = 'neutral' | 'brand' | 'success' | 'warning' | 'danger' | 'info';
 
 const TONE: Record<BadgeTone, string> = {
   neutral: 'bg-zinc-100 text-zinc-700 ring-zinc-200',

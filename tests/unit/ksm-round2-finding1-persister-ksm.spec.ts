@@ -27,9 +27,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
     KnowledgeConflictError,
     knowledgeRepos: {
       async create(input: { lifecycle_status: string }): Promise<string> {
-        const id = `00000000-0000-0000-0000-${Math.floor(
-          Math.random() * 1e12,
-        )
+        const id = `00000000-0000-0000-0000-${Math.floor(Math.random() * 1e12)
           .toString(16)
           .padStart(12, '0')}`;
         ksmStore.set(id, { lifecycle_status: input.lifecycle_status });
@@ -52,7 +50,7 @@ vi.mock('@/db/tenant-context.js', () => ({
     tenant_id: 'tenant-a',
     agent_id: 'agent-a',
   }),
-  runWithTenantContext: <T,>(_ctx: unknown, fn: () => Promise<T>) => fn(),
+  runWithTenantContext: <T>(_ctx: unknown, fn: () => Promise<T>) => fn(),
   MissingTenantContextError: class extends Error {},
 }));
 
@@ -61,9 +59,8 @@ vi.mock('@/db/tenant-context.js', () => ({
 const factsUpsert = vi.fn().mockResolvedValue({ id: 'legacy-fact-id' });
 const rulesCreate = vi.fn().mockResolvedValue({ id: 'legacy-rule-id' });
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     factsRepo: { upsert: factsUpsert },
@@ -104,9 +101,7 @@ afterEach(() => {
 describe('Finding 1 — persistCandidate routes LLM/worker through KSM when flag is on', () => {
   it('LLM-origin "fato" routes through KSM (never lifecycle_status="active")', async () => {
     const { persistCandidate } = await import('@/cognition/persister.js');
-    const { CandidateType, CognitiveEventType } = await import(
-      '@/types/enums.js'
-    );
+    const { CandidateType, CognitiveEventType } = await import('@/types/enums.js');
 
     const result = await persistCandidate(
       {
@@ -127,9 +122,7 @@ describe('Finding 1 — persistCandidate routes LLM/worker through KSM when flag
     );
 
     expect(result.persisted_to).toMatch(/^ksm:/);
-    expect(result.id).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
-    );
+    expect(result.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i);
     const row = ksmStore.get(result.id!)!;
     expect(row.lifecycle_status).not.toBe('active');
     expect(['ephemeral', 'pending_review']).toContain(row.lifecycle_status);
@@ -141,9 +134,7 @@ describe('Finding 1 — persistCandidate routes LLM/worker through KSM when flag
 
   it('LLM-origin "regra" always lands in pending_review through KSM', async () => {
     const { persistCandidate } = await import('@/cognition/persister.js');
-    const { CandidateType, CognitiveEventType } = await import(
-      '@/types/enums.js'
-    );
+    const { CandidateType, CognitiveEventType } = await import('@/types/enums.js');
 
     const result = await persistCandidate(
       {
@@ -171,9 +162,7 @@ describe('Finding 1 — persistCandidate routes LLM/worker through KSM when flag
 
   it('worker-origin candidate also routes through KSM', async () => {
     const { persistCandidate } = await import('@/cognition/persister.js');
-    const { CandidateType, CognitiveEventType } = await import(
-      '@/types/enums.js'
-    );
+    const { CandidateType, CognitiveEventType } = await import('@/types/enums.js');
 
     const result = await persistCandidate(
       {

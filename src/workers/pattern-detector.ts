@@ -6,11 +6,7 @@ import { reflect } from '@/cognition/reflector.js';
 import { classify } from '@/cognition/classifier.js';
 import { persistCandidate } from '@/cognition/persister.js';
 import { CognitiveEventType } from '@/types/enums.js';
-import {
-  runWithTenantContext,
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 
 const MIN_OCCURRENCES = 3;
@@ -71,10 +67,7 @@ export async function runPatternDetector(): Promise<void> {
     }
   }
 
-  logger.info(
-    { tuples: tuples.length, agents_processed, agents_failed },
-    'pattern_detector.done',
-  );
+  logger.info({ tuples: tuples.length, agents_processed, agents_failed }, 'pattern_detector.done');
 }
 
 /**

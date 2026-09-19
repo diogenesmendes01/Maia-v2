@@ -3,11 +3,7 @@ import {
   IntentClassifierImpl,
   type IntentClassifierDeps,
 } from '@/runtime/decision/intent-classifier.ts';
-import type {
-  ContentResolver,
-  HaikuClient,
-  MetricsClient,
-} from '@/runtime/decision/types.js';
+import type { ContentResolver, HaikuClient, MetricsClient } from '@/runtime/decision/types.js';
 import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
 
 function mkBase(): BaseContextPacket {
@@ -26,9 +22,7 @@ function mkDeps(content: string, overrides?: Partial<IntentClassifierDeps>): Int
     text: vi.fn().mockResolvedValue(content),
   };
   const haiku: HaikuClient = {
-    classify: vi
-      .fn()
-      .mockResolvedValue({ label: 'unknown', confidence: 0.5 }),
+    classify: vi.fn().mockResolvedValue({ label: 'unknown', confidence: 0.5 }),
   };
   const metrics: MetricsClient = {
     increment: vi.fn(),
@@ -98,34 +92,24 @@ describe('P9b — IntentClassifier (rules-first + Haiku fallback)', () => {
     const intent = await c.classify(mkBase());
     expect(deps.haiku.classify).toHaveBeenCalledTimes(1);
     expect(intent.label).toBe('information_request');
-    expect(intent.alternatives).toEqual([
-      'information_request',
-      'balance_query',
-      'help_request',
-    ]);
+    expect(intent.alternatives).toEqual(['information_request', 'balance_query', 'help_request']);
   });
 
   it('returns unknown low confidence on Haiku error', async () => {
     const deps = mkDeps('this is some long ambiguous message about life');
-    (deps.haiku.classify as ReturnType<typeof vi.fn>).mockRejectedValue(
-      new Error('timeout'),
-    );
+    (deps.haiku.classify as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('timeout'));
     const c = new IntentClassifierImpl(deps);
     const intent = await c.classify(mkBase());
     expect(intent.label).toBe('unknown');
     expect(intent.confidence).toBeLessThan(0.5);
-    expect(deps.metrics?.increment).toHaveBeenCalledWith(
-      'intent_classifier.llm_error',
-    );
+    expect(deps.metrics?.increment).toHaveBeenCalledWith('intent_classifier.llm_error');
   });
 
   it('increments llm_calls metric only when calling Haiku', async () => {
     const deps1 = mkDeps('olá!');
     const c1 = new IntentClassifierImpl(deps1);
     await c1.classify(mkBase());
-    expect(deps1.metrics?.increment).not.toHaveBeenCalledWith(
-      'intent_classifier.llm_calls',
-    );
+    expect(deps1.metrics?.increment).not.toHaveBeenCalledWith('intent_classifier.llm_calls');
 
     const deps2 = mkDeps('algum texto sem heurística clara aqui');
     (deps2.haiku.classify as ReturnType<typeof vi.fn>).mockResolvedValue({
@@ -134,8 +118,6 @@ describe('P9b — IntentClassifier (rules-first + Haiku fallback)', () => {
     });
     const c2 = new IntentClassifierImpl(deps2);
     await c2.classify(mkBase());
-    expect(deps2.metrics?.increment).toHaveBeenCalledWith(
-      'intent_classifier.llm_calls',
-    );
+    expect(deps2.metrics?.increment).toHaveBeenCalledWith('intent_classifier.llm_calls');
   });
 });

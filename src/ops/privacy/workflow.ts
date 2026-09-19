@@ -22,11 +22,7 @@
 import { TypedError } from '@/lib/utils.js';
 import { pseudonymize } from '@/ops/retention/tombstones.js';
 
-export type PrivacyRequestType =
-  | 'access_export'
-  | 'rectification'
-  | 'anonymization'
-  | 'deletion';
+export type PrivacyRequestType = 'access_export' | 'rectification' | 'anonymization' | 'deletion';
 
 export type PrivacyRequestStatus =
   | 'received'

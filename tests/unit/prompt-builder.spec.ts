@@ -175,7 +175,9 @@ beforeEach(() => {
   h.entityStatesById.mockResolvedValue(null);
 });
 
-async function build(over: Partial<PromptContext> = {}): Promise<{ system: string; messages: { role: string; content: unknown }[] }> {
+async function build(
+  over: Partial<PromptContext> = {},
+): Promise<{ system: string; messages: { role: string; content: unknown }[] }> {
   const ctx: PromptContext = {
     pessoa: over.pessoa ?? mkPessoa(),
     conversa: over.conversa ?? mkConversa(),
@@ -238,7 +240,10 @@ describe('prompt-builder — scope change sentinel', () => {
   it('emits the sentinel when scope hash differs AND a prior assistant turn exists', async () => {
     const scopeNow = mkScope([mkPerm({ entidade_id: 'ent-pf' })]);
     const conversa = mkConversa({
-      metadata: { last_scope_hash: 'old-hash-1234', last_scope_hash_set_at: '2026-05-11T14:00:00Z' },
+      metadata: {
+        last_scope_hash: 'old-hash-1234',
+        last_scope_hash_set_at: '2026-05-11T14:00:00Z',
+      },
     });
     h.recentInConversation.mockResolvedValue([mkAssistantMsg(), mkUserMsg(), mkInbound()]);
     const { system } = await build({ scope: scopeNow, conversa });
@@ -351,7 +356,9 @@ describe('prompt-builder — backend events block', () => {
       }),
       mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
     ]);
-    const { system } = await build({ inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }) });
+    const { system } = await build({
+      inbound: mkInbound({ created_at: new Date('2026-05-11T15:00:00Z') }),
+    });
     expect(system).not.toContain('lembrete antigo');
   });
 
@@ -650,8 +657,16 @@ describe('prompt-builder — role coalescing and event-only rows (PR #74)', () =
     // debouncing edge cases). Without coalescing, the messages array
     // ends with two user turns then the inbound user turn = three
     // adjacent user roles.
-    const a = mkUserMsg({ id: 'u-a', conteudo: 'parte 1', created_at: new Date('2026-05-11T14:57:00Z') });
-    const b = mkUserMsg({ id: 'u-b', conteudo: 'parte 2', created_at: new Date('2026-05-11T14:58:00Z') });
+    const a = mkUserMsg({
+      id: 'u-a',
+      conteudo: 'parte 1',
+      created_at: new Date('2026-05-11T14:57:00Z'),
+    });
+    const b = mkUserMsg({
+      id: 'u-b',
+      conteudo: 'parte 2',
+      created_at: new Date('2026-05-11T14:58:00Z'),
+    });
     h.recentInConversation.mockResolvedValue([b, a, mkInbound({ conteudo: 'parte 3' })]);
     const { messages } = await build({ inbound: mkInbound({ conteudo: 'parte 3' }) });
     // No two adjacent same-role messages.
@@ -771,7 +786,8 @@ describe('prompt-builder — round-1 review (write-priority + durable TTL)', () 
     });
     // Round-2: stale entries render in the lower-authority historical section — never silently dropped.
     const hasHistorical = /Hist[oó]rico.*verificar antes de repetir/i.test(system);
-    const hasAnyMarker = /n[ãa]o autoritat|leitura atualizada|transação registrada.*id tx-999/i.test(system);
+    const hasAnyMarker =
+      /n[ãa]o autoritat|leitura atualizada|transação registrada.*id tx-999/i.test(system);
     expect(hasHistorical || hasAnyMarker).toBe(true);
   });
 });
@@ -915,7 +931,9 @@ describe('prompt-builder — round-2 review (stale-success authority separation)
     // Must NOT be in lower-authority section — it is authoritative truth.
     expect(system).not.toMatch(/Hist[oó]rico.*verificar antes.*transação registrada/i);
     // Must carry authority framing (A verdade é o evento do backend or equivalent).
-    expect(system).toMatch(/verdade.*evento do backend|autorit[áa]tivo|trate.*inválid|descarte|obsolet/i);
+    expect(system).toMatch(
+      /verdade.*evento do backend|autorit[áa]tivo|trate.*inválid|descarte|obsolet/i,
+    );
   });
 });
 
@@ -977,7 +995,10 @@ describe('prompt-builder — round-3 review (supersession before bucket + tool-s
     // contradiction overlay — it was superseded by the later cancel event.
     expect(system).not.toMatch(/Contradi[çc][õo]es do backend/i);
     // Specifically must not appear in the overlay framing (obsolete/descarte wording).
-    const hasOverlayEntry = /transação registrada \(id tx-777\)[\s\S]*?obsoleta|obsoleta[\s\S]*?transação registrada \(id tx-777\)/i.test(system);
+    const hasOverlayEntry =
+      /transação registrada \(id tx-777\)[\s\S]*?obsoleta|obsoleta[\s\S]*?transação registrada \(id tx-777\)/i.test(
+        system,
+      );
     expect(hasOverlayEntry).toBe(false);
   });
 

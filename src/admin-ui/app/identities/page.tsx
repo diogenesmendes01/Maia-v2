@@ -8,20 +8,8 @@ import { PageHeader } from '../../components/ui/page-header.js';
 import { StatusBadge } from '../../components/ui/badge.js';
 import { Button } from '../../components/ui/button.js';
 import { Field, Select } from '../../components/ui/field.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-  Alert,
-} from '../../components/ui/states.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState, Alert } from '../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../components/ui/table.js';
 
 /**
  * Cross-agent view of operational profile versions — READ-ONLY overview.
@@ -45,10 +33,7 @@ export default function IdentitiesPage() {
   const canApprove = role === 'owner' || role === 'founder';
   const [agentId, setAgentId] = React.useState('');
 
-  const agentsQuery = trpc.agents.list.useQuery(
-    { tenantId },
-    { enabled: tenantId !== '' },
-  );
+  const agentsQuery = trpc.agents.list.useQuery({ tenantId }, { enabled: tenantId !== '' });
   const versionsQuery = trpc.versions.listVersions.useQuery(
     {
       tenantId,
@@ -77,8 +62,8 @@ export default function IdentitiesPage() {
             {pendingCount === 1
               ? 'Há 1 versão proposta aguardando aprovação.'
               : `Há ${pendingCount} versões propostas aguardando aprovação.`}{' '}
-            As propostas são revisadas e aprovadas na página do agente (aba
-            Versões), por owner ou founder.
+            As propostas são revisadas e aprovadas na página do agente (aba Versões), por owner ou
+            founder.
           </Alert>
         </div>
       )}
@@ -138,16 +123,9 @@ export default function IdentitiesPage() {
                   </Td>
                   <Td className="text-right">
                     {v.status === 'proposed' ? (
-                      <Link
-                        href={`/agents/${encodeURIComponent(v.sot_id)}?tab=versions`}
-                      >
-                        <Button
-                          size="sm"
-                          variant={canApprove ? 'success' : 'secondary'}
-                        >
-                          {canApprove
-                            ? 'Revisar e aprovar no agente'
-                            : 'Ver no agente'}
+                      <Link href={`/agents/${encodeURIComponent(v.sot_id)}?tab=versions`}>
+                        <Button size="sm" variant={canApprove ? 'success' : 'secondary'}>
+                          {canApprove ? 'Revisar e aprovar no agente' : 'Ver no agente'}
                         </Button>
                       </Link>
                     ) : (

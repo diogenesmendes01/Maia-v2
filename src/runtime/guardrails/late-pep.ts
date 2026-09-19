@@ -15,10 +15,7 @@ import type {
   LatePepDeps,
   PolicyValidationResult,
 } from './types.js';
-import type {
-  DecisionPacket,
-  PolicyDecision,
-} from '../context-packet/types.js';
+import type { DecisionPacket, PolicyDecision } from '../context-packet/types.js';
 import type { PolicyEvaluatorVerdict } from '../decision/types.js';
 
 export class LatePepImpl implements LatePep {

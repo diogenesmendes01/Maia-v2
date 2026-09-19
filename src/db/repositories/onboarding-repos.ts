@@ -678,9 +678,7 @@ export const onboardingRunsRepo = {
             updated_at: now,
             ...retryPoint,
           })
-          .where(
-            and(eq(onboarding_runs.id, run.id), eq(onboarding_runs.version, run.version)),
-          )
+          .where(and(eq(onboarding_runs.id, run.id), eq(onboarding_runs.version, run.version)))
           .returning();
 
         await tx.insert(onboarding_events).values({

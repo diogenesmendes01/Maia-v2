@@ -38,10 +38,10 @@ describe('P9b — WorkflowSelector', () => {
   it('returns none if execution not found', async () => {
     const deps = mkDeps();
     const selector = new WorkflowSelectorImpl(deps);
-    const r = await selector.select(
-      mkBase({ active_procedure_execution_id: 'exec_missing' }),
-      { label: 'help_request', confidence: 0.95 },
-    );
+    const r = await selector.select(mkBase({ active_procedure_execution_id: 'exec_missing' }), {
+      label: 'help_request',
+      confidence: 0.95,
+    });
     expect(r.mode).toBe('none');
   });
 
@@ -57,10 +57,10 @@ describe('P9b — WorkflowSelector', () => {
       },
     });
     const selector = new WorkflowSelectorImpl(deps);
-    const r = await selector.select(
-      mkBase({ active_procedure_execution_id: 'exec_1' }),
-      { label: 'onboarding_next_step', confidence: 0.85 },
-    );
+    const r = await selector.select(mkBase({ active_procedure_execution_id: 'exec_1' }), {
+      label: 'onboarding_next_step',
+      confidence: 0.85,
+    });
     expect(r.mode).toBe('continue');
     expect(r.workflow_id).toBe('onboard_pf');
   });
@@ -77,10 +77,10 @@ describe('P9b — WorkflowSelector', () => {
       },
     });
     const selector = new WorkflowSelectorImpl(deps);
-    const r = await selector.select(
-      mkBase({ active_procedure_execution_id: 'exec_1' }),
-      { label: 'help_request', confidence: 0.95 },
-    );
+    const r = await selector.select(mkBase({ active_procedure_execution_id: 'exec_1' }), {
+      label: 'help_request',
+      confidence: 0.95,
+    });
     expect(r.mode).toBe('continue');
     expect(r.workflow_id).toBe('onboard_pf');
   });
@@ -97,10 +97,10 @@ describe('P9b — WorkflowSelector', () => {
       },
     });
     const selector = new WorkflowSelectorImpl(deps);
-    const r = await selector.select(
-      mkBase({ active_procedure_execution_id: 'exec_1' }),
-      { label: 'transfer_intent', confidence: 0.85 },
-    );
+    const r = await selector.select(mkBase({ active_procedure_execution_id: 'exec_1' }), {
+      label: 'transfer_intent',
+      confidence: 0.85,
+    });
     expect(r.mode).toBe('switch');
     expect(r.workflow_id).toBeUndefined();
   });
@@ -117,10 +117,10 @@ describe('P9b — WorkflowSelector', () => {
       },
     });
     const selector = new WorkflowSelectorImpl(deps);
-    const r = await selector.select(
-      mkBase({ active_procedure_execution_id: 'exec_1' }),
-      { label: 'help_request', confidence: 0.99 },
-    );
+    const r = await selector.select(mkBase({ active_procedure_execution_id: 'exec_1' }), {
+      label: 'help_request',
+      confidence: 0.99,
+    });
     expect(r.mode).toBe('continue');
   });
 });

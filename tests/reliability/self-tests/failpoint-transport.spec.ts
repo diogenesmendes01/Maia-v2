@@ -51,7 +51,9 @@ let servidor: FailpointServer;
 let artefatos: ArtifactCollector;
 
 /** O ambiente que um filho receberia — montado aqui, nunca lido do processo. */
-function envDeFilho(extra: Record<string, string | undefined> = {}): Record<string, string | undefined> {
+function envDeFilho(
+  extra: Record<string, string | undefined> = {},
+): Record<string, string | undefined> {
   return { ...servidor.envDoFilho(), ...extra };
 }
 
@@ -72,7 +74,11 @@ describe('#510 harness — transporte de failpoint', () => {
   });
 
   it('sem gate armado, o failpoint devolve `release` e não custa nada', async () => {
-    const acao = await alcancar('after_running_before_llm', { turn_id: 't1' }, { env: envDeFilho() });
+    const acao = await alcancar(
+      'after_running_before_llm',
+      { turn_id: 't1' },
+      { env: envDeFilho() },
+    );
     expect(acao).toBe('release');
   });
 
@@ -230,9 +236,9 @@ describe('#510 harness — transporte de failpoint', () => {
     // primeira é o filho que não subiu, a segunda é a réplica que travou antes
     // do ponto. Um estouro mudo obrigaria a rodar de novo para descobrir qual.
     servidor.arm('before_successor_promotion', 'pause');
-    await expect(
-      servidor.esperarParadoEm('before_successor_promotion', 2, 120),
-    ).rejects.toThrow(/esperei 2 filho\(s\) PARADO\(s\) em 120ms e chegaram 0/);
+    await expect(servidor.esperarParadoEm('before_successor_promotion', 2, 120)).rejects.toThrow(
+      /esperei 2 filho\(s\) PARADO\(s\) em 120ms e chegaram 0/,
+    );
   });
 
   it('a barreira solta N réplicas de uma vez só', async () => {

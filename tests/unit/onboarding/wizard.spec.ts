@@ -184,7 +184,12 @@ const fakeRepo = {
         ...retryPoint,
       };
       runs.set(run.id, denied as OnboardingRunRow);
-      return { outcome: 'denied', run: denied as OnboardingRunRow, code: applied.deny.code, message: applied.deny.message };
+      return {
+        outcome: 'denied',
+        run: denied as OnboardingRunRow,
+        code: applied.deny.code,
+        message: applied.deny.message,
+      };
     }
 
     ledger.set(key, {
@@ -233,9 +238,15 @@ const fakeRepo = {
     }
 
     if (['active', 'cancelled', 'failed_terminal'].includes(run.state)) {
-      return { outcome: 'invalid_transition' as const, run, code: 'run_terminal', message: 'terminal' };
+      return {
+        outcome: 'invalid_transition' as const,
+        run,
+        code: 'run_terminal',
+        message: 'terminal',
+      };
     }
-    if (run.version !== input.expected_version) return { outcome: 'version_conflict' as const, run };
+    if (run.version !== input.expected_version)
+      return { outcome: 'version_conflict' as const, run };
     const result = { cancelled_at: new Date().toISOString(), reason_code: input.reason_code };
     ledger.set(key, {
       payload_hash: input.payload_hash,
@@ -243,7 +254,13 @@ const fakeRepo = {
       outcome_kind: 'cancelled',
       outcome_code: input.reason_code,
     });
-    const cancelled = { ...run, state: 'cancelled', version: run.version + 1, cancelled_at: new Date(), last_error_code: input.reason_code };
+    const cancelled = {
+      ...run,
+      state: 'cancelled',
+      version: run.version + 1,
+      cancelled_at: new Date(),
+      last_error_code: input.reason_code,
+    };
     runs.set(run.id, cancelled as OnboardingRunRow);
     return { outcome: 'committed' as const, run: cancelled as OnboardingRunRow, result };
   },
@@ -316,17 +333,29 @@ vi.mock('@/onboarding/provisioning.js', async (importOriginal) => {
     vi.fn(async () => ({ result, audit: { action, resource_type: 'x', resource_id: null } }));
   return {
     ...original,
-    applyProvisionTenant: vi.fn(async (_tx: unknown, _run: unknown, payload: { tenant_id: string }) => ({
-      result: { tenant_id: payload.tenant_id },
-      scope_patch: { tenant_id: payload.tenant_id },
-      audit: { action: 'onboarding_tenant_provisioned', resource_type: 'tenant', resource_id: payload.tenant_id },
-    })),
+    applyProvisionTenant: vi.fn(
+      async (_tx: unknown, _run: unknown, payload: { tenant_id: string }) => ({
+        result: { tenant_id: payload.tenant_id },
+        scope_patch: { tenant_id: payload.tenant_id },
+        audit: {
+          action: 'onboarding_tenant_provisioned',
+          resource_type: 'tenant',
+          resource_id: payload.tenant_id,
+        },
+      }),
+    ),
     applyProvisionAdmin: stub('onboarding_admin_provisioned'),
-    applyProvisionAgent: vi.fn(async (_tx: unknown, _run: unknown, payload: { agent_id: string }) => ({
-      result: { agent_id: payload.agent_id },
-      scope_patch: { agent_id: payload.agent_id },
-      audit: { action: 'onboarding_agent_provisioned', resource_type: 'agent', resource_id: payload.agent_id },
-    })),
+    applyProvisionAgent: vi.fn(
+      async (_tx: unknown, _run: unknown, payload: { agent_id: string }) => ({
+        result: { agent_id: payload.agent_id },
+        scope_patch: { agent_id: payload.agent_id },
+        audit: {
+          action: 'onboarding_agent_provisioned',
+          resource_type: 'agent',
+          resource_id: payload.agent_id,
+        },
+      }),
+    ),
     applyConfigureProfile: stub('onboarding_profile_activated'),
     applyCapabilityPacks: stub('onboarding_packs_applied'),
     applyConfigureRole: stub('onboarding_role_configured', { role_id: 'r1' }),
@@ -335,7 +364,11 @@ vi.mock('@/onboarding/provisioning.js', async (importOriginal) => {
     applyActivate: vi.fn(async () => ({
       result: { activated: true },
       completes: true,
-      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: 'acme-bot' },
+      audit: {
+        action: 'onboarding_agent_activated',
+        resource_type: 'agent',
+        resource_id: 'acme-bot',
+      },
     })),
   };
 });
@@ -660,9 +693,7 @@ describe('readiness e ativação — fail-closed', () => {
         run_id: 'run-1',
         step,
         payload:
-          step === 'activate'
-            ? { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' }
-            : {},
+          step === 'activate' ? { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' } : {},
         idempotency_key: `chave-uuid-${step}`,
         expected_version: version,
         actor: OWNER,
@@ -689,12 +720,22 @@ describe('readiness e ativação — fail-closed', () => {
     const payload = { confirm_tenant_id: 'acme', confirm_agent_id: 'acme-bot' };
     const deps = { evaluateReadiness: async () => readyReport() };
     const first = await executeOnboardingStep({
-      run_id: 'run-1', step: 'activate', payload, idempotency_key: 'chave-ativacao-a',
-      expected_version: 6, actor: OWNER, deps,
+      run_id: 'run-1',
+      step: 'activate',
+      payload,
+      idempotency_key: 'chave-ativacao-a',
+      expected_version: 6,
+      actor: OWNER,
+      deps,
     });
     const second = await executeOnboardingStep({
-      run_id: 'run-1', step: 'activate', payload, idempotency_key: 'chave-ativacao-b',
-      expected_version: 6, actor: OWNER, deps,
+      run_id: 'run-1',
+      step: 'activate',
+      payload,
+      idempotency_key: 'chave-ativacao-b',
+      expected_version: 6,
+      actor: OWNER,
+      deps,
     });
     expect(first.status).toBe('completed');
     expect(second.status).toBe('conflict');
@@ -726,7 +767,10 @@ describe('readiness e ativação — fail-closed', () => {
       },
     });
     expect(seen).toHaveLength(1);
-    expect(seen[0]?.tx, 'o avaliador recebeu `undefined` — a leitura saiu da transação').toBeDefined();
+    expect(
+      seen[0]?.tx,
+      'o avaliador recebeu `undefined` — a leitura saiu da transação',
+    ).toBeDefined();
   });
 
   /**
@@ -741,7 +785,11 @@ describe('readiness e ativação — fail-closed', () => {
     (applyActivate as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       result: { activated_channel_ids: ['ch-ok'], deactivated_channel_ids: ['ch-bad'] },
       completes: true,
-      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: 'acme-bot' },
+      audit: {
+        action: 'onboarding_agent_activated',
+        resource_type: 'agent',
+        resource_id: 'acme-bot',
+      },
     });
     const started: Array<{ scope: unknown; ids: readonly string[] }> = [];
     const out = await executeOnboardingStep({
@@ -771,7 +819,11 @@ describe('readiness e ativação — fail-closed', () => {
     (applyActivate as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce({
       result: { activated_channel_ids: ['ch-ok'] },
       completes: true,
-      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: 'acme-bot' },
+      audit: {
+        action: 'onboarding_agent_activated',
+        resource_type: 'agent',
+        resource_id: 'acme-bot',
+      },
     });
     const out = await executeOnboardingStep({
       run_id: 'run-1',
@@ -876,7 +928,8 @@ describe('readiness e ativação — fail-closed', () => {
 describe('pareamento (#518) — nenhum efeito antes da decisão', () => {
   const CH = '11111111-1111-4111-8111-111111111111';
 
-  const pairingPort = (calls: unknown[], result = { ok: true }) =>
+  const pairingPort =
+    (calls: unknown[], result = { ok: true }) =>
     async (i: unknown) => {
       calls.push(i);
       return result as { ok: boolean; reason?: string };
@@ -925,7 +978,12 @@ describe('pareamento (#518) — nenhum efeito antes da decisão', () => {
   });
 
   it.each([
-    ['run EXPIRADA', () => makeRun({ state: 'channel_declared', version: 7, expires_at: new Date(Date.now() - 1000) }), 7],
+    [
+      'run EXPIRADA',
+      () =>
+        makeRun({ state: 'channel_declared', version: 7, expires_at: new Date(Date.now() - 1000) }),
+      7,
+    ],
     ['run TERMINAL', () => makeRun({ state: 'cancelled', version: 7 }), 7],
     ['estado de origem ILEGAL', () => makeRun({ state: 'created', version: 1 }), 1],
     ['versão DIVERGENTE', () => makeRun({ state: 'channel_declared', version: 9 }), 7],
@@ -1118,9 +1176,7 @@ describe('métricas — o texto do chamador nunca vira label', () => {
     expect(scrape).toMatch(
       /maia_onboarding_step_failed_total\{[^}]*reason="readiness_blocked"[^}]*step="evaluate_readiness"/,
     );
-    expect(scrape).toMatch(
-      /maia_agent_readiness_failed_total\{[^}]*check_code="profile_active"/,
-    );
+    expect(scrape).toMatch(/maia_agent_readiness_failed_total\{[^}]*check_code="profile_active"/);
     // A chave antiga `error_code` não é emitida — ela nem está no allowlist.
     expect(scrape).not.toContain('error_code=');
   });
@@ -1268,9 +1324,9 @@ describe('criação da run — idempotente por chave', () => {
   });
 
   it('sem idempotency key o comando é RECUSADO', async () => {
-    await expect(
-      startOnboardingRun({ ...START, idempotency_key: '' }),
-    ).rejects.toMatchObject({ code: 'missing_idempotency_key' });
+    await expect(startOnboardingRun({ ...START, idempotency_key: '' })).rejects.toMatchObject({
+      code: 'missing_idempotency_key',
+    });
     expect(runs.size).toBe(0);
   });
 
@@ -1284,7 +1340,10 @@ describe('criação da run — idempotente por chave', () => {
       startOnboardingRun({
         ...START,
         idempotency_key: 'chave-criacao-4',
-        metadata: { source: 'console', note: 'token/telefone +5511987654321/e-mail j@a.com' } as never,
+        metadata: {
+          source: 'console',
+          note: 'token/telefone +5511987654321/e-mail j@a.com',
+        } as never,
       }),
     ).rejects.toMatchObject({ code: 'invalid_scope' });
     expect(runs.size).toBe(0);
@@ -1419,32 +1478,34 @@ describe('`failed_retryable` — a retomada é o passo que falhou', () => {
     expect(view!.allowed_steps).toEqual(['start_pairing']);
   });
 
-  it.each(['provision_tenant', 'provision_admin', 'declare_channel', 'evaluate_readiness'] as const)(
-    "o backend RECUSA '%s' depois da negativa em `start_pairing`",
-    async (step) => {
-      const before = { ...runs.get('run-1')! };
-      const out = await executeOnboardingStep({
-        run_id: 'run-1',
-        step,
-        payload:
-          step === 'provision_tenant'
-            ? { tenant_id: 'acme', nome: 'Acme' }
-            : step === 'provision_admin'
-              ? { user_id: 'admin-1', email: 'a@acme.com' }
-              : step === 'declare_channel'
-                ? { channel_type: 'whatsapp', external_id: '+5511999990000' }
-                : {},
-        idempotency_key: `chave-rebobina-${step}`,
-        expected_version: before.version,
-        actor: OWNER,
-        deps: { evaluateReadiness: async () => readyReport() },
-      });
-      expect(out).toMatchObject({ status: 'conflict', code: 'invalid_transition' });
-      // Nada rodou: o passo recusado não chegou ao `apply`.
-      expect(applyCalls).not.toContain(step);
-      expect(runs.get('run-1')!.state).toBe('failed_retryable');
-    },
-  );
+  it.each([
+    'provision_tenant',
+    'provision_admin',
+    'declare_channel',
+    'evaluate_readiness',
+  ] as const)("o backend RECUSA '%s' depois da negativa em `start_pairing`", async (step) => {
+    const before = { ...runs.get('run-1')! };
+    const out = await executeOnboardingStep({
+      run_id: 'run-1',
+      step,
+      payload:
+        step === 'provision_tenant'
+          ? { tenant_id: 'acme', nome: 'Acme' }
+          : step === 'provision_admin'
+            ? { user_id: 'admin-1', email: 'a@acme.com' }
+            : step === 'declare_channel'
+              ? { channel_type: 'whatsapp', external_id: '+5511999990000' }
+              : {},
+      idempotency_key: `chave-rebobina-${step}`,
+      expected_version: before.version,
+      actor: OWNER,
+      deps: { evaluateReadiness: async () => readyReport() },
+    });
+    expect(out).toMatchObject({ status: 'conflict', code: 'invalid_transition' });
+    // Nada rodou: o passo recusado não chegou ao `apply`.
+    expect(applyCalls).not.toContain(step);
+    expect(runs.get('run-1')!.state).toBe('failed_retryable');
+  });
 
   it('o retry do PRÓPRIO passo é aceito e limpa o ponto de retomada', async () => {
     const out = await executeOnboardingStep({

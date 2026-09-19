@@ -17,7 +17,12 @@ vi.mock('../../../src/db/repositories.js', () => ({
 }));
 
 vi.mock('../../../src/lib/logger.js', () => ({
-  logger: { info: () => undefined, warn: () => undefined, error: () => undefined, debug: () => undefined },
+  logger: {
+    info: () => undefined,
+    warn: () => undefined,
+    error: () => undefined,
+    debug: () => undefined,
+  },
 }));
 
 beforeEach(() => byIdsMock.mockReset());
@@ -65,10 +70,7 @@ describe('identify_entity — handler', () => {
       { id: 'e2', nome: 'Loja Central' },
     ]);
     const { identifyEntityTool } = await import('../../../src/tools/identify-entity.js');
-    const out = await identifyEntityTool.handler(
-      { texto: 'Loja Central' },
-      ctxWith(['e1', 'e2']),
-    );
+    const out = await identifyEntityTool.handler({ texto: 'Loja Central' }, ctxWith(['e1', 'e2']));
     expect(out.ambiguous).toBe(true);
     expect(out.entidade_id).toBeNull();
     expect(out.alternativas.length).toBe(2);

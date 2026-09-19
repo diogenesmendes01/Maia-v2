@@ -54,6 +54,8 @@ describe('initSyntheticProbe', () => {
   it('flag on + canal NÃO sintético ⇒ boot FALHA', async () => {
     (config as Record<string, unknown>).MAIA_SYNTHETIC_PROBE = true;
     h.checkChannelSynthetic.mockResolvedValue({ ok: false, reason: 'not_synthetic' });
-    await expect(initSyntheticProbe()).rejects.toThrow(/not_synthetic|não é exclusivamente sintético/);
+    await expect(initSyntheticProbe()).rejects.toThrow(
+      /not_synthetic|não é exclusivamente sintético/,
+    );
   });
 });

@@ -113,7 +113,9 @@ describe('auth dirs — UUID do canal, traversal rejeitado (review v3)', () => {
     // path.resolve da PLATAFORMA corrente — no Windows o separador é '\'
     // (review #498 médio 5: a comparação por prefixo '/' rejeitava tudo lá).
     expect(lineAuthDir(UUID)).toBe(nodePath.resolve('/tmp/maia-baileys-test-auth', 'lines', UUID));
-    expect(pairingAuthDir(UUID)).toBe(nodePath.resolve('/tmp/maia-baileys-test-auth', 'pairing', UUID));
+    expect(pairingAuthDir(UUID)).toBe(
+      nodePath.resolve('/tmp/maia-baileys-test-auth', 'pairing', UUID),
+    );
   });
 
   it('rejeita channelId com traversal (../) — defesa em profundidade', () => {
@@ -150,9 +152,9 @@ describe('auth dirs — UUID do canal, traversal rejeitado (review v3)', () => {
     });
 
     it('POSIX rejeita path absoluto como channelId', () => {
-      expect(() => resolveScopedAuthDir('/var/maia/auth', 'lines', '/etc/passwd', posix)).toThrowError(
-        expect.objectContaining({ code: 'auth_dir_escape' }),
-      );
+      expect(() =>
+        resolveScopedAuthDir('/var/maia/auth', 'lines', '/etc/passwd', posix),
+      ).toThrowError(expect.objectContaining({ code: 'auth_dir_escape' }));
     });
 
     it.each([

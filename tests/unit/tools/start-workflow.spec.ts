@@ -40,10 +40,7 @@ const ctx = {
 describe('start_workflow tool', () => {
   it('happy path: creates workflow + steps and audits reminder_scheduled', async () => {
     workflowsCreate.mockResolvedValueOnce({ id: 'wf-uuid-1' });
-    workflowStepsCreateMany.mockResolvedValueOnce([
-      { id: 's1' },
-      { id: 's2' },
-    ]);
+    workflowStepsCreateMany.mockResolvedValueOnce([{ id: 's1' }, { id: 's2' }]);
     const { startWorkflowTool } = await import('../../../src/tools/start-workflow.js');
     const result = await startWorkflowTool.handler(
       {
@@ -52,7 +49,12 @@ describe('start_workflow tool', () => {
         resumo: 'Fechar abril',
         steps: [
           { ordem: 1, descricao: 'Conferir saldos' },
-          { ordem: 2, descricao: 'Gerar relatório', tool: 'generate_report', args: { tipo: 'extrato' } },
+          {
+            ordem: 2,
+            descricao: 'Gerar relatório',
+            tool: 'generate_report',
+            args: { tipo: 'extrato' },
+          },
         ],
       } as never,
       ctx,

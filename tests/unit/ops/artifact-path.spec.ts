@@ -81,9 +81,7 @@ describe('absolute-path and drive vectors', () => {
 describe('control characters and whitespace', () => {
   it('rejects an embedded NUL (the C-string path truncator)', () => {
     const nul = String.fromCharCode(0);
-    expect(() => assertSafeArtifactRef(`maia-x.dump${nul}.evil`)).toThrowError(
-      /control character/,
-    );
+    expect(() => assertSafeArtifactRef(`maia-x.dump${nul}.evil`)).toThrowError(/control character/);
   });
 
   it('rejects newline and tab', () => {

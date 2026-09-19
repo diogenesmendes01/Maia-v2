@@ -20,7 +20,8 @@ const outputSchema = z.object({
 
 export const recallMemoryTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'recall_memory',
-  description: 'Busca memórias passadas por similaridade semântica dentro do escopo do interlocutor.',
+  description:
+    'Busca memórias passadas por similaridade semântica dentro do escopo do interlocutor.',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['read_transactions'],
@@ -35,7 +36,12 @@ export const recallMemoryTool: Tool<typeof inputSchema, typeof outputSchema> = {
       `pessoa:${ctx.pessoa.id}`,
       ...ctx.scope.entidades.map((e) => `entidade:${e}`),
     ];
-    const items = await recall({ query: args.query, escopo: escopos, tipos: args.tipos, k: args.k });
+    const items = await recall({
+      query: args.query,
+      escopo: escopos,
+      tipos: args.tipos,
+      k: args.k,
+    });
     return { items: items.map((i) => ({ conteudo: i.conteudo, tipo: i.tipo, score: i.score })) };
   },
 };

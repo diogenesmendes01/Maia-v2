@@ -79,9 +79,11 @@ export async function runTraceBodyRecoverer(): Promise<void> {
   );
 
   // pg returns rows[0]; drizzle exposes .rows on raw execute.
-  const row = (result as unknown as {
-    rows: Array<{ persisted_count: string; orphaned_count: string; still_pending_count: string }>;
-  }).rows[0];
+  const row = (
+    result as unknown as {
+      rows: Array<{ persisted_count: string; orphaned_count: string; still_pending_count: string }>;
+    }
+  ).rows[0];
   const persisted = row ? Number(row.persisted_count) : 0;
   const orphaned = row ? Number(row.orphaned_count) : 0;
   const still_pending = row ? Number(row.still_pending_count) : 0;
@@ -91,20 +93,10 @@ export async function runTraceBodyRecoverer(): Promise<void> {
   }
   if (orphaned > 0) {
     incCounter('maia_runtime_trace_body_recoverer_orphaned_total', {}, orphaned);
-    logger.warn(
-      { orphaned, orphan_sec, cutoff },
-      'trace_body_recoverer.alert_orphaned_envelopes',
-    );
+    logger.warn({ orphaned, orphan_sec, cutoff }, 'trace_body_recoverer.alert_orphaned_envelopes');
   }
   if (still_pending > 0) {
-    incCounter(
-      'maia_runtime_trace_body_recoverer_still_pending_total',
-      {},
-      still_pending,
-    );
+    incCounter('maia_runtime_trace_body_recoverer_still_pending_total', {}, still_pending);
   }
-  logger.info(
-    { persisted, orphaned, still_pending },
-    'trace_body_recoverer.tick',
-  );
+  logger.info({ persisted, orphaned, still_pending }, 'trace_body_recoverer.tick');
 }

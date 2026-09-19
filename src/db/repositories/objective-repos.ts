@@ -77,10 +77,7 @@ export const objectivesRepo = {
     return rows[0] ?? null;
   },
 
-  async listByAgent(args: {
-    tenant_id: string;
-    agent_id: string;
-  }): Promise<AgentObjective[]> {
+  async listByAgent(args: { tenant_id: string; agent_id: string }): Promise<AgentObjective[]> {
     return db
       .select()
       .from(agent_objectives)
@@ -212,10 +209,7 @@ export const objectivesRepo = {
    * primeira. Um reaper que contasse só as próprias reanimações daria uma
    * tentativa extra de graça a cada poison task.
    */
-  async claimNextPendingTask(args: {
-    worker_id: string;
-    lease_seconds: number;
-  }): Promise<{
+  async claimNextPendingTask(args: { worker_id: string; lease_seconds: number }): Promise<{
     task: ObjectiveTask;
     objective: AgentObjective;
     claim_token: string;

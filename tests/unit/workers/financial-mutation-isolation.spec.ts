@@ -140,7 +140,9 @@ describe('#355 H3 — contasRepo.addToBalance() adjusts ONLY the current tenant/
     // Only tenant-B owns the id. Running under tenant-A matches 0 rows → the
     // FINANCIAL single-row write must throw rather than silently return null
     // (a silent miss = balance un-incremented while its transaction committed).
-    store.reset([contaRow({ id: 'b-only', tenant_id: 'tenant-B', agent_id: 'agent-B', saldo_atual: 200 })]);
+    store.reset([
+      contaRow({ id: 'b-only', tenant_id: 'tenant-B', agent_id: 'agent-B', saldo_atual: 200 }),
+    ]);
     const { contasRepo } = await import('@/db/repositories.js');
 
     await expect(
@@ -162,14 +164,12 @@ describe('#355 H3 — transacoesRepo.update() patches ONLY the current tenant/ag
     ]);
     const { transacoesRepo } = await import('@/db/repositories.js');
 
-    await runWithTenantContext(A, () =>
-      transacoesRepo.update('shared', { status: 'cancelada' }),
-    );
+    await runWithTenantContext(A, () => transacoesRepo.update('shared', { status: 'cancelada' }));
 
     const rowsWithId = store.rows.filter((r) => r.id === 'shared');
-    expect(rowsWithId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.status).toBe(
-      'cancelada',
-    );
+    expect(
+      rowsWithId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.status,
+    ).toBe('cancelada');
     expect(rowsWithId.find((r) => r.tenant_id === 'tenant-B')!.status).toBe('paga'); // cross-tenant
     expect(rowsWithId.find((r) => r.agent_id === 'agent-Z')!.status).toBe('paga'); // cross-agent
     expectBoundTenantAgent();
@@ -198,7 +198,9 @@ describe('#364 blocker 1 — contasRepo.byId() reads ONLY the current tenant/age
     // addToBalance tripped — AFTER the ledger row committed. With byId scoped, a
     // foreign account simply does not load → the tool returns conta_not_found and
     // never creates the transaction.
-    store.reset([contaRow({ id: 'b-only', tenant_id: 'tenant-B', agent_id: 'agent-B', saldo_atual: 200 })]);
+    store.reset([
+      contaRow({ id: 'b-only', tenant_id: 'tenant-B', agent_id: 'agent-B', saldo_atual: 200 }),
+    ]);
     const { contasRepo } = await import('@/db/repositories.js');
 
     const found = await runWithTenantContext(A, () => contasRepo.byId('b-only'));

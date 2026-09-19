@@ -145,12 +145,9 @@ describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
     // -----------------------------------------------------------------------
     it('issue #287: key equals the buildCacheKey composition and neutralizes glob metachars', async () => {
       const { setCachedVision } = await import('@/tools/_vision-cache.js');
-      await runWithTenantContext(
-        { tenant_id: 'acme*', agent_id: 'agent!x' },
-        async () => {
-          await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme*', agent_id: 'agent!x' }, async () => {
+        await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
+      });
       const writes = ops.filter((o) => o.op === 'setex');
       expect(writes).toHaveLength(1);
       expect(writes[0]!.key).toBe(
@@ -207,10 +204,7 @@ describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
       const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
       await runWithTenantContext(A_CTX, async () => {
         await setCachedVision('parse_image', 'sha-RT', { kind: 'boleto', valor: 100 });
-        const got = await getCachedVision<{ kind: string; valor: number }>(
-          'parse_image',
-          'sha-RT',
-        );
+        const got = await getCachedVision<{ kind: string; valor: number }>('parse_image', 'sha-RT');
         expect(got).toEqual({ kind: 'boleto', valor: 100 });
       });
     });
@@ -385,12 +379,9 @@ describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
   describe('KEY ALIASING (delimiter escape)', () => {
     it('tenant id with `:` is URI-encoded so the segment boundary stays unambiguous', async () => {
       const { setCachedVision } = await import('@/tools/_vision-cache.js');
-      await runWithTenantContext(
-        { tenant_id: 'acme:dev', agent_id: 'agent-X' },
-        async () => {
-          await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme:dev', agent_id: 'agent-X' }, async () => {
+        await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
+      });
       const writes = ops.filter((o) => o.op === 'setex');
       expect(writes).toHaveLength(1);
       // `:` in the tenant id MUST be encoded — otherwise the key is
@@ -408,12 +399,9 @@ describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
       // Post-fix the `:` in each segment is encoded as `%3A`, so the two
       // tuples land in distinct cache buckets.
       const { setCachedVision } = await import('@/tools/_vision-cache.js');
-      await runWithTenantContext(
-        { tenant_id: 'acme:dev', agent_id: 'agent-1' },
-        async () => {
-          await setCachedVision('parse_image', 'sha-X', { tag: 'T1' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme:dev', agent_id: 'agent-1' }, async () => {
+        await setCachedVision('parse_image', 'sha-X', { tag: 'T1' });
+      });
       await runWithTenantContext({ tenant_id: 'acme', agent_id: 'dev' }, async () => {
         await setCachedVision('agent-1:parse_image', 'sha-X', { tag: 'T2' });
       });
@@ -431,12 +419,9 @@ describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
     it('tenant id with `:` does NOT receive another tenant`s cached payload (aliasing → ISOLATION)', async () => {
       const { setCachedVision, getCachedVision } = await import('@/tools/_vision-cache.js');
       // T1 caches under (tenant='acme:dev', agent='agent-1', tool='parse_image').
-      await runWithTenantContext(
-        { tenant_id: 'acme:dev', agent_id: 'agent-1' },
-        async () => {
-          await setCachedVision('parse_image', 'sha-X', { tag: 'T1' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme:dev', agent_id: 'agent-1' }, async () => {
+        await setCachedVision('parse_image', 'sha-X', { tag: 'T1' });
+      });
       // T2 reads from the would-be-aliased tuple
       // (tenant='acme', agent='dev', tool='agent-1:parse_image'). Under raw
       // interpolation this would have served T1's payload; post-fix it MUST
@@ -452,12 +437,9 @@ describe('Issue #250 — vision cache is (tenant, agent)-scoped (v3)', () => {
 
     it('agent id with `:` is URI-encoded (segment boundary stays unambiguous)', async () => {
       const { setCachedVision } = await import('@/tools/_vision-cache.js');
-      await runWithTenantContext(
-        { tenant_id: 'tenant-A', agent_id: 'agent:weird' },
-        async () => {
-          await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent:weird' }, async () => {
+        await setCachedVision('parse_image', 'sha-X', { kind: 'boleto' });
+      });
       const writes = ops.filter((o) => o.op === 'setex');
       expect(writes).toHaveLength(1);
       expect(writes[0]!.key).toBe('maia:vision:v3:tenant-A:agent%3Aweird:parse_image:sha-X');

@@ -195,10 +195,7 @@ describe('AudienceSliceBuilder (#407)', () => {
   });
 
   it('fails closed (null audience) when no profile row exists', async () => {
-    const b = new AudienceSliceBuilder(
-      mkPort({ getProfile: async () => null }),
-      cache,
-    );
+    const b = new AudienceSliceBuilder(mkPort({ getProfile: async () => null }), cache);
     const base = mkBaseContextPacket({
       actor: { user_id: null, pessoa_id: 'p1', role: 'x', is_authenticated: true },
     });

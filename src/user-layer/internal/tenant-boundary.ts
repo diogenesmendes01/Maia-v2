@@ -49,13 +49,9 @@ export interface TenantBoundaryDecision {
   agent_id: string;
 }
 
-export function enforceTenantBoundary(
-  input: TenantBoundaryInput,
-): TenantBoundaryDecision {
+export function enforceTenantBoundary(input: TenantBoundaryInput): TenantBoundaryDecision {
   if (!input.tenant_id || typeof input.tenant_id !== 'string') {
-    throw new TenantBoundaryViolation(
-      'input.tenant_id is required (string)',
-    );
+    throw new TenantBoundaryViolation('input.tenant_id is required (string)');
   }
 
   const ctx = tryGetCurrentContext();

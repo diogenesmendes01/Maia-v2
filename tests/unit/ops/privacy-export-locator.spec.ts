@@ -24,12 +24,14 @@ import {
 const UUID = '3f2504e0-4f89-41d3-9a0c-0305e82c3301';
 const ROOT = '/srv/backups/privacy-export';
 
-function probe(opts: {
-  files?: Record<string, { symlink?: boolean; dir?: boolean; nlink?: number }>;
-  realpaths?: Record<string, string>;
-  rootThrows?: boolean;
-  lstatThrows?: string;
-} = {}): ExportPathProbe {
+function probe(
+  opts: {
+    files?: Record<string, { symlink?: boolean; dir?: boolean; nlink?: number }>;
+    realpaths?: Record<string, string>;
+    rootThrows?: boolean;
+    lstatThrows?: string;
+  } = {},
+): ExportPathProbe {
   const files = opts.files ?? {};
   return {
     realpath: async (p) => {

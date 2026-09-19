@@ -430,36 +430,34 @@ export const agentsRouter = router({
    * Exposes `profile_body` so the UI can prefill the edit form with the
    * currently-running identity instead of forcing the operator to retype it.
    */
-  getProfileVersions: protectedProcedure
-    .input(GetByIdInputSchema)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      const agent = await ctx.repos.agentsRepo.findById(input.id);
-      if (!agent || agent.tenant_id !== tenantId) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
-      }
-      const [active, proposed] = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: agent.id },
-        async () =>
-          Promise.all([
-            ctx.repos.operationalProfileVersionsRepo.getActive(),
-            ctx.repos.operationalProfileVersionsRepo.listByStatus('proposed'),
-          ]),
-      );
-      const pick = (v: NonNullable<typeof active>) => ({
-        id: v.id,
-        version: v.version,
-        status: v.status,
-        profile_body: v.profile_body,
-        proposed_by: v.proposed_by,
-        proposed_reason: v.proposed_reason,
-        created_at: v.created_at,
-      });
-      return {
-        active: active ? pick(active) : null,
-        proposed: proposed.map(pick),
-      };
-    }),
+  getProfileVersions: protectedProcedure.input(GetByIdInputSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const agent = await ctx.repos.agentsRepo.findById(input.id);
+    if (!agent || agent.tenant_id !== tenantId) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+    }
+    const [active, proposed] = await runWithTenantContext(
+      { tenant_id: tenantId, agent_id: agent.id },
+      async () =>
+        Promise.all([
+          ctx.repos.operationalProfileVersionsRepo.getActive(),
+          ctx.repos.operationalProfileVersionsRepo.listByStatus('proposed'),
+        ]),
+    );
+    const pick = (v: NonNullable<typeof active>) => ({
+      id: v.id,
+      version: v.version,
+      status: v.status,
+      profile_body: v.profile_body,
+      proposed_by: v.proposed_by,
+      proposed_reason: v.proposed_reason,
+      created_at: v.created_at,
+    });
+    return {
+      active: active ? pick(active) : null,
+      proposed: proposed.map(pick),
+    };
+  }),
 
   /**
    * Issue #470 — capacidades efetivas do agente para exibição no console:
@@ -483,67 +481,62 @@ export const agentsRouter = router({
    * existe. Os packs externos são marcados com `external: true` para o card
    * poder explicar a diferença.
    */
-  getCapabilities: protectedProcedure
-    .input(GetByIdInputSchema)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      const agent = await ctx.repos.agentsRepo.findById(input.id);
-      if (!agent || agent.tenant_id !== tenantId) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+  getCapabilities: protectedProcedure.input(GetByIdInputSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const agent = await ctx.repos.agentsRepo.findById(input.id);
+    if (!agent || agent.tenant_id !== tenantId) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+    }
+    const grant = await runWithTenantContext(
+      { tenant_id: tenantId, agent_id: agent.id },
+      async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
+    );
+    // Mesmo contrato do runtime (resolveGrantedToolNames): com row, o único
+    // piso inamovível é baseline.core — domain.calendar é padrão de CRIAÇÃO
+    // (BASE_AGENT_PACKS/coluna default), mas revogável via updateCapabilities;
+    // unir BASE_AGENT_PACKS aqui exibiria calendar como concedido após uma
+    // revogação. Sem row ⇒ floor da plataforma (o que uma row nova teria).
+    const grantedPacks = grant
+      ? [...new Set(['baseline.core', ...grant.granted_packs])]
+      : [...BASE_AGENT_PACKS];
+    const deniedTools = grant?.denied_tools ?? [];
+    const deniedSet = new Set(deniedTools);
+    const mcpPacks = await resolveMcpPacks(ctx, tenantId, grantedPacks);
+    const packs = grantedPacks.map((id) => {
+      const def = TOOL_PACKS[id];
+      if (def) {
+        return {
+          id,
+          name: def.name ?? id,
+          risk_level: def.risk_level ?? null,
+          tools: [...def.tools],
+          known: true,
+          external: false,
+        };
       }
-      const grant = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: agent.id },
-        async () => ctx.repos.agentToolGrantsRepo.findForCurrentAgent(),
-      );
-      // Mesmo contrato do runtime (resolveGrantedToolNames): com row, o único
-      // piso inamovível é baseline.core — domain.calendar é padrão de CRIAÇÃO
-      // (BASE_AGENT_PACKS/coluna default), mas revogável via updateCapabilities;
-      // unir BASE_AGENT_PACKS aqui exibiria calendar como concedido após uma
-      // revogação. Sem row ⇒ floor da plataforma (o que uma row nova teria).
-      const grantedPacks = grant
-        ? [...new Set(['baseline.core', ...grant.granted_packs])]
-        : [...BASE_AGENT_PACKS];
-      const deniedTools = grant?.denied_tools ?? [];
-      const deniedSet = new Set(deniedTools);
-      const mcpPacks = await resolveMcpPacks(ctx, tenantId, grantedPacks);
-      const packs = grantedPacks.map((id) => {
-        const def = TOOL_PACKS[id];
-        if (def) {
-          return {
-            id,
-            name: def.name ?? id,
-            risk_level: def.risk_level ?? null,
-            tools: [...def.tools],
-            known: true,
-            external: false,
-          };
+      return (
+        mcpPacks.get(id) ?? {
+          id,
+          name: id,
+          risk_level: null,
+          tools: [] as string[],
+          known: false,
+          external: false,
         }
-        return (
-          mcpPacks.get(id) ?? {
-            id,
-            name: id,
-            risk_level: null,
-            tools: [] as string[],
-            known: false,
-            external: false,
-          }
-        );
-      });
-      const effectiveTools = [
-        ...new Set([
-          ...resolvePackTools(grantedPacks),
-          ...(grant?.granted_tools ?? []),
-        ]),
-      ].filter((t) => !deniedSet.has(t));
-      return {
-        packs,
-        granted_tools: grant?.granted_tools ?? [],
-        denied_tools: deniedTools,
-        effective_tool_count: effectiveTools.length,
-        effective_tools: effectiveTools,
-        reason: grant?.reason ?? null,
-      };
-    }),
+      );
+    });
+    const effectiveTools = [
+      ...new Set([...resolvePackTools(grantedPacks), ...(grant?.granted_tools ?? [])]),
+    ].filter((t) => !deniedSet.has(t));
+    return {
+      packs,
+      granted_tools: grant?.granted_tools ?? [],
+      denied_tools: deniedTools,
+      effective_tool_count: effectiveTools.length,
+      effective_tools: effectiveTools,
+      reason: grant?.reason ?? null,
+    };
+  }),
 
   /**
    * Edição de grants de packs de domínio + hard denies do agente — fase 4 do
@@ -601,10 +594,7 @@ export const agentsRouter = router({
             ...new Set(['baseline.core', ...input.granted_packs, ...unmanagedPacks]),
           ];
           const grantedTools = current?.granted_tools ?? [];
-          const nextEffective = new Set([
-            ...resolvePackTools(nextPacks),
-            ...grantedTools,
-          ]);
+          const nextEffective = new Set([...resolvePackTools(nextPacks), ...grantedTools]);
           const currentDenied = new Set(current?.denied_tools ?? []);
           const invalidDenies = input.denied_tools.filter(
             (t) => !nextEffective.has(t) && !currentDenied.has(t),
@@ -792,5 +782,4 @@ export const agentsRouter = router({
         previous_version_id: result.previous_version_id,
       };
     }),
-
 });

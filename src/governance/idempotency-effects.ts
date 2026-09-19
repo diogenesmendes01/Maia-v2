@@ -50,9 +50,7 @@ const whatsappTextPayloadSchema = z.object({
  * the row's `effect_type` (the dispatcher stamps both from the same plan); the
  * relayer asserts that equality defensively before dispatch.
  */
-export const plannedEffectSchema = z.discriminatedUnion('kind', [
-  whatsappTextPayloadSchema,
-]);
+export const plannedEffectSchema = z.discriminatedUnion('kind', [whatsappTextPayloadSchema]);
 
 export type PlannedEffect = z.infer<typeof plannedEffectSchema>;
 export type WhatsappTextEffect = z.infer<typeof whatsappTextPayloadSchema>;
@@ -133,11 +131,9 @@ const WHATSAPP_MSG_ID_HEX_LEN = 18;
 const DEDUP_IDENTITY_SEP = '\u0000';
 
 function deriveWhatsappMessageId(identity: OutboxRowIdentity): string {
-  const material = [
-    identity.tenant_id,
-    identity.agent_id,
-    identity.idempotency_key,
-  ].join(DEDUP_IDENTITY_SEP);
+  const material = [identity.tenant_id, identity.agent_id, identity.idempotency_key].join(
+    DEDUP_IDENTITY_SEP,
+  );
   const hex = sha256(material).toUpperCase().slice(0, WHATSAPP_MSG_ID_HEX_LEN);
   return WHATSAPP_MSG_ID_PREFIX + hex;
 }

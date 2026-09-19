@@ -39,9 +39,7 @@ function makeCtx(
       },
       agentsRepo: {
         async findById(_id: string) {
-          return opts?.agent === undefined
-            ? { id: 'agent-a', tenant_id: 'tenant-A' }
-            : opts.agent;
+          return opts?.agent === undefined ? { id: 'agent-a', tenant_id: 'tenant-A' } : opts.agent;
         },
         async listByTenant() {
           return [{ id: 'agent-a', tenant_id: 'tenant-A', nome: 'A' }];
@@ -55,9 +53,7 @@ function makeCtx(
           return { id: SERVER_UUID, ...args };
         },
         async findById(_args: Record<string, unknown>) {
-          return opts?.server === undefined
-            ? { id: SERVER_UUID, name: 'erp' }
-            : opts.server;
+          return opts?.server === undefined ? { id: SERVER_UUID, name: 'erp' } : opts.server;
         },
         async setStatus(args: Record<string, unknown>) {
           return { id: args.server_id, name: 'erp', status: args.status };
@@ -305,7 +301,7 @@ describe('mcp.setAgentPack', () => {
       granted: false,
     });
     expect(res.granted_packs).not.toContain('mcp.erp');
-    expect((upserts[0]!.granted_packs as string[])).toContain('baseline.core');
+    expect(upserts[0]!.granted_packs as string[]).toContain('baseline.core');
   });
 
   it('agent from another tenant = NOT_FOUND', async () => {

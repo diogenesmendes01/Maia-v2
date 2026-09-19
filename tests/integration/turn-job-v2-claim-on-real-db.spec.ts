@@ -121,7 +121,12 @@ async function mkInboundComTurno(args: {
     await c.query(
       `INSERT INTO mensagens (id, tenant_id, agent_id, direcao, tipo, conteudo, metadata, processada_em)
        VALUES ($1, $2, $3, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
-      [mensagem_id, args.msg_tenant, args.msg_agent, `WAID-504V2C-${randomInt(0, 1e9).toString(36)}`],
+      [
+        mensagem_id,
+        args.msg_tenant,
+        args.msg_agent,
+        `WAID-504V2C-${randomInt(0, 1e9).toString(36)}`,
+      ],
     );
     await c.query(
       `INSERT INTO agent_turns (id, tenant_id, agent_id, representative_message_id, status, queued_at)
@@ -207,9 +212,7 @@ d('#504 — job V2 com FEATURE_TURN_CLAIM LIGADA (DB real)', () => {
 
   it('ADVERSARIAL: a recusa cross-tenant NÃO depende da flag — ela acontece antes do claim', async () => {
     const { runAgentTurnJob } = await import('../../src/runtime/turns/job-consumer.js');
-    const { TurnScopeUnresolvedError } = await import(
-      '../../src/runtime/turns/scope-resolver.js'
-    );
+    const { TurnScopeUnresolvedError } = await import('../../src/runtime/turns/scope-resolver.js');
     const { mensagem_id: vitima, turn_id: turnoAtacante } = await mkInboundComTurno({
       msg_tenant: VICTIM_T,
       msg_agent: VICTIM_A,

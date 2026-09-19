@@ -93,7 +93,12 @@ describe('tool_mediated: max_tool_calls cap', () => {
         model: 'x',
       });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const out = await toolMediatedMode({ skill, input: {}, resolvedPolicies: [], turno_id: TURNO });
+      const out = await toolMediatedMode({
+        skill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: TURNO,
+      });
       expect(toolCalls).toBe(2);
       expect(out._tool_cap_hit).toBe(true);
       expect(out.answer).toBe('done');
@@ -122,7 +127,12 @@ describe('tool_mediated: max_tokens budget', () => {
       model: 'x',
     });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const out = await toolMediatedMode({ skill, input: {}, resolvedPolicies: [], turno_id: TURNO });
+      const out = await toolMediatedMode({
+        skill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: TURNO,
+      });
       expect(out._token_budget_exceeded).toBe(true);
       expect(out._tokens_in).toBe(5);
       expect(out._tokens_out).toBe(5);

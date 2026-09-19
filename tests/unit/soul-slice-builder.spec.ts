@@ -86,9 +86,8 @@ beforeEach(() => {
 describe('buildSoulSlice (P8b)', () => {
   it('depth="none" devolve slice vazio com rendered_block=null', async () => {
     mockBiases = [makeBias({ principle: 'x' })];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const slice = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -103,9 +102,8 @@ describe('buildSoulSlice (P8b)', () => {
 
   it('max_biases=0 devolve slice vazio', async () => {
     mockBiases = [makeBias({ principle: 'x' })];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const slice = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -125,9 +123,8 @@ describe('buildSoulSlice (P8b)', () => {
       }),
       makeBias({ principle: 'universal' }),
     ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const slice = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -149,9 +146,8 @@ describe('buildSoulSlice (P8b)', () => {
         activation_context: { role_in: ['finance_advisor'] },
       }),
     ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const sliceNoRole = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -177,9 +173,8 @@ describe('buildSoulSlice (P8b)', () => {
         activation_context: { intent_in: ['condolencia', 'apoio_emocional'] },
       }),
     ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const sliceMatch = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -206,9 +201,8 @@ describe('buildSoulSlice (P8b)', () => {
         activation_context: { risk_level_min: 'medium' },
       }),
     ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const low = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -231,13 +225,26 @@ describe('buildSoulSlice (P8b)', () => {
   it('ranqueia por strength DESC; tiebreak por scope specificity (domain > role > tenant)', async () => {
     mockBiases = [
       makeBias({ id: 'tenant_a', principle: 'A_tenant', scope: 'tenant', strength: '0.700' }),
-      makeBias({ id: 'role_a', principle: 'A_role', scope: 'role', scope_value: 'r', strength: '0.700', activation_context: { role_in: ['r'] } }),
-      makeBias({ id: 'domain_a', principle: 'A_domain', scope: 'domain', scope_value: 'd', strength: '0.700', activation_context: { domain_in: ['d'] } }),
+      makeBias({
+        id: 'role_a',
+        principle: 'A_role',
+        scope: 'role',
+        scope_value: 'r',
+        strength: '0.700',
+        activation_context: { role_in: ['r'] },
+      }),
+      makeBias({
+        id: 'domain_a',
+        principle: 'A_domain',
+        scope: 'domain',
+        scope_value: 'd',
+        strength: '0.700',
+        activation_context: { domain_in: ['d'] },
+      }),
       makeBias({ id: 'tenant_high', principle: 'B_highest', strength: '0.900' }),
     ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const slice = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -258,9 +265,8 @@ describe('buildSoulSlice (P8b)', () => {
     mockBiases = Array.from({ length: 12 }, (_, i) =>
       makeBias({ principle: `p${i}`, strength: '0.500' }),
     );
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const slice = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -273,12 +279,9 @@ describe('buildSoulSlice (P8b)', () => {
   });
 
   it('rendered_block inclui disclaimer "inclinam, não bloqueiam"', async () => {
-    mockBiases = [
-      makeBias({ principle: 'humildade', guidance: 'prefira "parece que" a "é"' }),
-    ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    mockBiases = [makeBias({ principle: 'humildade', guidance: 'prefira "parece que" a "é"' })];
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const slice = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -299,9 +302,8 @@ describe('buildSoulSlice (P8b)', () => {
         activation_context: { role_in: ['advisor'] },
       }),
     ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const slice = await buildSoulSlice({
       tenant_id: 'default',
       agent_id: 'default',
@@ -320,12 +322,11 @@ describe('buildSoulSlice (P8b)', () => {
         scope: 'role',
         scope_value: 'finance_advisor',
         principle: 'role_scoped_no_ctx',
-        activation_context: {},  // empty — scope enforcement must still block
+        activation_context: {}, // empty — scope enforcement must still block
       }),
     ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
 
     // wrong role — must NOT include bias
     const sliceWrong = await buildSoulSlice({
@@ -363,12 +364,11 @@ describe('buildSoulSlice (P8b)', () => {
         scope: 'domain',
         scope_value: 'condolencia',
         principle: 'domain_scoped_no_ctx',
-        activation_context: {},  // empty — scope enforcement must still block
+        activation_context: {}, // empty — scope enforcement must still block
       }),
     ];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
 
     // wrong domain — must NOT include bias
     const sliceWrong = await buildSoulSlice({
@@ -387,7 +387,9 @@ describe('buildSoulSlice (P8b)', () => {
       depth: 'relevant',
       max_biases: 5,
     });
-    expect(sliceNoDomain.active_biases.map((b) => b.principle)).not.toContain('domain_scoped_no_ctx');
+    expect(sliceNoDomain.active_biases.map((b) => b.principle)).not.toContain(
+      'domain_scoped_no_ctx',
+    );
 
     // correct domain — MUST include bias
     const sliceMatch = await buildSoulSlice({
@@ -402,9 +404,8 @@ describe('buildSoulSlice (P8b)', () => {
 
   it('cache_key é estável para os mesmos args', async () => {
     mockBiases = [makeBias({ principle: 'p1' })];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const a = await buildSoulSlice({
       tenant_id: 't',
       agent_id: 'a',
@@ -432,9 +433,8 @@ describe('buildSoulSlice (P8b)', () => {
 
   it('cache_key muda quando contexto muda', async () => {
     mockBiases = [makeBias({ principle: 'p1' })];
-    const { buildSoulSlice } = await import(
-      '@/runtime/context-assembly/slice-builders/soul-slice-builder.js'
-    );
+    const { buildSoulSlice } =
+      await import('@/runtime/context-assembly/slice-builders/soul-slice-builder.js');
     const a = await buildSoulSlice({
       tenant_id: 't',
       agent_id: 'a',

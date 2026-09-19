@@ -1,8 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  DecisionEngine,
-  type DecisionEngineDeps,
-} from '@/runtime/decision/decision-engine.ts';
+import { DecisionEngine, type DecisionEngineDeps } from '@/runtime/decision/decision-engine.ts';
 import type {
   ActionDecider,
   AgentSelector,
@@ -217,9 +214,9 @@ describe('P9b — DecisionEngine orchestrator', () => {
     const r = await engine.run({ base: mkBase() });
     expect(r.packet.action_mode).toBe('escalate');
     expect(r.packet.rationale).toContain('owner_plus_compliance');
-    expect(r.packet.policy_decisions.some(
-      (d) => d.decision === 'require_dual_approval',
-    )).toBe(true);
+    expect(r.packet.policy_decisions.some((d) => d.decision === 'require_dual_approval')).toBe(
+      true,
+    );
   });
 
   it('records metrics for each step', async () => {
@@ -243,9 +240,7 @@ describe('P9b — DecisionEngine orchestrator', () => {
 
   it('passes resolved_policies once to both PEPs (no duplicate resolver call)', async () => {
     const resolver: PolicyDescriptorResolver = {
-      resolveDescriptors: vi.fn().mockResolvedValue([
-        { policy_id: 'p1', descriptor: 'd1' },
-      ]),
+      resolveDescriptors: vi.fn().mockResolvedValue([{ policy_id: 'p1', descriptor: 'd1' }]),
     };
     const deps = mkDeps({ resolver });
     const engine = new DecisionEngine(deps);
@@ -370,9 +365,7 @@ describe('P9b — DecisionEngine orchestrator', () => {
   it('Codex #103 — slow resolver triggers deadline (hot path cannot hang on resolver)', async () => {
     // Resolver hangs forever; the deadline must fire and return fallback packet.
     const resolver: PolicyDescriptorResolver = {
-      resolveDescriptors: vi.fn().mockImplementation(
-        () => new Promise(() => {}),
-      ),
+      resolveDescriptors: vi.fn().mockImplementation(() => new Promise(() => {})),
     };
     const deps = mkDeps({ resolver });
     const engine = new DecisionEngine(deps);
@@ -433,7 +426,7 @@ describe('P9b — DecisionEngine orchestrator', () => {
     expect(r.packet.action_mode).toBe('ask_clarification');
   });
 
-  it('Codex round-2 finding 2 — Mid PEP receives the selected skill\'s actual allowed_tools (not empty)', async () => {
+  it("Codex round-2 finding 2 — Mid PEP receives the selected skill's actual allowed_tools (not empty)", async () => {
     // Engine wires SkillSelector → Mid PEP. Before the fix Mid PEP was always
     // handed `EMPTY_TOOL_PERMS`, so any policy evaluator inspecting the
     // tool surface saw `[]` and could not block/reduce tools that ended up
@@ -461,19 +454,14 @@ describe('P9b — DecisionEngine orchestrator', () => {
     const engine = new DecisionEngine(deps);
     await engine.run({ base: mkBase() });
 
-    const midInput = (midPep.evaluate as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0];
+    const midInput = (midPep.evaluate as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(midInput).toBeDefined();
     expect(midInput.tool_permissions_preview.allowed_tools).toEqual([
       'transfer_money',
       'view_balance',
     ]);
-    expect(midInput.tool_permissions_preview.blocked_tools).toEqual([
-      'delete_account',
-    ]);
-    expect(midInput.tool_permissions_preview.requires_confirmation).toEqual([
-      'transfer_money',
-    ]);
+    expect(midInput.tool_permissions_preview.blocked_tools).toEqual(['delete_account']);
+    expect(midInput.tool_permissions_preview.requires_confirmation).toEqual(['transfer_money']);
     // The same Skill object is also forwarded explicitly so the evaluator
     // can read schema refs / runtime hints / etc.
     expect(midInput.selected_skill?.id).toBe('skill_transfer');
@@ -493,8 +481,7 @@ describe('P9b — DecisionEngine orchestrator', () => {
     const engine = new DecisionEngine(deps);
     await engine.run({ base: mkBase() });
 
-    const midInput = (midPep.evaluate as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0];
+    const midInput = (midPep.evaluate as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     expect(midInput.tool_permissions_preview.allowed_tools).toEqual([]);
     expect(midInput.tool_permissions_preview.blocked_tools).toEqual([]);
     expect(midInput.selected_skill).toBeUndefined();
@@ -506,12 +493,12 @@ describe('P9b — DecisionEngine orchestrator', () => {
     // engine's deadline to fire.
     let capturedSignal: AbortSignal | undefined;
     const resolver: PolicyDescriptorResolver = {
-      resolveDescriptors: vi.fn().mockImplementation(
-        (_q: unknown, opts?: { signal?: AbortSignal }) => {
+      resolveDescriptors: vi
+        .fn()
+        .mockImplementation((_q: unknown, opts?: { signal?: AbortSignal }) => {
           capturedSignal = opts?.signal;
           return new Promise(() => {}); // hang
-        },
-      ),
+        }),
     };
     const deps = mkDeps({ resolver });
     const engine = new DecisionEngine(deps);
@@ -525,14 +512,12 @@ describe('P9b — DecisionEngine orchestrator', () => {
   it('Codex round-2 finding 4 — signal also reaches intent classifier when it runs', async () => {
     let capturedSignal: AbortSignal | undefined;
     const intentClassifier: IntentClassifier = {
-      classify: vi.fn().mockImplementation(
-        async (_b: unknown, opts?: { signal?: AbortSignal }) => {
-          capturedSignal = opts?.signal;
-          // Hang so the engine deadline fires while this step runs.
-          await new Promise(() => {});
-          return { label: 'greet', confidence: 0.95 };
-        },
-      ),
+      classify: vi.fn().mockImplementation(async (_b: unknown, opts?: { signal?: AbortSignal }) => {
+        capturedSignal = opts?.signal;
+        // Hang so the engine deadline fires while this step runs.
+        await new Promise(() => {});
+        return { label: 'greet', confidence: 0.95 };
+      }),
     };
     const deps = mkDeps({ intentClassifier });
     const engine = new DecisionEngine(deps);
@@ -547,13 +532,13 @@ describe('P9b — DecisionEngine orchestrator', () => {
     const controller = new AbortController();
     let capturedSignal: AbortSignal | undefined;
     const resolver: PolicyDescriptorResolver = {
-      resolveDescriptors: vi.fn().mockImplementation(
-        (_q: unknown, opts?: { signal?: AbortSignal }) => {
+      resolveDescriptors: vi
+        .fn()
+        .mockImplementation((_q: unknown, opts?: { signal?: AbortSignal }) => {
           capturedSignal = opts?.signal;
           controller.abort();
           return new Promise(() => {});
-        },
-      ),
+        }),
     };
     const deps = mkDeps({ resolver });
     const engine = new DecisionEngine(deps);
@@ -603,8 +588,7 @@ describe('P9b — DecisionEngine orchestrator', () => {
     const engine = new DecisionEngine(deps);
     await engine.run({ base: mkBase() });
 
-    const actionInput = (actionDecider.decide as ReturnType<typeof vi.fn>).mock
-      .calls[0]?.[0];
+    const actionInput = (actionDecider.decide as ReturnType<typeof vi.fn>).mock.calls[0]?.[0];
     // ActionDecider sees the EXACT object the SkillSelector returned —
     // identity check, not deep equality.
     expect(actionInput.skill.selected_skill).toBe(resolvedSkill);

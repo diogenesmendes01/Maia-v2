@@ -44,9 +44,9 @@ describe('resolveTenantId — property tests', () => {
 
   it('REJECTS spoofed tenantId for every non-founder role', () => {
     for (const role of NON_FOUNDER_ROLES) {
-      expect(() =>
-        resolveTenantId({ tenantId: 'tenant-A', userRole: role }, 'tenant-B'),
-      ).toThrow(TRPCError);
+      expect(() => resolveTenantId({ tenantId: 'tenant-A', userRole: role }, 'tenant-B')).toThrow(
+        TRPCError,
+      );
     }
   });
 
@@ -87,9 +87,7 @@ describe('resolveTenantId — property tests', () => {
 
   it('empty string input is rejected for non-founder (treated as a spoof attempt)', () => {
     // Empty string is truthy enough to enter the mismatch branch.
-    expect(() =>
-      resolveTenantId({ tenantId: 'tenant-A', userRole: 'owner' }, ''),
-    ).not.toThrow();
+    expect(() => resolveTenantId({ tenantId: 'tenant-A', userRole: 'owner' }, '')).not.toThrow();
     // Because !inputTenantId === true for '' under JS truthiness — and we want
     // empty to be treated as "not provided" rather than "spoofed". Documenting
     // the actual behavior so it's intentional.

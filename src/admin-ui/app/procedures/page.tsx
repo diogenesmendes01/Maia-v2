@@ -6,30 +6,13 @@ import { trpc } from '../../trpc/client.js';
 import { PageHeader } from '../../components/ui/page-header.js';
 import { Field, Select } from '../../components/ui/field.js';
 import { StatusBadge } from '../../components/ui/badge.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../components/ui/table.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState } from '../../components/ui/states.js';
 import { IconLayers } from '../../components/ui/icons.js';
 
 type ProcStatus = 'draft' | 'proposed' | 'active' | 'frozen' | 'rolled_back';
 
-const STATUS_OPTIONS: ProcStatus[] = [
-  'active',
-  'proposed',
-  'frozen',
-  'rolled_back',
-  'draft',
-];
+const STATUS_OPTIONS: ProcStatus[] = ['active', 'proposed', 'frozen', 'rolled_back', 'draft'];
 
 export default function ProceduresPage() {
   const { data: session, status } = useSession();
@@ -38,10 +21,7 @@ export default function ProceduresPage() {
   const [agentId, setAgentId] = React.useState('');
   const [procStatus, setProcStatus] = React.useState<ProcStatus>('active');
 
-  const agentsQuery = trpc.agents.list.useQuery(
-    { tenantId },
-    { enabled: tenantId !== '' },
-  );
+  const agentsQuery = trpc.agents.list.useQuery({ tenantId }, { enabled: tenantId !== '' });
 
   const defsQuery = trpc.procedures.listDefinitions.useQuery(
     { tenantId, agentId, status: procStatus, limit: 100 },
@@ -59,8 +39,8 @@ export default function ProceduresPage() {
         description={
           <>
             Definições de procedures por agente (
-            <code className="font-mono text-xs">procedure_definitions</code>),
-            filtradas por status de ciclo de vida.
+            <code className="font-mono text-xs">procedure_definitions</code>), filtradas por status
+            de ciclo de vida.
           </>
         }
       />
@@ -77,10 +57,7 @@ export default function ProceduresPage() {
           </Select>
         </Field>
         <Field label="Status" className="w-44">
-          <Select
-            value={procStatus}
-            onChange={(e) => setProcStatus(e.target.value as ProcStatus)}
-          >
+          <Select value={procStatus} onChange={(e) => setProcStatus(e.target.value as ProcStatus)}>
             {STATUS_OPTIONS.map((s) => (
               <option key={s} value={s}>
                 {s}
@@ -99,15 +76,9 @@ export default function ProceduresPage() {
       ) : defsQuery.isLoading ? (
         <LoadingState label="Carregando procedures…" />
       ) : defsQuery.error ? (
-        <ErrorState
-          message={defsQuery.error.message}
-          onRetry={() => void defsQuery.refetch()}
-        />
+        <ErrorState message={defsQuery.error.message} onRetry={() => void defsQuery.refetch()} />
       ) : items.length === 0 ? (
-        <EmptyState
-          icon={<IconLayers size={28} />}
-          title="Nenhuma procedure neste status"
-        />
+        <EmptyState icon={<IconLayers size={28} />} title="Nenhuma procedure neste status" />
       ) : (
         <TableShell>
           <Table>

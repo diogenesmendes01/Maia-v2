@@ -82,7 +82,10 @@ interface RawLine {
 /** Strip a quoted scalar; leave everything else byte-for-byte. */
 function scalar(raw: string): string {
   const t = raw.trim();
-  if (t.length >= 2 && ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))) {
+  if (
+    t.length >= 2 &&
+    ((t.startsWith('"') && t.endsWith('"')) || (t.startsWith("'") && t.endsWith("'")))
+  ) {
     return t.slice(1, -1);
   }
   return t;
@@ -135,7 +138,12 @@ function flowSequence(raw: string): string[] {
 
 const KEY_LINE = /^([A-Za-z0-9_.@/+-]+):(?:\s+(.*))?$/;
 
-function parseBlock(lines: RawLine[], start: number, indent: number, file: string): [ComposeNode, number] {
+function parseBlock(
+  lines: RawLine[],
+  start: number,
+  indent: number,
+  file: string,
+): [ComposeNode, number] {
   const first = lines[start];
   if (!first) return ['', start];
 
@@ -191,7 +199,8 @@ function parseBlock(lines: RawLine[], start: number, indent: number, file: strin
       continue;
     }
     const trimmed = value.trim();
-    map[key] = trimmed.startsWith('[') && trimmed.endsWith(']') ? flowSequence(trimmed) : scalar(trimmed);
+    map[key] =
+      trimmed.startsWith('[') && trimmed.endsWith(']') ? flowSequence(trimmed) : scalar(trimmed);
     i += 1;
   }
   return [map, i];
@@ -511,11 +520,7 @@ export function parseComposeEnvFile(
     }
     // Precedência do `GetEnvFromFile`: projeto/shell primeiro, depois o `envMap`
     // acumulado (arquivos anteriores, e as chaves já lidas DESTE arquivo).
-    out[key] = interpolate(
-      value,
-      { ...opts.previous, ...out, ...opts.project },
-      `${label}:${key}`,
-    );
+    out[key] = interpolate(value, { ...opts.previous, ...out, ...opts.project }, `${label}:${key}`);
   }
   return out;
 }
@@ -659,10 +664,7 @@ export function composeServices(compose: Record<string, ComposeNode>): Record<st
 }
 
 /** Os `env_file:` de um serviço, na ordem. Lista vazia quando não há nenhum. */
-export function envFileNamesOf(
-  compose: Record<string, ComposeNode>,
-  service: string,
-): string[] {
+export function envFileNamesOf(compose: Record<string, ComposeNode>, service: string): string[] {
   const declared = asMap(composeServices(compose)[service], `services.${service}`).env_file;
   if (declared === undefined) return [];
   const list = Array.isArray(declared) ? declared : [asString(declared, 'env_file')];

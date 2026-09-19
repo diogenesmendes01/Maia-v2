@@ -208,7 +208,9 @@ describe('#510 fatia D — a lane de fault injection roda no CI e é um GATE', (
       for (const m of expr.matchAll(/process\.env\.([A-Z0-9_]+)/g)) vars.add(m[1]!);
       // Um nível de indireção: `const PYTHON = process.env.X;` usado na condição.
       for (const id of expr.matchAll(/\b([A-Z][A-Z0-9_]*)\b/g)) {
-        const alias = new RegExp(`const\\s+${id[1]}\\s*=\\s*process\\.env\\.([A-Z0-9_]+)`).exec(fonte);
+        const alias = new RegExp(`const\\s+${id[1]}\\s*=\\s*process\\.env\\.([A-Z0-9_]+)`).exec(
+          fonte,
+        );
         if (alias) vars.add(alias[1]!);
       }
       return [...vars].sort();
@@ -235,7 +237,9 @@ describe('#510 fatia D — a lane de fault injection roda no CI e é um GATE', (
 
     it('o extrator pega a guarda direta e a guarda por alias (controles sintéticos)', () => {
       expect(
-        variaveisDaGuarda('const SHOULD_RUN = !!process.env.FOO_BAR; const d = SHOULD_RUN ? describe : describe.skip;'),
+        variaveisDaGuarda(
+          'const SHOULD_RUN = !!process.env.FOO_BAR; const d = SHOULD_RUN ? describe : describe.skip;',
+        ),
       ).toEqual(['FOO_BAR']);
       expect(
         variaveisDaGuarda(
@@ -246,7 +250,9 @@ describe('#510 fatia D — a lane de fault injection roda no CI e é um GATE', (
     });
 
     it('a varredura não é vácua: acha as specs com guarda da lane', () => {
-      const comGuarda = specsDaLane().filter((f) => variaveisDaGuarda(readFileSync(f, 'utf8')).length > 0);
+      const comGuarda = specsDaLane().filter(
+        (f) => variaveisDaGuarda(readFileSync(f, 'utf8')).length > 0,
+      );
       // 8 hoje (os 6 cenários e 2 self-tests), todos guardados só por banco.
       expect(comGuarda.length).toBeGreaterThanOrEqual(8);
     });
@@ -255,7 +261,10 @@ describe('#510 fatia D — a lane de fault injection roda no CI e é um GATE', (
       const disponiveis = envDoJobELane();
       const faltando = specsDaLane()
         .map((f) => ({
-          spec: f.slice(RAIZ.length + 1).split('\\').join('/'),
+          spec: f
+            .slice(RAIZ.length + 1)
+            .split('\\')
+            .join('/'),
           faltam: variaveisDaGuarda(readFileSync(f, 'utf8')).filter((v) => !disponiveis.has(v)),
         }))
         .filter((x) => x.faltam.length > 0);

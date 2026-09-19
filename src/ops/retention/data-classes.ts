@@ -137,9 +137,7 @@ export type ClassDecision =
       readonly still_owed: { readonly owner: DecisionOwner; readonly question: string } | null;
     };
 
-function cls(
-  d: Omit<DataClass, 'retention_days' | 'approval_state'>,
-): DataClass {
+function cls(d: Omit<DataClass, 'retention_days' | 'approval_state'>): DataClass {
   return {
     ...d,
     retention_days: null,
@@ -478,7 +476,7 @@ export const DATA_CLASSES: readonly DataClass[] = Object.freeze([
       ratified_in:
         'issue #536 — ratificação do dono da plataforma, recebida por escrito na direção da tarefa (2026-09-02) e reafirmada na decisão do dono sobre a PR #732 (2026-09-03)',
       decision:
-        'tombstones are structurally non-purgeable: `purge_mechanism: \'not_purgeable\'` here, `parseRetentionPolicy` drops any policy entry for the class, and `resolveRetention` returns `purgeable: false` with `class_not_purgeable` BEFORE it ever looks at the policy',
+        "tombstones are structurally non-purgeable: `purge_mechanism: 'not_purgeable'` here, `parseRetentionPolicy` drops any policy entry for the class, and `resolveRetention` returns `purgeable: false` with `class_not_purgeable` BEFORE it ever looks at the policy",
       rationale:
         'a MINIMUM tombstone retention would have to exceed the LONGEST backup-artifact retention at all times, or restoring an old artifact resurrects data that should already be gone — the exact scenario tombstones exist to cover. Non-purgeable removes the arithmetic entirely: there is no period left to get wrong, and no future `RETENTION_POLICY` can shorten it',
       still_owed: null,
@@ -537,10 +535,7 @@ export const retentionPolicySchema = z.object({
   version: z.string().min(1),
   approved_by: z.string().min(1),
   approved_at: z.string().datetime({ offset: true }),
-  classes: z.record(
-    z.string(),
-    z.object({ retention_days: z.number().int().positive() }),
-  ),
+  classes: z.record(z.string(), z.object({ retention_days: z.number().int().positive() })),
 });
 
 export type RetentionPolicyInput = z.infer<typeof retentionPolicySchema>;
@@ -596,11 +591,7 @@ export interface RetentionVerdict {
   retention_days: number | null;
   policy_version: string;
   /** Stable code, safe for logs and `maia doctor`. */
-  reason:
-    | 'ok'
-    | 'policy_not_approved'
-    | 'class_not_in_policy'
-    | 'class_not_purgeable';
+  reason: 'ok' | 'policy_not_approved' | 'class_not_in_policy' | 'class_not_purgeable';
 }
 
 /**

@@ -169,8 +169,6 @@ export function turnWriteConditions(input: {
 }
 
 /** Conveniência: o `and(...)` já montado, para quem só quer a condição única. */
-export function turnWriteWhere(
-  input: Parameters<typeof turnWriteConditions>[0],
-): SQL {
+export function turnWriteWhere(input: Parameters<typeof turnWriteConditions>[0]): SQL {
   return and(...turnWriteConditions(input)) as SQL;
 }

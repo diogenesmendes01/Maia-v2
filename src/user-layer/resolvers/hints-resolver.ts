@@ -44,10 +44,7 @@ export const hintsResolver = {
       isVisibleLifecycle(behavioral_hint.lifecycle_status),
       // Active hints: not revoked + not expired (or no expiration)
       isNull(behavioral_hint.revoked_at),
-      or(
-        isNull(behavioral_hint.expires_at),
-        gt(behavioral_hint.expires_at, now),
-      ),
+      or(isNull(behavioral_hint.expires_at), gt(behavioral_hint.expires_at, now)),
     ];
 
     // PR #94 round-2 high: enforce agent isolation.

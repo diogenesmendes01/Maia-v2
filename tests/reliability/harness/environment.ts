@@ -75,7 +75,10 @@ const NOMES_PROIBIDOS = new Set(['postgres', 'template0', 'template1', 'maia', '
 
 export class AlvoDestrutivoInvalidoError extends Error {
   readonly motivos: readonly string[];
-  constructor(motivos: readonly string[], alvo: { database: string; host: string; queuePrefix: string }) {
+  constructor(
+    motivos: readonly string[],
+    alvo: { database: string; host: string; queuePrefix: string },
+  ) {
     super(
       `Faxina RECUSADA para database="${alvo.database}" host="${alvo.host}" ` +
         `queuePrefix="${alvo.queuePrefix}". Motivos: ${motivos.join('; ')}.`,
@@ -103,7 +106,8 @@ export function suiteSlug(nome: string): string {
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 24);
-  if (s.length === 0) throw new Error(`Nome de suíte sem caractere utilizável: ${JSON.stringify(nome)}`);
+  if (s.length === 0)
+    throw new Error(`Nome de suíte sem caractere utilizável: ${JSON.stringify(nome)}`);
   return s;
 }
 
@@ -118,7 +122,9 @@ export function nomeDeBancoDaSuite(base: string, nomeDaSuite: string): string {
   const sufixo = `${MARCADOR_DE_BANCO}${slug}`;
   const espacoParaBase = 63 - sufixo.length;
   if (espacoParaBase < 1) {
-    throw new Error(`Nome de suíte longo demais para caber num identificador do Postgres: ${nomeDaSuite}`);
+    throw new Error(
+      `Nome de suíte longo demais para caber num identificador do Postgres: ${nomeDaSuite}`,
+    );
   }
   return `${base.slice(0, espacoParaBase)}${sufixo}`;
 }
@@ -185,7 +191,11 @@ export function assertAlvoDestrutivo(
   }
 
   if (motivos.length > 0) {
-    throw new AlvoDestrutivoInvalidoError(motivos, { database, host, queuePrefix: alvo.queuePrefix });
+    throw new AlvoDestrutivoInvalidoError(motivos, {
+      database,
+      host,
+      queuePrefix: alvo.queuePrefix,
+    });
   }
 }
 
@@ -366,7 +376,9 @@ export class ReliabilityEnvironment {
    * Variáveis que um processo filho precisa para apontar para ESTE ambiente.
    * Passe direto em `SpawnOptions.env`.
    */
-  envDoFilho(extra: Readonly<Record<string, string | undefined>> = {}): Record<string, string | undefined> {
+  envDoFilho(
+    extra: Readonly<Record<string, string | undefined>> = {},
+  ): Record<string, string | undefined> {
     return {
       NODE_ENV: 'test',
       MAIA_ENV: 'development',
@@ -454,7 +466,9 @@ export class ReliabilityEnvironment {
         // `WITH (FORCE)` derruba conexões pendentes de um filho que morreu por
         // SIGKILL sem fechar o pool — sem isso o DROP fica preso e a suíte
         // seguinte herda o banco.
-        await admin.query(`DROP DATABASE IF EXISTS "${this.estado.databaseName.replace(/"/g, '""')}" WITH (FORCE)`);
+        await admin.query(
+          `DROP DATABASE IF EXISTS "${this.estado.databaseName.replace(/"/g, '""')}" WITH (FORCE)`,
+        );
       } finally {
         await admin.end();
       }
@@ -469,7 +483,9 @@ export class ReliabilityEnvironment {
         const admin = new pg.Client({ connectionString: urlDeManutencao(this.estado.databaseUrl) });
         await admin.connect();
         try {
-          await admin.query(`DROP DATABASE IF EXISTS "${this.estado.databaseName.replace(/"/g, '""')}" WITH (FORCE)`);
+          await admin.query(
+            `DROP DATABASE IF EXISTS "${this.estado.databaseName.replace(/"/g, '""')}" WITH (FORCE)`,
+          );
         } finally {
           await admin.end();
         }

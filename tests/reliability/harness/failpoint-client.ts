@@ -98,7 +98,9 @@ export interface OpcoesDeAlcance {
  * A injeção está ligada NESTE processo? Checagem barata e sem efeito — é o
  * guard que mantém o failpoint zero-custo no caminho normal.
  */
-export function injecaoLigada(env: Readonly<Record<string, string | undefined>> = process.env): boolean {
+export function injecaoLigada(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): boolean {
   return env[FAILPOINT_ENABLE_ENV] === '1' && typeof env[FAILPOINT_ENDPOINT_ENV] === 'string';
 }
 
@@ -160,10 +162,7 @@ export async function alcancar(
  * Não é um failpoint e não passa pelo catálogo: o catálogo é a lista fechada
  * dos pontos que a PRODUÇÃO tem, e uma barreira não é um deles.
  */
-export async function barreira(
-  nome: string,
-  opts: OpcoesDeAlcance = {},
-): Promise<AcaoLocal> {
+export async function barreira(nome: string, opts: OpcoesDeAlcance = {}): Promise<AcaoLocal> {
   const env = opts.env ?? process.env;
   if (!injecaoLigada(env)) return 'release';
   await falar(env, ROTA_BARREIRA, { barreira: nome }, `barreira:${nome}`, opts.timeoutMs ?? 60_000);

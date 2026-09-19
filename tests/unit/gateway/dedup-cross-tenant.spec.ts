@@ -66,10 +66,7 @@
  *     loud-failure path.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 import { buildCacheKey } from '@/lib/cache-key.js';
 
 // ---------------------------------------------------------------------------
@@ -117,9 +114,12 @@ vi.mock('@/lib/redis.js', () => ({
 // mensagensRepo.findByWhatsappId default: no DB hit. Individual tests
 // override `findByWhatsappIdMock` to force the DB-confirmed-duplicate
 // branch (which backfills Redis).
-const findByWhatsappIdMock = vi.fn(async (_id: string) => null as null | {
-  id: string;
-});
+const findByWhatsappIdMock = vi.fn(
+  async (_id: string) =>
+    null as null | {
+      id: string;
+    },
+);
 
 vi.mock('@/db/repositories.js', () => ({
   mensagensRepo: {
@@ -172,12 +172,9 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
   // -------------------------------------------------------------------------
   describe('markSeen', () => {
     it('emits a Redis key prefixed with tenant_id AND agent_id', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
 
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(1);
@@ -189,12 +186,9 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
       // markSeen calls could race between EXISTS and SET. With NX, only
       // the first writer wins; the loser observes the cached "1" on the
       // next isDuplicate.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
       const setCall = calls.find((c) => c.op === 'set');
       expect(setCall).toBeDefined();
       // Must include NX in the args.
@@ -205,18 +199,12 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
     });
 
     it('SYMMETRY — same whatsapp_id under tenant-B emits a DIFFERENT key', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
 
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(2);
@@ -228,18 +216,12 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
     it('CROSS-AGENT (same tenant) — different agents emit DIFFERENT keys', async () => {
       // Mirrors the DB fallback scoping (tenant_id + agent_id + wid) — the
       // cache cannot diverge from the source of truth.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A2 },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A2 }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
 
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(2);
@@ -251,9 +233,7 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
     it('throws MissingTenantContextError when called without tenant context', async () => {
       // Loud failure — invariant: a missing-context bug must crash, NOT
       // fall back to an empty/shared namespace.
-      await expect(markSeen(COLLIDING_WID)).rejects.toThrow(
-        MissingTenantContextError,
-      );
+      await expect(markSeen(COLLIDING_WID)).rejects.toThrow(MissingTenantContextError);
 
       // Nothing should have been written to Redis.
       expect(redisStub.set).not.toHaveBeenCalled();
@@ -265,12 +245,9 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
       // here: markSeen should be a quiet no-op. The dedup contract is
       // deferred to the DB fallback (covered by repositories' own tests).
       redisConnected = false;
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
       expect(redisStub.set).not.toHaveBeenCalled();
       expect(redisStub.exists).not.toHaveBeenCalled();
     });
@@ -294,12 +271,9 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
 
     it('CROSS-TENANT INDEPENDENCE — same whatsapp_id seen by tenant-A is NOT a duplicate for tenant-B', async () => {
       // This is the core property the bug violated.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
       const aIsDup = await runWithTenantContext(
         { tenant_id: TENANT_A, agent_id: AGENT_A },
         async () => isDuplicate(COLLIDING_WID),
@@ -317,12 +291,9 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
       // Mirrors the DB fallback's `(tenant, agent, wid)` scoping at the
       // cache layer. Without agent_id in the key, agent-A2 would be
       // silently deduped by agent-A1's cache and lose a legitimate inbound.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
       const a1IsDup = await runWithTenantContext(
         { tenant_id: TENANT_A, agent_id: AGENT_A },
         async () => isDuplicate(COLLIDING_WID),
@@ -338,12 +309,9 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
 
     it('SYMMETRY (B → A) — tenant-B cache hit does NOT dedup tenant-A', async () => {
       // Mirror of the cross-tenant test: prove the property is symmetric.
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await markSeen(COLLIDING_WID);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await markSeen(COLLIDING_WID);
+      });
       const bIsDup = await runWithTenantContext(
         { tenant_id: TENANT_B, agent_id: AGENT_B },
         async () => isDuplicate(COLLIDING_WID),
@@ -393,9 +361,7 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
       ).toBe(true);
       expect(
         existsKeys.some((k) =>
-          k.startsWith(
-            'dedup:msg:' + encodeURIComponent(ATTACKER_TENANT) + ':',
-          ),
+          k.startsWith('dedup:msg:' + encodeURIComponent(ATTACKER_TENANT) + ':'),
         ),
       ).toBe(false);
     });
@@ -418,9 +384,7 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
     });
 
     it('throws MissingTenantContextError when called without tenant context', async () => {
-      await expect(isDuplicate(COLLIDING_WID)).rejects.toThrow(
-        MissingTenantContextError,
-      );
+      await expect(isDuplicate(COLLIDING_WID)).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.exists).not.toHaveBeenCalled();
       expect(redisStub.set).not.toHaveBeenCalled();
       expect(findByWhatsappIdMock).not.toHaveBeenCalled();
@@ -466,18 +430,12 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
       // Without encoding both tuples would produce the SAME raw string
       // `dedup:msg:acme:dev:WID`. With encoding they're distinct because
       // the colon is escaped to %3A and lands in a different segment.
-      await runWithTenantContext(
-        { tenant_id: 'acme:dev', agent_id: 'x' },
-        async () => {
-          await markSeen('WID');
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: 'acme', agent_id: 'dev:x' },
-        async () => {
-          await markSeen('WID');
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme:dev', agent_id: 'x' }, async () => {
+        await markSeen('WID');
+      });
+      await runWithTenantContext({ tenant_id: 'acme', agent_id: 'dev:x' }, async () => {
+        await markSeen('WID');
+      });
 
       const setKeys = keysOf('set');
       expect(setKeys).toHaveLength(2);
@@ -489,12 +447,9 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
     it('whatsapp_id containing ":" or "%" is encoded', async () => {
       // External-system value — we cannot assume it never contains the
       // delimiter or a percent prefix.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await markSeen('WID:weird%val');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await markSeen('WID:weird%val');
+      });
       const setKeys = keysOf('set');
       expect(setKeys[0]).toBe(
         'dedup:msg:' +
@@ -516,12 +471,9 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
     // wildcard in any KEYS/SCAN MATCH pattern derived from the segment.
     // -------------------------------------------------------------------------
     it('issue #287: key equals the buildCacheKey composition and neutralizes glob metachars', async () => {
-      await runWithTenantContext(
-        { tenant_id: 'acme*', agent_id: AGENT_A },
-        async () => {
-          await markSeen('WID!glob');
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme*', agent_id: AGENT_A }, async () => {
+        await markSeen('WID!glob');
+      });
       const key = keysOf('set')[0]!;
       expect(key).toBe(buildCacheKey('dedup:msg:', 'acme*', AGENT_A, 'WID!glob'));
       expect(key).toContain('acme%2A');
@@ -539,9 +491,8 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
   describe('fail-closed validation of ALS context', () => {
     it('throws on empty-string tenant_id (corrupted ALS)', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: '', agent_id: AGENT_A },
-          async () => markSeen(COLLIDING_WID),
+        runWithTenantContext({ tenant_id: '', agent_id: AGENT_A }, async () =>
+          markSeen(COLLIDING_WID),
         ),
       ).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.set).not.toHaveBeenCalled();
@@ -549,9 +500,8 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
 
     it('throws on whitespace-only tenant_id (corrupted ALS)', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: '   ', agent_id: AGENT_A },
-          async () => markSeen(COLLIDING_WID),
+        runWithTenantContext({ tenant_id: '   ', agent_id: AGENT_A }, async () =>
+          markSeen(COLLIDING_WID),
         ),
       ).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.set).not.toHaveBeenCalled();
@@ -559,9 +509,8 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
 
     it('throws on tenant_id with surrounding whitespace (forces ingress-side normalisation)', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: ' ' + TENANT_A + ' ', agent_id: AGENT_A },
-          async () => markSeen(COLLIDING_WID),
+        runWithTenantContext({ tenant_id: ' ' + TENANT_A + ' ', agent_id: AGENT_A }, async () =>
+          markSeen(COLLIDING_WID),
         ),
       ).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.set).not.toHaveBeenCalled();
@@ -569,9 +518,8 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
 
     it('throws on empty-string agent_id (corrupted ALS)', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: TENANT_A, agent_id: '' },
-          async () => markSeen(COLLIDING_WID),
+        runWithTenantContext({ tenant_id: TENANT_A, agent_id: '' }, async () =>
+          markSeen(COLLIDING_WID),
         ),
       ).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.set).not.toHaveBeenCalled();
@@ -579,9 +527,8 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
 
     it('throws on whitespace-only agent_id (corrupted ALS)', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: TENANT_A, agent_id: '\t' },
-          async () => markSeen(COLLIDING_WID),
+        runWithTenantContext({ tenant_id: TENANT_A, agent_id: '\t' }, async () =>
+          markSeen(COLLIDING_WID),
         ),
       ).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.set).not.toHaveBeenCalled();
@@ -589,9 +536,8 @@ describe('issue #247 — gateway dedup Redis keys are tenant+agent-scoped', () =
 
     it('isDuplicate ALSO rejects corrupted context before any Redis or DB op', async () => {
       await expect(
-        runWithTenantContext(
-          { tenant_id: '', agent_id: AGENT_A },
-          async () => isDuplicate(COLLIDING_WID),
+        runWithTenantContext({ tenant_id: '', agent_id: AGENT_A }, async () =>
+          isDuplicate(COLLIDING_WID),
         ),
       ).rejects.toThrow(MissingTenantContextError);
       // No Redis or DB op should have been issued.

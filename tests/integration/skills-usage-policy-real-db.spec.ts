@@ -109,9 +109,7 @@ d('skills.usage_policy (migration 077) — real DB', () => {
         ORDER BY skill_descriptor`,
       [TENANT, [...BASELINE_DESCRIPTORS]],
     );
-    expect(rows.map((r) => r.skill_descriptor).sort()).toEqual(
-      [...BASELINE_DESCRIPTORS].sort(),
-    );
+    expect(rows.map((r) => r.skill_descriptor).sort()).toEqual([...BASELINE_DESCRIPTORS].sort());
     for (const r of rows) {
       const policy = parseUsagePolicy(r.usage_policy);
       expect(policy, `${r.skill_descriptor} must carry a usage_policy`).not.toBeNull();

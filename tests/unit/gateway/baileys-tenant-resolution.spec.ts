@@ -47,9 +47,7 @@ const {
   handlerState,
 } = vi.hoisted(() => {
   const state: {
-    upsertHandler:
-      | ((args: { messages: unknown[] }) => Promise<void>)
-      | null;
+    upsertHandler: ((args: { messages: unknown[] }) => Promise<void>) | null;
   } = { upsertHandler: null };
   return {
     findByExternalCrossTenantMock: vi.fn<
@@ -82,9 +80,7 @@ vi.mock('@whiskeysockets/baileys', () => ({
   default: () => fakeSocket,
   DisconnectReason: { loggedOut: 401 },
   useMultiFileAuthState: vi.fn().mockResolvedValue({ state: {}, saveCreds: vi.fn() }),
-  fetchLatestBaileysVersion: vi
-    .fn()
-    .mockResolvedValue({ version: [2, 3000, 0], isLatest: true }),
+  fetchLatestBaileysVersion: vi.fn().mockResolvedValue({ version: [2, 3000, 0], isLatest: true }),
   downloadMediaMessage: vi.fn(),
 }));
 
@@ -234,9 +230,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
 
     const observed: Array<{ tenant_id: string; agent_id: string }> = [];
     createInboundMock.mockImplementation(async () => {
-      const { tryGetCurrentContext } = await import(
-        '@/db/tenant-context.js'
-      );
+      const { tryGetCurrentContext } = await import('@/db/tenant-context.js');
       const ctx = tryGetCurrentContext();
       if (!ctx) throw new Error('no ALS context');
       observed.push({ tenant_id: ctx.tenant_id, agent_id: ctx.agent_id });
@@ -293,9 +287,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     let observedTenant: string | null = null;
     let observedAgent: string | null = null;
     createInboundMock.mockImplementation(async () => {
-      const { getCurrentTenant, getCurrentAgent } = await import(
-        '@/db/tenant-context.js'
-      );
+      const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
       observedTenant = getCurrentTenant();
       observedAgent = getCurrentAgent();
       return {
@@ -353,10 +345,9 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     expect(audited.metadata.raw_jid).toBe('5511999999999@s.whatsapp.net');
     expect(audited.metadata.whatsapp_id).toBe('WAID-UNKNOWN');
     expect(audited.metadata.emitter).toBe('baileys_ingress');
-    expect(
-      (audited.metadata.resolver_details as { resolver_path?: string })
-        ?.resolver_path,
-    ).toBe('unknown_or_inactive_channel');
+    expect((audited.metadata.resolver_details as { resolver_path?: string })?.resolver_path).toBe(
+      'unknown_or_inactive_channel',
+    );
   });
 
   it('malformed JID → audit + drop, NO repo lookup (jid_unparseable)', async () => {
@@ -373,11 +364,10 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
       (call) => (call[0] as { acao?: string })?.acao === 'channel_resolution_failed',
     );
     expect(failedAudits).toHaveLength(1);
-    const md = (failedAudits[0]![0] as { metadata: Record<string, unknown> })
-      .metadata;
-    expect(
-      (md.resolver_details as { resolver_path?: string })?.resolver_path,
-    ).toBe('jid_unparseable');
+    const md = (failedAudits[0]![0] as { metadata: Record<string, unknown> }).metadata;
+    expect((md.resolver_details as { resolver_path?: string })?.resolver_path).toBe(
+      'jid_unparseable',
+    );
   });
 
   it('🟠 MEDIUM (#417): malformed envelope with NO key → fail-closed audit (channel_resolution_failed), NOT an opaque handle_failed crash', async () => {
@@ -400,9 +390,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     };
 
     // Must NOT throw out of the handler (the deref bug would crash the audit).
-    await expect(
-      handlerState.upsertHandler!({ messages: [noKeyMsg] }),
-    ).resolves.toBeUndefined();
+    await expect(handlerState.upsertHandler!({ messages: [noKeyMsg] })).resolves.toBeUndefined();
 
     // No tenant resolution, no inbound persisted.
     expect(findByExternalCrossTenantMock).not.toHaveBeenCalled();
@@ -449,9 +437,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     let observedTenant: string | null = null;
     let observedAgent: string | null = null;
     createInboundMock.mockImplementation(async () => {
-      const { getCurrentTenant, getCurrentAgent } = await import(
-        '@/db/tenant-context.js'
-      );
+      const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
       observedTenant = getCurrentTenant();
       observedAgent = getCurrentAgent();
       return {
@@ -501,9 +487,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     await startBaileys();
 
     await handlerState.upsertHandler!({
-      messages: [
-        inbound('99999@lid', 'WAID-LID', { senderPn: '5511555555555' }),
-      ],
+      messages: [inbound('99999@lid', 'WAID-LID', { senderPn: '5511555555555' })],
     });
 
     expect(observedTenant).toBe('tenant-lid');
@@ -534,18 +518,14 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
 
     // The de-noised, dedicated action — NOT the generic failure.
     const skipped = auditMock.mock.calls.filter(
-      (c) =>
-        (c[0] as { acao?: string })?.acao ===
-        'channel_resolution_skipped_lid_unmapped',
+      (c) => (c[0] as { acao?: string })?.acao === 'channel_resolution_skipped_lid_unmapped',
     );
     expect(skipped).toHaveLength(1);
     const md = (skipped[0]![0] as { metadata: Record<string, unknown> }).metadata;
     expect(md.raw_jid).toBe('168813890908183@lid');
     expect(md.whatsapp_id).toBe('WAID-LID-SYNC');
     expect(md.emitter).toBe('baileys_ingress');
-    expect(
-      (md.resolver_details as { resolver_path?: string })?.resolver_path,
-    ).toBe('lid_unmapped');
+    expect((md.resolver_details as { resolver_path?: string })?.resolver_path).toBe('lid_unmapped');
 
     // The generic ownership-miss action stays clean of this benign sync noise.
     const failed = auditMock.mock.calls.filter(
@@ -555,9 +535,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
   });
 
   it('@lid without senderPn but LID store maps it → recovers the real phone, resolves and processes', async () => {
-    const getPNForLID = vi
-      .fn()
-      .mockResolvedValue('5511555555555@s.whatsapp.net');
+    const getPNForLID = vi.fn().mockResolvedValue('5511555555555@s.whatsapp.net');
     (fakeSocket as Record<string, unknown>).signalRepository = {
       lidMapping: { getPNForLID },
     };
@@ -574,8 +552,7 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
     createInboundMock.mockImplementation(async (arg: unknown) => {
       const { getCurrentTenant } = await import('@/db/tenant-context.js');
       observedTenant = getCurrentTenant();
-      observedTel = (arg as { metadata?: { telefone?: unknown } })?.metadata
-        ?.telefone;
+      observedTel = (arg as { metadata?: { telefone?: unknown } })?.metadata?.telefone;
       return {
         row: { id: 'msg-lid-store', tenant_id: observedTenant, agent_id: 'agent-lid-store' },
         duplicate: false,
@@ -602,10 +579,9 @@ describe('baileys messages.upsert — runs handleIncoming inside RESOLVED tenant
 
     // No drop audits of either kind.
     const drops = auditMock.mock.calls.filter((c) =>
-      [
-        'channel_resolution_failed',
-        'channel_resolution_skipped_lid_unmapped',
-      ].includes((c[0] as { acao?: string })?.acao ?? ''),
+      ['channel_resolution_failed', 'channel_resolution_skipped_lid_unmapped'].includes(
+        (c[0] as { acao?: string })?.acao ?? '',
+      ),
     );
     expect(drops).toHaveLength(0);
 

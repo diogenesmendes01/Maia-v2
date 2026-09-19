@@ -44,7 +44,12 @@ const ctx = {
 describe('read_turn_context (none)', () => {
   it('returns recent messages of the conversa, oldest-first', async () => {
     recentInConversationMock.mockResolvedValueOnce([
-      { direcao: 'out', tipo: 'texto', conteudo: 'B', created_at: new Date('2026-01-02T00:00:00Z') },
+      {
+        direcao: 'out',
+        tipo: 'texto',
+        conteudo: 'B',
+        created_at: new Date('2026-01-02T00:00:00Z'),
+      },
       { direcao: 'in', tipo: 'texto', conteudo: 'A', created_at: new Date('2026-01-01T00:00:00Z') },
     ]);
     const { readTurnContextTool } = await import('../../../src/tools/read-turn-context.js');
@@ -86,11 +91,17 @@ describe('remember_safe_fact (write, save_safe_fact)', () => {
       fonte: 'aprendido',
     });
     // The input schema has no `escopo` field — the LLM cannot widen scope.
-    expect(rememberSafeFactTool.input_schema.safeParse({
-      chave: 'k', valor: 'v', escopo: 'global',
-    }).success).toBe(true); // extra key ignored by zod object (non-strict)
+    expect(
+      rememberSafeFactTool.input_schema.safeParse({
+        chave: 'k',
+        valor: 'v',
+        escopo: 'global',
+      }).success,
+    ).toBe(true); // extra key ignored by zod object (non-strict)
     const parsed = rememberSafeFactTool.input_schema.parse({
-      chave: 'k', valor: 'v', escopo: 'global',
+      chave: 'k',
+      valor: 'v',
+      escopo: 'global',
     }) as Record<string, unknown>;
     expect(parsed).not.toHaveProperty('escopo');
   });
@@ -155,7 +166,10 @@ describe('audit_decision (none) — wrapper over audit()', () => {
     expect(auditMock).toHaveBeenCalledTimes(1);
     const call = auditMock.mock.calls[0]![0] as { acao: string; metadata: Record<string, unknown> };
     expect(call.acao).toBe('decision_audited'); // fixed; cannot be forged
-    expect(call.metadata).toMatchObject({ decision: 'declined_refund', rationale: 'no validation' });
+    expect(call.metadata).toMatchObject({
+      decision: 'declined_refund',
+      rationale: 'no validation',
+    });
   });
 });
 

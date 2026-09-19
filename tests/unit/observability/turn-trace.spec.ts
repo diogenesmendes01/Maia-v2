@@ -5,9 +5,7 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const traceMock = vi.fn();
 vi.mock('@/control-plane/runtime-trace/index.js', async (importOriginal) => {
-  const actual = await importOriginal<
-    typeof import('@/control-plane/runtime-trace/index.js')
-  >();
+  const actual = await importOriginal<typeof import('@/control-plane/runtime-trace/index.js')>();
   return { ...actual, trace: traceMock };
 });
 
@@ -151,19 +149,20 @@ describe('issue #514 — runtime trace on the hot path', () => {
     it('effect-capable action modes require an envelope', () => {
       const lowRisk = { risk_profile: { level: 'low' as const } };
       expect(sideEffectLevelFor({ ...lowRisk, action_mode: 'call_tool' }, false)).toBe('medium');
-      expect(sideEffectLevelFor({ ...lowRisk, action_mode: 'execute_skill' }, false)).toBe('medium');
+      expect(sideEffectLevelFor({ ...lowRisk, action_mode: 'execute_skill' }, false)).toBe(
+        'medium',
+      );
       expect(
-        sideEffectLevelFor(
-          { risk_profile: { level: 'high' }, action_mode: 'call_tool' },
-          false,
-        ),
+        sideEffectLevelFor({ risk_profile: { level: 'high' }, action_mode: 'call_tool' }, false),
       ).toBe('high');
     });
 
     it('read-only modes stay best-effort', () => {
       const lowRisk = { risk_profile: { level: 'low' as const } };
       expect(sideEffectLevelFor({ ...lowRisk, action_mode: 'respond' }, false)).toBe('low');
-      expect(sideEffectLevelFor({ ...lowRisk, action_mode: 'ask_clarification' }, false)).toBe('low');
+      expect(sideEffectLevelFor({ ...lowRisk, action_mode: 'ask_clarification' }, false)).toBe(
+        'low',
+      );
     });
 
     it('a governance block is itself mandatory evidence', () => {

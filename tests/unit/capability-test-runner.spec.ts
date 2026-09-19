@@ -23,9 +23,8 @@ const { getByIdMock, recordMock, createGapMock } = vi.hoisted(() => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     capabilityProposalsRepo: { getById: getByIdMock },
@@ -174,9 +173,9 @@ describe('runCapabilityTests', () => {
   it('proposal não encontrada → throw proposal_not_found', async () => {
     getByIdMock.mockResolvedValueOnce(null);
 
-    await expect(
-      runCapabilityTests({ proposal_id: 'missing' }),
-    ).rejects.toThrow('proposal_not_found');
+    await expect(runCapabilityTests({ proposal_id: 'missing' })).rejects.toThrow(
+      'proposal_not_found',
+    );
 
     expect(recordMock).not.toHaveBeenCalled();
     expect(createGapMock).not.toHaveBeenCalled();

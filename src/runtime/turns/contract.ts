@@ -433,7 +433,7 @@ export function sanitizeTurnError(input: {
   const raw =
     input.code ??
     (typeof (input.error as { code?: unknown } | null | undefined)?.code === 'string'
-      ? ((input.error as { code: string }).code)
+      ? (input.error as { code: string }).code
       : null);
   const code = normalizeTurnErrorCode(raw);
 

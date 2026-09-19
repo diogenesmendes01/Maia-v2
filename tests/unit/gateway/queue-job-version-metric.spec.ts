@@ -75,9 +75,7 @@ const { startAgentWorker } = await import('@/gateway/queue.js');
 const { lifecycle } = await import('@/runtime/lifecycle/controller.js');
 const { _resetForTests, renderPrometheus } = await import('@/lib/metrics.js');
 const { _resetLabelGuardForTests } = await import('@/observability/labels.js');
-const { currentTraceId, tryGetCorrelation } = await import(
-  '@/observability/correlation.js'
-);
+const { currentTraceId, tryGetCorrelation } = await import('@/observability/correlation.js');
 
 const TURN = 'aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa';
 const MENSAGEM = 'bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb';
@@ -196,6 +194,8 @@ describe('#504 — o boot liga o consumidor dual ao worker', () => {
   it('o processor registrado em `startAgentWorker` é `runAgentTurnJob`', async () => {
     const fonte = await readFile(new URL('../../../src/index.ts', import.meta.url), 'utf8');
     expect(fonte).toContain("import { runAgentTurnJob } from '@/runtime/turns/job-consumer.js'");
-    expect(fonte).toMatch(/startAgentWorker\(async \(_job, parsed, facts\) => \{\s*await runAgentTurnJob\(parsed, facts\);/);
+    expect(fonte).toMatch(
+      /startAgentWorker\(async \(_job, parsed, facts\) => \{\s*await runAgentTurnJob\(parsed, facts\);/,
+    );
   });
 });

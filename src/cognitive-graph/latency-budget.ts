@@ -69,9 +69,7 @@ export async function measureSyncP95(args: {
     )
     .groupBy(cognitive_module_log.turno_id);
 
-  const perTurnTotals = rows
-    .filter((r) => r.turno_id !== null)
-    .map((r) => Number(r.total));
+  const perTurnTotals = rows.filter((r) => r.turno_id !== null).map((r) => Number(r.total));
 
   return { p95_ms: computeP95(perTurnTotals), sample_size: perTurnTotals.length };
 }

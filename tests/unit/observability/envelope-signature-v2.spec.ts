@@ -49,14 +49,16 @@ vi.mock('@/db/client.js', () => ({
   db: { select: vi.fn(() => chain()) },
 }));
 
-const { runtimeTraceRepo, TraceAttemptScopeError } = await import(
-  '@/db/repositories/runtime-trace-repos.js'
-);
-const { signHmac, _resetHmacCacheForTests, _setTestMasterSecretForTests, _clearTestMasterSecretForTests } =
-  await import('@/control-plane/runtime-trace/lib/hmac.js');
-const { verifyEnvelopeIntegrity } = await import(
-  '@/control-plane/runtime-trace/verify-envelope.js'
-);
+const { runtimeTraceRepo, TraceAttemptScopeError } =
+  await import('@/db/repositories/runtime-trace-repos.js');
+const {
+  signHmac,
+  _resetHmacCacheForTests,
+  _setTestMasterSecretForTests,
+  _clearTestMasterSecretForTests,
+} = await import('@/control-plane/runtime-trace/lib/hmac.js');
+const { verifyEnvelopeIntegrity } =
+  await import('@/control-plane/runtime-trace/verify-envelope.js');
 
 const TENANT = 'tenant-A';
 const ROOT = '7e6d5c4b-3a29-4180-9f7e-6d5c4b3a2918';

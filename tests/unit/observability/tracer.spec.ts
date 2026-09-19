@@ -96,9 +96,7 @@ describe('issue #535 — tracer', () => {
 
     it('rethrows the wrapped error untouched and still emits the span', async () => {
       const boom = new Error('boom');
-      await expect(withSpan(SPAN.TURN, async () => Promise.reject(boom))).rejects.toBe(
-        boom,
-      );
+      await expect(withSpan(SPAN.TURN, async () => Promise.reject(boom))).rejects.toBe(boom);
       expect(captured).toHaveLength(1);
       expect(captured[0]?.status).toBe('error');
     });
@@ -190,10 +188,7 @@ describe('issue #535 — tracer', () => {
       recordElapsedSpan(SPAN.QUEUE_WAIT, start, start + 5_000, { queue: 'agent' });
       const span = captured[0];
       expect(span?.name).toBe(SPAN.QUEUE_WAIT);
-      expect(Number(span!.end_unix_nano - span!.start_unix_nano) / 1e6).toBeCloseTo(
-        5_000,
-        0,
-      );
+      expect(Number(span!.end_unix_nano - span!.start_unix_nano) / 1e6).toBeCloseTo(5_000, 0);
       expect(span?.attributes.queue).toBe('agent');
     });
 
@@ -239,9 +234,8 @@ describe('issue #535 — tracer', () => {
       // Without the `result` attribute the waterfall would render a blocked
       // dispatch as a clean success and disagree with
       // `maia_tool_dispatch_total` about the very same call.
-      const { instrumentToolDispatch } = await import(
-        '../../../src/observability/instrumentation.js'
-      );
+      const { instrumentToolDispatch } =
+        await import('../../../src/observability/instrumentation.js');
       await instrumentToolDispatch('criar_lancamento', async () => ({
         error: 'tool_not_granted',
       }));
@@ -251,9 +245,8 @@ describe('issue #535 — tracer', () => {
     });
 
     it('nests the dispatch span under the open turn span', async () => {
-      const { instrumentToolDispatch } = await import(
-        '../../../src/observability/instrumentation.js'
-      );
+      const { instrumentToolDispatch } =
+        await import('../../../src/observability/instrumentation.js');
       await runWithCorrelation({ trace_id: TURN_UUID }, () =>
         withSpan(SPAN.TURN, () => instrumentToolDispatch('listar', async () => ({ ok: 1 }))),
       );

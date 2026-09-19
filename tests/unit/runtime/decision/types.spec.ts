@@ -112,9 +112,7 @@ describe('P9b — Decision Engine types', () => {
       approval_class: 'owner_plus_compliance',
     };
     const asMid: MidPepOutput = decision;
-    expect((asMid as RequireDualApprovalDecision).decision).toBe(
-      'require_dual_approval',
-    );
+    expect((asMid as RequireDualApprovalDecision).decision).toBe('require_dual_approval');
   });
 
   it('EarlyPepOutput accepts either Block or Continue', () => {

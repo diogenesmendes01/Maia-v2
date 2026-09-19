@@ -46,9 +46,7 @@ test.describe('Console construído — boot', () => {
     await expect(page).toHaveURL(/\/auth\/signin\?callbackUrl=%2Finbox$/);
   });
 
-  test('route handler do NextAuth responde /api/auth/providers em JSON', async ({
-    request,
-  }) => {
+  test('route handler do NextAuth responde /api/auth/providers em JSON', async ({ request }) => {
     const res = await request.get('/api/auth/providers');
     expect(res.status(), await res.text()).toBe(200);
     expect(res.headers()['content-type']).toContain('application/json');
@@ -71,9 +69,7 @@ test.describe('Console construído — boot', () => {
     });
   });
 
-  test('cabeçalhos de segurança de next.config.mjs chegam na resposta', async ({
-    request,
-  }) => {
+  test('cabeçalhos de segurança de next.config.mjs chegam na resposta', async ({ request }) => {
     const res = await request.get('/auth/signin');
     expect(res.status()).toBe(200);
     const headers = res.headers();
@@ -82,9 +78,7 @@ test.describe('Console construído — boot', () => {
     expect(headers['x-frame-options']).toBe('DENY');
   });
 
-  test('nenhum erro de console e nenhuma resposta 5xx na jornada pública', async ({
-    page,
-  }) => {
+  test('nenhum erro de console e nenhuma resposta 5xx na jornada pública', async ({ page }) => {
     const erros: string[] = [];
     const servidor: string[] = [];
 

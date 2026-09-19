@@ -6,7 +6,11 @@ describe('P7 — postturn-graph composition', () => {
   it('inclui step-evaluator-trigger + correction-reflection + success-reflection todos ASYNC', () => {
     const nodes = buildPostturnNodes();
     const names = nodes.map((n) => n.name).sort();
-    expect(names).toEqual(['correction-reflection', 'step-evaluator-trigger', 'success-reflection']);
+    expect(names).toEqual([
+      'correction-reflection',
+      'step-evaluator-trigger',
+      'success-reflection',
+    ]);
     nodes.forEach((n) => expect(n.layer).toBe(CognitiveLayer.ASYNC));
   });
 

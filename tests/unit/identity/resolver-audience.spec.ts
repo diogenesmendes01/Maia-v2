@@ -128,9 +128,7 @@ describe('resolveIdentity — AudienceContext (#407)', () => {
 
     // Agent Y sees the SAME phone as an employee (different pessoa row, scoped
     // by the other agent — exactly what the relaxed composite unique enables).
-    findByPhone.mockResolvedValueOnce(
-      mkPessoa({ id: 'pessoa-2', agent_id: 'agent-y' }),
-    );
+    findByPhone.mockResolvedValueOnce(mkPessoa({ id: 'pessoa-2', agent_id: 'agent-y' }));
     findByPessoa.mockResolvedValueOnce(
       mkProfile({
         id: 'aud-2',

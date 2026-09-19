@@ -262,4 +262,3 @@ async function commitOutboundIntentInner(
     row: result.row,
   };
 }
-

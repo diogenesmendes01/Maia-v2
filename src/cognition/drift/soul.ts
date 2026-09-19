@@ -101,7 +101,11 @@ export const soulDriftDetector: DriftDetector = {
         messages_evaluated: agentMessages.length,
         severity_hint,
       },
-      evidence_summary: `${violations.length} bias(es) com aderência baixa em ${agentMessages.length} msgs`.slice(0, 200),
+      evidence_summary:
+        `${violations.length} bias(es) com aderência baixa em ${agentMessages.length} msgs`.slice(
+          0,
+          200,
+        ),
     };
   },
 };
@@ -166,7 +170,10 @@ async function llmJudgeBiasAdherence(
   // silenciosamente mesmo com LLM configurado.
   if (!isLLMConfigured()) return null;
 
-  const sample = messages.slice(-10).map((m) => `- ${m.text}`).join('\n');
+  const sample = messages
+    .slice(-10)
+    .map((m) => `- ${m.text}`)
+    .join('\n');
   const system = [
     'Você é um auditor de aderência comportamental.',
     'Dado um princípio comportamental ("soul bias") e mensagens recentes do agente, analise se as mensagens demonstram aderência ao princípio.',

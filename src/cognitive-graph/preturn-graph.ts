@@ -25,7 +25,9 @@ export type PreturnContext = GraphContext & {
  * do `agent/core.ts`. O grafo cobre apenas os módulos cognitivos LLM-backed
  * que já passam por `runCognitiveModule` no path legacy.
  */
-export function buildPreturnNodes(args: { multi_channel_on: boolean }): ModuleDescriptor<PreturnContext, unknown>[] {
+export function buildPreturnNodes(args: {
+  multi_channel_on: boolean;
+}): ModuleDescriptor<PreturnContext, unknown>[] {
   const nodes: ModuleDescriptor<PreturnContext, unknown>[] = [];
 
   // Node: procedure-selector

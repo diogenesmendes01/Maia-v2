@@ -57,9 +57,7 @@ const __TEST_KEYRING = new Map<number, string>();
  */
 export function _setTestMasterSecretForTests(secret: string): void {
   if (config.NODE_ENV === 'production') {
-    throw new Error(
-      'p10b: _setTestMasterSecretForTests is forbidden when NODE_ENV=production',
-    );
+    throw new Error('p10b: _setTestMasterSecretForTests is forbidden when NODE_ENV=production');
   }
   __TEST_MASTER_SECRET = secret;
   // Bust cache so the new secret takes effect immediately.
@@ -76,9 +74,7 @@ export function _setTestMasterSecretForTests(secret: string): void {
  */
 export function _setTestKeyringEntryForTests(version: number, secret: string): void {
   if (config.NODE_ENV === 'production') {
-    throw new Error(
-      'p10b: _setTestKeyringEntryForTests is forbidden when NODE_ENV=production',
-    );
+    throw new Error('p10b: _setTestKeyringEntryForTests is forbidden when NODE_ENV=production');
   }
   __TEST_KEYRING.set(version, secret);
   KEY_CACHE.clear();
@@ -246,11 +242,7 @@ export function canonicalJson(value: unknown): string {
 }
 
 /** Sign a payload with the tenant-scoped key. Returns base64. */
-export function signHmac(
-  tenant_id: string,
-  version: number,
-  payload: unknown,
-): string {
+export function signHmac(tenant_id: string, version: number, payload: unknown): string {
   const key = deriveTenantKey(tenant_id, version);
   const h = createHmac('sha256', key);
   h.update(canonicalJson(payload), 'utf8');

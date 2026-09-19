@@ -11,20 +11,8 @@ import { Button } from '../../../components/ui/button.js';
 import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
 import { Field, Textarea } from '../../../components/ui/field.js';
 import { Modal } from '../../../components/ui/modal.js';
-import {
-  Alert,
-  EmptyState,
-  ErrorState,
-  LoadingState,
-} from '../../../components/ui/states.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../../components/ui/table.js';
+import { Alert, EmptyState, ErrorState, LoadingState } from '../../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../../components/ui/table.js';
 import { IconArrowLeft, IconBot } from '../../../components/ui/icons.js';
 import {
   DEFAULT_PROFILE,
@@ -45,13 +33,7 @@ import ObjectivesTab from './_components/objectives-tab.js';
 import GoLiveChecklist from './_components/go-live-checklist.js';
 import CapabilitiesModal from './_components/capabilities-modal.js';
 
-type TabId =
-  | 'overview'
-  | 'profile'
-  | 'versions'
-  | 'activity'
-  | 'playground'
-  | 'objectives';
+type TabId = 'overview' | 'profile' | 'versions' | 'activity' | 'playground' | 'objectives';
 
 const TAB_IDS: readonly TabId[] = [
   'overview',
@@ -79,9 +61,7 @@ export default function AgentDetailPage() {
   // ?tab=versions etc. — permite que Identidades e a fila Aprovações
   // aterrissem direto na aba certa (a aprovação de perfil vive aqui).
   const requestedTab = search.get('tab');
-  const [tab, setTab] = React.useState<TabId>(
-    isTabId(requestedTab) ? requestedTab : 'overview',
-  );
+  const [tab, setTab] = React.useState<TabId>(isTabId(requestedTab) ? requestedTab : 'overview');
 
   const agentQuery = trpc.agents.getById.useQuery(
     { tenantId, id: agentId },
@@ -100,10 +80,7 @@ export default function AgentDetailPage() {
     return <LoadingState label="Carregando agente…" />;
   if (agentQuery.error)
     return (
-      <ErrorState
-        message={agentQuery.error.message}
-        onRetry={() => void agentQuery.refetch()}
-      />
+      <ErrorState message={agentQuery.error.message} onRetry={() => void agentQuery.refetch()} />
     );
 
   const agent = agentQuery.data;
@@ -177,9 +154,7 @@ export default function AgentDetailPage() {
             id: 'versions',
             label: 'Versões',
             badge:
-              proposed.length > 0 ? (
-                <Badge tone="warning">{proposed.length}</Badge>
-              ) : undefined,
+              proposed.length > 0 ? <Badge tone="warning">{proposed.length}</Badge> : undefined,
           },
           { id: 'activity', label: 'Atividade' },
           { id: 'objectives', label: 'Objetivos' },
@@ -225,9 +200,7 @@ export default function AgentDetailPage() {
           agentId={agent.id}
           canApprove={canManage}
           activeBody={active?.profile_body ?? null}
-          proposedBodies={Object.fromEntries(
-            proposed.map((p) => [p.id, p.profile_body]),
-          )}
+          proposedBodies={Object.fromEntries(proposed.map((p) => [p.id, p.profile_body]))}
           onChanged={() => void profileQuery.refetch()}
         />
       )}
@@ -313,11 +286,7 @@ function OverviewTab({
         }
         actions={
           canManage && (
-            <Button
-              size="sm"
-              variant="secondary"
-              onClick={() => setShowCapabilitiesModal(true)}
-            >
+            <Button size="sm" variant="secondary" onClick={() => setShowCapabilitiesModal(true)}>
               Gerenciar
             </Button>
           )
@@ -524,8 +493,8 @@ function ProfileTab({
     <div className="space-y-4">
       <Alert tone="info">
         Mudanças de perfil não entram em operação direto: o envio cria uma{' '}
-        <strong>nova versão proposta</strong>, que precisa de aprovação na aba
-        Versões. A versão ativa atual continua valendo até lá.
+        <strong>nova versão proposta</strong>, que precisa de aprovação na aba Versões. A versão
+        ativa atual continua valendo até lá.
       </Alert>
 
       <IdentitySection value={value} onChange={setValue} />
@@ -594,9 +563,7 @@ function VersionsTab({
   // decisão, uma trilha de auditoria, mesmas classes por risco computado
   // (dual para high — a segunda assinatura pode vir daqui ou do /inbox).
   const approveMutation = trpc.proposals.approve.useMutation();
-  const [target, setTarget] = React.useState<{ id: string; version: number } | null>(
-    null,
-  );
+  const [target, setTarget] = React.useState<{ id: string; version: number } | null>(null);
   const [comment, setComment] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
   const [notice, setNotice] = React.useState<string | null>(null);
@@ -725,8 +692,8 @@ function VersionsTab({
           ) : (
             target && (
               <Alert tone="warning" title="Conteúdo da proposta indisponível">
-                Não foi possível carregar o corpo desta versão para comparação.
-                Recarregue a página antes de aprovar.
+                Não foi possível carregar o corpo desta versão para comparação. Recarregue a página
+                antes de aprovar.
               </Alert>
             )
           )}

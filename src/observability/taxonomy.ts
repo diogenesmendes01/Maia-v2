@@ -61,33 +61,30 @@ export type SpanName = (typeof SPAN)[keyof typeof SPAN];
  * Parent of each span, `null` for the root. Encodes the tree drawn in issue
  * #514 §2 so a test can assert the shape and an exporter can rebuild it.
  */
-export const SPAN_PARENT: Readonly<Record<SpanName, SpanName | null>> =
-  Object.freeze({
-    [SPAN.TURN]: null,
-    [SPAN.QUEUE_WAIT]: SPAN.TURN,
-    [SPAN.IDENTITY_RESOLVE]: SPAN.TURN,
-    [SPAN.AUDIENCE_RESOLVE]: SPAN.TURN,
-    [SPAN.PRETURN_GRAPH]: SPAN.TURN,
-    [SPAN.ROLE_SELECT]: SPAN.PRETURN_GRAPH,
-    [SPAN.PROCEDURE_SELECT]: SPAN.PRETURN_GRAPH,
-    [SPAN.DECISION_EVALUATE]: SPAN.TURN,
-    [SPAN.RISK_CLASSIFY]: SPAN.DECISION_EVALUATE,
-    [SPAN.PROMPT_RENDER]: SPAN.TURN,
-    [SPAN.CONTEXT_LOAD]: SPAN.PROMPT_RENDER,
-    [SPAN.REACT_ITERATION]: SPAN.TURN,
-    [SPAN.LLM_REQUEST]: SPAN.REACT_ITERATION,
-    [SPAN.TOOL_DISPATCH]: SPAN.REACT_ITERATION,
-    [SPAN.PERMISSION_CHECK]: SPAN.TOOL_DISPATCH,
-    [SPAN.CONSTITUTIONAL_CHECK]: SPAN.TOOL_DISPATCH,
-    [SPAN.IDEMPOTENCY_CLAIM]: SPAN.TOOL_DISPATCH,
-    [SPAN.HANDLER_EXECUTE]: SPAN.TOOL_DISPATCH,
-    [SPAN.OUTBOUND_COMMIT]: SPAN.REACT_ITERATION,
-    [SPAN.TURN_COMPLETE]: SPAN.TURN,
-  });
+export const SPAN_PARENT: Readonly<Record<SpanName, SpanName | null>> = Object.freeze({
+  [SPAN.TURN]: null,
+  [SPAN.QUEUE_WAIT]: SPAN.TURN,
+  [SPAN.IDENTITY_RESOLVE]: SPAN.TURN,
+  [SPAN.AUDIENCE_RESOLVE]: SPAN.TURN,
+  [SPAN.PRETURN_GRAPH]: SPAN.TURN,
+  [SPAN.ROLE_SELECT]: SPAN.PRETURN_GRAPH,
+  [SPAN.PROCEDURE_SELECT]: SPAN.PRETURN_GRAPH,
+  [SPAN.DECISION_EVALUATE]: SPAN.TURN,
+  [SPAN.RISK_CLASSIFY]: SPAN.DECISION_EVALUATE,
+  [SPAN.PROMPT_RENDER]: SPAN.TURN,
+  [SPAN.CONTEXT_LOAD]: SPAN.PROMPT_RENDER,
+  [SPAN.REACT_ITERATION]: SPAN.TURN,
+  [SPAN.LLM_REQUEST]: SPAN.REACT_ITERATION,
+  [SPAN.TOOL_DISPATCH]: SPAN.REACT_ITERATION,
+  [SPAN.PERMISSION_CHECK]: SPAN.TOOL_DISPATCH,
+  [SPAN.CONSTITUTIONAL_CHECK]: SPAN.TOOL_DISPATCH,
+  [SPAN.IDEMPOTENCY_CLAIM]: SPAN.TOOL_DISPATCH,
+  [SPAN.HANDLER_EXECUTE]: SPAN.TOOL_DISPATCH,
+  [SPAN.OUTBOUND_COMMIT]: SPAN.REACT_ITERATION,
+  [SPAN.TURN_COMPLETE]: SPAN.TURN,
+});
 
-export const SPAN_NAMES: readonly SpanName[] = Object.freeze(
-  Object.values(SPAN) as SpanName[],
-);
+export const SPAN_NAMES: readonly SpanName[] = Object.freeze(Object.values(SPAN) as SpanName[]);
 
 /** Terminal status of a span. Mirrors the metric `status` enum. */
 export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
@@ -175,29 +172,28 @@ export type SpanStatus = 'ok' | 'error' | 'blocked' | 'timeout' | 'cancelled';
  */
 export type SpanEmission = 'emitted' | 'declared';
 
-export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> =
-  Object.freeze({
-    [SPAN.TURN]: 'emitted',
-    [SPAN.QUEUE_WAIT]: 'emitted',
-    [SPAN.IDENTITY_RESOLVE]: 'emitted',
-    [SPAN.AUDIENCE_RESOLVE]: 'emitted',
-    [SPAN.PRETURN_GRAPH]: 'emitted',
-    [SPAN.ROLE_SELECT]: 'emitted',
-    [SPAN.PROCEDURE_SELECT]: 'emitted',
-    [SPAN.RISK_CLASSIFY]: 'emitted',
-    [SPAN.DECISION_EVALUATE]: 'emitted',
-    [SPAN.CONTEXT_LOAD]: 'emitted',
-    [SPAN.PROMPT_RENDER]: 'emitted',
-    [SPAN.REACT_ITERATION]: 'emitted',
-    [SPAN.LLM_REQUEST]: 'emitted',
-    [SPAN.TOOL_DISPATCH]: 'emitted',
-    [SPAN.PERMISSION_CHECK]: 'emitted',
-    [SPAN.CONSTITUTIONAL_CHECK]: 'emitted',
-    [SPAN.IDEMPOTENCY_CLAIM]: 'emitted',
-    [SPAN.HANDLER_EXECUTE]: 'emitted',
-    [SPAN.OUTBOUND_COMMIT]: 'emitted',
-    [SPAN.TURN_COMPLETE]: 'emitted',
-  });
+export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> = Object.freeze({
+  [SPAN.TURN]: 'emitted',
+  [SPAN.QUEUE_WAIT]: 'emitted',
+  [SPAN.IDENTITY_RESOLVE]: 'emitted',
+  [SPAN.AUDIENCE_RESOLVE]: 'emitted',
+  [SPAN.PRETURN_GRAPH]: 'emitted',
+  [SPAN.ROLE_SELECT]: 'emitted',
+  [SPAN.PROCEDURE_SELECT]: 'emitted',
+  [SPAN.RISK_CLASSIFY]: 'emitted',
+  [SPAN.DECISION_EVALUATE]: 'emitted',
+  [SPAN.CONTEXT_LOAD]: 'emitted',
+  [SPAN.PROMPT_RENDER]: 'emitted',
+  [SPAN.REACT_ITERATION]: 'emitted',
+  [SPAN.LLM_REQUEST]: 'emitted',
+  [SPAN.TOOL_DISPATCH]: 'emitted',
+  [SPAN.PERMISSION_CHECK]: 'emitted',
+  [SPAN.CONSTITUTIONAL_CHECK]: 'emitted',
+  [SPAN.IDEMPOTENCY_CLAIM]: 'emitted',
+  [SPAN.HANDLER_EXECUTE]: 'emitted',
+  [SPAN.OUTBOUND_COMMIT]: 'emitted',
+  [SPAN.TURN_COMPLETE]: 'emitted',
+});
 
 /**
  * The three names #535 REMOVED, and the individual technical reason for each.
@@ -215,43 +211,42 @@ export const SPAN_EMISSION: Readonly<Record<SpanName, SpanEmission>> =
  * They are listed rather than deleted silently so a future reader who wants one
  * back has to answer the objection instead of rediscovering it.
  */
-export const SPANS_REMOVED_IN_535: Readonly<Record<string, string>> =
-  Object.freeze({
-    /**
-     * Normalising a Baileys `WebMessageInfo` into Maia's inbound shape happens in
-     * the GATEWAY process, before the job is enqueued. The `turn` span is opened
-     * by the BullMQ worker (`src/gateway/queue.ts`) when it PICKS UP that job, so
-     * the declared parent begins strictly after this child has ended. There is
-     * also no trace id to hang it on yet: `deriveTraceId()` derives from the
-     * persisted `mensagens.id`, which does not exist until `ingress.persist`
-     * completes. Rate and failures of this stage are already published by
-     * `maia_inbound_received_total` / `maia_inbound_rejected_total`.
-     */
-    'ingress.normalize':
-      'gateway-side; it ends before the declared parent `turn` begins, and it runs before the trace id it would need exists',
-    /**
-     * Same impossible parentage, plus a sharper form of the id problem: this is
-     * the INSERT that mints `mensagens.id`, the value the whole trace is keyed on.
-     * A span cannot carry the trace id its own completion creates. The duration
-     * and outcome of the write are already covered by
-     * `maia_inbound_persisted_total` and the DB-pool gauges.
-     */
-    'ingress.persist':
-      'the operation that MINTS the trace id cannot be a span inside that trace, and it too ends before `turn` begins',
-    /**
-     * The physical provider call moved to the durable outbox (#316/#630): it runs
-     * in the delivery worker, off its own BullMQ queue, after retries and possibly
-     * minutes later. The `turn` span has long since closed, and the delivery
-     * worker establishes no correlation scope, so the span would carry a random
-     * trace id and join nothing. The boundary that IS inside the turn — the
-     * transactional commit that makes the send durable — is `outbound.commit`, and
-     * that one has a real emitter. Delivery itself is measured by
-     * `maia_outbound_send_total` / `maia_outbound_send_ms`; giving it a trace of
-     * its own, linked by trace id, is a separate design, not this span.
-     */
-    'whatsapp.send':
-      'the send now happens in the delivery worker after `turn` has closed, so the declared parent cannot contain it',
-  });
+export const SPANS_REMOVED_IN_535: Readonly<Record<string, string>> = Object.freeze({
+  /**
+   * Normalising a Baileys `WebMessageInfo` into Maia's inbound shape happens in
+   * the GATEWAY process, before the job is enqueued. The `turn` span is opened
+   * by the BullMQ worker (`src/gateway/queue.ts`) when it PICKS UP that job, so
+   * the declared parent begins strictly after this child has ended. There is
+   * also no trace id to hang it on yet: `deriveTraceId()` derives from the
+   * persisted `mensagens.id`, which does not exist until `ingress.persist`
+   * completes. Rate and failures of this stage are already published by
+   * `maia_inbound_received_total` / `maia_inbound_rejected_total`.
+   */
+  'ingress.normalize':
+    'gateway-side; it ends before the declared parent `turn` begins, and it runs before the trace id it would need exists',
+  /**
+   * Same impossible parentage, plus a sharper form of the id problem: this is
+   * the INSERT that mints `mensagens.id`, the value the whole trace is keyed on.
+   * A span cannot carry the trace id its own completion creates. The duration
+   * and outcome of the write are already covered by
+   * `maia_inbound_persisted_total` and the DB-pool gauges.
+   */
+  'ingress.persist':
+    'the operation that MINTS the trace id cannot be a span inside that trace, and it too ends before `turn` begins',
+  /**
+   * The physical provider call moved to the durable outbox (#316/#630): it runs
+   * in the delivery worker, off its own BullMQ queue, after retries and possibly
+   * minutes later. The `turn` span has long since closed, and the delivery
+   * worker establishes no correlation scope, so the span would carry a random
+   * trace id and join nothing. The boundary that IS inside the turn — the
+   * transactional commit that makes the send durable — is `outbound.commit`, and
+   * that one has a real emitter. Delivery itself is measured by
+   * `maia_outbound_send_total` / `maia_outbound_send_ms`; giving it a trace of
+   * its own, linked by trace id, is a separate design, not this span.
+   */
+  'whatsapp.send':
+    'the send now happens in the delivery worker after `turn` has closed, so the declared parent cannot contain it',
+});
 
 /**
  * The spans PRODUCTION REACHES today — not the spans an instrumentation site
@@ -1043,8 +1038,7 @@ export const METRIC = {
    * há linha vencida" É zero. Não confundir com o `NaN` que o coletor devolve
    * quando NÃO CONSEGUIU LER: ausência de leitura nunca é zero saudável.
    */
-  ONBOARDING_EXPIRY_OLDEST_AGE_SECONDS:
-    'maia_onboarding_expiry_oldest_age_seconds',
+  ONBOARDING_EXPIRY_OLDEST_AGE_SECONDS: 'maia_onboarding_expiry_oldest_age_seconds',
 
   // --- ops / restore drill (issue #536) ------------------------------------
   /**
@@ -1319,14 +1313,7 @@ export const FORBIDDEN_KEY_SUBSTRINGS: readonly string[] = Object.freeze([
  * against them.
  */
 export const ENUM_VALUES = Object.freeze({
-  status: [
-    'ok',
-    'error',
-    'blocked',
-    'timeout',
-    'cancelled',
-    'skipped',
-  ] as const,
+  status: ['ok', 'error', 'blocked', 'timeout', 'cancelled', 'skipped'] as const,
   outcome: [
     'completed',
     'retryable',
@@ -1343,14 +1330,7 @@ export const ENUM_VALUES = Object.freeze({
   // canal novo tem que DECIDIR a sua história de idempotência lá antes de
   // aparecer aqui.
   channel: ['whatsapp'] as const,
-  origin: [
-    'ingress',
-    'queue',
-    'recovery',
-    'replay',
-    'probe',
-    'internal',
-  ] as const,
+  origin: ['ingress', 'queue', 'recovery', 'replay', 'probe', 'internal'] as const,
   required: ['true', 'false'] as const,
 });
 
@@ -1383,11 +1363,11 @@ export const CONTEXT_LOAD_STAGE = Object.freeze({
   TURN_CONTEXT: 'turn_context',
 } as const);
 
-export type ContextLoadStage =
-  (typeof CONTEXT_LOAD_STAGE)[keyof typeof CONTEXT_LOAD_STAGE];
+export type ContextLoadStage = (typeof CONTEXT_LOAD_STAGE)[keyof typeof CONTEXT_LOAD_STAGE];
 
-export const CONTEXT_LOAD_STAGE_VALUES: readonly ContextLoadStage[] =
-  Object.freeze(Object.values(CONTEXT_LOAD_STAGE));
+export const CONTEXT_LOAD_STAGE_VALUES: readonly ContextLoadStage[] = Object.freeze(
+  Object.values(CONTEXT_LOAD_STAGE),
+);
 
 // ---------------------------------------------------------------------------
 // 3.1 Onboarding saga — vocabulários FECHADOS (issue #519, review do PR #541)
@@ -1606,8 +1586,7 @@ export const EFFECT_BOUNDARY = Object.freeze({
   REACT_TOOL_REFUSED: 'react_tool_refused',
 } as const);
 
-export type EffectBoundary =
-  (typeof EFFECT_BOUNDARY)[keyof typeof EFFECT_BOUNDARY];
+export type EffectBoundary = (typeof EFFECT_BOUNDARY)[keyof typeof EFFECT_BOUNDARY];
 
 export const EFFECT_BOUNDARY_VALUES: readonly EffectBoundary[] = Object.freeze(
   Object.values(EFFECT_BOUNDARY),
@@ -1619,10 +1598,9 @@ export const EFFECT_BOUNDARY_VALUES: readonly EffectBoundary[] = Object.freeze(
  * `docs/runbooks/turn-state-machine.md` documenta, e a que o pinning test
  * compara com o código.
  */
-export const EFFECT_BOUNDARY_METRIC_VALUES: readonly EffectBoundary[] =
-  Object.freeze(
-    Object.values(EFFECT_BOUNDARY).filter((b) => b !== 'react_tool_refused'),
-  );
+export const EFFECT_BOUNDARY_METRIC_VALUES: readonly EffectBoundary[] = Object.freeze(
+  Object.values(EFFECT_BOUNDARY).filter((b) => b !== 'react_tool_refused'),
+);
 
 /**
  * Issue #504 §Contrato do job — os três valores que o label `version` de
@@ -1632,11 +1610,7 @@ export const EFFECT_BOUNDARY_METRIC_VALUES: readonly EffectBoundary[] =
  * a igualdade é pinada por `tests/unit/observability/turn-job-version-taxonomy.spec.ts`
  * — uma quarta forma de payload não pode virar série sem passar por aqui.
  */
-export const TURN_JOB_VERSION_VALUES: readonly string[] = Object.freeze([
-  'v1',
-  'v2',
-  'invalid',
-]);
+export const TURN_JOB_VERSION_VALUES: readonly string[] = Object.freeze(['v1', 'v2', 'invalid']);
 
 /**
  * Issue #504 — motivos pelos quais o resolvedor de escopo do job V2 RECUSA um
@@ -1722,33 +1696,32 @@ export function closedVocabulary(
  * and `METRIC.LABEL_CARDINALITY_OVERFLOW` increments — the registry degrades
  * instead of exploding (issue #514 "Rollback: se cardinalidade explodir").
  */
-export const LABEL_CARDINALITY_BUDGET: Readonly<Record<string, number>> =
-  Object.freeze({
-    tenant_id: 500,
-    agent_id: 2000,
-    model: 50,
-    tool: 200,
-    skill: 200,
-    queue: 20,
-    worker: 100,
-    job: 100,
-    stage: 60,
-    span: 60,
-    reason: 60,
-    // Vocabulários fechados e pequenos: 11 passos e 17 códigos de check. O
-    // budget é o teto do contrato, não uma estimativa.
-    step: 20,
-    check_code: 24,
-    // Issue #601: `EFFECT_BOUNDARY` tem 16 membros (15 emitem) + o `other` do
-    // colapso, e a série carrega no máximo os 15 + `other`. O
-    // budget é o teto do contrato com folga para novos limites de efeito, não uma
-    // estimativa — e o vocabulário fechado já impede que texto livre chegue aqui.
-    boundary: 20,
-    // Issue #504: `v1` | `v2` | `invalid` + o `other` do colapso. O budget é o
-    // teto do contrato, não uma estimativa — e o vocabulário fechado já impede
-    // que uma versão inventada chegue aqui.
-    version: 8,
-  });
+export const LABEL_CARDINALITY_BUDGET: Readonly<Record<string, number>> = Object.freeze({
+  tenant_id: 500,
+  agent_id: 2000,
+  model: 50,
+  tool: 200,
+  skill: 200,
+  queue: 20,
+  worker: 100,
+  job: 100,
+  stage: 60,
+  span: 60,
+  reason: 60,
+  // Vocabulários fechados e pequenos: 11 passos e 17 códigos de check. O
+  // budget é o teto do contrato, não uma estimativa.
+  step: 20,
+  check_code: 24,
+  // Issue #601: `EFFECT_BOUNDARY` tem 16 membros (15 emitem) + o `other` do
+  // colapso, e a série carrega no máximo os 15 + `other`. O
+  // budget é o teto do contrato com folga para novos limites de efeito, não uma
+  // estimativa — e o vocabulário fechado já impede que texto livre chegue aqui.
+  boundary: 20,
+  // Issue #504: `v1` | `v2` | `invalid` + o `other` do colapso. O budget é o
+  // teto do contrato, não uma estimativa — e o vocabulário fechado já impede
+  // que uma versão inventada chegue aqui.
+  version: 8,
+});
 
 /** Budget applied to any allowed key without an explicit entry above. */
 export const DEFAULT_LABEL_CARDINALITY_BUDGET = 30;
@@ -1814,8 +1787,7 @@ export const FORBIDDEN_SPAN_ATTRIBUTE_KEYS: ReadonlySet<string> = new Set(
 
 export const FORBIDDEN_SPAN_KEY_SUBSTRINGS: readonly string[] = Object.freeze(
   FORBIDDEN_KEY_SUBSTRINGS.filter(
-    (frag) =>
-      frag !== 'trace_id' && frag !== 'conversa' && frag !== 'conversation',
+    (frag) => frag !== 'trace_id' && frag !== 'conversa' && frag !== 'conversation',
   ),
 );
 

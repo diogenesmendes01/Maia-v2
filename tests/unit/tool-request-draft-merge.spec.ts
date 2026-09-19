@@ -60,7 +60,10 @@ function rascunho(args: {
 
 describe('#637 — fusão de rascunhos: um pedido só', () => {
   it('um membro é `single` e o contrato é o dele, byte a byte', () => {
-    const r = rascunho({ nome: 'emitir_guia', inputs: [{ name: 'competencia', zod: 'z.string()' }] });
+    const r = rascunho({
+      nome: 'emitir_guia',
+      inputs: [{ name: 'competencia', zod: 'z.string()' }],
+    });
     const f = dm().fundirRascunhos({
       membros: [{ origem: 'm1', rascunho: r }],
       gap_id_do_representante: GAP,
@@ -253,10 +256,16 @@ describe('#637 — rascunhos INCOMPATÍVEIS: divergente, e ninguém vence', () =
   it('conflito na SAÍDA também diverge — os dois lados do contrato valem igual', () => {
     const f = dm().fundirRascunhos({
       membros: [
-        { origem: 'm1', rascunho: rascunho({ nome: 't', outputs: [{ name: 'url', zod: 'z.string()' }] }) },
+        {
+          origem: 'm1',
+          rascunho: rascunho({ nome: 't', outputs: [{ name: 'url', zod: 'z.string()' }] }),
+        },
         {
           origem: 'm2',
-          rascunho: rascunho({ nome: 't', outputs: [{ name: 'url', zod: 'z.array(z.unknown())' }] }),
+          rascunho: rascunho({
+            nome: 't',
+            outputs: [{ name: 'url', zod: 'z.array(z.unknown())' }],
+          }),
         },
       ],
       gap_id_do_representante: GAP,
@@ -297,8 +306,8 @@ describe('#637 — rascunhos INCOMPATÍVEIS: divergente, e ninguém vence', () =
   });
 
   it('agregado sem membro nenhum não existe — e falhar alto é melhor que fingir', () => {
-    expect(() =>
-      dm().fundirRascunhos({ membros: [], gap_id_do_representante: GAP }),
-    ).toThrow(/nenhum membro/);
+    expect(() => dm().fundirRascunhos({ membros: [], gap_id_do_representante: GAP })).toThrow(
+      /nenhum membro/,
+    );
   });
 });

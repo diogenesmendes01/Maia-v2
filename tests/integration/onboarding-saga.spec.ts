@@ -211,15 +211,23 @@ d('saga de onboarding — ponta a ponta', () => {
     const payload = { tenant_id: TENANT, nome: 'Saga Acme' };
 
     const first = await executeOnboardingStep({
-      run_id: run.id, step: 'provision_tenant', payload,
-      idempotency_key: 'retry-key-1', expected_version: 1, actor: ACTOR,
+      run_id: run.id,
+      step: 'provision_tenant',
+      payload,
+      idempotency_key: 'retry-key-1',
+      expected_version: 1,
+      actor: ACTOR,
     });
     expect(first).toMatchObject({ status: 'completed', replayed: false });
 
     // O cliente não viu a resposta: repete com a MESMA chave e a versão ANTIGA.
     const retry = await executeOnboardingStep({
-      run_id: run.id, step: 'provision_tenant', payload,
-      idempotency_key: 'retry-key-1', expected_version: 1, actor: ACTOR,
+      run_id: run.id,
+      step: 'provision_tenant',
+      payload,
+      idempotency_key: 'retry-key-1',
+      expected_version: 1,
+      actor: ACTOR,
     });
     expect(retry).toMatchObject({ status: 'completed', replayed: true });
 
@@ -244,14 +252,20 @@ d('saga de onboarding — ponta a ponta', () => {
     const { executeOnboardingStep } = await import('../../src/onboarding/wizard.js');
     const run = await startRun();
     await executeOnboardingStep({
-      run_id: run.id, step: 'provision_tenant',
+      run_id: run.id,
+      step: 'provision_tenant',
       payload: { tenant_id: TENANT, nome: 'Saga Acme' },
-      idempotency_key: 'conflict-key', expected_version: 1, actor: ACTOR,
+      idempotency_key: 'conflict-key',
+      expected_version: 1,
+      actor: ACTOR,
     });
     const out = await executeOnboardingStep({
-      run_id: run.id, step: 'provision_tenant',
+      run_id: run.id,
+      step: 'provision_tenant',
       payload: { tenant_id: TENANT, nome: 'OUTRO NOME' },
-      idempotency_key: 'conflict-key', expected_version: 1, actor: ACTOR,
+      idempotency_key: 'conflict-key',
+      expected_version: 1,
+      actor: ACTOR,
     });
     expect(out).toMatchObject({ status: 'conflict', code: 'idempotency_payload_mismatch' });
   });
@@ -261,9 +275,12 @@ d('saga de onboarding — ponta a ponta', () => {
     const run = await startRun();
     const call = (key: string) =>
       executeOnboardingStep({
-        run_id: run.id, step: 'provision_tenant',
+        run_id: run.id,
+        step: 'provision_tenant',
         payload: { tenant_id: TENANT, nome: 'Saga Acme' },
-        idempotency_key: key, expected_version: 1, actor: ACTOR,
+        idempotency_key: key,
+        expected_version: 1,
+        actor: ACTOR,
       });
     const [a, b] = await Promise.all([call('conc-key-a'), call('conc-key-b')]);
     const statuses = [a.status, b.status].sort();
@@ -304,7 +321,9 @@ d('saga de onboarding — ponta a ponta', () => {
         [run.id],
       );
       expect(ledger.rows[0].n).toBe(0);
-      const state = await c.query('SELECT state, version FROM onboarding_runs WHERE id=$1', [run.id]);
+      const state = await c.query('SELECT state, version FROM onboarding_runs WHERE id=$1', [
+        run.id,
+      ]);
       expect(state.rows[0]).toEqual({ state: 'created', version: 1 });
     } finally {
       c.release();
@@ -315,7 +334,9 @@ d('saga de onboarding — ponta a ponta', () => {
     const { evaluateAgentReadiness } = await import('../../src/onboarding/readiness.js');
     const c = await pool.connect();
     try {
-      await c.query('INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT DO NOTHING', [TENANT]);
+      await c.query('INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT DO NOTHING', [
+        TENANT,
+      ]);
       await c.query(
         'INSERT INTO agents(id, tenant_id, nome, status) VALUES ($1,$2,$1,$3) ON CONFLICT DO NOTHING',
         [AGENT, TENANT, 'provisioning'],
@@ -369,9 +390,8 @@ d('saga de onboarding — ponta a ponta', () => {
     // para `tenants(id)`, e aqui a linha-alvo não existe nem no fim do teste.
     // Estes são os dois sítios em que o defeito de FK era fatal — a criação da
     // run e o cancelamento de uma run ainda em `created`.
-    const { startOnboardingRun, cancelOnboardingRun } = await import(
-      '../../src/onboarding/wizard.js'
-    );
+    const { startOnboardingRun, cancelOnboardingRun } =
+      await import('../../src/onboarding/wizard.js');
     const ghost = 'saga-fantasma';
     const actor = { actor_id: 'saga-tester', actor_role: 'owner' as const, tenant_id: ghost };
 
@@ -430,9 +450,8 @@ d('saga de onboarding — ponta a ponta', () => {
  */
 d('saga de onboarding — caminho feliz completo até a ativação', () => {
   it('provisiona, prova posse da linha, aprova readiness e ativa', async () => {
-    const { startOnboardingRun, executeOnboardingStep } = await import(
-      '../../src/onboarding/wizard.js'
-    );
+    const { startOnboardingRun, executeOnboardingStep } =
+      await import('../../src/onboarding/wizard.js');
 
     const started = await startOnboardingRun({
       kind: 'tenant_onboarding',

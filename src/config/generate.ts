@@ -208,8 +208,7 @@ function templatePlaceholder(spec: EnvVarSpec, profile: MaiaProfile): string {
   const example = spec.example ?? '';
   const url = /^([a-z][a-z0-9+.-]*):\/\//i.exec(example);
   if (url?.[1]) {
-    const scheme =
-      url[1].toLowerCase() === 'http' && profile !== 'development' ? 'https' : url[1];
+    const scheme = url[1].toLowerCase() === 'http' && profile !== 'development' ? 'https' : url[1];
     return `${scheme}://__SET_ME__`;
   }
   // Keep the documented example ONLY when a bare marker would not satisfy the
@@ -339,7 +338,9 @@ function renderEnvFile(options: EnvRenderOptions): string {
       ),
     );
     for (const t of TOMBSTONES) {
-      lines.push(`#   ${t.name} — removida em ${t.removedIn}${t.replacement ? ` (use ${t.replacement})` : ''}`);
+      lines.push(
+        `#   ${t.name} — removida em ${t.removedIn}${t.replacement ? ` (use ${t.replacement})` : ''}`,
+      );
     }
     lines.push('');
   }
@@ -398,7 +399,9 @@ export function renderConfigDoc(): string {
   out.push('');
   out.push('> **ARQUIVO GERADO — não edite à mão.**');
   out.push('> Fonte da verdade: [`src/config/contract.ts`](../src/config/contract.ts).');
-  out.push('> Regenerar: `npm run config:generate`. Verificar drift: `npm run config:check:drift`.');
+  out.push(
+    '> Regenerar: `npm run config:generate`. Verificar drift: `npm run config:check:drift`.',
+  );
   out.push('');
   out.push(`Versão do contrato: \`${CONTRACT_VERSION}\``);
   out.push('');
@@ -414,9 +417,15 @@ export function renderConfigDoc(): string {
   out.push('');
   out.push('| Profile | Postura |');
   out.push('|---|---|');
-  out.push('| `development` | Endpoints locais permitidos, alertas podem ser só `log`, backup remoto opcional, auth de desenvolvimento explicitamente permitida, placeholders tolerados. |');
-  out.push('| `staging` | Equivalente a produção sempre que possível: secrets de teste obrigatórios, backup validado, nenhum placeholder. |');
-  out.push('| `production` | Placeholders e auth de desenvolvimento recusados, dependências condicionais obrigatórias, thresholds validados, configuração mínima por serviço. |');
+  out.push(
+    '| `development` | Endpoints locais permitidos, alertas podem ser só `log`, backup remoto opcional, auth de desenvolvimento explicitamente permitida, placeholders tolerados. |',
+  );
+  out.push(
+    '| `staging` | Equivalente a produção sempre que possível: secrets de teste obrigatórios, backup validado, nenhum placeholder. |',
+  );
+  out.push(
+    '| `production` | Placeholders e auth de desenvolvimento recusados, dependências condicionais obrigatórias, thresholds validados, configuração mínima por serviço. |',
+  );
   out.push('');
   out.push(
     '**O boot falha fechado em TODOS os profiles.** Variável desconhecida, variável removida ' +
@@ -438,10 +447,16 @@ export function renderConfigDoc(): string {
   out.push('## Comandos');
   out.push('');
   out.push('```bash');
-  out.push('npm run config:generate                 # regenera .env.example, docs, manifest, fixtures');
-  out.push('npm run config:check:drift              # falha se os artefatos gerados estiverem desatualizados');
+  out.push(
+    'npm run config:generate                 # regenera .env.example, docs, manifest, fixtures',
+  );
+  out.push(
+    'npm run config:check:drift              # falha se os artefatos gerados estiverem desatualizados',
+  );
   out.push('npm run config:check -- --profile production --env-file .env');
-  out.push('npm run config:check -- --profile development --env-file .env.example --allow-placeholders');
+  out.push(
+    'npm run config:check -- --profile development --env-file .env.example --allow-placeholders',
+  );
   out.push('npm run config:init -- --profile production   # ponto de partida operacional');
   out.push('```');
   out.push('');
@@ -484,9 +499,7 @@ export function renderConfigDoc(): string {
   out.push('|---|---:|---:|');
   for (const service of MAIA_SERVICES) {
     const specs = entriesForService(service);
-    out.push(
-      `| \`${service}\` | ${specs.length} | ${specs.filter((s) => s.secret).length} |`,
-    );
+    out.push(`| \`${service}\` | ${specs.length} | ${specs.filter((s) => s.secret).length} |`);
   }
   out.push('');
   out.push(
@@ -504,7 +517,9 @@ export function renderConfigDoc(): string {
     out.push('|---|---|---|---|---|---|---|');
     for (const spec of specs) {
       const facts = schemaFacts(spec.schema);
-      const type = facts.enumValues ? facts.enumValues.map((v) => `\`${v}\``).join(' \\| ') : facts.type;
+      const type = facts.enumValues
+        ? facts.enumValues.map((v) => `\`${v}\``).join(' \\| ')
+        : facts.type;
       const def = documentedDefault(spec);
       const notes: string[] = [mdEscape(spec.description)];
       if (spec.requiredWhen)
@@ -548,19 +563,29 @@ export function renderConfigDoc(): string {
   out.push('');
   out.push('**Adicionar**');
   out.push('');
-  out.push('1. Declare a entrada em `src/config/contract.ts` (schema + `description` + `group` + `secret` + `services` + `example` + `fixture` + `restartRequired`).');
-  out.push('2. Se a variável tem dependência de outra, escreva a regra em `src/config/rules.ts` (escopo `contract`) com mensagem e remediação.');
+  out.push(
+    '1. Declare a entrada em `src/config/contract.ts` (schema + `description` + `group` + `secret` + `services` + `example` + `fixture` + `restartRequired`).',
+  );
+  out.push(
+    '2. Se a variável tem dependência de outra, escreva a regra em `src/config/rules.ts` (escopo `contract`) com mensagem e remediação.',
+  );
   out.push('3. `npm run config:generate` e commite os artefatos regenerados.');
-  out.push('4. Consuma via o loader do serviço — nunca `process.env` direto (a regra ESLint `no-restricted-properties` bloqueia leituras novas fora da allowlist em `eslint.config.js`).');
+  out.push(
+    '4. Consuma via o loader do serviço — nunca `process.env` direto (a regra ESLint `no-restricted-properties` bloqueia leituras novas fora da allowlist em `eslint.config.js`).',
+  );
   out.push('');
   out.push('**Depreciar**');
   out.push('');
-  out.push('1. Preencha `deprecatedSince` (e `replacement`) na entrada. A validação passa a emitir aviso identificável (`contract/deprecated`).');
+  out.push(
+    '1. Preencha `deprecatedSince` (e `replacement`) na entrada. A validação passa a emitir aviso identificável (`contract/deprecated`).',
+  );
   out.push('2. Mantenha o comportamento funcionando por, no mínimo, um ciclo de release.');
   out.push('');
   out.push('**Remover**');
   out.push('');
-  out.push('1. Remova a entrada de `ENV_CONTRACT` e adicione um `Tombstone` em `TOMBSTONES` com `removedIn`, `reason` e `failsOn`.');
+  out.push(
+    '1. Remova a entrada de `ENV_CONTRACT` e adicione um `Tombstone` em `TOMBSTONES` com `removedIn`, `reason` e `failsOn`.',
+  );
   out.push('2. `npm run config:generate`. O tombstone aparece no `.env.example` e nesta página.');
   out.push('3. Nunca renomeie nem reutilize o nome de uma variável removida.');
   out.push('');

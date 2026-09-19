@@ -25,10 +25,7 @@ import * as fc from 'fast-check';
 import { evaluate } from '@/governance/policy-dsl/evaluator.js';
 import { resetRegexCache } from '@/governance/policy-dsl/regex-cache.js';
 import { MAX_PREDICATE_DEPTH } from '@/governance/policy-dsl/constants.js';
-import type {
-  PolicyPredicate,
-  PolicyRuleBody,
-} from '@/governance/policy-dsl/types.js';
+import type { PolicyPredicate, PolicyRuleBody } from '@/governance/policy-dsl/types.js';
 
 afterEach(() => {
   resetRegexCache();
@@ -100,13 +97,7 @@ const predicateArb: fc.Arbitrary<PolicyPredicate> = fc.letrec((tie) => ({
   ),
 })).predicate as fc.Arbitrary<PolicyPredicate>;
 
-const effectActionArb = fc.constantFrom(
-  'allow',
-  'block',
-  'require_dual_approval',
-  'warn',
-  'log',
-);
+const effectActionArb = fc.constantFrom('allow', 'block', 'require_dual_approval', 'warn', 'log');
 
 const ruleBodyArb: fc.Arbitrary<PolicyRuleBody> = fc.record({
   rule_id: fc.option(fc.string({ maxLength: 32 }), { nil: undefined }),
@@ -117,11 +108,7 @@ const ruleBodyArb: fc.Arbitrary<PolicyRuleBody> = fc.record({
   }) as fc.Arbitrary<PolicyRuleBody['effect']>,
 }) as fc.Arbitrary<PolicyRuleBody>;
 
-const contextArb = fc.dictionary(
-  fc.string({ maxLength: 8 }),
-  valueArb,
-  { maxKeys: 8 },
-);
+const contextArb = fc.dictionary(fc.string({ maxLength: 8 }), valueArb, { maxKeys: 8 });
 
 describe('property: totality', () => {
   it('evaluate never throws for arbitrary inputs', () => {
@@ -134,12 +121,9 @@ describe('property: totality', () => {
         expect(Array.isArray(decision.errors)).toBe(true);
         expect(decision.diagnostics).toBeDefined();
         // Outcome must be one of the four enum values (Architecture Lock).
-        expect([
-          'matched',
-          'not_matched',
-          'not_applicable',
-          'evaluation_error',
-        ]).toContain(decision.outcome);
+        expect(['matched', 'not_matched', 'not_applicable', 'evaluation_error']).toContain(
+          decision.outcome,
+        );
       }),
       { numRuns: 200 },
     );
@@ -243,12 +227,9 @@ describe('property: totality', () => {
           throw new Error(`evaluator threw: ${String(e)}`, { cause: e });
         }
         expect(decision).toBeDefined();
-        expect([
-          'matched',
-          'not_matched',
-          'not_applicable',
-          'evaluation_error',
-        ]).toContain(decision.outcome);
+        expect(['matched', 'not_matched', 'not_applicable', 'evaluation_error']).toContain(
+          decision.outcome,
+        );
         expect(Array.isArray(decision.errors)).toBe(true);
         expect(typeof decision.matched).toBe('boolean');
 
@@ -307,24 +288,15 @@ describe('property: determinism', () => {
 describe('property: depth bound', () => {
   it('predicates deeper than MAX_PREDICATE_DEPTH surface predicate_depth_exceeded', () => {
     fc.assert(
-      fc.property(
-        fc.integer({ min: 1, max: 16 }),
-        leafArb,
-        (extraDepth, leaf) => {
-          let pred: PolicyPredicate = leaf;
-          for (let i = 0; i < MAX_PREDICATE_DEPTH + extraDepth; i += 1) {
-            pred = { kind: 'and', predicates: [pred] };
-          }
-          const decision = evaluate(
-            { predicate: pred, effect: { action: 'block' } },
-            {},
-          );
-          expect(decision.matched).toBe(false);
-          expect(
-            decision.errors.some((e) => e.code === 'predicate_depth_exceeded'),
-          ).toBe(true);
-        },
-      ),
+      fc.property(fc.integer({ min: 1, max: 16 }), leafArb, (extraDepth, leaf) => {
+        let pred: PolicyPredicate = leaf;
+        for (let i = 0; i < MAX_PREDICATE_DEPTH + extraDepth; i += 1) {
+          pred = { kind: 'and', predicates: [pred] };
+        }
+        const decision = evaluate({ predicate: pred, effect: { action: 'block' } }, {});
+        expect(decision.matched).toBe(false);
+        expect(decision.errors.some((e) => e.code === 'predicate_depth_exceeded')).toBe(true);
+      }),
       { numRuns: 50 },
     );
   });

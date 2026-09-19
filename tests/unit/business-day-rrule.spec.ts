@@ -19,10 +19,7 @@ import {
 } from '../../src/scheduling/business-day-rrule.js';
 import { runWithTenantContext } from '../../src/db/tenant-context.js';
 import { _internal_cache } from '../../src/lib/holidays-cache.js';
-import {
-  NATIONAL_FIXED,
-  nationalMovingHolidays,
-} from '../../src/lib/national-holidays.js';
+import { NATIONAL_FIXED, nationalMovingHolidays } from '../../src/lib/national-holidays.js';
 
 const TENANT_CTX = { tenant_id: 'tenant-a', agent_id: 'default' };
 
@@ -82,9 +79,9 @@ describe('parseRRule extension', () => {
   });
 
   it('rejects WORKDAY_KIND inválido', () => {
-    expect(() =>
-      parseRRule('FREQ=MONTHLY;BYNTHWORKDAY=5;WORKDAY_KIND=foo'),
-    ).toThrow(/standard\|clt/);
+    expect(() => parseRRule('FREQ=MONTHLY;BYNTHWORKDAY=5;WORKDAY_KIND=foo')).toThrow(
+      /standard\|clt/,
+    );
   });
 
   it('parses BYNTHWORKDAY=-1 (último DU)', () => {
@@ -104,8 +101,8 @@ describe('computeNextWithBusinessDays — BYWORKDAY same-day (Codex #105 round-2
   beforeEach(() => {
     _internal_cache.clear();
     findInRangeMock.mockReset();
-    findInRangeMock.mockImplementation(
-      async (args: { start: Date }) => nationalRowsFor(args.start.getUTCFullYear()),
+    findInRangeMock.mockImplementation(async (args: { start: Date }) =>
+      nationalRowsFor(args.start.getUTCFullYear()),
     );
   });
   afterEach(() => {

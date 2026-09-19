@@ -10,15 +10,21 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import Fastify from 'fastify';
 
-const { probeDbMock, redisConnectedMock, pingMock, baileysConnectedMock, memoryReadinessMock, schemaMock } =
-  vi.hoisted(() => ({
-    probeDbMock: vi.fn<[], Promise<boolean>>(),
-    redisConnectedMock: vi.fn<[], boolean>(),
-    pingMock: vi.fn<[], Promise<string>>(),
-    baileysConnectedMock: vi.fn<[], boolean>(),
-    memoryReadinessMock: vi.fn(),
-    schemaMock: vi.fn(),
-  }));
+const {
+  probeDbMock,
+  redisConnectedMock,
+  pingMock,
+  baileysConnectedMock,
+  memoryReadinessMock,
+  schemaMock,
+} = vi.hoisted(() => ({
+  probeDbMock: vi.fn<[], Promise<boolean>>(),
+  redisConnectedMock: vi.fn<[], boolean>(),
+  pingMock: vi.fn<[], Promise<string>>(),
+  baileysConnectedMock: vi.fn<[], boolean>(),
+  memoryReadinessMock: vi.fn(),
+  schemaMock: vi.fn(),
+}));
 
 vi.mock('../../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -226,8 +232,7 @@ describe('checkRoleReadiness — per-component fail-closed', () => {
       blocker: {
         kind: 'missing_file',
         id: '124_from_the_future.sql',
-        detail:
-          'the database applied "124_from_the_future.sql", which this build does not ship.',
+        detail: 'the database applied "124_from_the_future.sql", which this build does not ship.',
       },
     },
     {
@@ -281,7 +286,10 @@ describe('checkRoleReadiness — per-component fail-closed', () => {
   it('the schema detail never leaks a DSN or driver text', async () => {
     schemaMock.mockResolvedValue(
       verdict('unknown', [
-        { kind: 'ledger_unavailable', detail: 'schema state could not be determined (28P01) — failing closed' },
+        {
+          kind: 'ledger_unavailable',
+          detail: 'schema state could not be determined (28P01) — failing closed',
+        },
       ]),
     );
     const r = await checkRoleReadiness();
@@ -365,7 +373,10 @@ describe('checkRoleReadiness — role awareness', () => {
     lifecycle.setRole('scheduler');
     lifecycle.transitionTo('ready');
     const r = await checkRoleReadiness();
-    const required = r.checks.filter((c) => c.required).map((c) => c.component).sort();
+    const required = r.checks
+      .filter((c) => c.required)
+      .map((c) => c.component)
+      .sort();
     expect(required).toEqual(
       ['config', 'cron_scheduler', 'db', 'redis', 'redis_memory', 'schema'].sort(),
     );

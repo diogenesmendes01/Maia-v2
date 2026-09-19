@@ -26,10 +26,7 @@ import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { channelsRepo, normalizeWhatsappLine } from '@/db/repositories/channel-repos.js';
-import {
-  getLineSessionManager,
-  lineAuthDir,
-} from '@/gateway/line-session-manager.js';
+import { getLineSessionManager, lineAuthDir } from '@/gateway/line-session-manager.js';
 import { evaluateLineReadiness } from './line-readiness.js';
 
 export type ChannelPairingState = {
@@ -81,9 +78,7 @@ export interface PairingActor {
  * vê-lo; ele deve cifrar antes de qualquer persistência e nunca logar.
  */
 export interface PairingHooks {
-  onMaterial?: (
-    material: { kind: 'qr'; qr: string } | { kind: 'code'; code: string },
-  ) => void;
+  onMaterial?: (material: { kind: 'qr'; qr: string } | { kind: 'code'; code: string }) => void;
   onPhase?: (phase: {
     phase: 'pairing' | 'verified' | 'failed';
     reason_code?: string | null;
@@ -111,9 +106,8 @@ function auditScoped(
   channel: { tenant_id: string; agent_id: string },
   input: Parameters<typeof audit>[0],
 ): Promise<void> {
-  return runWithTenantContext(
-    { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
-    () => audit(input),
+  return runWithTenantContext({ tenant_id: channel.tenant_id, agent_id: channel.agent_id }, () =>
+    audit(input),
   );
 }
 
@@ -204,7 +198,10 @@ export async function startChannelPairing(args: {
         }
         hooks.onPhase?.({ phase: 'failed', reason_code: reason });
         await auditScoped(channel, {
-          acao: reason === 'ttl_expired_or_aborted' ? 'pairing_session_expired' : 'pairing_session_failed',
+          acao:
+            reason === 'ttl_expired_or_aborted'
+              ? 'pairing_session_expired'
+              : 'pairing_session_failed',
           metadata: {
             channel_id: channel.id,
             declared_line: declared,
@@ -225,13 +222,8 @@ export async function startChannelPairing(args: {
       // também o efeito colateral: sem posse corrente, o auth promovido é
       // destruído e nada é ativado.
       if (!stillCurrent()) {
-        await rm(lineAuthDir(channel.id), { recursive: true, force: true }).catch(
-          () => undefined,
-        );
-        logger.warn(
-          { channel_id: channel.id },
-          'pairing_session.superseded_result_discarded',
-        );
+        await rm(lineAuthDir(channel.id), { recursive: true, force: true }).catch(() => undefined);
+        logger.warn({ channel_id: channel.id }, 'pairing_session.superseded_result_discarded');
         await auditScoped(channel, {
           acao: 'pairing_session_failed',
           metadata: {
@@ -327,9 +319,7 @@ export async function startChannelPairing(args: {
         if (stillCurrent()) {
           pairings.set(channel.id, { ...IDLE, phase: 'failed', error: act.reason });
         }
-        await rm(lineAuthDir(channel.id), { recursive: true, force: true }).catch(
-          () => undefined,
-        );
+        await rm(lineAuthDir(channel.id), { recursive: true, force: true }).catch(() => undefined);
         hooks.onPhase?.({ phase: 'failed', reason_code: act.reason });
         await auditScoped(channel, {
           acao: 'pairing_session_failed',

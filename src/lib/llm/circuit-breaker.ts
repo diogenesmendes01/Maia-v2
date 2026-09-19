@@ -724,7 +724,11 @@ function shed(entry: Entry): void {
  * tentativa morre por cancelamento ou deadline (`'ignored'`), senão a sonda de
  * half-open fica presa e o disjuntor nunca mais fecha.
  */
-export function releaseCircuit(permit: CircuitPermit, outcome: CircuitOutcome, now = Date.now()): void {
+export function releaseCircuit(
+  permit: CircuitPermit,
+  outcome: CircuitOutcome,
+  now = Date.now(),
+): void {
   if (!permit.allowed) return;
   // `off`, ou postura que virou `off` com a permissão em voo: não há estado.
   const entry = permit.entry;

@@ -352,8 +352,6 @@ d('#738 — resolveScope com 501 profiles distintos, em Postgres real', () => {
 
     expect(rows).toHaveLength(PROFILE_COUNT);
     expect(rows.map((r) => r.id)).toEqual([...semeadoA.profile_ids].sort());
-    expect(rows.every((r) => r.tenant_id === A.tenant_id && r.agent_id === A.agent_id)).toBe(
-      true,
-    );
+    expect(rows.every((r) => r.tenant_id === A.tenant_id && r.agent_id === A.agent_id)).toBe(true);
   }, 60_000);
 });

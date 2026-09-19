@@ -58,7 +58,11 @@ beforeEach(async () => {
   app = Fastify();
   const { registerSetupRoutes } = await import('../../src/setup/index.js');
   const { setupState } = await import('../../src/setup/state.js');
-  try { setupState.setUnpaired(); } catch { /* already unpaired */ }
+  try {
+    setupState.setUnpaired();
+  } catch {
+    /* already unpaired */
+  }
   await registerSetupRoutes(app);
   await app.ready();
 });
@@ -266,7 +270,9 @@ describe('setup routes — canário: nenhum token em HTML, redirect ou header', 
   it('o polling embutido chama /setup/status sem query e com credenciais same-origin', async () => {
     const cookie = (await openSession()).header;
     const r = await app.inject({ method: 'GET', url: '/setup', headers: { cookie } });
-    expect(r.body).toContain(`fetch('/setup/status', { cache: 'no-store', credentials: 'same-origin' })`);
+    expect(r.body).toContain(
+      `fetch('/setup/status', { cache: 'no-store', credentials: 'same-origin' })`,
+    );
   });
 
   it('o redirect pós-start volta para /setup limpo', async () => {
@@ -584,7 +590,11 @@ describe('setup routes - rate limit (production mode)', () => {
     prodApp = Fastify();
     const { registerSetupRoutes } = await import('../../src/setup/index.js');
     const { setupState } = await import('../../src/setup/state.js');
-    try { setupState.setUnpaired(); } catch { /* already unpaired */ }
+    try {
+      setupState.setUnpaired();
+    } catch {
+      /* already unpaired */
+    }
     await registerSetupRoutes(prodApp);
     await prodApp.ready();
   });
@@ -627,9 +637,10 @@ describe('setup routes - rate limit (production mode)', () => {
 
   it('os cookies de sessão e csrf são Secure quando NODE_ENV=production', async () => {
     const gate = await prodApp.inject({ method: 'GET', url: '/setup' });
-    const gateStr = (Array.isArray(gate.headers['set-cookie'])
-      ? gate.headers['set-cookie']
-      : [gate.headers['set-cookie'] ?? '']
+    const gateStr = (
+      Array.isArray(gate.headers['set-cookie'])
+        ? gate.headers['set-cookie']
+        : [gate.headers['set-cookie'] ?? '']
     ).join('\n');
     expect(gateStr).toMatch(/maia_setup_csrf=/);
     expect(gateStr).toMatch(/Secure/);
@@ -641,9 +652,10 @@ describe('setup routes - rate limit (production mode)', () => {
       url: '/setup/session',
       payload: { token: TOKEN },
     });
-    const sessionStr = (Array.isArray(session.headers['set-cookie'])
-      ? session.headers['set-cookie']
-      : [session.headers['set-cookie'] ?? '']
+    const sessionStr = (
+      Array.isArray(session.headers['set-cookie'])
+        ? session.headers['set-cookie']
+        : [session.headers['set-cookie'] ?? '']
     ).join('\n');
     expect(sessionStr).toMatch(/maia_setup_session=/);
     expect(sessionStr).toMatch(/Secure/);

@@ -153,9 +153,9 @@ describe('issue #535 — span attribute gate', () => {
     it('throws under MAIA_STRICT_METRIC_LABELS so a leak fails a test', () => {
       cfg.strictLabels = true;
       try {
-        expect(() =>
-          sanitizeSpanAttributes('turn', { telefone: '+5511999999999' }),
-        ).toThrow(ForbiddenSpanAttributeError);
+        expect(() => sanitizeSpanAttributes('turn', { telefone: '+5511999999999' })).toThrow(
+          ForbiddenSpanAttributeError,
+        );
       } finally {
         cfg.strictLabels = false;
       }

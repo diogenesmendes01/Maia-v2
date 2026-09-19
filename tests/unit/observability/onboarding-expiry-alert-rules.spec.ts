@@ -88,9 +88,15 @@ interface RuleDoc {
 
 const rulesText = existsSync(RULES_PATH) ? readFileSync(RULES_PATH, 'utf8') : '';
 
-function alerts(): Map<string, NonNullable<NonNullable<RuleDoc['groups']>[number]['rules']>[number]> {
+function alerts(): Map<
+  string,
+  NonNullable<NonNullable<RuleDoc['groups']>[number]['rules']>[number]
+> {
   const doc = (rulesText ? parseYaml(rulesText) : null) as RuleDoc | null;
-  const out = new Map<string, NonNullable<NonNullable<RuleDoc['groups']>[number]['rules']>[number]>();
+  const out = new Map<
+    string,
+    NonNullable<NonNullable<RuleDoc['groups']>[number]['rules']>[number]
+  >();
   for (const g of doc?.groups ?? []) {
     for (const r of g.rules ?? []) if (r.alert) out.set(r.alert, r);
   }
@@ -117,10 +123,7 @@ function replica(backlog: number, oldestAgeSeconds: number, instance = 'maia-0:3
 
 describe('decisão 14 — o alerta de backlog do onboarding', () => {
   it('o arquivo de regras existe e é YAML válido com os três alertas', () => {
-    expect(
-      existsSync(RULES_PATH),
-      'monitoring/alerts/onboarding.rules.yml não existe',
-    ).toBe(true);
+    expect(existsSync(RULES_PATH), 'monitoring/alerts/onboarding.rules.yml não existe').toBe(true);
     const names = [...alerts().keys()].sort();
     expect(names).toEqual([CRITICAL, ABSENT, WARNING].sort());
   });
@@ -212,13 +215,21 @@ describe('decisão 14 — o alerta de backlog do onboarding', () => {
 
   it('SÓ a idade em `NaN`: os de atraso ficam cegos, e o guarda fala', () => {
     const meia = replica(7, Number.NaN);
-    expect(fires(expr(WARNING), meia), 'backlog finito e idade ilegível não pode alertar atraso').toBe(false);
+    expect(
+      fires(expr(WARNING), meia),
+      'backlog finito e idade ilegível não pode alertar atraso',
+    ).toBe(false);
     expect(fires(expr(CRITICAL), meia)).toBe(false);
-    expect(fires(expr(ABSENT), meia), 'idade ilegível com backlog são é cegueira, e ninguém a reportava').toBe(true);
+    expect(
+      fires(expr(ABSENT), meia),
+      'idade ilegível com backlog são é cegueira, e ninguém a reportava',
+    ).toBe(true);
   });
 
   it('SÓ a idade AUSENTE do scrape: mesmo veredito', () => {
-    const soBacklog: SeriesDb = { [BACKLOG]: [{ labels: { instance: 'maia-0:3000', job: 'maia' }, value: 7 }] };
+    const soBacklog: SeriesDb = {
+      [BACKLOG]: [{ labels: { instance: 'maia-0:3000', job: 'maia' }, value: 7 }],
+    };
     expect(fires(expr(WARNING), soBacklog)).toBe(false);
     expect(fires(expr(ABSENT), soBacklog)).toBe(true);
   });
@@ -405,7 +416,12 @@ describe('promql-instant — as semânticas de que a suíte acima depende', () =
   const l = { instance: 'i', job: 'j' };
 
   it('`max()` ignora `NaN` enquanto houver amostra finita', () => {
-    const db: SeriesDb = { m: [{ labels: l, value: Number.NaN }, { labels: { instance: 'k', job: 'j' }, value: 4 }] };
+    const db: SeriesDb = {
+      m: [
+        { labels: l, value: Number.NaN },
+        { labels: { instance: 'k', job: 'j' }, value: 4 },
+      ],
+    };
     expect(evalInstant('max(m)', db)).toEqual([{ labels: {}, value: 4 }]);
   });
 

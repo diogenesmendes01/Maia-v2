@@ -50,10 +50,7 @@ import type {
   Skill,
   SkillsRepo,
 } from './types.js';
-import type {
-  ContextRequirements,
-  DecisionPacket,
-} from '../context-packet/types.js';
+import type { ContextRequirements, DecisionPacket } from '../context-packet/types.js';
 import { DEFAULT_CONTEXT_REQUIREMENTS } from '../context-packet/types.js';
 
 export interface ActionDeciderDeps {
@@ -171,11 +168,7 @@ export class ActionDeciderImpl implements ActionDecider {
       };
       const findOpts: { signal?: AbortSignal } = {};
       if (input.signal) findOpts.signal = input.signal;
-      skill = await this.deps.skillsRepo.find(
-        input.skill.selected_skill_id,
-        lookupScope,
-        findOpts,
-      );
+      skill = await this.deps.skillsRepo.find(input.skill.selected_skill_id, lookupScope, findOpts);
     }
 
     if (!skill) {
@@ -315,18 +308,14 @@ function applyToolReductions(
   }
   if (removed.size === 0) return perms;
   const remainingAllowed = perms.allowed_tools.filter((t) => !removed.has(t));
-  const removedActuallyAllowed = perms.allowed_tools.filter((t) =>
-    removed.has(t),
-  );
+  const removedActuallyAllowed = perms.allowed_tools.filter((t) => removed.has(t));
   // Merge into blocked_tools (dedup, preserve original order then appended).
   const blockedSet = new Set<string>(perms.blocked_tools);
   for (const t of removedActuallyAllowed) blockedSet.add(t);
   return {
     allowed_tools: remainingAllowed,
     blocked_tools: Array.from(blockedSet),
-    requires_confirmation: perms.requires_confirmation.filter(
-      (t) => !removed.has(t),
-    ),
+    requires_confirmation: perms.requires_confirmation.filter((t) => !removed.has(t)),
   };
 }
 

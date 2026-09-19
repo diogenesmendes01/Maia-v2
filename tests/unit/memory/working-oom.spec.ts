@@ -44,7 +44,7 @@ const { stub, logWarn } = vi.hoisted(() => {
   // catches this. Using this form (not the bare `OOM …` reply) ensures the test
   // exercises the production fail-open path instead of trivially passing.
   const WRAPPED_OOM_MESSAGE =
-    "ERR Error running script (call to f_0123456789abcdef): @user_script:1: " +
+    'ERR Error running script (call to f_0123456789abcdef): @user_script:1: ' +
     "OOM command not allowed when used memory > 'maxmemory'.";
   const oom = () =>
     Object.assign(new Error(WRAPPED_OOM_MESSAGE), {
@@ -125,9 +125,8 @@ vi.mock('@/lib/redis.js', () => ({
   },
 }));
 
-const { pushMessage, readRecent, _resetWriteDeadlinesForTests } = await import(
-  '@/memory/working.js'
-);
+const { pushMessage, readRecent, _resetWriteDeadlinesForTests } =
+  await import('@/memory/working.js');
 const { _resetForTests, renderPrometheus } = await import('@/lib/metrics.js');
 
 const TENANT_A = '11111111-1111-1111-1111-111111111111';

@@ -24,7 +24,9 @@ const outputSchema = z.object({
   found: z.boolean(),
   status: z.string().optional(),
   expected_date: z.string().optional(),
-  history: z.array(z.object({ date: z.string().optional(), event: z.string().optional() })).default([]),
+  history: z
+    .array(z.object({ date: z.string().optional(), event: z.string().optional() }))
+    .default([]),
   pending_items: z.array(z.string()).default([]),
   final_receipt_reference: z.string().optional(),
 });

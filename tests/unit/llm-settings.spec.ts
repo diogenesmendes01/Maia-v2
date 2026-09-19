@@ -198,9 +198,7 @@ describe('llm-settings (global_settings storage)', () => {
   // deleted in the same round.
 
   it('falls back to env default if DB throws on read (no legacy row either)', async () => {
-    globalSettingsRepoMock.getByKey.mockRejectedValueOnce(
-      new Error('connection lost'),
-    );
+    globalSettingsRepoMock.getByKey.mockRejectedValueOnce(new Error('connection lost'));
     const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
     expect(await getCurrentMainModel()).toBe('anthropic/claude-sonnet-4.6');
   });
@@ -251,9 +249,7 @@ describe('llm-settings (global_settings storage)', () => {
   });
 
   it('dual-read fallback: legacy used when global read throws', async () => {
-    globalSettingsRepoMock.getByKey.mockRejectedValueOnce(
-      new Error('connection lost'),
-    );
+    globalSettingsRepoMock.getByKey.mockRejectedValueOnce(new Error('connection lost'));
     setLegacyRow('llm.model.main', {
       valor: { model: 'openai/gpt-5' },
     });
@@ -364,9 +360,7 @@ describe('llm-settings (global_settings storage)', () => {
       },
     });
 
-    const { setGlobalLLMSettingsAtomic } = await import(
-      '../../src/lib/llm-settings.js'
-    );
+    const { setGlobalLLMSettingsAtomic } = await import('../../src/lib/llm-settings.js');
     const res = await setGlobalLLMSettingsAtomic({
       main: 'x-ai/grok-4.1-fast',
       fast: 'anthropic/claude-haiku-4.5',
@@ -399,9 +393,7 @@ describe('llm-settings (global_settings storage)', () => {
       },
     });
 
-    const { setGlobalLLMSettingsAtomic } = await import(
-      '../../src/lib/llm-settings.js'
-    );
+    const { setGlobalLLMSettingsAtomic } = await import('../../src/lib/llm-settings.js');
     const res = await setGlobalLLMSettingsAtomic({
       main: 'anthropic/claude-sonnet-4.6',
       fast: 'openai/gpt-5',
@@ -428,9 +420,7 @@ describe('llm-settings (global_settings storage)', () => {
   // ============================================================
   describe('getCurrentLLMSettings (source-aware)', () => {
     it('source=env when no global_settings row and no legacy row exists', async () => {
-      const { getCurrentLLMSettings } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentLLMSettings } = await import('../../src/lib/llm-settings.js');
       const r = await getCurrentLLMSettings();
       expect(r.main).toEqual({
         value: 'anthropic/claude-sonnet-4.6',
@@ -448,9 +438,7 @@ describe('llm-settings (global_settings storage)', () => {
         updated_at: new Date(),
         updated_by: 'founder@example.com',
       });
-      const { getCurrentLLMSettings } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentLLMSettings } = await import('../../src/lib/llm-settings.js');
       const r = await getCurrentLLMSettings();
       expect(r.main).toEqual({ value: 'openai/gpt-5', source: 'global' });
       // fast still env (no global, no legacy)
@@ -461,9 +449,7 @@ describe('llm-settings (global_settings storage)', () => {
       setLegacyRow('llm.model.main', {
         valor: { model: 'openai/gpt-5' },
       });
-      const { getCurrentLLMSettings } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentLLMSettings } = await import('../../src/lib/llm-settings.js');
       const r = await getCurrentLLMSettings();
       expect(r.main).toEqual({ value: 'openai/gpt-5', source: 'legacy' });
       expect(r.fast.source).toBe('env');
@@ -485,9 +471,7 @@ describe('llm-settings (global_settings storage)', () => {
         { valor: { model: 'openai/gpt-5' } },
         { valor: { model: 'anthropic/claude-opus-4.7' } },
       ]);
-      const { getCurrentMainModel } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
       // Distinct count = 2 → guard trips → env default served.
       expect(await getCurrentMainModel()).toBe('anthropic/claude-sonnet-4.6');
     });
@@ -499,9 +483,7 @@ describe('llm-settings (global_settings storage)', () => {
         { valor: { model: 'openai/gpt-5' } },
         { valor: { model: 'openai/gpt-5' } },
       ]);
-      const { getCurrentMainModel } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
       expect(await getCurrentMainModel()).toBe('openai/gpt-5');
     });
 
@@ -510,9 +492,7 @@ describe('llm-settings (global_settings storage)', () => {
         { valor: { model: 'openai/gpt-5' } },
         { valor: { model: 'openai/gpt-5' } },
       ]);
-      const { getCurrentLLMSettings } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentLLMSettings } = await import('../../src/lib/llm-settings.js');
       const r = await getCurrentLLMSettings();
       expect(r.main).toEqual({ value: 'openai/gpt-5', source: 'legacy' });
     });
@@ -529,9 +509,7 @@ describe('llm-settings (global_settings storage)', () => {
   describe('provider field (Codex round 5)', () => {
     it('write stamps provider alongside model (provider=anthropic mode)', async () => {
       mockLlmProvider = 'anthropic';
-      const { setGlobalLLMSettingsAtomic } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { setGlobalLLMSettingsAtomic } = await import('../../src/lib/llm-settings.js');
       await setGlobalLLMSettingsAtomic({
         main: 'claude-sonnet-4-6',
         fast: 'claude-haiku-4-5-20251001',
@@ -557,9 +535,7 @@ describe('llm-settings (global_settings storage)', () => {
 
     it('write stamps provider=openrouter when LLM_PROVIDER=openrouter', async () => {
       mockLlmProvider = 'openrouter';
-      const { setGlobalLLMSettingsAtomic } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { setGlobalLLMSettingsAtomic } = await import('../../src/lib/llm-settings.js');
       await setGlobalLLMSettingsAtomic({
         main: 'openai/gpt-5',
         fast: 'x-ai/grok-4.1-fast',
@@ -587,9 +563,7 @@ describe('llm-settings (global_settings storage)', () => {
         updated_at: new Date(),
         updated_by: 'someone-on-anthropic',
       });
-      const { getCurrentMainModel } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
       // Env default for openrouter is anthropic/claude-sonnet-4.6.
       // The stored anthropic-native slug must NOT be served.
       expect(await getCurrentMainModel()).toBe('anthropic/claude-sonnet-4.6');
@@ -602,9 +576,7 @@ describe('llm-settings (global_settings storage)', () => {
         updated_at: new Date(),
         updated_by: 'founder@example.com',
       });
-      const { getCurrentMainModel } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
       expect(await getCurrentMainModel()).toBe('claude-sonnet-4-6');
     });
 
@@ -615,9 +587,7 @@ describe('llm-settings (global_settings storage)', () => {
         updated_at: new Date(),
         updated_by: 'someone-on-openrouter',
       });
-      const { getCurrentMainModel } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
       // Env default for anthropic is claude-sonnet-4-6.
       expect(await getCurrentMainModel()).toBe('claude-sonnet-4-6');
     });
@@ -633,9 +603,7 @@ describe('llm-settings (global_settings storage)', () => {
         updated_at: new Date(),
         updated_by: 'pre-round-5-writer',
       });
-      const { getCurrentMainModel } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
       expect(await getCurrentMainModel()).toBe('claude-sonnet-4-6');
     });
 
@@ -650,9 +618,7 @@ describe('llm-settings (global_settings storage)', () => {
         warn: ReturnType<typeof vi.fn>;
       };
       logger.warn.mockClear();
-      const { getCurrentMainModel } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentMainModel } = await import('../../src/lib/llm-settings.js');
       await getCurrentMainModel();
       const warns = logger.warn.mock.calls.filter(
         (c: unknown[]) => c[1] === 'llm_settings.provider_mismatch',
@@ -695,9 +661,7 @@ describe('llm-settings (global_settings storage)', () => {
         updated_at: new Date(),
         updated_by: 'someone-on-anthropic',
       });
-      const { getCurrentLLMSettings } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentLLMSettings } = await import('../../src/lib/llm-settings.js');
       const r = await getCurrentLLMSettings();
       // value must be the env default (runtime-safe slug for openrouter).
       expect(r.main.value).toBe('anthropic/claude-sonnet-4.6');
@@ -716,9 +680,7 @@ describe('llm-settings (global_settings storage)', () => {
         updated_at: new Date(),
         updated_by: 'someone-on-openrouter',
       });
-      const { getCurrentLLMSettings } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { getCurrentLLMSettings } = await import('../../src/lib/llm-settings.js');
       const r = await getCurrentLLMSettings();
       expect(r.fast.source).toBe('global_mismatched');
       if (r.fast.source !== 'global_mismatched') throw new Error('unreachable');
@@ -768,9 +730,8 @@ describe('llm-settings (global_settings storage)', () => {
                     typeof lockedValue === 'object' &&
                     Object.keys(expected).every(
                       (k) =>
-                        JSON.stringify(
-                          (lockedValue as Record<string, unknown>)[k],
-                        ) === JSON.stringify(expected[k]),
+                        JSON.stringify((lockedValue as Record<string, unknown>)[k]) ===
+                        JSON.stringify(expected[k]),
                     );
               if (!matches) {
                 return {
@@ -831,9 +792,7 @@ describe('llm-settings (global_settings storage)', () => {
 
     it('expected_*=object passes through to the repo unchanged', async () => {
       const storedRow = { model: 'claude-sonnet-4-6', provider: 'anthropic' };
-      const { setGlobalLLMSettingsAtomic } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { setGlobalLLMSettingsAtomic } = await import('../../src/lib/llm-settings.js');
       await setGlobalLLMSettingsAtomic({
         main: 'openai/gpt-5',
         fast: 'x-ai/grok-4.1-fast',
@@ -859,9 +818,7 @@ describe('llm-settings (global_settings storage)', () => {
   // ============================================================
   describe('setGlobalLLMSettingsAtomic accepts expected_*=null', () => {
     it('first update succeeds when expected_main=null and no global row exists', async () => {
-      const { setGlobalLLMSettingsAtomic } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { setGlobalLLMSettingsAtomic } = await import('../../src/lib/llm-settings.js');
       const res = await setGlobalLLMSettingsAtomic({
         main: 'openai/gpt-5',
         fast: 'x-ai/grok-4.1-fast',
@@ -894,9 +851,7 @@ describe('llm-settings (global_settings storage)', () => {
         updated_at: new Date(),
         updated_by: 'seed',
       });
-      const { setGlobalLLMSettingsAtomic } = await import(
-        '../../src/lib/llm-settings.js',
-      );
+      const { setGlobalLLMSettingsAtomic } = await import('../../src/lib/llm-settings.js');
       await setGlobalLLMSettingsAtomic({
         main: 'openai/gpt-5',
         fast: 'openai/gpt-5',

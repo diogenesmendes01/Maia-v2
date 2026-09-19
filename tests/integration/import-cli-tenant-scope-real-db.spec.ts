@@ -712,7 +712,11 @@ d('#720 — CLIs de importação sob escopo de tenant (Postgres real)', () => {
       // Caso ORDINÁRIO: outro tenant com o seu próprio agent. Pina a
       // conjunção — qualquer um dos dois predicados sozinho já exclui esta
       // isca; os casos (6) e (7) pinam cada predicado separadamente.
-      await provarReconciliacaoEscopada('caso5', { tenant: TENANT_B, agent: AGENT_B, conta: contaB }, 5);
+      await provarReconciliacaoEscopada(
+        'caso5',
+        { tenant: TENANT_B, agent: AGENT_B, conta: contaB },
+        5,
+      );
     },
     PRAZO_MS,
   );

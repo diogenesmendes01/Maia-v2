@@ -31,11 +31,7 @@ import { promptOnlyMode } from './modes/prompt-only.js';
 import { procedureAdapterMode } from './modes/procedure-adapter.js';
 import { toolMediatedMode } from './modes/tool-mediated.js';
 import { evaluatorMode } from './modes/evaluator.js';
-import {
-  tryGetCurrentContext,
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { tryGetCurrentContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { audit } from '@/governance/audit.js';
 import type { AuditAction } from '@/governance/audit-actions.js';
@@ -144,11 +140,7 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     };
   }
   // Explicit input.agent_id mismatch is rejected even before lookup.
-  if (
-    input.agent_id !== undefined &&
-    input.agent_id !== null &&
-    input.agent_id !== ctx.agent_id
-  ) {
+  if (input.agent_id !== undefined && input.agent_id !== null && input.agent_id !== ctx.agent_id) {
     return {
       ok: false,
       reason: 'agent_scope_violation',
@@ -211,8 +203,7 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   // Fail-closed on mismatch so the caller degrades safely instead of running it.
   if (
     (input.expected_skill_id !== undefined && skill.id !== input.expected_skill_id) ||
-    (input.expected_skill_version !== undefined &&
-      skill.version !== input.expected_skill_version)
+    (input.expected_skill_version !== undefined && skill.version !== input.expected_skill_version)
   ) {
     logger.warn(
       {
@@ -249,7 +240,10 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   }
 
   // Gate 3: input validation
-  const inputValidation = validateAgainstSchema(input.input, skill.input_schema as Record<string, unknown>);
+  const inputValidation = validateAgainstSchema(
+    input.input,
+    skill.input_schema as Record<string, unknown>,
+  );
   if (!inputValidation.valid) {
     return {
       ok: false,
@@ -283,11 +277,13 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
   // pass-through so existing P9a unit tests keep covering the post-Gate-4
   // flow until P9d delivers the real effect-resolution.
   const p8eOutput = p8eOutputRaw as unknown as {
-    resolved: Array<Partial<ResolvedPolicyDescriptor> & {
-      policy_id: string;
-      descriptor: string;
-      rule_kind?: string;
-    }>;
+    resolved: Array<
+      Partial<ResolvedPolicyDescriptor> & {
+        policy_id: string;
+        descriptor: string;
+        rule_kind?: string;
+      }
+    >;
     unresolved: Array<string | { descriptor: string; reason?: string }>;
     failures?: Array<{ descriptor: string; reason: string }>;
   };
@@ -296,7 +292,8 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     descriptor: p.descriptor,
     effect: p.effect ?? 'noop',
     reason: p.reason,
-    rule_kind: p.rule_kind === 'hard_limit' ? 'hard_limit' : p.rule_kind === 'soft' ? 'soft' : undefined,
+    rule_kind:
+      p.rule_kind === 'hard_limit' ? 'hard_limit' : p.rule_kind === 'soft' ? 'soft' : undefined,
     evaluator: p.evaluator,
   }));
   const resolvedPolicyIds = resolvedPolicies.map((p) => p.policy_id);
@@ -384,8 +381,7 @@ export async function runSkill(input: SkillExecutionInput): Promise<SkillExecuti
     if (input.signal.aborted) {
       abortController.abort(input.signal.reason ?? 'caller_cancelled');
     } else {
-      callerAbortHandler = () =>
-        abortController.abort(input.signal?.reason ?? 'caller_cancelled');
+      callerAbortHandler = () => abortController.abort(input.signal?.reason ?? 'caller_cancelled');
       input.signal.addEventListener('abort', callerAbortHandler, { once: true });
     }
   }
@@ -648,7 +644,9 @@ export function validateAgainstSchema(
 
   if (schema.type === 'object') {
     if (data === null || typeof data !== 'object' || Array.isArray(data)) {
-      errors.push(`expected object, got ${data === null ? 'null' : Array.isArray(data) ? 'array' : typeof data}`);
+      errors.push(
+        `expected object, got ${data === null ? 'null' : Array.isArray(data) ? 'array' : typeof data}`,
+      );
       return { valid: false, errors };
     }
     const obj = data as Record<string, unknown>;

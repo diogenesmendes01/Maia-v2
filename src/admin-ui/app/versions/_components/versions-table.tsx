@@ -3,18 +3,8 @@
 import * as React from 'react';
 import { Button } from '../../../components/ui/button.js';
 import { StatusBadge } from '../../../components/ui/badge.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../../components/ui/table.js';
-import {
-  isSupportedSotKind,
-  validateRollbackTarget,
-} from '../../../lib/rollback-targets.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../../components/ui/table.js';
+import { isSupportedSotKind, validateRollbackTarget } from '../../../lib/rollback-targets.js';
 
 export interface VersionItem {
   id: string;
@@ -68,17 +58,11 @@ export default function VersionsTable({
                 <Td>
                   <StatusBadge status={v.status} />
                 </Td>
-                <Td className="text-zinc-600">
-                  {new Date(v.created_at).toLocaleString('pt-BR')}
-                </Td>
+                <Td className="text-zinc-600">{new Date(v.created_at).toLocaleString('pt-BR')}</Td>
                 {canRollback && (
                   <Td className="text-right">
                     {rollbackable && fromVersion !== undefined && (
-                      <Button
-                        variant="danger"
-                        size="sm"
-                        onClick={() => onRollback(v, fromVersion)}
-                      >
+                      <Button variant="danger" size="sm" onClick={() => onRollback(v, fromVersion)}>
                         Reverter
                       </Button>
                     )}

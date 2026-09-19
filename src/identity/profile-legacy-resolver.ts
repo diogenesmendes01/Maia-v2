@@ -132,18 +132,13 @@ export function resolveLegacyPayload(
         : typeof body.identity?.role_descriptor === 'string'
           ? body.identity.role_descriptor
           : undefined,
-    principles: Array.isArray(body.identity?.principles)
-      ? body.identity!.principles
-      : undefined,
+    principles: Array.isArray(body.identity?.principles) ? body.identity!.principles : undefined,
   };
   const synthesizedOp: LegacyOperationalProfile = {
     voice_descriptor:
-      typeof body.identity?.voice?.tone === 'string'
-        ? body.identity.voice.tone
-        : undefined,
+      typeof body.identity?.voice?.tone === 'string' ? body.identity.voice.tone : undefined,
     thresholds:
-      body.identity?.cognitive_limits &&
-      typeof body.identity.cognitive_limits === 'object'
+      body.identity?.cognitive_limits && typeof body.identity.cognitive_limits === 'object'
         ? { ...body.identity.cognitive_limits }
         : undefined,
   };
@@ -158,20 +153,14 @@ export function resolveLegacyPayload(
     return { value: synthesized, from: 'synthesized' };
   }
 
-  const core = pick<LegacyCoreImmutable>(
-    body.core_immutable,
-    row.core_immutable,
-    synthesizedCore,
-  );
+  const core = pick<LegacyCoreImmutable>(body.core_immutable, row.core_immutable, synthesizedCore);
   const op = pick<LegacyOperationalProfile>(
     body.operational_profile,
     row.operational_profile,
     synthesizedOp,
   );
-  const episodic =
-    body.episodic_temp ?? row.episodic_temp ?? ({} as LegacyEpisodicTemp);
-  const growth =
-    body.growth_backlog ?? row.growth_backlog ?? ([] as LegacyGrowthBacklog);
+  const episodic = body.episodic_temp ?? row.episodic_temp ?? ({} as LegacyEpisodicTemp);
+  const growth = body.growth_backlog ?? row.growth_backlog ?? ([] as LegacyGrowthBacklog);
 
   return {
     core_immutable: core.value,

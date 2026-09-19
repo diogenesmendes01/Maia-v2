@@ -92,16 +92,15 @@ export const parseReceiptTool: Tool<typeof inputSchema, typeof outputSchema> = {
       beneficiario_nome: result.beneficiario_nome
         ? wrapWithTag(result.beneficiario_nome, 'ocr')
         : undefined,
-      beneficiario_documento: validateOrDrop(result.beneficiario_documento, OCR_REGEXES.cpf_or_cnpj),
+      beneficiario_documento: validateOrDrop(
+        result.beneficiario_documento,
+        OCR_REGEXES.cpf_or_cnpj,
+      ),
       beneficiario_chave_pix: result.beneficiario_chave_pix
         ? wrapWithTag(result.beneficiario_chave_pix, 'ocr')
         : undefined,
-      banco_origem: result.banco_origem
-        ? wrapWithTag(result.banco_origem, 'ocr')
-        : undefined,
-      banco_destino: result.banco_destino
-        ? wrapWithTag(result.banco_destino, 'ocr')
-        : undefined,
+      banco_origem: result.banco_origem ? wrapWithTag(result.banco_origem, 'ocr') : undefined,
+      banco_destino: result.banco_destino ? wrapWithTag(result.banco_destino, 'ocr') : undefined,
       endToEndId: validateOrDrop(result.endToEndId, OCR_REGEXES.end_to_end_id),
       confianca: result.valor && result.beneficiario_nome ? 0.85 : 0.6,
     };

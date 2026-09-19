@@ -324,7 +324,9 @@ async function rodarTurno(mensagem_id: string): Promise<void> {
 }
 
 /** As linhas DURÁVEIS de saída desta pessoa, com o texto commitado. */
-async function saidasDuraveis(in_reply_to: string): Promise<Array<{ texto: string; status: string }>> {
+async function saidasDuraveis(
+  in_reply_to: string,
+): Promise<Array<{ texto: string; status: string }>> {
   const r = await pool.query<{ texto: string; status: string }>(
     `SELECT coalesce(payload_json->>'text','') AS texto, status
        FROM outbound_messages
@@ -384,7 +386,9 @@ d('#703 — as três jornadas de backend, ponta a ponta', () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
     await limparTenant();
-    await pool.query(`INSERT INTO tenants(id, nome) VALUES ($1,'e703') ON CONFLICT DO NOTHING`, [T]);
+    await pool.query(`INSERT INTO tenants(id, nome) VALUES ($1,'e703') ON CONFLICT DO NOTHING`, [
+      T,
+    ]);
     await pool.query(
       `INSERT INTO agents(id, tenant_id, nome) VALUES ($1,$2,'e703 agent') ON CONFLICT DO NOTHING`,
       [A, T],
@@ -715,10 +719,9 @@ d('#703 — as três jornadas de backend, ponta a ponta', () => {
     const msgAtiva = await inbound(TEL_DONO, 'me dá um oi');
     await rodarTurno(msgAtiva);
 
-    expect(
-      llm.workloads,
-      'CONTROLE: a pessoa ativa tem de alcançar o reasoner do ReAct',
-    ).toContain('reasoner');
+    expect(llm.workloads, 'CONTROLE: a pessoa ativa tem de alcançar o reasoner do ReAct').toContain(
+      'reasoner',
+    );
     const saidasAtiva = await saidasDuraveis(msgAtiva);
     expect(saidasAtiva.length, 'CONTROLE: a pessoa ativa tem de receber resposta durável').toBe(1);
     expect(saidasAtiva[0]!.texto).toContain('claro, tudo certo por aqui.');

@@ -13,11 +13,7 @@ import { createHash } from 'node:crypto';
 import type { BaseContextPacket, SkillSlice } from '../../context-packet/types.js';
 import { sliceCacheKey, type SliceCache } from '../../context-packet/cache/slice-cache.js';
 import { getTTLForSlice } from '../../context-packet/cache/ttl-policy.js';
-import type {
-  SliceBuilder,
-  SliceBuilderInput,
-  SliceBuilderResult,
-} from './_types.js';
+import type { SliceBuilder, SliceBuilderInput, SliceBuilderResult } from './_types.js';
 
 /**
  * Requirement: chosen by Decision Engine. P8a derives from
@@ -51,15 +47,10 @@ export interface SkillSummary {
 
 export interface SkillRepoPort {
   getSkillById(tenant_id: string, skill_id: string): Promise<SkillRecord | null>;
-  listSkillSummaries(
-    tenant_id: string,
-    skill_ids: string[],
-  ): Promise<SkillSummary[]>;
+  listSkillSummaries(tenant_id: string, skill_ids: string[]): Promise<SkillSummary[]>;
 }
 
-export class SkillSliceBuilder
-  implements SliceBuilder<SkillRequirements, SkillSlice>
-{
+export class SkillSliceBuilder implements SliceBuilder<SkillRequirements, SkillSlice> {
   readonly name = 'skill' as const;
 
   constructor(
@@ -104,10 +95,7 @@ export class SkillSliceBuilder
     let slice: SkillSlice;
 
     if (selected_skill_id && input.requirements === 'selected_only') {
-      const skill = await this.repo.getSkillById(
-        input.base.tenant_id,
-        selected_skill_id,
-      );
+      const skill = await this.repo.getSkillById(input.base.tenant_id, selected_skill_id);
       if (skill) {
         slice = {
           mode: 'selected_only',
@@ -133,10 +121,7 @@ export class SkillSliceBuilder
       }
     } else {
       // candidates mode (or selected_only with no selected_skill_id)
-      const summaries = await this.repo.listSkillSummaries(
-        input.base.tenant_id,
-        candidate_ids,
-      );
+      const summaries = await this.repo.listSkillSummaries(input.base.tenant_id, candidate_ids);
       slice = {
         mode: 'candidates',
         selected_skill: null,
@@ -164,8 +149,5 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 function hashShort(obj: Record<string, unknown>): string {
-  return createHash('sha256')
-    .update(JSON.stringify(obj))
-    .digest('hex')
-    .substring(0, 12);
+  return createHash('sha256').update(JSON.stringify(obj)).digest('hex').substring(0, 12);
 }

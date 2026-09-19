@@ -20,9 +20,7 @@ describe('metrics — Prometheus exposition', () => {
     expect(out).toContain(
       'maia_llm_calls_total{model="sonnet",provider="anthropic",status="ok"} 2',
     );
-    expect(out).toContain(
-      'maia_llm_calls_total{model="haiku",provider="anthropic",status="ok"} 1',
-    );
+    expect(out).toContain('maia_llm_calls_total{model="haiku",provider="anthropic",status="ok"} 1');
   });
 
   it('gauges read from provider on each scrape', async () => {

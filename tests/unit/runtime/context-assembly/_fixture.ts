@@ -4,15 +4,10 @@
  * mockBase / mockDecision produce sensible defaults. Overrides allow specs to
  * tweak just what they care about.
  */
-import type {
-  BaseContextPacket,
-  DecisionPacket,
-} from '@/runtime/context-packet/types.js';
+import type { BaseContextPacket, DecisionPacket } from '@/runtime/context-packet/types.js';
 import { DEFAULT_CONTEXT_REQUIREMENTS } from '@/runtime/context-packet/types.js';
 
-export const mockBase = (
-  overrides?: Partial<BaseContextPacket>,
-): BaseContextPacket => ({
+export const mockBase = (overrides?: Partial<BaseContextPacket>): BaseContextPacket => ({
   trace_id: 'uuid1',
   tenant_id: 'tenant1',
   agent_id: 'agent1',
@@ -37,9 +32,7 @@ export const mockBase = (
   ...overrides,
 });
 
-export const mockDecision = (
-  overrides?: Partial<DecisionPacket>,
-): DecisionPacket => ({
+export const mockDecision = (overrides?: Partial<DecisionPacket>): DecisionPacket => ({
   trace_id: 'uuid1',
   intent: { label: 'test', confidence: 0.9 },
   risk_profile: { level: 'low', reasons: [], requires_human_review: false },

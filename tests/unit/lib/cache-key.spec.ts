@@ -40,9 +40,26 @@ describe('buildCacheKey — collision-by-delimiter', () => {
   it.each([
     // Each row is a set of tuples that a naive `:`-concat would alias to ONE
     // key. With per-segment encoding they must all be DISTINCT.
-    [[['a:b', 'c'], ['a', 'b:c']]],
-    [[['a:b', 'c', 'd'], ['a', 'b:c', 'd'], ['a', 'b', 'c:d']]],
-    [[['x:', 'y'], ['x', ':y'], ['x', '', ':y']]],
+    [
+      [
+        ['a:b', 'c'],
+        ['a', 'b:c'],
+      ],
+    ],
+    [
+      [
+        ['a:b', 'c', 'd'],
+        ['a', 'b:c', 'd'],
+        ['a', 'b', 'c:d'],
+      ],
+    ],
+    [
+      [
+        ['x:', 'y'],
+        ['x', ':y'],
+        ['x', '', ':y'],
+      ],
+    ],
   ])('parametrized: colliding tuples #%# all produce distinct keys', (tuples) => {
     const keys = tuples.map((segs) => buildCacheKey('p:', ...segs));
     expect(new Set(keys).size).toBe(keys.length);
@@ -71,19 +88,17 @@ describe('buildCacheKey — null/undefined fail closed (B3)', () => {
   });
 
   it('rejects an undefined segment with a TypeError naming the index', () => {
-    expect(() =>
-      buildCacheKey('p:', 'tenant', undefined as unknown as string, 'phone'),
-    ).toThrow(TypeError);
-    expect(() =>
-      buildCacheKey('p:', 'tenant', undefined as unknown as string, 'phone'),
-    ).toThrow(/index 1/);
+    expect(() => buildCacheKey('p:', 'tenant', undefined as unknown as string, 'phone')).toThrow(
+      TypeError,
+    );
+    expect(() => buildCacheKey('p:', 'tenant', undefined as unknown as string, 'phone')).toThrow(
+      /index 1/,
+    );
   });
 
   it('rejects null/undefined in the first or last slot too', () => {
     expect(() => buildCacheKey('p:', null as unknown as string)).toThrow(/index 0/);
-    expect(() => buildCacheKey('p:', 'a', undefined as unknown as string)).toThrow(
-      /index 1/,
-    );
+    expect(() => buildCacheKey('p:', 'a', undefined as unknown as string)).toThrow(/index 1/);
   });
 
   it('an explicit empty string is still accepted (the documented sentinel)', () => {
@@ -172,9 +187,7 @@ describe('buildCacheKey — composition', () => {
   it('preserves segment order in the joined key', () => {
     expect(buildCacheKey('rl:', 'a', 'b', 'c')).toBe('rl:a:b:c');
     expect(buildCacheKey('rl:', 'c', 'b', 'a')).toBe('rl:c:b:a');
-    expect(buildCacheKey('rl:', 'a', 'b', 'c')).not.toBe(
-      buildCacheKey('rl:', 'c', 'b', 'a'),
-    );
+    expect(buildCacheKey('rl:', 'a', 'b', 'c')).not.toBe(buildCacheKey('rl:', 'c', 'b', 'a'));
   });
 
   it('zero segments returns just the prefix', () => {
@@ -207,8 +220,6 @@ describe('buildCacheKey — backpressure migration parity', () => {
   });
 
   it('per-second rate key uses number segment unchanged for ASCII digits', () => {
-    expect(buildCacheKey('outbox:rate:sec:', 1717000000)).toBe(
-      'outbox:rate:sec:1717000000',
-    );
+    expect(buildCacheKey('outbox:rate:sec:', 1717000000)).toBe('outbox:rate:sec:1717000000');
   });
 });

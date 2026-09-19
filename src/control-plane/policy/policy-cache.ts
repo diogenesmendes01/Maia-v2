@@ -54,11 +54,7 @@
 import IORedis from 'ioredis';
 import { config } from '@/config/env.js';
 import { logger } from '@/lib/logger.js';
-import type {
-  PolicyRuleScope,
-  ResolvedPolicy,
-  PolicyLifecycleEvent,
-} from './types.js';
+import type { PolicyRuleScope, ResolvedPolicy, PolicyLifecycleEvent } from './types.js';
 import {
   POLICY_LIFECYCLE_CHANNEL,
   buildPolicyLifecycleChannel,
@@ -239,11 +235,7 @@ export class PolicyResolverCacheImpl implements PolicyResolverCache {
     }
   }
 
-  invalidate(args: {
-    tenant_id: string;
-    agent_id: string | null;
-    descriptor: string;
-  }): void {
+  invalidate(args: { tenant_id: string; agent_id: string | null; descriptor: string }): void {
     // Codex review #93 finding: when agent_id is null (tenant-wide
     // lifecycle event), we MUST also evict any agent-specific cache entries
     // for the same (tenant, descriptor). The resolver caches under the
@@ -259,7 +251,11 @@ export class PolicyResolverCacheImpl implements PolicyResolverCache {
       // Fan-out: evict all entries for this (tenant, descriptor) regardless of agent_id.
       for (const [k, e] of this.store) {
         let parsed: unknown;
-        try { parsed = JSON.parse(k); } catch { continue; }
+        try {
+          parsed = JSON.parse(k);
+        } catch {
+          continue;
+        }
         if (!Array.isArray(parsed) || parsed.length < 3) continue;
         // slots: [tenant_id, agent_id, descriptor, scope_str]
         if (parsed[0] === args.tenant_id && parsed[2] === args.descriptor) {
@@ -276,9 +272,17 @@ export class PolicyResolverCacheImpl implements PolicyResolverCache {
       if (k.startsWith(prefix)) {
         // Verify the prefix is not a false positive by parsing.
         let parsed: unknown;
-        try { parsed = JSON.parse(k); } catch { continue; }
+        try {
+          parsed = JSON.parse(k);
+        } catch {
+          continue;
+        }
         if (!Array.isArray(parsed) || parsed.length < 3) continue;
-        if (parsed[0] === args.tenant_id && parsed[1] === args.agent_id && parsed[2] === args.descriptor) {
+        if (
+          parsed[0] === args.tenant_id &&
+          parsed[1] === args.agent_id &&
+          parsed[2] === args.descriptor
+        ) {
           this.removeFromList(k, e);
           this.store.delete(k);
         }
@@ -438,10 +442,7 @@ export function handlePolicyLifecycleMessage(
     // no tenant suffix) or an unrelated channel. Drop silently for
     // unrelated channels; warn for the legacy shape to surface stragglers.
     if (channel === POLICY_LIFECYCLE_CHANNEL) {
-      logger.warn(
-        { channel },
-        'policy_cache.legacy_global_channel_ignored_issue_249',
-      );
+      logger.warn({ channel }, 'policy_cache.legacy_global_channel_ignored_issue_249');
     }
     return;
   }

@@ -51,9 +51,7 @@ describe('#637 — a medição que sustenta o limiar', () => {
 
   it('NO LIMIAR EM VIGOR não há UMA falsa fusão no conjunto negativo real', () => {
     const { negativos } = medicao().construirCorpus();
-    const fundidos = negativos.filter(
-      (p) => medicao().scoreDoPar(p) >= sim().LIMIAR_SIMILARIDADE,
-    );
+    const fundidos = negativos.filter((p) => medicao().scoreDoPar(p) >= sim().LIMIAR_SIMILARIDADE);
     expect(
       fundidos.map((p) => `${p.a} ~ ${p.b} = ${medicao().scoreDoPar(p).toFixed(3)}`),
       'o limiar deixou de separar: rode `npx tsx scripts/medir-limiar-tool-request.ts` e re-decida o número',
@@ -77,10 +75,7 @@ describe('#637 — a medição que sustenta o limiar', () => {
 
   it('o vizinho de cima não compra segurança e custa recall — por isso não subimos', () => {
     const { negativos, positivos } = medicao().construirCorpus();
-    const [aqui, acima] = medicao().varrer(negativos, positivos, [
-      sim().LIMIAR_SIMILARIDADE,
-      0.9,
-    ]);
+    const [aqui, acima] = medicao().varrer(negativos, positivos, [sim().LIMIAR_SIMILARIDADE, 0.9]);
     expect(aqui!.falsas_fusoes).toBe(0);
     expect(acima!.falsas_fusoes).toBe(0); // nada a ganhar
     expect(acima!.recall).toBeLessThan(aqui!.recall); // e algo a perder

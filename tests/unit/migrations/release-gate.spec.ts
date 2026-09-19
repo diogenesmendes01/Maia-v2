@@ -118,7 +118,9 @@ describe('release gate — o subset `migrator` do contrato (#515), por allowlist
       ...PROCESS_PASSTHROUGH,
     ]);
     const extra = Object.keys(scrub.env).filter((k) => !allowed.has(k));
-    expect(extra, `variáveis fora da allowlist chegaram ao migrator: ${extra.join(', ')}`).toEqual([]);
+    expect(extra, `variáveis fora da allowlist chegaram ao migrator: ${extra.join(', ')}`).toEqual(
+      [],
+    );
   });
 
   it('retém TODA variável de contrato que não é do migrator, e a nomeia', () => {
@@ -204,13 +206,18 @@ describe('release gate — exit code: 0 sai por um caminho só', () => {
   });
 
   it('bloqueia quando o migrator morre por sinal', async () => {
-    const { code, events } = await gateWith(COOLIFY_STYLE_ENV, { kind: 'signal', signal: 'SIGKILL' });
+    const { code, events } = await gateWith(COOLIFY_STYLE_ENV, {
+      kind: 'signal',
+      signal: 'SIGKILL',
+    });
     expect(code).not.toBe(0);
     expect(events.at(-1)?.detail.reason).toBe('killed_by_signal');
   });
 
   it('bloqueia quando o processo nem chega a nascer', async () => {
-    const { code, events } = await gateWith(COOLIFY_STYLE_ENV, () => Promise.reject(new Error('ENOENT')));
+    const { code, events } = await gateWith(COOLIFY_STYLE_ENV, () =>
+      Promise.reject(new Error('ENOENT')),
+    );
     expect(code).toBe(1);
     expect(events.at(-1)?.detail.reason).toBe('spawn_failed');
   });

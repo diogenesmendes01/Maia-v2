@@ -66,9 +66,7 @@ const { persisted, txRows, dbTransactionMock, dbInsertValuesMock, dbExecuteMock,
         where: () => self,
         limit: () =>
           Promise.resolve(
-            [...persisted.entries()]
-              .filter(([k]) => k.startsWith(`${table}:`))
-              .map(([, v]) => v),
+            [...persisted.entries()].filter(([k]) => k.startsWith(`${table}:`)).map(([, v]) => v),
           ),
       };
       return self;
@@ -131,10 +129,7 @@ vi.mock('@/config/contract-env.js', () => ({
 const { writeEnvelope, DivergentTraceReplayError, divergedEnvelopeFields, bodyPayloadDigest } =
   await import('@/control-plane/runtime-trace/envelope-writer.js');
 
-import type {
-  TraceEnvelopeInput,
-  TraceBodyInput,
-} from '@/control-plane/runtime-trace/types.js';
+import type { TraceEnvelopeInput, TraceBodyInput } from '@/control-plane/runtime-trace/types.js';
 
 const TRACE_ID = '3f1a9d2e-4c5b-4a7e-9f0d-1b2c3d4e5f60';
 
@@ -189,7 +184,9 @@ describe('issue #514 [P2] — divergent replay is refused, identical replay is a
       await writeEnvelope(input(), { outbox_body: body() });
       await expect(
         writeEnvelope(
-          input({ decision: { decision: 'deny', side_effect_level: 'medium', policy_id: 'pol-1' } }),
+          input({
+            decision: { decision: 'deny', side_effect_level: 'medium', policy_id: 'pol-1' },
+          }),
           { outbox_body: body() },
         ),
       ).rejects.toBeInstanceOf(DivergentTraceReplayError);
@@ -315,10 +312,7 @@ describe('issue #514 [P2] — divergent replay is refused, identical replay is a
 
     it('null and undefined root are the same absence', () => {
       expect(
-        divergedEnvelopeFields(
-          { ...base, root_trace_id: null },
-          { ...base, root_trace_id: null },
-        ),
+        divergedEnvelopeFields({ ...base, root_trace_id: null }, { ...base, root_trace_id: null }),
       ).toEqual([]);
     });
 
@@ -331,13 +325,7 @@ describe('issue #514 [P2] — divergent replay is refused, identical replay is a
           attempt: 9,
           signature_version: 1,
         }),
-      ).toEqual([
-        'tenant_id',
-        'envelope_hmac',
-        'root_trace_id',
-        'attempt',
-        'signature_version',
-      ]);
+      ).toEqual(['tenant_id', 'envelope_hmac', 'root_trace_id', 'attempt', 'signature_version']);
     });
 
     it('issue #535 — um replay que só troca a versão da assinatura é divergência', () => {

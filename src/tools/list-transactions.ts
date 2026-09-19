@@ -5,8 +5,14 @@ import { toDecimal } from '@/lib/decimal.js';
 
 const inputSchema = z.object({
   entidade_id: z.string().uuid(),
-  date_from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  date_to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  date_from: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional(),
+  date_to: z
+    .string()
+    .regex(/^\d{4}-\d{2}-\d{2}$/)
+    .optional(),
   categoria_id: z.string().uuid().optional(),
   natureza: z.enum(['receita', 'despesa', 'movimentacao']).optional(),
   limit: z.number().int().positive().max(200).default(50),

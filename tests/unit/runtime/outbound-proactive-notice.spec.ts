@@ -36,10 +36,11 @@ describe('#506 — enqueueProactiveNotice', () => {
     expect(enqueueMock).toHaveBeenCalledTimes(1);
     const arg = enqueueMock.mock.calls[0]![0] as Record<string, unknown>;
     expect(arg.kind).toBe('whatsapp_text');
-    expect(arg.payload).toEqual({ jid: '5511999@s.whatsapp.net', text: 'Solicitação AP-abc expirou.' });
-    expect(arg.dedup_key).toBe(
-      'approval_request:11111111-1111-4111-8111-111111111111:expired',
-    );
+    expect(arg.payload).toEqual({
+      jid: '5511999@s.whatsapp.net',
+      text: 'Solicitação AP-abc expirou.',
+    });
+    expect(arg.dedup_key).toBe('approval_request:11111111-1111-4111-8111-111111111111:expired');
     // `occurrence_id`/`task_id` NULOS de propósito: o drain só acopla conclusão
     // de task/ocorrência quando eles existem. Um aviso de governança que
     // fechasse uma ocorrência de agendamento seria um efeito colateral em
@@ -80,9 +81,9 @@ describe('#506 — enqueueProactiveNotice', () => {
     enqueueMock.mockImplementationOnce(async () => {
       throw new Error('connection terminated');
     });
-    await expect(
-      enqueueProactiveNotice({ jid: 'j', text: 't', dedupe_key: 'k4' }),
-    ).rejects.toThrow(/connection terminated/);
+    await expect(enqueueProactiveNotice({ jid: 'j', text: 't', dedupe_key: 'k4' })).rejects.toThrow(
+      /connection terminated/,
+    );
   });
 
   it('não toca primitiva de canal nenhuma — o emissor é ledger, não gateway', async () => {
@@ -92,9 +93,7 @@ describe('#506 — enqueueProactiveNotice', () => {
     const fonte = await import('node:fs').then((fs) =>
       fs.readFileSync('src/runtime/outbound/proactive-notice.ts', 'utf8'),
     );
-    const semComentarios = fonte
-      .replace(/\/\*[\s\S]*?\*\//g, '')
-      .replace(/\/\/.*$/gm, '');
+    const semComentarios = fonte.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/.*$/gm, '');
     expect(semComentarios).not.toMatch(/\.send(Text|Document|Voice|Poll|Reaction)\s*\(/);
   });
 });

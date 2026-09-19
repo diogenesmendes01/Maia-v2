@@ -41,12 +41,7 @@ const envAnterior = vi.hoisted(() => {
 });
 
 import { lifecycle } from '@/runtime/lifecycle/controller.js';
-import {
-  agentQueue,
-  enqueueAgent,
-  awaitQueueReady,
-  shutdownQueue,
-} from '@/gateway/queue.js';
+import { agentQueue, enqueueAgent, awaitQueueReady, shutdownQueue } from '@/gateway/queue.js';
 import { agentTurnJobId } from '@/runtime/turns/job.js';
 
 const SHOULD_RUN =
@@ -112,13 +107,7 @@ d('#504 — o produtor emite o payload V2 (Redis real)', () => {
     // grava um campo no hash `meta` e deixa os jobs em `wait`, então `'paused'`
     // não é mais estado de job (saiu de `JobType`) e a consulta por esse nome
     // devolve `[]` sempre. `'waiting'` cobre o caso que ele cobria.
-    const jobs = await agentQueue.getJobs([
-      'waiting',
-      'delayed',
-      'active',
-      'completed',
-      'failed',
-    ]);
+    const jobs = await agentQueue.getJobs(['waiting', 'delayed', 'active', 'completed', 'failed']);
     const mine = jobs.filter(
       (j) => (j.data as { mensagem_id?: string }).mensagem_id === mensagem_id,
     );

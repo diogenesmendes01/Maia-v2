@@ -58,9 +58,8 @@ vi.mock('@/db/client.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureDefinitionsRepo: {
@@ -200,165 +199,147 @@ describe('P3c test gate — proposed → active', () => {
   });
 
   it('cenário 1: zero tests → bloqueia com reason=tests_required', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const def = await seedProposedDefinition('no-tests');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const def = await seedProposedDefinition('no-tests');
 
-        const result = await transitionProcedureStatus({
-          definition: def,
-          to: 'active',
-          actor: 'owner-1',
-        });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'active',
+        actor: 'owner-1',
+      });
 
-        expect(result.ok).toBe(false);
-        if (result.ok === false) {
-          expect(result.reason).toBe('tests_required');
-          expect(result.missing_tests).toBe(true);
-        }
-        // definition stays in 'proposed' — gate aborted the transition
-        expect(definitionsState[def.id].status).toBe('proposed');
-      },
-    );
+      expect(result.ok).toBe(false);
+      if (result.ok === false) {
+        expect(result.reason).toBe('tests_required');
+        expect(result.missing_tests).toBe(true);
+      }
+      // definition stays in 'proposed' — gate aborted the transition
+      expect(definitionsState[def.id].status).toBe('proposed');
+    });
   });
 
   it('cenário 2: 1 test passing + 1 failing → bloqueia com reason=tests_not_passing e failing_tests preenchido', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const def = await seedProposedDefinition('mixed-results');
-        await seedTest(def.id, 'pass');
-        const failing = await seedTest(def.id, 'fail');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const def = await seedProposedDefinition('mixed-results');
+      await seedTest(def.id, 'pass');
+      const failing = await seedTest(def.id, 'fail');
 
-        const result = await transitionProcedureStatus({
-          definition: def,
-          to: 'active',
-          actor: 'owner-1',
-        });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'active',
+        actor: 'owner-1',
+      });
 
-        expect(result.ok).toBe(false);
-        if (result.ok === false) {
-          expect(result.reason).toBe('tests_not_passing');
-          expect(Array.isArray(result.failing_tests)).toBe(true);
-          expect(result.failing_tests!.length).toBe(1);
-          expect(result.failing_tests![0]!.id).toBe(failing.id);
-        }
-        expect(definitionsState[def.id].status).toBe('proposed');
-      },
-    );
+      expect(result.ok).toBe(false);
+      if (result.ok === false) {
+        expect(result.reason).toBe('tests_not_passing');
+        expect(Array.isArray(result.failing_tests)).toBe(true);
+        expect(result.failing_tests!.length).toBe(1);
+        expect(result.failing_tests![0]!.id).toBe(failing.id);
+      }
+      expect(definitionsState[def.id].status).toBe('proposed');
+    });
   });
 
   it('cenário 3: todos tests passing → promove com sucesso', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const def = await seedProposedDefinition('all-green');
-        await seedTest(def.id, 'pass');
-        await seedTest(def.id, 'pass');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const def = await seedProposedDefinition('all-green');
+      await seedTest(def.id, 'pass');
+      await seedTest(def.id, 'pass');
 
-        const result = await transitionProcedureStatus({
-          definition: def,
-          to: 'active',
-          actor: 'owner-1',
-        });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'active',
+        actor: 'owner-1',
+      });
 
-        expect(result.ok).toBe(true);
-        expect(definitionsState[def.id].status).toBe('active');
-        expect(definitionsState[def.id].approved_by).toBe('owner-1');
-        expect(definitionsState[def.id].activated_at).toBeDefined();
-      },
-    );
+      expect(result.ok).toBe(true);
+      expect(definitionsState[def.id].status).toBe('active');
+      expect(definitionsState[def.id].approved_by).toBe('owner-1');
+      expect(definitionsState[def.id].activated_at).toBeDefined();
+    });
   });
 
   it('cenário 4: tests com last_run_status null (nunca rodaram) também bloqueiam como tests_not_passing', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const def = await seedProposedDefinition('never-ran');
-        const never = await seedTest(def.id, null); // created, never recordRun-ed
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const def = await seedProposedDefinition('never-ran');
+      const never = await seedTest(def.id, null); // created, never recordRun-ed
 
-        const result = await transitionProcedureStatus({
-          definition: def,
-          to: 'active',
-          actor: 'owner-1',
-        });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'active',
+        actor: 'owner-1',
+      });
 
-        expect(result.ok).toBe(false);
-        if (result.ok === false) {
-          expect(result.reason).toBe('tests_not_passing');
-          expect(result.failing_tests!.map((t) => t.id)).toContain(never.id);
-        }
-        expect(definitionsState[def.id].status).toBe('proposed');
-      },
-    );
+      expect(result.ok).toBe(false);
+      if (result.ok === false) {
+        expect(result.reason).toBe('tests_not_passing');
+        expect(result.failing_tests!.map((t) => t.id)).toContain(never.id);
+      }
+      expect(definitionsState[def.id].status).toBe('proposed');
+    });
   });
 
   it('cenário 5: gate NÃO dispara em draft → proposed (não há gate aí)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
-        const def = await procedureDefinitionsRepo.create({
-          scope: 'agent',
-          nome: 'no-gate-here',
-          version_number: 1,
-          status: 'draft',
-          intencao: 'X',
-          when_apply: {},
-          when_not_apply: {},
-          steps: [],
-          success_criteria: [],
-          failure_modes: [],
-          tools_referenced: [],
-          source: 'ensino',
-        } as any);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
+      const def = await procedureDefinitionsRepo.create({
+        scope: 'agent',
+        nome: 'no-gate-here',
+        version_number: 1,
+        status: 'draft',
+        intencao: 'X',
+        when_apply: {},
+        when_not_apply: {},
+        steps: [],
+        success_criteria: [],
+        failure_modes: [],
+        tools_referenced: [],
+        source: 'ensino',
+      } as any);
 
-        // No tests seeded — but draft→proposed should not consult the gate.
-        const result = await transitionProcedureStatus({
-          definition: def,
-          to: 'proposed',
-          actor: 'owner-1',
-        });
+      // No tests seeded — but draft→proposed should not consult the gate.
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'proposed',
+        actor: 'owner-1',
+      });
 
-        expect(result.ok).toBe(true);
-        expect(definitionsState[def.id].status).toBe('proposed');
-        const { procedureTestsRepo } = await import('@/db/repositories.js');
-        expect(procedureTestsRepo.listByDefinition).not.toHaveBeenCalled();
-      },
-    );
+      expect(result.ok).toBe(true);
+      expect(definitionsState[def.id].status).toBe('proposed');
+      const { procedureTestsRepo } = await import('@/db/repositories.js');
+      expect(procedureTestsRepo.listByDefinition).not.toHaveBeenCalled();
+    });
   });
 
   it('cenário 6: gate NÃO dispara em active → frozen', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
-        const def = await procedureDefinitionsRepo.create({
-          scope: 'agent',
-          nome: 'active-to-frozen',
-          version_number: 1,
-          status: 'active',
-          intencao: 'X',
-          when_apply: {},
-          when_not_apply: {},
-          steps: [],
-          success_criteria: [],
-          failure_modes: [],
-          tools_referenced: [],
-          source: 'ensino',
-        } as any);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { procedureDefinitionsRepo } = await import('@/db/repositories.js');
+      const def = await procedureDefinitionsRepo.create({
+        scope: 'agent',
+        nome: 'active-to-frozen',
+        version_number: 1,
+        status: 'active',
+        intencao: 'X',
+        when_apply: {},
+        when_not_apply: {},
+        steps: [],
+        success_criteria: [],
+        failure_modes: [],
+        tools_referenced: [],
+        source: 'ensino',
+      } as any);
 
-        const result = await transitionProcedureStatus({
-          definition: def,
-          to: 'frozen',
-          actor: 'owner-1',
-        });
+      const result = await transitionProcedureStatus({
+        definition: def,
+        to: 'frozen',
+        actor: 'owner-1',
+      });
 
-        expect(result.ok).toBe(true);
-        expect(definitionsState[def.id].status).toBe('frozen');
-        const { procedureTestsRepo } = await import('@/db/repositories.js');
-        expect(procedureTestsRepo.listByDefinition).not.toHaveBeenCalled();
-      },
-    );
+      expect(result.ok).toBe(true);
+      expect(definitionsState[def.id].status).toBe('frozen');
+      const { procedureTestsRepo } = await import('@/db/repositories.js');
+      expect(procedureTestsRepo.listByDefinition).not.toHaveBeenCalled();
+    });
   });
 });

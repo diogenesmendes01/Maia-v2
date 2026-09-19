@@ -56,12 +56,14 @@ type AuditRow = {
 
 type Agent = { id: string; tenant_id: string; nome: string; status: string };
 
-function makeRepos(opts: {
-  channels?: Channel[];
-  roles?: Role[];
-  policies?: Policy[];
-  agents?: Agent[];
-} = {}) {
+function makeRepos(
+  opts: {
+    channels?: Channel[];
+    roles?: Role[];
+    policies?: Policy[];
+    agents?: Agent[];
+  } = {},
+) {
   const channels = [...(opts.channels ?? [])];
   const roles = [...(opts.roles ?? [])];
   const policies = [...(opts.policies ?? [])];
@@ -149,12 +151,8 @@ function makeRepos(opts: {
         if (roles.some((r) => r.role_key === args.role.role_key)) {
           return { ok: false as const, reason: 'duplicate' as const };
         }
-        const isDefault =
-          args.role.is_default ?? roles.filter((r) => r.active).length === 0;
-        if (
-          isDefault &&
-          roles.some((r) => (r as Role & { is_default?: boolean }).is_default)
-        ) {
+        const isDefault = args.role.is_default ?? roles.filter((r) => r.active).length === 0;
+        if (isDefault && roles.some((r) => (r as Role & { is_default?: boolean }).is_default)) {
           return { ok: false as const, reason: 'duplicate' as const };
         }
         const row = {
@@ -281,21 +279,18 @@ const role2: Role = {
 };
 
 describe('channelPoliciesRouter.upsert — role gate', () => {
-  it.each(['analyst', 'viewer', 'compliance_officer'])(
-    '%s cannot upsert',
-    async (role) => {
-      const repos = makeRepos({ channels: [channel1], roles: [role1] });
-      await expect(
-        caller(role, 'tenant-A', 'u1', repos).upsert({
-          agentId: 'agent-1',
-          channel_id: channel1.id,
-          default_role_id: role1.id,
-          switch_behavior: 'locked',
-          comment: 'attempt without permission',
-        }),
-      ).rejects.toThrow(TRPCError);
-    },
-  );
+  it.each(['analyst', 'viewer', 'compliance_officer'])('%s cannot upsert', async (role) => {
+    const repos = makeRepos({ channels: [channel1], roles: [role1] });
+    await expect(
+      caller(role, 'tenant-A', 'u1', repos).upsert({
+        agentId: 'agent-1',
+        channel_id: channel1.id,
+        default_role_id: role1.id,
+        switch_behavior: 'locked',
+        comment: 'attempt without permission',
+      }),
+    ).rejects.toThrow(TRPCError);
+  });
 
   it('owner creates a new policy and audits action=create', async () => {
     const repos = makeRepos({ channels: [channel1], roles: [role1] });
@@ -342,9 +337,7 @@ describe('channelPoliciesRouter.upsert — update path', () => {
     expect(repos._inspect.policies[0]!.default_role_id).toBe(role2.id);
     expect(repos._inspect.policies[0]!.switch_behavior).toBe('by_context');
     expect(repos._inspect.audit[0]!.action).toBe('channel_policy_update');
-    expect(repos._inspect.audit[0]!.change_summary?.previous_policy_id).toBe(
-      'policy-existing',
-    );
+    expect(repos._inspect.audit[0]!.change_summary?.previous_policy_id).toBe('policy-existing');
   });
 });
 
@@ -478,20 +471,17 @@ describe('channelPoliciesRouter.createChannel', () => {
 });
 
 describe('channelPoliciesRouter.createRole', () => {
-  it.each(['analyst', 'viewer', 'compliance_officer'])(
-    '%s cannot create a role',
-    async (role) => {
-      const repos = makeRepos({ agents: [agent1] });
-      await expect(
-        caller(role, 'tenant-A', 'u1', repos).createRole({
-          agentId: 'agent-1',
-          role_key: 'comercial',
-          display_name: 'Comercial',
-          comment: 'attempt without permission',
-        }),
-      ).rejects.toThrow(TRPCError);
-    },
-  );
+  it.each(['analyst', 'viewer', 'compliance_officer'])('%s cannot create a role', async (role) => {
+    const repos = makeRepos({ agents: [agent1] });
+    await expect(
+      caller(role, 'tenant-A', 'u1', repos).createRole({
+        agentId: 'agent-1',
+        role_key: 'comercial',
+        display_name: 'Comercial',
+        comment: 'attempt without permission',
+      }),
+    ).rejects.toThrow(TRPCError);
+  });
 
   it('owner creates a role and audits action=role_create', async () => {
     const repos = makeRepos({ agents: [agent1] });

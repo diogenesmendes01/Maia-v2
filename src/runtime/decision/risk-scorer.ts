@@ -15,11 +15,7 @@
  * Budget target: <40ms (stub is sync-equivalent).
  */
 import type { RiskScorer } from './types.js';
-import type {
-  BaseContextPacket,
-  DecisionPacket,
-  RiskLevel,
-} from '../context-packet/types.js';
+import type { BaseContextPacket, DecisionPacket, RiskLevel } from '../context-packet/types.js';
 
 const HIGH_RISK_INTENTS = new Set([
   'transfer_intent',

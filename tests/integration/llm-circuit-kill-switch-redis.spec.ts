@@ -223,7 +223,8 @@ describe('kill switch — adoção depois do SUBSCRIBE confirmado', () => {
     const seen: string[] = [];
     monitor.on('monitor', (_time: string, args: string[]) => {
       const cmd = String(args[0]).toLowerCase();
-      if (cmd === 'subscribe' && args.includes(LLM_CIRCUIT_OVERRIDE_CHANNEL)) seen.push('subscribe');
+      if (cmd === 'subscribe' && args.includes(LLM_CIRCUIT_OVERRIDE_CHANNEL))
+        seen.push('subscribe');
       if (cmd === 'get' && args[1] === LLM_CIRCUIT_OVERRIDE_KEY) seen.push('get');
     });
 
