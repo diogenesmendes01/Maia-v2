@@ -2079,6 +2079,21 @@
         "true"
       ]
     },
+    "MAIA_HERMES_KILL_SWITCH": {
+      "type": "string",
+      "description": "Kill switch do Hermes (K-15): true força maia_react em todo turno novo, por cima de agent_engine_policies. Só desliga; nunca liga o Hermes — ligar é linha por (tenant, agente, canal). Não muda turno já pinado. Só false/0 explícitos o deixam solto: qualquer outro valor aciona.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
     "MAIA_SYNTHETIC_PROBE": {
       "type": "string",
       "description": "Sonda sintética ponta-a-ponta. Inerte enquanto false. Exige MAIA_CHANNEL_ROUTING_MODE em exact_first ou strict.",
