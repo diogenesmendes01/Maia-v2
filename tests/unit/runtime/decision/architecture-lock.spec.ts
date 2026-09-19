@@ -29,7 +29,12 @@ async function walk(dir: string, out: string[] = []): Promise<string[]> {
 describe('P9b — Architecture lock (G7)', () => {
   it('src/runtime/decision/* does NOT import policy-descriptor-resolver directly', async () => {
     const dir = join(REPO_ROOT, 'src', 'runtime', 'decision');
-    const files = await walk(dir);
+    // `prod-env.ts` É o composition root: monta os adapters de produção e
+    // injeta o resolver no env (ver o cabeçalho dele). Antes da normalização
+    // do prettier, o import quebrado em várias linhas escapava desta regex por
+    // acidente; a exceção agora é declarada, e qualquer outro arquivo reprova.
+    const compositionRoot = join(dir, 'prod-env.ts');
+    const files = (await walk(dir)).filter((f) => f !== compositionRoot);
     expect(files.length).toBeGreaterThan(0);
     for (const f of files) {
       const content = await readFile(f, 'utf8');
