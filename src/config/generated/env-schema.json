@@ -1671,6 +1671,20 @@
         "5"
       ]
     },
+    "MAIA_HERMES_INFERENCE_ALLOWED_SOURCES": {
+      "type": "string",
+      "description": "Origens, além da loopback, que podem chamar o gateway de inferência Hermes: IPv4/CIDR ou IPv6 exato, separados por vírgula (ex.: a rede do container worker). Ausente = só loopback. Nunca a rede do proxy da borda.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "examples": [
+        "172.18.0.0/16"
+      ]
+    },
     "FEATURE_MCP_TOOLS": {
       "type": "string",
       "description": "MCP externo v1 (#478). Fail-closed: PROIBIDO em produção até o gate G4 (threat model + pentest).",
