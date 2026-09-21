@@ -20,6 +20,7 @@ import {
   riskFloorFromScan,
   MAX_SCAN_DEPTH,
   MAX_SCAN_NODES,
+  MAX_SCAN_CHARS,
 } from '@/control-plane/knowledge-state-machine/payload-scan.js';
 
 // CPF sintético com dígito verificador válido.
@@ -107,6 +108,29 @@ describe('scanPayload — o que não foi percorrido é declarado', () => {
     const scan = scanPayload(a);
     expect(scan.coverage).toBe('incomplete');
     expect(scan.coverage === 'incomplete' && scan.reason).toBe('cyclic');
+  });
+
+  it('chave ultrapassando teto de caracteres vira incomplete com too_large', () => {
+    // Reprodução: chave maior que MAX_SCAN_CHARS deveria marcar incompleto.
+    const chaveGrande = 'x'.repeat(MAX_SCAN_CHARS + 1);
+    const scan = scanPayload({ [chaveGrande]: null });
+    expect(scan.coverage).toBe('incomplete');
+    expect(scan.coverage === 'incomplete' && scan.reason).toBe('too_large');
+  });
+
+  it('objeto com muitas chaves nomeadas sensíveis interrompe após cutoff', () => {
+    // Reprodução: objeto com MAX_SCAN_NODES + 100 chaves no padrão kN-password
+    // deve retornar incomplete e NÃO emitir findings para além do cutoff.
+    const muitas: Record<string, number> = {};
+    const numChaves = MAX_SCAN_NODES + 100;
+    for (let i = 0; i < numChaves; i++) {
+      muitas[`k${i}-password`] = i;
+    }
+    const scan = scanPayload(muitas);
+    expect(scan.coverage).toBe('incomplete');
+    expect(scan.coverage === 'incomplete' && scan.reason).toBe('too_large');
+    // Verificar que não emitimos findings excessivos: no máximo MAX_SCAN_NODES.
+    expect(scan.findings.length).toBeLessThanOrEqual(MAX_SCAN_NODES);
   });
 });
 

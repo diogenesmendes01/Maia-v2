@@ -202,11 +202,24 @@ export function scanPayload(raiz: unknown): PayloadScanV1 {
     vistos.add(obj);
 
     if (Array.isArray(obj)) {
-      for (let i = 0; i < obj.length; i++) visitar(obj[i], `${path}[${i}]`, depth + 1);
+      for (let i = 0; i < obj.length; i++) {
+        if (incompleto !== null) break;
+        visitar(obj[i], `${path}[${i}]`, depth + 1);
+      }
       return;
     }
 
-    for (const [k, valor] of Object.entries(obj as Record<string, unknown>)) {
+    const entries = Object.entries(obj as Record<string, unknown>);
+    for (const [k, valor] of entries) {
+      if (incompleto !== null) break;
+
+      // Contabiliza o comprimento da chave no orçamento de caracteres.
+      chars += k.length;
+      if (chars > MAX_SCAN_CHARS) {
+        incompleto = 'too_large';
+        break;
+      }
+
       // A chave entra na varredura de segredo: o marcador costuma estar no
       // NOME do campo.
       if (RE_SEGREDO.test(`${k}:`)) findings.push({ signal: 'secret_like', path: `${path}.${k}` });
