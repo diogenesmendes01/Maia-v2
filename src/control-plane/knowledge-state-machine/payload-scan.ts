@@ -178,13 +178,33 @@ export function scanPayload(raiz: unknown): PayloadScanV1 {
         varrerTexto(v, path, findings);
         return;
       }
-      case 'number':
+      case 'number': {
+        // Números também podem carregar documentos (CPF, CNPJ), especialmente
+        // quando JSON traz valores como tipo nativo. Converter para texto e
+        // varrer, respeitando o orçamento de caracteres como strings fazem.
+        const str = String(v);
+        chars += str.length;
+        if (chars > MAX_SCAN_CHARS) {
+          incompleto = 'too_large';
+          return;
+        }
+        varrerTexto(str, path, findings);
+        return;
+      }
       case 'boolean':
         return;
-      case 'bigint':
+      case 'bigint': {
         // Cabe em texto sem perda e pode carregar um documento inteiro.
-        varrerTexto(v.toString(), path, findings);
+        // Como números agora também são varridos, bigint segue o mesmo padrão.
+        const bigintStr = v.toString();
+        chars += bigintStr.length;
+        if (chars > MAX_SCAN_CHARS) {
+          incompleto = 'too_large';
+          return;
+        }
+        varrerTexto(bigintStr, path, findings);
         return;
+      }
       case 'object':
         break;
       default:

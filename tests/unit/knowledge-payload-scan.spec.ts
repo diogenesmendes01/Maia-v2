@@ -77,6 +77,19 @@ describe('scanPayload — cobertura integral', () => {
     expect(scan.findings.map((f) => f.signal)).toEqual(['phone_br']);
   });
 
+  it('número JSON com valor de CPF/CNPJ válido é detectado', () => {
+    // JSON pode trazer um documento como tipo nativo de número.
+    // `scanPayload({cpf: 52998224725})` não deve passar despercebido.
+    const scan1 = scanPayload({ cpf: 52998224725 });
+    expect(scan1.coverage).toBe('complete');
+    expect(scan1.findings.some((f) => f.signal === 'cpf')).toBe(true);
+
+    // CNPJ numérico também.
+    const scan2 = scanPayload({ cnpj: 11222333000181 });
+    expect(scan2.coverage).toBe('complete');
+    expect(scan2.findings.some((f) => f.signal === 'cnpj')).toBe(true);
+  });
+
   it('o caminho do achado não carrega o valor encontrado', () => {
     const scan = scanPayload({ cliente: { documento: CPF_VALIDO } });
     const achado = scan.findings.find((f) => f.signal === 'cpf');
