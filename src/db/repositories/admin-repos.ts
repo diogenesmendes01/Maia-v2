@@ -1,5 +1,6 @@
 import { eq, and, desc, isNull, sql, gt } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
+import { applyKnowledgeDecisionTx } from '@/learning/approval-adapter.js';
 import {
   capability_proposals,
   agent_operational_profile_versions,
@@ -106,6 +107,28 @@ export function decodeListCursor(
  * call time via information_schema lookups). Once the dependent PRs merge,
  * the UNION view materializes the full federation without code changes.
  */
+/**
+ * O risco REGISTRADO do item, lido da última transição gravada.
+ *
+ * Não recalcula. O scorer decidiu quando o item nasceu, e refazer a conta aqui
+ * daria outro número para o MESMO item conforme o texto do modelo mudasse de
+ * versão — a fila mostraria risco oscilando sem nada ter acontecido.
+ *
+ * Sem registro legível, `critical`. É o lado que exige a assinatura mais forte:
+ * um default baixo faria uma leitura falha virar aprovação mais fácil.
+ */
+export function riscoDaUltimaTransicao(transicoes: unknown): RiskLevelId {
+  if (!Array.isArray(transicoes)) return 'critical';
+  for (let i = transicoes.length - 1; i >= 0; i--) {
+    const t = transicoes[i] as { risk_score?: { level?: unknown } } | null;
+    const nivel = t?.risk_score?.level;
+    if (nivel === 'low' || nivel === 'medium' || nivel === 'high' || nivel === 'critical') {
+      return nivel;
+    }
+  }
+  return 'critical';
+}
+
 export const proposalsUnifiedRepo = {
   /** Tables expected to exist post-merge; queried with COALESCE-style fallback. */
   EXPECTED_TABLES: [
@@ -223,6 +246,79 @@ export const proposalsUnifiedRepo = {
           proposed_at: r.created_at,
           proposed_by: r.decided_by ?? 'system',
         });
+      }
+    }
+
+    /**
+     * P10 (spec §7.9.2) — PROPOSTAS DE CONHECIMENTO na fila unificada.
+     *
+     * `knowledge_proposal` já era tipo declarado — `countersByType` o listava
+     * com zero — e a fila NUNCA produzia uma linha dele. O efeito: itens
+     * nascendo em `pending_review` pelo KSM ficavam num estado sem porta.
+     * Ninguém os via, ninguém os decidia, e a fila de revisão que o G1 passou
+     * a alimentar não tinha para onde crescer.
+     *
+     * As quatro tabelas do KSM entram como uma fonte só. O `source` carrega a
+     * TABELA de origem, porque é ela que o adapter de decisão precisa para
+     * saber onde escrever — e derivar isso do id seria impossível: os ids são
+     * UUIDs em todas.
+     *
+     * O risco vem da última transição gravada, não de recálculo: o scorer já
+     * decidiu quando o item nasceu, e refazer a conta aqui poderia dar outro
+     * número para o mesmo item conforme o texto do modelo mudasse de versão.
+     */
+    {
+      const ksmStatusMap: Record<ProposalUnifiedStatus, string | null> = {
+        proposed: 'pending_review',
+        pending_review: 'pending_review',
+        rejected: 'revoked',
+        // `activated` é o item que já vale. Ele não é proposta — sai da fila.
+        activated: null,
+      };
+      const alvo = ksmStatusMap[status];
+      if (alvo !== null) {
+        const tabelas: Array<{ nome: string; kind: string; descritor: string }> = [
+          { nome: 'agent_facts', kind: 'fact', descritor: 'chave' },
+          { nome: 'memory_entry', kind: 'memory', descritor: 'content' },
+          { nome: 'learned_rules', kind: 'rule', descritor: 'contexto' },
+          { nome: 'behavioral_hint', kind: 'behavioral_hint', descritor: 'content' },
+        ];
+        for (const t of tabelas) {
+          if (!available.includes(t.nome)) continue;
+          const rows = await db.execute<{
+            id: string;
+            descriptor: string;
+            created_at: Date;
+            lifecycle_transitions: unknown;
+          }>(sql`
+            SELECT id,
+                   LEFT(COALESCE(${sql.raw(t.descritor)}::text, ''), 200) AS descriptor,
+                   created_at,
+                   lifecycle_transitions
+              FROM ${sql.raw(t.nome)}
+             WHERE tenant_id = ${input.tenantId}
+               AND lifecycle_status = ${alvo}
+             ORDER BY created_at DESC, id DESC
+             LIMIT ${input.limit + 1}
+          `);
+          for (const r of rows.rows) {
+            items.push({
+              id: String(r.id),
+              type: 'knowledge_proposal',
+              descriptor: String(r.descriptor ?? ''),
+              risk: riscoDaUltimaTransicao(r.lifecycle_transitions),
+              // O KIND vai no `source`: é o que diz ao adapter qual tabela
+              // escrever, e não há como derivá-lo do id.
+              source: t.kind,
+              status,
+              proposed_at: r.created_at,
+              // O KSM não guarda "quem propôs" como identidade — a proposta
+              // vem de inferência. `system` é honesto; um nome ali seria
+              // inventado.
+              proposed_by: 'system',
+            });
+          }
+        }
       }
     }
 
@@ -538,6 +634,16 @@ export const proposalsUnifiedRepo = {
     decision: 'approved' | 'rejected';
     comment: string;
     /**
+     * P10 — qual das quatro tabelas do KSM a proposta de conhecimento habita.
+     *
+     * Vem do `source` da linha da fila unificada. NÃO é derivável do id: as
+     * quatro usam UUID, então um id sozinho não diz onde escrever. Ausente
+     * num `knowledge_proposal`, a decisão é recusada em vez de adivinhar.
+     */
+    knowledgeKind?: 'fact' | 'memory' | 'rule' | 'behavioral_hint';
+    /** Escopo da proposta, quando a fonte o carrega. */
+    agentId?: string | null;
+    /**
      * Provided by the tRPC layer for gate recomputation inside the tx.
      * If absent, falls back to the pre-computed dualComplete (old behaviour,
      * kept for backwards-compat with the mock in tests).
@@ -597,6 +703,91 @@ export const proposalsUnifiedRepo = {
     const available = await this._availableTables();
 
     return await withTx(async (tx) => {
+      /**
+       * P10 (spec §7.9.2) — `knowledge_proposal` deixa de ser não suportado.
+       *
+       * O ramo é autocontido como os demais: insere a linha de aprovação,
+       * audita, e só então aplica a decisão no item canônico — tudo no MESMO
+       * `tx`. É a razão de `knowledgeRepos` ter ganhado executor: em
+       * transações separadas, um crash entre as duas deixaria decisão sem
+       * efeito (o console diz "aprovado" e o item segue invisível) ou efeito
+       * sem decisão (o item vira ativo sem linha dizendo quem autorizou).
+       *
+       * A auditoria vem ANTES da mutação, pela mesma razão do ramo de
+       * capability: a linha de auditoria sobrevive mesmo que o UPDATE role
+       * back, e "tentou decidir e falhou" é um fato que precisa ficar.
+       */
+      if (input.type === 'knowledge_proposal') {
+        const kind = input.knowledgeKind;
+        if (kind === undefined) {
+          // Sem o kind não dá para saber QUAL das quatro tabelas decidir —
+          // todas usam UUID, então o id não revela a origem. Recusar é o
+          // único desfecho honesto: adivinhar escreveria na tabela errada.
+          return { ok: false, reason: 'source_not_supported' as const };
+        }
+
+        const inseridas = await tx
+          .insert(proposal_approvals)
+          .values({
+            tenant_id: input.tenantId,
+            agent_id: input.agentId ?? null,
+            proposal_source: 'knowledge_proposal',
+            proposal_id: input.proposalId,
+            approval_class: input.approvalClass,
+            approver_user_id: input.actorId,
+            approver_role: input.actorRole,
+            decision: input.decision,
+            comment: input.comment,
+          })
+          .returning();
+        const approval = inseridas[0];
+        if (!approval) {
+          throw new TypedError('approval_insert_failed', 'Could not record approval');
+        }
+
+        await tx.insert(admin_audit_log).values({
+          tenant_id: input.tenantId,
+          actor_id: input.actorId,
+          actor_role: input.actorRole,
+          action: input.decision === 'approved' ? 'proposal_approve' : 'proposal_reject',
+          resource_type: 'knowledge_proposal',
+          resource_id: input.proposalId,
+          change_summary: {
+            approval_class: input.approvalClass,
+            comment: input.comment,
+            knowledge_kind: kind,
+          },
+        });
+
+        const r = await applyKnowledgeDecisionTx(tx, {
+          kind,
+          proposal_id: input.proposalId,
+          decision: input.decision === 'approved' ? 'approve' : 'reject',
+          decided_by_app_user_id: input.actorId,
+          reason: input.comment,
+        });
+        if (!r.ok) {
+          if (r.reason === 'not_found') return { ok: false, reason: 'not_found' as const };
+          if (r.reason === 'invalid_source_status') {
+            return { ok: false, reason: 'invalid_source_status' as const };
+          }
+          return { ok: false, reason: 'transition_failed' as const };
+        }
+
+        return {
+          ok: true as const,
+          sourceTransitioned: true,
+          approval,
+          finalStatus: (input.decision === 'approved'
+            ? 'activated'
+            : 'rejected') as ProposalUnifiedStatus,
+          // Conhecimento não tem gate dual próprio nesta fatia: a classe de
+          // aprovação já foi escolhida por `getLearningApprovalClassFor`, e
+          // quem exige duas assinaturas é o router, antes de chegar aqui.
+          dualComplete: input.dualComplete,
+        };
+      }
+
       // (1) Re-read + LOCK source row to prevent races.
       if (input.type === 'capability_proposal') {
         if (!available.includes('capability_proposals')) {
@@ -775,7 +966,7 @@ export const proposalsUnifiedRepo = {
         };
       }
 
-      // policy_rule / soul_bias / skill / knowledge_proposal:
+      // policy_rule / soul_bias / skill:
       //
       // Reverted (Codex review of PR #162, finding [critical]): the previous
       // attempt to add a generic raw-table activation path skipped each
