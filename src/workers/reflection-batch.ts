@@ -6,7 +6,7 @@ import { logger } from '@/lib/logger.js';
 import { callLLM } from '@/lib/claude.js';
 import { rulesRepo } from '@/db/repositories.js';
 import { audit } from '@/governance/audit.js';
-import { writeMemory } from '@/memory/vector.js';
+import { proposeFromWorker } from '@/learning/service.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { runCognitiveModule } from '@/cognition/runner.js';
 import {
@@ -361,46 +361,84 @@ async function runReflectionBatchInner(since: ReturnType<typeof sql>): Promise<R
     }
 
     try {
-      const r = await rulesRepo.create({
-        tipo: proposal.tipo,
-        contexto: proposal.contexto,
-        acao: proposal.acao,
-        contexto_jsonb: proposal.contexto_jsonb ?? {},
-        acoes_jsonb: proposal.acoes_jsonb ?? {},
-        confianca: '0.50',
-        acertos: 0,
-        erros: 0,
-        ativa: true,
-        exemplo_origem_id: cluster.signals[0]?.alvo_id ?? null,
-        // P10a: lifecycle columns populated by DB defaults.
+      /**
+       * G1 (spec §7.6.1 itens 5 e 6) — O WORKER DEIXA DE ESCREVER CONHECIMENTO
+       * ATIVO.
+       *
+       * O que estava aqui eram duas linhas, e juntas elas diziam o seguinte:
+       * um lote noturno, a partir de um agrupamento de correções, criava uma
+       * REGRA ATIVA (`rulesRepo.create({ …, ativa: true })`) que passava a
+       * governar todos os turnos seguintes, e publicava a justificativa do
+       * modelo como memória GLOBAL (`writeMemory({ escopo: 'global' })`).
+       * Nenhum humano aparecia no caminho.
+       *
+       * O §7.6.1 é explícito sobre o que `source='worker'` significa: não é
+       * selo de confiança. Agora a proposta passa pelo `LearningService`, que
+       * a leva ao KSM com nascimento obrigatório em revisão, disposição
+       * privada e `visible_to_llm=false`.
+       *
+       * A `writeMemory(escopo:'global')` saiu e NÃO foi substituída. O item 6
+       * é literal: "Raciocínio/justificativa do LLM não vira memória global".
+       * A justificativa continua existindo — como METADADO da proposta, que é
+       * onde um humano a lê ao decidir, e não como conhecimento indexado que
+       * volta ao prompt sem ninguém ter aprovado.
+       */
+      const r = await proposeFromWorker({
+        kind: 'learned_rule',
+        tenant_id,
+        agent_id,
+        trace_id: `reflection_batch:${cluster.descricao_normalized}`,
+        key: cluster.descricao_normalized,
+        content: {
+          type: proposal.tipo,
+          context: proposal.contexto,
+          action: proposal.acao,
+          conditions: proposal.contexto_jsonb ?? {},
+          effects: proposal.acoes_jsonb ?? {},
+        },
+        content_text: `[${proposal.tipo}] ${proposal.contexto} -> ${proposal.acao}`,
+        source: 'worker',
+        source_event_ids: cluster.signals
+          .map((sig) => sig.alvo_id)
+          .filter((id): id is string => typeof id === 'string' && id.length > 0),
+        native: {
+          rule_tipo: proposal.tipo,
+          rule_contexto: proposal.contexto,
+          rule_acao: proposal.acao,
+          rule_contexto_jsonb: proposal.contexto_jsonb ?? {},
+          rule_acoes_jsonb: proposal.acoes_jsonb ?? {},
+        },
       });
+
+      if (r.kind === 'refused') {
+        logger.warn(
+          { tenant_id, agent_id, reason: r.reason, detail: r.detail },
+          'reflection_batch.proposal_refused',
+        );
+        continue;
+      }
+
+      /**
+       * `learning_proposed`, e não `rule_learned` (§7.6.1 item 7).
+       *
+       * A ação legada afirma que uma regra foi APRENDIDA, e quem lê contadores
+       * ou UI baseados nela concluiria que o agente mudou de comportamento. O
+       * que aconteceu foi outra coisa: existe uma proposta esperando um humano.
+       * Distinguir proposta de publicação é o item inteiro.
+       */
       await audit({
-        acao: 'rule_learned',
-        alvo_id: r.id,
+        acao: 'learning_proposed',
+        alvo_id: r.proposal_id,
         metadata: {
           source: 'batch',
+          learning_kind: 'learned_rule',
           cluster_size: cluster.signals.length,
+          lifecycle_status: r.lifecycle_status,
+          approval_class: r.approval_class,
+          risk: r.risk,
           justificativa: proposal.justificativa,
         },
       });
-      // Write a reflexao memory so future recall can surface the reasoning.
-      // writeMemory resolves tenant/agent from the active ALS context (#229/#237)
-      // — the routed tuple, NEVER 'default/default'.
-      await writeMemory({
-        conteudo: `Regra ${r.id.slice(0, 8)}: ${proposal.contexto} → ${proposal.acao}. ${
-          proposal.justificativa ?? ''
-        }`,
-        tipo: 'reflexao',
-        escopo: 'global',
-        metadata: { rule_id: r.id, cluster_size: cluster.signals.length },
-      }).catch((err) =>
-        // Codex REQUEST_CHANGES (PR #251) LOW: incluir tenant/agent no log
-        // de falha pra simetria com o caminho de sucesso. Antes só `{err}`.
-        logger.warn(
-          { err: (err as Error).message, tenant_id, agent_id },
-          'reflection_batch.memory_write_failed',
-        ),
-      );
       created++;
     } catch (err) {
       // Idem — log de falha simétrico ao de sucesso.
