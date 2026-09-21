@@ -75,6 +75,17 @@ export type OutputCoordinatorDepsV1 = {
    * propósito por um operador ou pelo recovery.
    */
   isEgressAuthorized?: () => Promise<boolean>;
+  /**
+   * C24 — a trilha durável do resultado barrado (`engine_result_fenced`).
+   *
+   * Injetada como as demais: `@/governance/audit.js` resolve tenant e agent
+   * pelo ALS, e este módulo é exercitado sem contexto nos testes.
+   */
+  audit?: (input: {
+    acao: 'engine_result_fenced';
+    alvo_id: string;
+    metadata: Record<string, unknown>;
+  }) => Promise<void>;
   /** Lacuna interna: fire-and-forget, NUNCA bloqueia a resposta (§5.9.2.9). */
   onDelivered?: (rawText: string) => void;
 };
@@ -153,6 +164,29 @@ export async function coordinateOutput(
     // turno vazio. Sem este motivo explícito, uma divergência com efeito fica
     // indistinguível de um turno que simplesmente não produziu resposta.
     exitReason = 'claim_divergence_blocked';
+
+    /**
+     * C24 — a linha durável do resultado barrado.
+     *
+     * O `logger.error` acima é diagnóstico e some na rotação. Um resultado que
+     * a Maia se recusou a entregar é decisão de governança, e decisão de
+     * governança precisa de linha que sobreviva — é ela que alguém lê para
+     * reconciliar o run depois.
+     *
+     * O payload leva IDS de chamada e nada mais: nenhum argumento, resultado
+     * ou texto entra, pela mesma razão de sempre.
+     */
+    if (deps.audit !== undefined) {
+      await deps.audit({
+        acao: 'engine_result_fenced',
+        alvo_id: inbound.id,
+        metadata: {
+          conversa_id: conversa.id,
+          divergence: divergenceToAuditPayload(assembled.divergence),
+          side_effects_committed: assembled.sideEffectsCommitted,
+        },
+      });
+    }
 
     if (assembled.toolSummaries.length > 0) {
       await deps.flushUnconfirmedToolSummaries(

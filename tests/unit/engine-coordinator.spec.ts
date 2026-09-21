@@ -281,3 +281,60 @@ describe('T22 — egresso bloqueado depois da revogação de grant', () => {
     expect(r.delivery.dispatched).toBe(true);
   });
 });
+
+describe('C24 — resultado barrado deixa linha durável (engine_result_fenced)', () => {
+  /** Resultado com divergência: o motor afirma uma chamada sem receipt. */
+  function comDivergencia() {
+    return assembleTurnResult({
+      proposal: {
+        version: 1,
+        run_id: '11111111-1111-4111-8111-111111111111',
+        request_key: '22222222-2222-4222-8222-222222222222',
+        stop: { kind: 'reply', raw_text: 'Pronto.' } as EngineStopV1,
+        iterations: 1,
+        observed_tool_call_ids: ['fantasma'],
+        usage: {
+          input_tokens: null,
+          output_tokens: null,
+          cost_microusd: null,
+          source: 'unavailable' as const,
+        },
+      },
+      receipts: [],
+      outboundPrefix: null,
+    });
+  }
+
+  it('audita o bloqueio com os ids da divergência', async () => {
+    const audit = vi.fn(async () => {});
+    const dispatch = vi.fn(async () => ({ status: 'delivered' as const }));
+    const r = await coordinateOutput(HOST, comDivergencia(), {
+      dispatch,
+      flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+      audit,
+    });
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(r.delivery.exitReason).toBe('claim_divergence_blocked');
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acao: 'engine_result_fenced',
+        metadata: expect.objectContaining({
+          divergence: expect.objectContaining({ kind: 'claimed_not_journaled' }),
+        }),
+      }),
+    );
+  });
+
+  it('o log não substitui a linha: sem a dependência, o bloqueio ainda acontece', async () => {
+    // A auditoria é a trilha, não o fence. Quem não liga a dependência perde a
+    // trilha — nunca o bloqueio.
+    const dispatch = vi.fn(async () => ({ status: 'delivered' as const }));
+    const r = await coordinateOutput(HOST, comDivergencia(), {
+      dispatch,
+      flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+    });
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(r.delivery.dispatched).toBe(false);
+  });
+});
