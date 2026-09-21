@@ -34,9 +34,16 @@
  */
 import type { EngineToolCallV1, EngineToolReplyV1, Json } from '@/runtime/engines/contracts.js';
 import type { ToolAdmissionV1 } from './tool-broker.js';
-import type { ToolCallAdmission, ToolClassification } from '@/db/repositories/engine-repos.js';
+import type {
+  ToolCallAdmission,
+  ToolClassification,
+  ToolSettlement,
+  FreezeIdentityResult,
+  HandlerStartedResult,
+} from '@/db/repositories/engine-repos.js';
 import type { ToolContext, DispatchResult } from '@/tools/_dispatcher.js';
 import { logger } from '@/lib/logger.js';
+import { canonicalDigest } from './canonical-json.js';
 
 /** Identidade durável do run, resolvida uma vez e usada em toda chamada. */
 export type GatewayRunIdentityV1 = {
@@ -77,7 +84,28 @@ export type ToolGatewayDepsV1 = {
   }) => Promise<
     { ok: true; dispatch_token: string; row_version: number } | { ok: false; reason: string }
   >;
-  /** Liquida a chamada com o desfecho observado. */
+  /** Congela a identidade de idempotência (§5.6.3). */
+  freezeToolIdentity: (input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    call_id: string;
+    idempotency_key: string;
+    idempotency_payload_hash: string;
+    normalized_args: Json;
+  }) => Promise<FreezeIdentityResult>;
+  /** Marca que o handler começou a rodar (§5.6.4). */
+  markToolHandlerStarted: (input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    call_id: string;
+    expected_row_version: number;
+    dispatch_token: string;
+    reservation_token: string;
+    approval_claim_token?: string | null;
+  }) => Promise<HandlerStartedResult>;
+  /** Liquida a chamada com o desfecho observado (§5.7.4). */
   settle: (input: {
     run_id: string;
     turn_id: string;
@@ -85,10 +113,7 @@ export type ToolGatewayDepsV1 = {
     call_id: string;
     expected_row_version: number;
     dispatch_token: string;
-    outcome:
-      | { kind: 'completed'; result: Json }
-      | { kind: 'failed'; result: Json }
-      | { kind: 'effect_unknown' };
+    outcome: ToolSettlement;
   }) => Promise<{ ok: true } | { ok: false; reason: string }>;
   /** O dispatcher da casa. Mantém o PRÓPRIO fence de posse. */
   dispatch: (input: { tool: string; args: unknown; ctx: ToolContext }) => Promise<DispatchResult>;
@@ -250,6 +275,45 @@ export function createEngineToolGateway(
       return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
     }
 
+    // ── (3a) IDENTIDADE DE IDEMPOTÊNCIA CONGELADA (§5.6.3) ──────────────
+    // Antes de marcar que o handler começou, é preciso congelar a identidade
+    // de idempotência. Isso garante que a chamada é determinística.
+    const congelada = await deps.freezeToolIdentity({
+      ...base,
+      call_id: admissao.call_id,
+      idempotency_key: call.call_id,
+      idempotency_payload_hash: canonicalDigest(call.args),
+      normalized_args: call.args,
+    });
+
+    if (!congelada.ok) {
+      logger.warn(
+        { run_id: identity.run_id, call_id: call.call_id, reason: congelada.reason },
+        'engine.tool_gateway.freeze_identity_refused',
+      );
+      return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
+    }
+
+    // ── (3b) MARCADOR DO HANDLER (§5.6.4) ───────────────────────────────
+    // Depois de congelar a identidade, marca que o handler vai começar.
+    // Isso separa "não começou" de "pode ter começado". A row_version
+    // é incrementada neste passo; precisamos dessa versão nova para o settle.
+    const marcou = await deps.markToolHandlerStarted({
+      ...base,
+      call_id: admissao.call_id,
+      expected_row_version: congelou.row_version,
+      dispatch_token: congelou.dispatch_token,
+      reservation_token: `res-${call.call_id}`,
+    });
+
+    if (!marcou.ok) {
+      logger.warn(
+        { run_id: identity.run_id, call_id: call.call_id, reason: marcou.reason },
+        'engine.tool_gateway.handler_started_refused',
+      );
+      return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
+    }
+
     // ── (4) O HANDLER ───────────────────────────────────────────────────
     const ctx = await deps.buildToolContext(call);
     let resultado: DispatchResult;
@@ -257,7 +321,7 @@ export function createEngineToolGateway(
       resultado = await deps.dispatch({ tool: call.name, args: call.args, ctx });
     } catch (err) {
       /**
-       * O handler lançou. NÃO é `failed`: uma exceção depois de o dispatcher
+       * O handler lançou. NÃO é `denied`: uma exceção depois de o dispatcher
        * ter começado não prova que nada aconteceu — a tool pode ter emitido o
        * boleto e falhado ao gravar o retorno. `effect_unknown` é o único
        * desfecho honesto, e é o que impede um retry de duplicar efeito.
@@ -275,23 +339,25 @@ export function createEngineToolGateway(
       await deps.settle({
         ...base,
         call_id: admissao.call_id,
-        expected_row_version: congelou.row_version,
+        expected_row_version: marcou.row_version,
         dispatch_token: congelou.dispatch_token,
-        outcome: { kind: 'effect_unknown' },
+        outcome: { kind: 'effect_unknown', result: null },
       });
       return { kind: 'refused', call_id: call.call_id, code: 'effect_unknown' };
     }
 
     // ── (5) LIQUIDAÇÃO ──────────────────────────────────────────────────
     const erro = ehErroDeHandler(resultado);
+    const outcome: ToolSettlement = erro
+      ? { kind: 'denied', result: resultado as Json }
+      : { kind: 'completed', result: resultado as Json, receipt: null };
+
     const liquidou = await deps.settle({
       ...base,
       call_id: admissao.call_id,
-      expected_row_version: congelou.row_version,
+      expected_row_version: marcou.row_version,
       dispatch_token: congelou.dispatch_token,
-      outcome: erro
-        ? { kind: 'failed', result: resultado as Json }
-        : { kind: 'completed', result: resultado as Json },
+      outcome,
     });
 
     if (!liquidou.ok) {

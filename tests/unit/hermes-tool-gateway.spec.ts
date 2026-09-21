@@ -13,6 +13,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { createEngineToolGateway } from '@/integrations/hermes/tool-gateway.js';
+import type { ToolGatewayDepsV1 } from '@/integrations/hermes/tool-gateway.js';
 import type { EngineToolCallV1 } from '@/runtime/engines/contracts.js';
 import type { ToolClassification } from '@/db/repositories/engine-repos.js';
 
@@ -46,7 +47,7 @@ const CLASSIFICACAO: ToolClassification = {
 
 const TOOL = { name: 'consultar_saldo', input_schema: {}, result_limit_chars: 1000 };
 
-function deps(over: Partial<Parameters<typeof createEngineToolGateway>[1]> = {}) {
+function deps(over: Partial<ToolGatewayDepsV1> = {}): ToolGatewayDepsV1 {
   return {
     decide: vi.fn(() => ({ kind: 'admit' as const, tool: TOOL as never })),
     admit: vi.fn(async () => ({
@@ -60,6 +61,15 @@ function deps(over: Partial<Parameters<typeof createEngineToolGateway>[1]> = {})
       dispatch_token: 'dt-1',
       row_version: 1,
     })),
+    freezeToolIdentity: vi.fn(async () => ({
+      ok: true as const,
+      frozen: true,
+    })),
+    markToolHandlerStarted: vi.fn(async () => ({
+      ok: true as const,
+      effect_evidence: 'none' as const,
+      row_version: 2,
+    })),
     settle: vi.fn(async () => ({ ok: true as const })),
     dispatch: vi.fn(async () => ({ saldo: 10 })),
     buildToolContext: vi.fn(async () => ({}) as never),
@@ -70,16 +80,69 @@ function deps(over: Partial<Parameters<typeof createEngineToolGateway>[1]> = {})
 
 beforeEach(() => vi.clearAllMocks());
 
+describe('EngineToolGateway — compatibilidade de contrato', () => {
+  it('sonda: settle deve aceitar ToolSettlement com os desfechos corretos', async () => {
+    // Falha o build se os deps divergirem do repositório real.
+    // Esta sonda força o compilador a provar o alinhamento.
+    const d = deps();
+    const settle = d.settle;
+
+    // Chamadas que precisam compilar corretamente:
+    await settle({
+      run_id: 'r1',
+      turn_id: 't1',
+      origin_claim_token: 'tok',
+      call_id: 'c1',
+      expected_row_version: 2,
+      dispatch_token: 'dt',
+      outcome: { kind: 'completed', result: { ok: true }, receipt: null },
+    });
+
+    await settle({
+      run_id: 'r1',
+      turn_id: 't1',
+      origin_claim_token: 'tok',
+      call_id: 'c1',
+      expected_row_version: 2,
+      dispatch_token: 'dt',
+      outcome: { kind: 'denied', result: { error: 'test' } },
+    });
+
+    await settle({
+      run_id: 'r1',
+      turn_id: 't1',
+      origin_claim_token: 'tok',
+      call_id: 'c1',
+      expected_row_version: 2,
+      dispatch_token: 'dt',
+      outcome: { kind: 'effect_unknown', result: null },
+    });
+
+    expect(settle).toHaveBeenCalled();
+  });
+});
+
 describe('EngineToolGateway — o handler só roda depois da releitura', () => {
-  it('caminho feliz: decide, admite, congela, despacha e liquida', async () => {
+  it('caminho feliz: decide, admite, congela, congela identidade, marca handler, despacha e liquida', async () => {
     const d = deps();
     const invoke = createEngineToolGateway(IDENT, d);
     const r = await invoke(CHAMADA);
 
     expect(r).toEqual({ kind: 'result', call_id: 'c1', result: { saldo: 10 }, is_error: false });
-    expect(d.markDispatching).toHaveBeenCalledBefore(d.dispatch as never);
+
+    // Verifica a sequência correta de chamadas
+    expect(d.markDispatching).toHaveBeenCalledBefore(d.freezeToolIdentity as never);
+    expect(d.freezeToolIdentity).toHaveBeenCalledBefore(d.markToolHandlerStarted as never);
+    expect(d.markToolHandlerStarted).toHaveBeenCalledBefore(d.dispatch as never);
+    expect(d.dispatch).toHaveBeenCalledBefore(d.settle as never);
+
+    // Verifica que settle foi chamado com row_version do markToolHandlerStarted
     expect(d.settle).toHaveBeenCalledWith(
-      expect.objectContaining({ dispatch_token: 'dt-1', expected_row_version: 1 }),
+      expect.objectContaining({
+        dispatch_token: 'dt-1',
+        expected_row_version: 2,
+        outcome: expect.objectContaining({ kind: 'completed', receipt: null }),
+      }),
     );
   });
 
@@ -162,7 +225,7 @@ describe('EngineToolGateway — o handler só roda depois da releitura', () => {
 });
 
 describe('EngineToolGateway — efeito incerto nunca vira retry seguro', () => {
-  it('handler que LANÇA liquida como effect_unknown, não como failed', async () => {
+  it('handler que LANÇA liquida como effect_unknown, não como denied', async () => {
     const d = deps({
       dispatch: vi.fn(async () => {
         throw new Error('timeout no banco externo');
@@ -172,7 +235,7 @@ describe('EngineToolGateway — efeito incerto nunca vira retry seguro', () => {
 
     expect(r).toMatchObject({ code: 'effect_unknown' });
     expect(d.settle).toHaveBeenCalledWith(
-      expect.objectContaining({ outcome: { kind: 'effect_unknown' } }),
+      expect.objectContaining({ outcome: { kind: 'effect_unknown', result: null } }),
     );
   });
 
@@ -192,7 +255,7 @@ describe('EngineToolGateway — efeito incerto nunca vira retry seguro', () => {
     const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
     expect(r).toMatchObject({ kind: 'result', is_error: true });
     expect(d.settle).toHaveBeenCalledWith(
-      expect.objectContaining({ outcome: expect.objectContaining({ kind: 'failed' }) }),
+      expect.objectContaining({ outcome: expect.objectContaining({ kind: 'denied' }) }),
     );
   });
 
@@ -207,5 +270,30 @@ describe('EngineToolGateway — efeito incerto nunca vira retry seguro', () => {
     const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
     expect(r).toMatchObject({ kind: 'in_progress' });
     expect(d.admit).not.toHaveBeenCalled();
+  });
+
+  it('falha ao congelar identidade recusa a chamada', async () => {
+    const d = deps({
+      freezeToolIdentity: vi.fn(async () => ({
+        ok: false as const,
+        reason: 'state_conflict' as const,
+        current_state: 'completed',
+      })),
+    });
+    const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
+    expect(r).toMatchObject({ kind: 'refused', code: 'run_not_authorized' });
+    expect(d.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('falha ao marcar handler recusa a chamada', async () => {
+    const d = deps({
+      markToolHandlerStarted: vi.fn(async () => ({
+        ok: false as const,
+        reason: 'capabilities_revoked' as const,
+      })),
+    });
+    const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
+    expect(r).toMatchObject({ kind: 'refused', code: 'run_not_authorized' });
+    expect(d.dispatch).not.toHaveBeenCalled();
   });
 });
