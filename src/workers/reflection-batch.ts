@@ -398,9 +398,15 @@ async function runReflectionBatchInner(since: ReturnType<typeof sql>): Promise<R
         },
         content_text: `[${proposal.tipo}] ${proposal.contexto} -> ${proposal.acao}`,
         source: 'worker',
-        source_event_ids: cluster.signals
+        // `alvo_id` é `transacoes.id`, não `audit_log.id` — o nome do campo
+        // preserva essa semântica para o consumidor não procurar na tabela
+        // errada.
+        source_example_ids: cluster.signals
           .map((sig) => sig.alvo_id)
           .filter((id): id is string => typeof id === 'string' && id.length > 0),
+        // O MESMO exemplo que o caminho anterior gravava em
+        // `learned_rules.exemplo_origem_id`.
+        primary_example_id: cluster.signals[0]?.alvo_id ?? null,
         native: {
           rule_tipo: proposal.tipo,
           rule_contexto: proposal.contexto,

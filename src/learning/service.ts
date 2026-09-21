@@ -64,8 +64,23 @@ export type LearningProposalV1 = {
    * confiança: `worker` não vale mais que `tool` (§7.6.1).
    */
   source: 'worker' | 'tool' | 'operator_draft';
-  /** Ids dos eventos que sustentam a proposta. Linhagem, não autoridade. */
-  source_event_ids: readonly string[];
+  /**
+   * Ids que sustentam a proposta. Linhagem, não autoridade.
+   *
+   * O nome diz `example` e não `event` de propósito: o `reflection-batch`
+   * carrega `transacoes.id` (o `alvo_id` do sinal de correção), NÃO
+   * `audit_log.id`. Chamá-los de "eventos" faria o consumidor procurar na
+   * tabela errada.
+   */
+  source_example_ids: readonly string[];
+  /**
+   * O exemplo REPRESENTATIVO, que vai para a coluna durável do destino.
+   *
+   * Separado da lista porque a coluna guarda um só, e escolher qual é do
+   * chamador — ele é quem sabe qual caso explica melhor a proposta. Ausente,
+   * o primeiro da lista serve.
+   */
+  primary_example_id?: string | null;
   /** Nativos da tabela de destino, validados pelo chamador. */
   native?: Record<string, unknown>;
 };
@@ -136,7 +151,7 @@ export async function proposeFromWorker(
     };
   }
 
-  if (proposta.source_event_ids.length === 0) {
+  if (proposta.source_example_ids.length === 0) {
     // Sem linhagem não há como auditar de onde a proposta veio, nem como
     // revogá-la pela fonte depois.
     return {
@@ -164,7 +179,18 @@ export async function proposeFromWorker(
     // isso — é o que "`source='worker'` não é selo de confiança" quer dizer.
     origin: 'llm_inference',
     source: `learning:${proposta.source}`,
-    ...(proposta.native !== undefined ? { native: proposta.native as never } : {}),
+    native: {
+      ...(proposta.native ?? {}),
+      /**
+       * O exemplo de origem desce até a coluna `learned_rules.exemplo_origem_id`.
+       *
+       * O caminho que este serviço substituiu já persistia essa referência.
+       * Contar a linhagem no log e não gravá-la seria trocar um vínculo
+       * durável por uma métrica — a revisão humana veria a proposta sem o
+       * caso concreto que a motivou.
+       */
+      rule_exemplo_origem_id: proposta.primary_example_id ?? proposta.source_example_ids[0] ?? null,
+    } as never,
   });
 
   /**
@@ -197,7 +223,8 @@ export async function proposeFromWorker(
       ksm_kind: destino.kind,
       initial_status: resultado.initial_status,
       source: proposta.source,
-      lineage: proposta.source_event_ids.length,
+      lineage: proposta.source_example_ids.length,
+      primary_example_id: proposta.primary_example_id ?? proposta.source_example_ids[0] ?? null,
     },
     'learning.proposed',
   );

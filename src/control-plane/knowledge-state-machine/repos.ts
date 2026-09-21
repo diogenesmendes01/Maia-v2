@@ -182,6 +182,9 @@ export const knowledgeRepos = {
             acao,
             contexto_jsonb: (native.rule_contexto_jsonb ?? {}) as object,
             acoes_jsonb: (native.rule_acoes_jsonb ?? {}) as object,
+            // O exemplo que originou a regra. Sem ele, a revisão humana vê a
+            // proposta e não vê o caso concreto que a motivou.
+            exemplo_origem_id: native.rule_exemplo_origem_id ?? null,
             confianca: String(input.confidence),
             ativa: true,
             lifecycle_status: input.lifecycle_status,

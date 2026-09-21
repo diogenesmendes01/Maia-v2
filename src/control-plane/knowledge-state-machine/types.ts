@@ -86,6 +86,19 @@ export interface KnowledgeProposalNativeFields {
   rule_acao?: string;
   rule_contexto_jsonb?: Record<string, unknown>;
   rule_acoes_jsonb?: Record<string, unknown>;
+  /**
+   * Exemplo que ORIGINOU a regra — `transacoes.id`, na coluna
+   * `learned_rules.exemplo_origem_id`.
+   *
+   * Existe porque o caminho que o `LearningService` substituiu já persistia
+   * essa referência (`rulesRepo.create({ exemplo_origem_id })`), e sem ela a
+   * revisão humana perde o vínculo com o caso concreto que motivou a
+   * proposta — justamente a evidência que o revisor precisa para decidir.
+   *
+   * É `transacoes.id`, NÃO `audit_log.id`: quem preencher deve preservar essa
+   * semântica em vez de apresentar um id de evento de auditoria aqui.
+   */
+  rule_exemplo_origem_id?: string | null;
 
   // memory
   memory_type?: string;
