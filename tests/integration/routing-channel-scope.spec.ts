@@ -376,6 +376,49 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
         'utf8',
       );
 
+      // ── Dependentes da 090 saem ANTES dela ───────────────────────────
+      //
+      // O forward acima aplica TODAS as migrations, não só até a 091. A 145
+      // cria FK composta para `channels (tenant_id, agent_id, id)`, que se
+      // apoia no unique `channels_tenant_agent_id_uq` criado pela 090 — e o
+      // `DROP` desse índice no down da 090 falha com "cannot drop index
+      // channels_tenant_agent_id_uq because other objects depend on it".
+      //
+      // Não é detalhe de teste: é a ordem REAL de um rollback. Não existe
+      // desfazer a 090 com a 145 ainda aplicada, em produção ou aqui.
+      //
+      // O `expect` abaixo é o que impede este arquivo de apodrecer. Ele lê o
+      // catálogo em vez de confiar na lista: a próxima migration que se apoiar
+      // no mesmo unique e esquecer deste teste falha AQUI, nomeando a
+      // constraint, em vez de voltar como o erro opaco de `DROP INDEX`.
+      const down145 = await readFile(
+        new URL('145_agent_engine_policies_down.sql', migrationsDir),
+        'utf8',
+      );
+      await c.query(down145);
+
+      const dependentes = await c.query<{ conname: string; tabela: string }>(
+        `SELECT con.conname, con.conrelid::regclass::text AS tabela
+           FROM pg_constraint con
+           JOIN pg_class idx ON idx.oid = con.conindid
+          WHERE idx.relname = 'channels_tenant_agent_id_uq'
+            AND con.contype = 'f'`,
+      );
+      // As três que sobram são as que a PRÓPRIA 090 criou e o down dela
+      // derruba (090_channel_scoped_egress_down.sql:38-50) antes do
+      // `DROP INDEX` da linha 53. Qualquer nome ALÉM destes é FK de outra
+      // migration, e o down dela tem de rodar acima.
+      expect(
+        dependentes.rows.map((r) => `${r.tabela}.${r.conname}`).sort(),
+        'FK apoiada em channels_tenant_agent_id_uq que a 090 não derruba: o down da migration dona precisa rodar antes do down da 090, aqui neste teste',
+      ).toEqual(
+        [
+          'conversas.conversas_channel_scope_fk',
+          'mensagens.mensagens_channel_scope_fk',
+          'outbox_messages.outbox_channel_scope_fk',
+        ].sort(),
+      );
+
       // ── 091 down: restaura SÓ o que o forward mudou ──────────────────
       await c.query(down091);
       const restored = await c.query<{ external_id: string }>(
