@@ -57,13 +57,20 @@ export function decideTurnAction(delivery: ReActDelivery): TurnAction {
       : { kind: 'retry', code: delivery.exitReason };
   }
 
-  // 2b. [P2] Bloqueio de reconciliação — divergência com efeito.
-  //     O motor alegou ter chamado ferramentas sem receipt: um efeito ocorreu,
-  //     mas não sabemos qual subset da alegação corresponde ao que foi realmente
-  //     executado. Bloquear e exigir investigação/reconciliação é mandatório.
-  //     Sem este reconhecimento explícito, divergência com efeito fica
-  //     indistinguível de um turno que simplesmente não produziu resposta.
-  if (delivery.exitReason === 'claim_divergence_blocked' && delivery.sideEffectsCommitted) {
+  // 2b. Bloqueio de reconciliação — o motor alegou chamadas sem receipt.
+  //
+  //     `sideEffectsCommitted` NÃO entra nesta condição, e a ausência dele é o
+  //     ponto. Ele é derivado dos receipts: ele diz "das chamadas que a Maia
+  //     GRAVOU, alguma tinha efeito". A divergência é justamente sobre chamadas
+  //     que a Maia NÃO gravou — então `sideEffectsCommitted: false` aqui não
+  //     significa "nada rodou", significa "não temos registro", e tratar a
+  //     ausência de registro como prova de não-execução é exatamente o que o
+  //     §5.3.1 proíbe no resto da épica.
+  //
+  //     Por isso `unsafe_to_retry` é o rótulo certo nos dois casos: o que torna
+  //     o retry inseguro não é um efeito conhecido, é um efeito que não se
+  //     consegue descartar. Um humano olha e reconcilia.
+  if (delivery.exitReason === 'claim_divergence_blocked') {
     return { kind: 'dead_letter', code: delivery.exitReason, outcome: 'unsafe_to_retry' };
   }
 
