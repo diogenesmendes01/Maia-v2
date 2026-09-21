@@ -171,9 +171,10 @@ describe('EngineResultAssembler — o journal é a fonte', () => {
     const r = assembleTurnResult({
       proposal: proposta({ stop: { kind: 'reply', raw_text: 'Não sei.' } }),
       receipts: [],
-      outboundPrefix: '[Consultor] ',
+      outboundPrefix: '[Consultor]',
     });
-    expect(r.candidate).toEqual({ rawText: 'Não sei.', text: '[Consultor] Não sei.' });
+    // A junção é `\n\n`: o anúncio é parágrafo próprio, como no laço local.
+    expect(r.candidate).toEqual({ rawText: 'Não sei.', text: '[Consultor]\n\nNão sei.' });
   });
 
   it('desfecho sem texto não produz candidato', () => {

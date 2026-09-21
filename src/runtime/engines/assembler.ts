@@ -41,8 +41,12 @@ export type EngineToolReceiptV1 = {
   /** Saída crua do dispatcher, como o step-evaluator pós-turno espera. */
   result: unknown;
   status: 'success' | 'error';
-  /** `null` quando a tool não declara efeito no registry. */
-  side_effect: 'read' | 'write' | 'communication' | null;
+  /**
+   * Efeito declarado no registry. `'none'` é um valor REAL (tools de parse,
+   * que não tocam nada) e é distinto de `null`, que é "a tool não está no
+   * registry" — e essa segunda é a que deveria assustar.
+   */
+  side_effect: 'none' | 'read' | 'write' | 'communication' | null;
   sensitive: boolean;
   summary: ToolExecutionSummary;
   /** Pending aberto POR esta chamada, quando houve. */
@@ -152,8 +156,14 @@ function montarCandidato(
   if (stop.kind !== 'reply') return null;
   const rawText = stop.raw_text;
   if (rawText.length === 0) return null;
+  // A junção é `\n\n`, igual à do laço local (`react-loop.ts`, montagem do
+  // candidato). Não é detalhe cosmético: o anúncio de troca de role vira um
+  // parágrafo próprio na mensagem que o usuário lê, e concatenar direto
+  // grudaria o anúncio no texto do modelo.
   const text =
-    outboundPrefix !== null && outboundPrefix.length > 0 ? `${outboundPrefix}${rawText}` : rawText;
+    outboundPrefix !== null && outboundPrefix.length > 0
+      ? `${outboundPrefix}\n\n${rawText}`
+      : rawText;
   return { rawText, text };
 }
 
