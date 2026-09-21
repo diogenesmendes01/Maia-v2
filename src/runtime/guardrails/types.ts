@@ -3,10 +3,7 @@
  *
  * Spec §4.3.
  */
-import type {
-  DecisionPacket,
-  PolicyDecision,
-} from '../context-packet/types.js';
+import type { DecisionPacket, PolicyDecision } from '../context-packet/types.js';
 import type { PolicyEvaluator, PolicyRulesRepo } from '../decision/types.js';
 
 /** Output candidate produced by the agent runtime (Layer 4). */

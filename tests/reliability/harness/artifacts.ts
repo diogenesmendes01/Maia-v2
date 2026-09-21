@@ -98,7 +98,14 @@ export class ArtifactCollector {
   /** Registra um filho. Chamado pelo `ProcessSupervisor` no spawn. */
   registrarProcesso(label: string, pid: number | undefined): void {
     if (!this.processos.has(label)) {
-      this.processos.set(label, { label, pid, stdout: '', stderr: '', exitCode: null, signal: null });
+      this.processos.set(label, {
+        label,
+        pid,
+        stdout: '',
+        stderr: '',
+        exitCode: null,
+        signal: null,
+      });
     }
     this.evento('process.spawn', { label, pid });
   }

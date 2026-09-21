@@ -62,10 +62,7 @@ export async function runInactivitySweep(): Promise<void> {
     }
   }
 
-  logger.info(
-    { tuples: tuples.length, agents_processed, agents_failed },
-    'inactivity_sweep.done',
-  );
+  logger.info({ tuples: tuples.length, agents_processed, agents_failed }, 'inactivity_sweep.done');
 }
 
 async function runInactivitySweepInner(): Promise<void> {

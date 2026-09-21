@@ -104,9 +104,8 @@ async function driveToChannelReady(
   line: string,
   opts: { stopAfterDeclare?: boolean } = {},
 ): Promise<SagaState> {
-  const { startOnboardingRun, executeOnboardingStep } = await import(
-    '../../src/onboarding/wizard.js'
-  );
+  const { startOnboardingRun, executeOnboardingStep } =
+    await import('../../src/onboarding/wizard.js');
   const tenant = `${PREFIX}-${suffix}`;
   const agent = `${PREFIX}-${suffix}-bot`;
   tenants.add(tenant);
@@ -365,9 +364,9 @@ d('[High] readiness e ativação concordam sobre QUAIS canais são válidos', ()
     const readiness = await evaluateAgentReadiness({ tenant_id: s.tenant, agent_id: s.agent });
     expect(readiness.ready).toBe(false);
     expect(readiness.activatable_channel_ids).toEqual([]);
-    expect(
-      readiness.checks.find((k) => k.code === 'channel_ownership_proven')!.status,
-    ).toBe('fail');
+    expect(readiness.checks.find((k) => k.code === 'channel_ownership_proven')!.status).toBe(
+      'fail',
+    );
 
     // E a ativação recusa, sem escrever nada.
     const { executeOnboardingStep } = await import('../../src/onboarding/wizard.js');
@@ -434,9 +433,10 @@ d('[High] a criação da run é idempotente e o escopo inicial é único', () =>
 
     const c = await pool.connect();
     try {
-      const runs = await c.query('SELECT count(*)::int AS n FROM onboarding_runs WHERE tenant_id=$1', [
-        tenant,
-      ]);
+      const runs = await c.query(
+        'SELECT count(*)::int AS n FROM onboarding_runs WHERE tenant_id=$1',
+        [tenant],
+      );
       expect(runs.rows[0].n).toBe(1);
       // Uma única trilha de criação — o retry não duplicou nem evento nem auditoria.
       const events = await c.query(
@@ -516,9 +516,7 @@ d('[High] a criação da run é idempotente e o escopo inicial é único', () =>
       ).rejects.toMatchObject({ code: '23505' });
 
       // E a segunda run passa a ser possível assim que a primeira termina.
-      await c.query(`UPDATE onboarding_runs SET state='cancelled' WHERE id=$1`, [
-        first.rows[0].id,
-      ]);
+      await c.query(`UPDATE onboarding_runs SET state='cancelled' WHERE id=$1`, [first.rows[0].id]);
       const second = await c.query(
         `INSERT INTO onboarding_runs
            (kind, tenant_id, agent_id, state, created_by, expires_at,
@@ -558,9 +556,10 @@ d('[High] a criação da run é idempotente e o escopo inicial é único', () =>
 
     const c = await pool.connect();
     try {
-      const runs = await c.query('SELECT count(*)::int AS n FROM onboarding_runs WHERE tenant_id=$1', [
-        tenant,
-      ]);
+      const runs = await c.query(
+        'SELECT count(*)::int AS n FROM onboarding_runs WHERE tenant_id=$1',
+        [tenant],
+      );
       expect(runs.rows[0].n).toBe(1);
     } finally {
       c.release();
@@ -637,9 +636,8 @@ d('[Medium] negativa e cancelamento são resultados CONCLUSIVOS no ledger', () =
   }, 60_000);
 
   it('o cancelamento é replayável — e não vira `run_terminal` no retry', async () => {
-    const { startOnboardingRun, cancelOnboardingRun } = await import(
-      '../../src/onboarding/wizard.js'
-    );
+    const { startOnboardingRun, cancelOnboardingRun } =
+      await import('../../src/onboarding/wizard.js');
     const tenant = `${PREFIX}-cancel`;
     tenants.add(tenant);
     const actor = { actor_id: ACTOR_ID, actor_role: 'owner' as const, tenant_id: tenant };
@@ -696,9 +694,8 @@ d('[Medium] negativa e cancelamento são resultados CONCLUSIVOS no ledger', () =
 
 d('[Medium] `failed_retryable` guarda o ponto de retomada no BANCO', () => {
   it('uma negativa em `start_pairing` grava o passo e bloqueia os passos que rebobinam', async () => {
-    const { startOnboardingRun, executeOnboardingStep } = await import(
-      '../../src/onboarding/wizard.js'
-    );
+    const { startOnboardingRun, executeOnboardingStep } =
+      await import('../../src/onboarding/wizard.js');
     // Para em `channel_declared`: `start_pairing` é legal a partir daí, e é a
     // negativa DELE que a review usa como cenário.
     const s = await driveToChannelReady('retry', '+5511987651031', { stopAfterDeclare: true });
@@ -821,9 +818,10 @@ d('[Medium] `metadata` e `reason_code` não aceitam texto livre', () => {
 
     const c = await pool.connect();
     try {
-      const runs = await c.query('SELECT count(*)::int AS n FROM onboarding_runs WHERE tenant_id=$1', [
-        tenant,
-      ]);
+      const runs = await c.query(
+        'SELECT count(*)::int AS n FROM onboarding_runs WHERE tenant_id=$1',
+        [tenant],
+      );
       expect(runs.rows[0].n).toBe(0);
     } finally {
       c.release();
@@ -831,9 +829,8 @@ d('[Medium] `metadata` e `reason_code` não aceitam texto livre', () => {
   });
 
   it('reason_code fora do vocabulário é recusado — e a PII não chega a NENHUMA tabela', async () => {
-    const { startOnboardingRun, cancelOnboardingRun } = await import(
-      '../../src/onboarding/wizard.js'
-    );
+    const { startOnboardingRun, cancelOnboardingRun } =
+      await import('../../src/onboarding/wizard.js');
     const tenant = `${PREFIX}-pii2`;
     tenants.add(tenant);
     const actor = { actor_id: ACTOR_ID, actor_role: 'owner' as const, tenant_id: tenant };
@@ -860,10 +857,9 @@ d('[Medium] `metadata` e `reason_code` não aceitam texto livre', () => {
     const c = await pool.connect();
     try {
       // A run continua viva: a recusa aconteceu ANTES de qualquer escrita.
-      const run = await c.query(
-        'SELECT state, last_error_code FROM onboarding_runs WHERE id=$1',
-        [started.run.id],
-      );
+      const run = await c.query('SELECT state, last_error_code FROM onboarding_runs WHERE id=$1', [
+        started.run.id,
+      ]);
       expect(run.rows[0].state).toBe('created');
       expect(run.rows[0].last_error_code).toBeNull();
 

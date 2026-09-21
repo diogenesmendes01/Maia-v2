@@ -67,7 +67,7 @@ async function insertRequest(over: {
       over.agent ?? A_A,
       over.subject_ref ?? `subj-${randomUUID()}`,
       over.locator === undefined ? randomUUID() : over.locator,
-      over.expires_at === undefined ? "2020-01-01T00:00:00Z" : over.expires_at,
+      over.expires_at === undefined ? '2020-01-01T00:00:00Z' : over.expires_at,
       over.purged_at ?? null,
     ],
   );

@@ -81,12 +81,10 @@ vi.mock('drizzle-orm', () => {
     },
   });
   const and = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
+    __pred: (row: Row) => conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
   });
   const or = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
+    __pred: (row: Row) => conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
   });
   const desc = (col: unknown) => ({ __desc: isColRef(col) ? col.__col : col });
   // sql tag — the repo only uses sql`agent_id IS NULL` in these paths.
@@ -237,11 +235,7 @@ class UpdateBuilder {
     // concurrent commit in the TOCTOU window between activate()'s locked read
     // and its status-conditioned write. Scoped to the activation write so the
     // earlier prior-active deprecation UPDATE in the same tx is untouched.
-    if (
-      this._table === skillsTable &&
-      this._set.status === 'active' &&
-      interceptNextSkillUpdate
-    ) {
+    if (this._table === skillsTable && this._set.status === 'active' && interceptNextSkillUpdate) {
       const hook = interceptNextSkillUpdate;
       interceptNextSkillUpdate = null;
       hook();
@@ -284,7 +278,10 @@ vi.mock('@/db/client.js', () => {
   const withTx = async (fn: (tx: unknown) => Promise<unknown>) => {
     const snapshot = new Map<unknown, Row[]>();
     for (const [k, rows] of store.entries()) {
-      snapshot.set(k, rows.map((r) => ({ ...r })));
+      snapshot.set(
+        k,
+        rows.map((r) => ({ ...r })),
+      );
     }
     try {
       return await fn(makeDbHandle());

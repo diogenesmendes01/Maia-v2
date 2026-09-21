@@ -228,9 +228,8 @@ async function main() {
     // P8e: cross-instance policy cache invalidation. Subscriber is idempotent.
     // Codex review #93: previously this was defined but never called,
     // leaving stale positive/negative cache entries until natural TTL.
-    const { startPolicyCacheInvalidationSubscriber } = await import(
-      '@/control-plane/policy/index.js'
-    );
+    const { startPolicyCacheInvalidationSubscriber } =
+      await import('@/control-plane/policy/index.js');
     startPolicyCacheInvalidationSubscriber();
     logger.info('policy_resolver.cache_invalidation_subscriber_started');
 
@@ -248,9 +247,8 @@ async function main() {
     // playground drain, the synthetic probe and the briefings are crons), so
     // gating on `agent_worker` would silently degrade the scheduler role to an
     // un-invalidatable — hence declined — cache.
-    const { startTurnContextCacheInvalidationSubscriber } = await import(
-      '@/agent/turn-context/cache.js'
-    );
+    const { startTurnContextCacheInvalidationSubscriber } =
+      await import('@/agent/turn-context/cache.js');
     startTurnContextCacheInvalidationSubscriber();
     if (config.FEATURE_TURN_CONTEXT_CACHE) {
       logger.info('turn_context.cache_invalidation_subscriber_started');
@@ -269,9 +267,8 @@ async function main() {
     // passo `llm_settings_subscriber` da sequência de drain — foi exatamente
     // um socket assim, deixado aberto, que fazia todo deploy limpo reportar
     // shutdown forçado na #512.
-    const { startLLMSettingsInvalidationSubscriber } = await import(
-      '@/lib/llm/cache-invalidation.js'
-    );
+    const { startLLMSettingsInvalidationSubscriber } =
+      await import('@/lib/llm/cache-invalidation.js');
     startLLMSettingsInvalidationSubscriber();
   });
 
@@ -329,9 +326,8 @@ async function main() {
       // consome assim que existe, então "registrar e não usar" não é opção.
       if (config.FEATURE_OUTBOUND_DELIVERY_WORKER) {
         const { startOutboundDeliveryWorker } = await import('@/gateway/queue.js');
-        const { consumeOutboundDeliveryJob } = await import(
-          '@/runtime/outbound/delivery-consumer.js'
-        );
+        const { consumeOutboundDeliveryJob } =
+          await import('@/runtime/outbound/delivery-consumer.js');
         startOutboundDeliveryWorker(async (outbound_id) => {
           await consumeOutboundDeliveryJob(outbound_id);
         });
@@ -407,11 +403,9 @@ async function main() {
       { role },
       'maia.awaiting_whatsapp_open — startup is NOT complete until the session opens; on a cold start, pair via /setup',
     );
-    const opened = await lifecycle.waitForComponent(
-      'whatsapp_session',
-      (s) => s === 'ready',
-      { heartbeatMs: 30_000 },
-    );
+    const opened = await lifecycle.waitForComponent('whatsapp_session', (s) => s === 'ready', {
+      heartbeatMs: 30_000,
+    });
     // `aborted` = a stop signal arrived; `runStartupStep`'s post-await check
     // turns that into a clean `StartupAbortedError` right after this returns.
     if (opened === 'matched') logger.info('maia.whatsapp_session_open');

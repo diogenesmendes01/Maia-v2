@@ -211,9 +211,9 @@ afterEach(() => {
 
 describe('issue #535 — os quatro portões do dispatcher abrem span de verdade', () => {
   it('um dispatch completo abre os quatro, um de cada, sob tool.dispatch', async () => {
-    await expect(
-      dispatchTool({ tool: 'query_balance', args: {}, ctx: fakeCtx }),
-    ).resolves.toEqual({ ok: true });
+    await expect(dispatchTool({ tool: 'query_balance', args: {}, ctx: fakeCtx })).resolves.toEqual({
+      ok: true,
+    });
 
     const dispatch = de(SPAN.TOOL_DISPATCH);
     expect(dispatch).toHaveLength(1);

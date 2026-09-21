@@ -616,10 +616,7 @@ export const idempotencyRepo = {
    * como as demais transições. Um dono preemptado carrega token velho e o
    * DELETE não toca a reserva viva do novo dono. Devolve se apagou de fato.
    */
-  async abandonReservation(input: {
-    key: string;
-    reservation_token: string;
-  }): Promise<boolean> {
+  async abandonReservation(input: { key: string; reservation_token: string }): Promise<boolean> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const deleted = await db
@@ -657,10 +654,7 @@ export const idempotencyRepo = {
    * is a no-op (0 rows) and cannot mark the NEW owner's live reservation
    * as failed. Returns whether the row was actually transitioned.
    */
-  async releaseReservation(input: {
-    key: string;
-    reservation_token: string;
-  }): Promise<boolean> {
+  async releaseReservation(input: { key: string; reservation_token: string }): Promise<boolean> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const updated = await db
@@ -767,10 +761,7 @@ export const idempotencyRepo = {
           expected_payload_hash !== undefined &&
           isRealPayloadHashCollision(row.payload_hash, expected_payload_hash)
         ) {
-          reportPayloadHashCollision(
-            { key, payload_hash: expected_payload_hash },
-            row,
-          );
+          reportPayloadHashCollision({ key, payload_hash: expected_payload_hash }, row);
           return { status: 'collision' };
         }
         return { status: 'completed', resultado: row.resultado };
@@ -845,12 +836,7 @@ export const idempotencyRepo = {
     // tenant-scoped read; it cannot leak (no row body returned).
     const reaped = await db
       .delete(idempotency_keys)
-      .where(
-        and(
-          eq(idempotency_keys.state, 'in_progress'),
-          sql`expires_at < now()`,
-        ),
-      )
+      .where(and(eq(idempotency_keys.state, 'in_progress'), sql`expires_at < now()`))
       .returning({ key: idempotency_keys.key });
     const aged = await db
       .delete(idempotency_keys)
@@ -1016,9 +1002,9 @@ export const idempotencyOutboxRepo = {
    * outbound-messages-sweeper `listTenantsWithWork` (#292). Belt-and-suspenders
    * NOT NULL predicate (schema already enforces) mirrors #251/#292.
    */
-  async listTenantsWithWork(retentionDays: number): Promise<
-    Array<{ tenant_id: string; agent_id: string }>
-  > {
+  async listTenantsWithWork(
+    retentionDays: number,
+  ): Promise<Array<{ tenant_id: string; agent_id: string }>> {
     const result = await db.execute<{ tenant_id: string; agent_id: string }>(sql`
       SELECT DISTINCT tenant_id, agent_id
       FROM ${idempotency_effect_outbox}
@@ -1168,10 +1154,7 @@ export const idempotencyOutboxRepo = {
    * itself, not only inside the `id IN (...)` subquery — defense-in-depth
    * against the (theoretical) reuse of an `id` value across tenants.
    */
-  async cleanupTerminal(input: {
-    olderThanDays: number;
-    batchSize: number;
-  }): Promise<number> {
+  async cleanupTerminal(input: { olderThanDays: number; batchSize: number }): Promise<number> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const deleted = await db.execute<{ id: string }>(sql`

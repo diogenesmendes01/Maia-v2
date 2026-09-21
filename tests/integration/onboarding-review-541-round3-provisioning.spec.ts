@@ -108,9 +108,8 @@ type RunCursor = {
 };
 
 async function openRunToAdminReady(base: string): Promise<RunCursor> {
-  const { startOnboardingRun, executeOnboardingStep } = await import(
-    '../../src/onboarding/wizard.js'
-  );
+  const { startOnboardingRun, executeOnboardingStep } =
+    await import('../../src/onboarding/wizard.js');
   const suffix = `${base}${++scopeSeq}`;
   const tenant = `${PREFIX}-${suffix}`;
   tenants.add(tenant);

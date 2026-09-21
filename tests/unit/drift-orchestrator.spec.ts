@@ -139,10 +139,12 @@ describe('runAllDriftDetectors', () => {
 
   it('chama runCognitiveModule 9x (um por detector) com opções corretas e retorna apenas outputs não-null', async () => {
     // Make runCognitiveModule simply invoke the detector and wrap result
-    runCognitiveModuleMock.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => {
-      const output = await fn();
-      return { output, status: 'success', fallback_triggered: false, latency_ms: 5 };
-    });
+    runCognitiveModuleMock.mockImplementation(
+      async (_opts: unknown, fn: () => Promise<unknown>) => {
+        const output = await fn();
+        return { output, status: 'success', fallback_triggered: false, latency_ms: 5 };
+      },
+    );
 
     // tom, vies, papel return evidence; the rest return null.
     tomDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.TOM));
@@ -210,10 +212,12 @@ describe('runAllDriftDetectors', () => {
   });
 
   it('todos os detectores retornam evidence → 9 evidences no resultado', async () => {
-    runCognitiveModuleMock.mockImplementation(async (_opts: unknown, fn: () => Promise<unknown>) => {
-      const output = await fn();
-      return { output, status: 'success', fallback_triggered: false, latency_ms: 5 };
-    });
+    runCognitiveModuleMock.mockImplementation(
+      async (_opts: unknown, fn: () => Promise<unknown>) => {
+        const output = await fn();
+        return { output, status: 'success', fallback_triggered: false, latency_ms: 5 };
+      },
+    );
 
     tomDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.TOM));
     valoresDetectMock.mockResolvedValueOnce(makeEvidence(DriftType.VALORES));

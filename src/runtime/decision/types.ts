@@ -104,10 +104,7 @@ export interface PolicyEvaluator {
  * lookup when the hot-path budget fires.
  */
 export interface PolicyRulesRepo {
-  getBody(
-    policy_id: string,
-    options?: { signal?: AbortSignal },
-  ): Promise<PolicyRuleBody | null>;
+  getBody(policy_id: string, options?: { signal?: AbortSignal }): Promise<PolicyRuleBody | null>;
   /** Sync access (cached). Returns null if not in cache. */
   getBodySync(policy_id: string): PolicyRuleBody | null;
 }
@@ -261,10 +258,7 @@ export interface LockdownReader {
     tenant_id: string,
     options?: { signal?: AbortSignal },
   ): Promise<boolean>;
-  isTenantInGlobalLockdown(
-    tenant_id: string,
-    options?: { signal?: AbortSignal },
-  ): Promise<boolean>;
+  isTenantInGlobalLockdown(tenant_id: string, options?: { signal?: AbortSignal }): Promise<boolean>;
   /**
    * Returns true if tenant has data that makes a budget-fallback
    * `ask_clarification` unsafe (must escalate instead). Spec §6.2.

@@ -7,7 +7,8 @@ const mockAssignments: any[] = [];
 const mockDefinitions: Record<string, any> = {};
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureAssignmentsRepo: {
@@ -18,7 +19,10 @@ vi.mock('@/db/repositories.js', async () => {
       ...actual.procedureDefinitionsRepo,
       findById: vi.fn(async (id: string) => mockDefinitions[id] ?? null),
     },
-    cognitiveModuleLogRepo: { record: vi.fn(async () => {}), recentByModule: vi.fn(async () => []) },
+    cognitiveModuleLogRepo: {
+      record: vi.fn(async () => {}),
+      recentByModule: vi.fn(async () => []),
+    },
   };
 });
 
@@ -56,7 +60,14 @@ describe('selectProcedure', () => {
 
   it('1 assignment match → decision=start com selected_procedure_id', async () => {
     const defId = 'def-qualify';
-    mockAssignments.push({ id: 'a1', definition_id: defId, definition_version: 1, target_type: 'agent', target_id: 'default', enabled: true });
+    mockAssignments.push({
+      id: 'a1',
+      definition_id: defId,
+      definition_version: 1,
+      target_type: 'agent',
+      target_id: 'default',
+      enabled: true,
+    });
     mockDefinitions[defId] = {
       id: defId,
       nome: 'qualify-lead',

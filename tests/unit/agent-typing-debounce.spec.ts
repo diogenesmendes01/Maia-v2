@@ -18,7 +18,12 @@ vi.mock('../../src/lib/logger.js', () => ({
 }));
 
 vi.mock('../../src/db/repositories.js', () => ({
-  mensagensRepo: { findById: vi.fn(), setConversaId: vi.fn(), markProcessed: vi.fn(), create: vi.fn() },
+  mensagensRepo: {
+    findById: vi.fn(),
+    setConversaId: vi.fn(),
+    markProcessed: vi.fn(),
+    create: vi.fn(),
+  },
   conversasRepo: { findActive: vi.fn(), create: vi.fn(), touch: vi.fn() },
   pessoasRepo: { findByPhone: vi.fn(), findById: vi.fn() },
 }));

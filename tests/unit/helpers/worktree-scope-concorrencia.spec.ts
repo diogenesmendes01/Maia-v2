@@ -143,7 +143,6 @@ async function esperarArquivo(caminho: string, prazoMs = 60_000): Promise<void> 
 }
 
 describe('#571 — duas rodadas simultâneas em worktrees de verdade', () => {
-
   it(
     'slot livre: cada árvore sai com banco, ledger e db do Redis próprios',
     async () => {
@@ -168,7 +167,9 @@ describe('#571 — duas rodadas simultâneas em worktrees de verdade', () => {
       const roots = [repo.criarWorktree('wt-c')];
       const respostas = await rodarSondas(roots);
       exigirIsolamento(respostas, roots);
-      expect(respostas[0].escopo?.redisDb, 'o slot 1 estava livre e devia ter sido reusado').toBe(1);
+      expect(respostas[0].escopo?.redisDb, 'o slot 1 estava livre e devia ter sido reusado').toBe(
+        1,
+      );
     },
     PRAZO,
   );

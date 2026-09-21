@@ -26,9 +26,7 @@ import type { AgentOperationalProfileVersion } from '@/db/schema.js';
  * When the renderer migrates to read from `profile_body`, update this helper
  * to nest the keys inside profile_body instead.
  */
-function buildVersion(
-  overrides: Record<string, unknown>,
-): AgentOperationalProfileVersion {
+function buildVersion(overrides: Record<string, unknown>): AgentOperationalProfileVersion {
   return {
     id: 'prof-1',
     tenant_id: 'default',
@@ -78,9 +76,7 @@ describe('renderOperationalProfile', () => {
         ],
       },
       growth_backlog: {
-        items: [
-          { descricao: 'Reconciliação automática mensal' },
-        ],
+        items: [{ descricao: 'Reconciliação automática mensal' }],
       },
     });
 
@@ -90,9 +86,7 @@ describe('renderOperationalProfile', () => {
     expect(result.system_prompt_block).toContain('Você é a **Maia**');
     expect(result.system_prompt_block).toContain('## Princípios');
     expect(result.system_prompt_block).toContain('- Separação acima de tudo. PF é PF.');
-    expect(result.system_prompt_block).toContain(
-      '- Confirme antes de agir em coisas relevantes.',
-    );
+    expect(result.system_prompt_block).toContain('- Confirme antes de agir em coisas relevantes.');
     expect(result.system_prompt_block).toContain('## Voz operacional');
     expect(result.system_prompt_block).toContain('Português brasileiro');
     expect(result.system_prompt_block).toContain('## Parâmetros calibrados');
@@ -109,9 +103,7 @@ describe('renderOperationalProfile', () => {
     // episodic_summary_block
     expect(result.episodic_summary_block).not.toBeNull();
     expect(result.episodic_summary_block).toContain('## Contexto recente');
-    expect(result.episodic_summary_block).toContain(
-      '- Mendes consolidou três contas em janeiro.',
-    );
+    expect(result.episodic_summary_block).toContain('- Mendes consolidou três contas em janeiro.');
   });
 
   it('2. growth_backlog vazio → growth_hints_block === null', () => {
@@ -404,9 +396,7 @@ describe('renderOperationalProfile', () => {
           thresholds: { max_inference_depth: 4 },
         },
         episodic_temp: {
-          entries: [
-            { summary: 'evento direct', mention_allowed: true, proactive_use: true },
-          ],
+          entries: [{ summary: 'evento direct', mention_allowed: true, proactive_use: true }],
         },
         growth_backlog: ['Hint direct'],
       },

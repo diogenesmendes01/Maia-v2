@@ -203,9 +203,7 @@ describe('#511 every rendered section respects its byte budget', () => {
       (sum, m) => sum + utf8Bytes(typeof m.content === 'string' ? m.content : ''),
       0,
     );
-    expect(historyBytes).toBeLessThanOrEqual(
-      SECTION_BUDGETS.history.max_bytes + WRAPPER_SLACK,
-    );
+    expect(historyBytes).toBeLessThanOrEqual(SECTION_BUDGETS.history.max_bytes + WRAPPER_SLACK);
   });
 
   it('the whole system prompt stays within a sane total', async () => {

@@ -150,9 +150,13 @@ describe('issue #514 — sanitized metric emitters', () => {
   });
 
   it('a failing gauge provider renders NaN, not a healthy 0', async () => {
-    gauge(METRIC.QUEUE_OLDEST_JOB_AGE_MS, () => {
-      throw new Error('redis down');
-    }, { queue: 'agent' });
+    gauge(
+      METRIC.QUEUE_OLDEST_JOB_AGE_MS,
+      () => {
+        throw new Error('redis down');
+      },
+      { queue: 'agent' },
+    );
     const out = await renderPrometheus();
     expect(out).toContain('maia_queue_oldest_job_age_ms{queue="agent"} NaN');
   });

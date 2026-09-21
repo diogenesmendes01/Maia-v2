@@ -143,7 +143,9 @@ d('release gate (#565) — executado contra um Postgres real', () => {
     // Sem isto o DROP falha com "is being accessed by other users" e o banco
     // descartável fica para trás num Postgres compartilhado.
     await admin
-      .query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, [DISPOSABLE_DB])
+      .query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, [
+        DISPOSABLE_DB,
+      ])
       .catch(() => undefined);
     await admin.query(`DROP DATABASE IF EXISTS "${DISPOSABLE_DB}"`).catch(() => undefined);
     await admin.end().catch(() => undefined);

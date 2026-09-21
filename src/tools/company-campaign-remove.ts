@@ -47,13 +47,7 @@ const inputSchema = z
 
 const outputSchema = z.object({
   executed: z.boolean(),
-  status: z.enum([
-    'stub_not_executed',
-    'removed',
-    'blocked',
-    'requires_confirmation',
-    'failed',
-  ]),
+  status: z.enum(['stub_not_executed', 'removed', 'blocked', 'requires_confirmation', 'failed']),
   // Set ONLY by a real integration; the stub fabricates neither.
   operation_protocol: z.string().optional(),
   updated_status: z.string().optional(),

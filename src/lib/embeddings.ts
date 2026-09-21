@@ -184,7 +184,10 @@ export function getEmbeddingProvider(): EmbeddingProvider {
     throw new Error(`unsupported embedding provider: ${config.EMBEDDING_PROVIDER}`);
   }
   _provider = new DimensionGuard(raw, config.EMBEDDING_DIMENSIONS);
-  logger.info({ provider: _provider.name, model: _provider.modelId, dim: _provider.dimensions }, 'embeddings.ready');
+  logger.info(
+    { provider: _provider.name, model: _provider.modelId, dim: _provider.dimensions },
+    'embeddings.ready',
+  );
   return _provider;
 }
 

@@ -361,9 +361,7 @@ describe('turn lifecycle — begin execution', () => {
     });
     const h = handle({ status: 'received', state_version: 1, attempt_count: 0 });
     await beginTurnExecution(h, { conversa_id: 'conv-9' });
-    expect(repo.markClaimed).toHaveBeenCalledWith(
-      expect.objectContaining({ expected_version: 1 }),
-    );
+    expect(repo.markClaimed).toHaveBeenCalledWith(expect.objectContaining({ expected_version: 1 }));
     expect(repo.markRunning).toHaveBeenCalledWith(
       expect.objectContaining({ expected_version: 2, conversa_id: 'conv-9' }),
     );

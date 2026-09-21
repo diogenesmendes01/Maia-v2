@@ -45,7 +45,10 @@ import { resolveSkillToolScope } from '@/tools/grant-math.js';
  * within the same turn (round-2 review #99 finding 3).
  */
 function simpleArgsHash(args: unknown): string {
-  const json = JSON.stringify(args, Object.keys(args && typeof args === 'object' ? args as object : {}).sort());
+  const json = JSON.stringify(
+    args,
+    Object.keys(args && typeof args === 'object' ? (args as object) : {}).sort(),
+  );
   let h = 5381;
   for (let i = 0; i < json.length; i++) {
     h = ((h << 5) + h) ^ json.charCodeAt(i);
@@ -146,9 +149,7 @@ export function setToolDispatcher(d: ToolDispatcher | null): void {
   toolDispatcher = d;
 }
 
-export async function toolMediatedMode(
-  ctx: ModeContext,
-): Promise<Record<string, unknown>> {
+export async function toolMediatedMode(ctx: ModeContext): Promise<Record<string, unknown>> {
   const procedure = (ctx.skill.procedure ?? {}) as ProcedureSpec;
   const hints = (ctx.skill.runtime_hints ?? {}) as Record<string, unknown>;
   // Issue #408 — SkillToolScope. `allowed_tools` is the existing allowlist;
@@ -169,8 +170,8 @@ export async function toolMediatedMode(
     typeof hints.max_tokens === 'number'
       ? hints.max_tokens
       : typeof hints.max_prompt_tokens === 'number'
-      ? hints.max_prompt_tokens + max_tokens * (maxToolCalls + 1)
-      : Number.POSITIVE_INFINITY;
+        ? hints.max_prompt_tokens + max_tokens * (maxToolCalls + 1)
+        : Number.POSITIVE_INFINITY;
 
   // Resolve tool schemas from the registry for tools declared in allowed_tools
   // and NOT in denied_tools (defense in depth — #408 SkillToolScope HARD deny).
@@ -427,7 +428,10 @@ export async function toolMediatedMode(
         if (e.message === 'aborted' || ctx.signal?.aborted) {
           throw new Error('aborted', { cause: err });
         }
-        logger.warn({ skill_id: ctx.skill.id, tool: tu.tool, err: e.message }, 'p9a.tool_dispatch_error');
+        logger.warn(
+          { skill_id: ctx.skill.id, tool: tu.tool, err: e.message },
+          'p9a.tool_dispatch_error',
+        );
         toolResults.push({
           type: 'tool_result',
           tool_use_id: tu.id,

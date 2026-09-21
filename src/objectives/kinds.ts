@@ -28,13 +28,10 @@ export type ExecuteResult =
 export interface ObjectiveKind {
   id: string;
   /** Materializa tarefas (idempotente). Omitido ⇒ tarefas só via console. */
-  perceive?: (objective: AgentObjective) => Promise<
-    Array<{ natural_key: string; title: string; payload: Record<string, unknown> }>
-  >;
-  execute: (args: {
-    objective: AgentObjective;
-    task: ObjectiveTask;
-  }) => Promise<ExecuteResult>;
+  perceive?: (
+    objective: AgentObjective,
+  ) => Promise<Array<{ natural_key: string; title: string; payload: Record<string, unknown> }>>;
+  execute: (args: { objective: AgentObjective; task: ObjectiveTask }) => Promise<ExecuteResult>;
 }
 
 const manualKind: ObjectiveKind = {

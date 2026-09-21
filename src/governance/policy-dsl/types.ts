@@ -111,12 +111,7 @@ export type PolicyComparableValue =
  * Effects are advisory: the evaluator returns `decision.effects` as data;
  * enforcement lives in the consumer (P9b Decision Engine).
  */
-export type PolicyEffectAction =
-  | 'allow'
-  | 'block'
-  | 'require_dual_approval'
-  | 'warn'
-  | 'log';
+export type PolicyEffectAction = 'allow' | 'block' | 'require_dual_approval' | 'warn' | 'log';
 
 export type PolicyEffect = {
   action: PolicyEffectAction;
@@ -166,11 +161,7 @@ export type PolicyRuleBody = {
  * new variant requires founder approval because every PEP must explicitly
  * handle each case.
  */
-export type PolicyOutcome =
-  | 'matched'
-  | 'not_matched'
-  | 'not_applicable'
-  | 'evaluation_error';
+export type PolicyOutcome = 'matched' | 'not_matched' | 'not_applicable' | 'evaluation_error';
 
 /**
  * Result of `evaluate()`. The evaluator never throws — every error is
@@ -313,6 +304,4 @@ export type PolicyValidationError = {
   path: string;
 };
 
-export type PolicyValidationResult =
-  | { ok: true }
-  | { ok: false; errors: PolicyValidationError[] };
+export type PolicyValidationResult = { ok: true } | { ok: false; errors: PolicyValidationError[] };

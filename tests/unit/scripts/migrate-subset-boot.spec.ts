@@ -107,51 +107,43 @@ const NUNCA_COBRADAS = [
 ] as const;
 
 describe('scripts/migrate.ts — o boot exige o subset `migrator`, não o da aplicação (#565)', () => {
-  it(
-    'sobe com o .env.migrator.prod.example e mais nada',
-    async () => {
-      const { code, stdout, stderr, started } = await runMigrate(ambienteDoRecursoDeMigration());
+  it('sobe com o .env.migrator.prod.example e mais nada', async () => {
+    const { code, stdout, stderr, started } = await runMigrate(ambienteDoRecursoDeMigration());
 
-      expect(started, 'a CLI não chegou a executar').toBe(true);
+    expect(started, 'a CLI não chegou a executar').toBe(true);
 
-      // Primeiro as asserções que NOMEIAM o defeito: quando o boot volta a
-      // exigir o contrato da aplicação, é aqui que se lê o quê.
-      for (const nome of NUNCA_COBRADAS) {
-        expect(
-          `${stdout}\n${stderr}`,
-          `o migrator cobrou ${nome} — uma chave de aplicação num job que só aplica DDL`,
-        ).not.toContain(nome);
-      }
-      expect(stderr).not.toContain('Invalid configuration for service');
-      expect(stderr).not.toContain('profile/required');
+    // Primeiro as asserções que NOMEIAM o defeito: quando o boot volta a
+    // exigir o contrato da aplicação, é aqui que se lê o quê.
+    for (const nome of NUNCA_COBRADAS) {
       expect(
-        code,
-        `saiu ${code}; 2 é "configuração inválida" — o migrator estaria cobrando ` +
-          'configuração que este recurso não tem',
-      ).not.toBe(2);
+        `${stdout}\n${stderr}`,
+        `o migrator cobrou ${nome} — uma chave de aplicação num job que só aplica DDL`,
+      ).not.toContain(nome);
+    }
+    expect(stderr).not.toContain('Invalid configuration for service');
+    expect(stderr).not.toContain('profile/required');
+    expect(
+      code,
+      `saiu ${code}; 2 é "configuração inválida" — o migrator estaria cobrando ` +
+        'configuração que este recurso não tem',
+    ).not.toBe(2);
 
-      // E, por último, a asserção POSITIVA: o gate de configuração foi
-      // atravessado e a única coisa que barrou o comando foi o banco fechado.
-      // Sem ela o caso seria vacuoso — um processo que morresse antes também
-      // produziria stderr sem os nomes de aplicação.
-      expect(stdout, 'a CLI não chegou ao passo que fala com o banco').toContain('readiness:');
-    },
-    180_000,
-  );
+    // E, por último, a asserção POSITIVA: o gate de configuração foi
+    // atravessado e a única coisa que barrou o comando foi o banco fechado.
+    // Sem ela o caso seria vacuoso — um processo que morresse antes também
+    // produziria stderr sem os nomes de aplicação.
+    expect(stdout, 'a CLI não chegou ao passo que fala com o banco').toContain('readiness:');
+  }, 180_000);
 
-  it(
-    'e ainda assim falha fechado sem DSN — o canário do caso acima',
-    async () => {
-      // Prova que o harness DETECTA falha de configuração. Sem ele,
-      // "atravessou o gate" e "o gate sumiu" seriam o mesmo resultado.
-      const { DATABASE_URL: _semDsn, ...semDatabaseUrl } = ambienteDoRecursoDeMigration();
-      const { code, stderr, started } = await runMigrate(semDatabaseUrl);
+  it('e ainda assim falha fechado sem DSN — o canário do caso acima', async () => {
+    // Prova que o harness DETECTA falha de configuração. Sem ele,
+    // "atravessou o gate" e "o gate sumiu" seriam o mesmo resultado.
+    const { DATABASE_URL: _semDsn, ...semDatabaseUrl } = ambienteDoRecursoDeMigration();
+    const { code, stderr, started } = await runMigrate(semDatabaseUrl);
 
-      expect(started, 'a CLI não chegou a executar').toBe(true);
-      expect(code, 'faltando o DSN, o migrator tem de recusar o boot').toBe(2);
-      expect(stderr).toContain('DATABASE_URL');
-      expect(stderr).toMatch(/→/);
-    },
-    180_000,
-  );
+    expect(started, 'a CLI não chegou a executar').toBe(true);
+    expect(code, 'faltando o DSN, o migrator tem de recusar o boot').toBe(2);
+    expect(stderr).toContain('DATABASE_URL');
+    expect(stderr).toMatch(/→/);
+  }, 180_000);
 });

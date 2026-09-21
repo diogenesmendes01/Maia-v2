@@ -46,7 +46,16 @@
  */
 import { describe, it, expect, beforeAll } from 'vitest';
 import { spawnSync } from 'node:child_process';
-import { readFileSync, mkdtempSync, copyFileSync, mkdirSync, writeFileSync, existsSync, readdirSync, rmSync } from 'node:fs';
+import {
+  readFileSync,
+  mkdtempSync,
+  copyFileSync,
+  mkdirSync,
+  writeFileSync,
+  existsSync,
+  readdirSync,
+  rmSync,
+} from 'node:fs';
 import { resolve, join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { pathToFileURL } from 'node:url';
@@ -115,7 +124,9 @@ describe('scripts/check-node.mjs — guard de versão do Node', () => {
 
   it('não importa nada além de builtins do Node', () => {
     const src = readFileSync(CHECKER, 'utf8');
-    const specifiers = [...src.matchAll(/(?:^|\s)(?:import|export)[^;\n]*?from\s+['"]([^'"]+)['"]/g)]
+    const specifiers = [
+      ...src.matchAll(/(?:^|\s)(?:import|export)[^;\n]*?from\s+['"]([^'"]+)['"]/g),
+    ]
       .map((m) => m[1])
       .concat([...src.matchAll(/\bimport\s*\(\s*['"]([^'"]+)['"]\s*\)/g)].map((m) => m[1]));
     const external = specifiers.filter((s) => !/^(node:|\.{1,2}\/)/.test(s));
@@ -285,11 +296,7 @@ describe('fronteiras de versão — comparação por versão completa, não por 
 
     // `engines.node` agora carrega teto (">=22.13.0 <23"): o piso é o primeiro
     // termo. Sem este split o parser lia "0 <23" e produzia NaN.
-    const declared = readPkg()
-      .engines.node.replace(/^>=/, '')
-      .split(' ')[0]
-      .split('.')
-      .map(Number);
+    const declared = readPkg().engines.node.replace(/^>=/, '').split(' ')[0].split('.').map(Number);
     expect(declared[0]).toBe(MAJOR);
     const declaredOk =
       declared[1] > required[0] || (declared[1] === required[0] && declared[2] >= required[1]);
@@ -372,7 +379,10 @@ describe('devEngines.runtime é o gate que roda ANTES da instalação', () => {
       [...npmCmd.slice(1), 'install', '--package-lock-only', ...NPM_ARGS],
       { cwd: dir, encoding: 'utf8' },
     );
-    expect(gen.status, `não consegui gerar o lockfile da fixture:\n${gen.stdout}${gen.stderr}`).toBe(0);
+    expect(
+      gen.status,
+      `não consegui gerar o lockfile da fixture:\n${gen.stdout}${gen.stderr}`,
+    ).toBe(0);
     rmSync(join(dir, 'node_modules'), { recursive: true, force: true });
     // O próprio `--package-lock-only` dispara o `preinstall`, então o marcador
     // dele precisa sumir antes da medição — senão o teste leria o resíduo da
@@ -384,7 +394,10 @@ describe('devEngines.runtime é o gate que roda ANTES da instalação', () => {
   }
 
   function npmCi(dir: string) {
-    return spawnSync(npmCmd[0], [...npmCmd.slice(1), 'ci', ...NPM_ARGS], { cwd: dir, encoding: 'utf8' });
+    return spawnSync(npmCmd[0], [...npmCmd.slice(1), 'ci', ...NPM_ARGS], {
+      cwd: dir,
+      encoding: 'utf8',
+    });
   }
 
   it('um devEngines.runtime insatisfeito para o npm ANTES de escrever node_modules', () => {
@@ -409,7 +422,10 @@ describe('devEngines.runtime é o gate que roda ANTES da instalação', () => {
   it('CONTRA-PROVA: com o preinstall no lugar do devEngines, a árvore JÁ está instalada quando ele roda', () => {
     const dir = mkdtempSync(join(tmpdir(), 'maia-preinstall-'));
     mkdirSync(join(dir, 'dep'));
-    writeFileSync(join(dir, 'dep', 'package.json'), JSON.stringify({ name: 'fixture-dep', version: '1.0.0' }));
+    writeFileSync(
+      join(dir, 'dep', 'package.json'),
+      JSON.stringify({ name: 'fixture-dep', version: '1.0.0' }),
+    );
     writeFileSync(
       join(dir, 'package.json'),
       JSON.stringify({
@@ -422,10 +438,14 @@ describe('devEngines.runtime é o gate que roda ANTES da instalação', () => {
         dependencies: { 'fixture-dep': 'file:./dep' },
       }),
     );
-    const gen = spawnSync(npmCmd[0], [...npmCmd.slice(1), 'install', '--package-lock-only', ...NPM_ARGS], {
-      cwd: dir,
-      encoding: 'utf8',
-    });
+    const gen = spawnSync(
+      npmCmd[0],
+      [...npmCmd.slice(1), 'install', '--package-lock-only', ...NPM_ARGS],
+      {
+        cwd: dir,
+        encoding: 'utf8',
+      },
+    );
     expect(gen.status).toBe(0);
     rmSync(join(dir, 'node_modules'), { recursive: true, force: true });
     const r = npmCi(dir);
@@ -466,12 +486,17 @@ describe('[declaração] o guard é invocado explicitamente antes de todo `npm c
         for (const line of stage.lines) {
           if (/^\s*COPY\s/i.test(line) && !/--from=/i.test(line)) {
             if (/(^|\s)(\.\/)?package\.json(\s|$)/.test(line)) rootPkgCopied = true;
-            if (line.includes(GUARD_PATH) || /^\s*COPY\s+\.\s+\.\/?\s*$/.test(line)) guardAvailable = true;
+            if (line.includes(GUARD_PATH) || /^\s*COPY\s+\.\s+\.\/?\s*$/.test(line))
+              guardAvailable = true;
           }
           if (/^\s*RUN\b/i.test(line) && GUARD_INVOCATION.test(line)) guardInvoked = true;
           if (/^\s*RUN\b/i.test(line) && /\bnpm\s+ci\b/.test(line) && rootPkgCopied) {
-            if (!guardAvailable) offenders.push(`${dockerfile} [${stage.name}] guard não copiado: ${line.trim()}`);
-            else if (!guardInvoked) offenders.push(`${dockerfile} [${stage.name}] guard não invocado antes: ${line.trim()}`);
+            if (!guardAvailable)
+              offenders.push(`${dockerfile} [${stage.name}] guard não copiado: ${line.trim()}`);
+            else if (!guardInvoked)
+              offenders.push(
+                `${dockerfile} [${stage.name}] guard não invocado antes: ${line.trim()}`,
+              );
           }
         }
       }
@@ -489,7 +514,9 @@ describe('[declaração] o guard é invocado explicitamente antes de todo `npm c
         if (/^ {2}[A-Za-z0-9_-]+:\s*$/.test(line)) guardInvoked = false;
         if (GUARD_INVOCATION.test(line)) guardInvoked = true;
         if (/\bnpm\s+ci\b/.test(line) && !line.trim().startsWith('#') && !guardInvoked) {
-          offenders.push(`${file.replace(REPO_ROOT + '/', '')}: \`npm ci\` sem \`node ${GUARD_PATH}\` antes → ${line.trim()}`);
+          offenders.push(
+            `${file.replace(REPO_ROOT + '/', '')}: \`npm ci\` sem \`node ${GUARD_PATH}\` antes → ${line.trim()}`,
+          );
         }
       }
     }
@@ -577,12 +604,16 @@ describe('[declaração] toda lane de CI pina a versão de Node', () => {
       readFileSync(file, 'utf8')
         .split('\n')
         .forEach((line, i) => {
-          const m = /^\s*node-version:\s*['"]?(\d+)(?:\.(\d+))?(?:\.(\d+))?['"]?\s*(?:#.*)?$/.exec(line);
+          const m = /^\s*node-version:\s*['"]?(\d+)(?:\.(\d+))?(?:\.(\d+))?['"]?\s*(?:#.*)?$/.exec(
+            line,
+          );
           if (!m) return;
           const v = [Number(m[1]), Number(m[2] ?? 0), Number(m[3] ?? 0)];
           if (v[0] !== floor[0]) return; // outro major (26) tem sua própria perna
           if (v[1] < floor[1] || (v[1] === floor[1] && v[2] < floor[2])) {
-            offenders.push(`${file.replace(REPO_ROOT + '/', '')}:${i + 1} node-version ${v.join('.')} < ${floor.join('.')}`);
+            offenders.push(
+              `${file.replace(REPO_ROOT + '/', '')}:${i + 1} node-version ${v.join('.')} < ${floor.join('.')}`,
+            );
           }
         });
     }

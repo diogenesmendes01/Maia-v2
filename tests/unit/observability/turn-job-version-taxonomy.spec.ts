@@ -74,9 +74,7 @@ describe('#504 — o vocabulário de `version` é espelho de `jobVersionLabel`',
 
   it('um valor fora do vocabulário COLAPSA antes de virar série', () => {
     expect(closedVocabulary('v3', TURN_JOB_VERSION_VALUES)).toBe(CLOSED_VOCABULARY_FALLBACK);
-    expect(closedVocabulary(undefined, TURN_JOB_VERSION_VALUES)).toBe(
-      CLOSED_VOCABULARY_FALLBACK,
-    );
+    expect(closedVocabulary(undefined, TURN_JOB_VERSION_VALUES)).toBe(CLOSED_VOCABULARY_FALLBACK);
   });
 
   it('os motivos de recusa do resolvedor também são um vocabulário fechado', () => {

@@ -7,10 +7,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { featureFlags } from '@/config/feature-flags.js';
-import {
-  _internal_cache,
-  cacheKey,
-} from '@/lib/holidays-cache.js';
+import { _internal_cache, cacheKey } from '@/lib/holidays-cache.js';
 import type { CapabilityProposal } from '@/db/schema.js';
 
 // ---------- in-memory state ----------
@@ -192,7 +189,9 @@ describe('Calendar v2 — approval pipeline (holiday)', () => {
       cacheKey('tenant-a', 'default', 'entidade-001', 2026, 'standard'),
       new Set(['2026-12-25']),
     );
-    expect(_internal_cache.get(cacheKey('tenant-a', 'default', 'entidade-001', 2026, 'standard'))).toBeDefined();
+    expect(
+      _internal_cache.get(cacheKey('tenant-a', 'default', 'entidade-001', 2026, 'standard')),
+    ).toBeDefined();
 
     const { dispatchApproval } = await import('@/cognition/proposal-approval-handler.js');
     const proposal = makeProposal();
@@ -306,6 +305,8 @@ describe('Calendar v2 — cross-tenant isolation (Cenário 5)', () => {
     });
 
     // tenant-B cache continua intacto
-    expect(_internal_cache.get(cacheKey('tenant-b', 'default', 'entidade-B', 2026, 'standard'))).toBeDefined();
+    expect(
+      _internal_cache.get(cacheKey('tenant-b', 'default', 'entidade-B', 2026, 'standard')),
+    ).toBeDefined();
   });
 });

@@ -45,9 +45,8 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
  * repo method.
  */
 async function runDecideAndApply(args: Parameters<typeof decideAndApply>[0]) {
-  return await runWithTenantContext(
-    { tenant_id: TENANT_ID, agent_id: AGENT_ID },
-    async () => decideAndApply(args),
+  return await runWithTenantContext({ tenant_id: TENANT_ID, agent_id: AGENT_ID }, async () =>
+    decideAndApply(args),
   );
 }
 
@@ -81,23 +80,21 @@ function transitionOk() {
 
 describe('classifySeverity (deterministic, per type)', () => {
   it('TOM: 1 example → baixo, 2 → medio, 3+ → alto (without hint)', () => {
-    expect(
-      classifySeverity(makeEvidence(DriftType.TOM, { examples: ['a'] })),
-    ).toBe(DriftSeverity.BAIXO);
-    expect(
-      classifySeverity(makeEvidence(DriftType.TOM, { examples: ['a', 'b'] })),
-    ).toBe(DriftSeverity.MEDIO);
-    expect(
-      classifySeverity(makeEvidence(DriftType.TOM, { examples: ['a', 'b', 'c'] })),
-    ).toBe(DriftSeverity.ALTO);
+    expect(classifySeverity(makeEvidence(DriftType.TOM, { examples: ['a'] }))).toBe(
+      DriftSeverity.BAIXO,
+    );
+    expect(classifySeverity(makeEvidence(DriftType.TOM, { examples: ['a', 'b'] }))).toBe(
+      DriftSeverity.MEDIO,
+    );
+    expect(classifySeverity(makeEvidence(DriftType.TOM, { examples: ['a', 'b', 'c'] }))).toBe(
+      DriftSeverity.ALTO,
+    );
   });
 
   it('VALORES: violated_principles → ALTO mesmo sem hint; hint critico promove', () => {
-    expect(
-      classifySeverity(
-        makeEvidence(DriftType.VALORES, { violated_principles: [0] }),
-      ),
-    ).toBe(DriftSeverity.ALTO);
+    expect(classifySeverity(makeEvidence(DriftType.VALORES, { violated_principles: [0] }))).toBe(
+      DriftSeverity.ALTO,
+    );
     expect(
       classifySeverity(
         makeEvidence(DriftType.VALORES, {
@@ -109,18 +106,18 @@ describe('classifySeverity (deterministic, per type)', () => {
   });
 
   it('CONFIANCA: max_gap thresholds (deterministico)', () => {
-    expect(
-      classifySeverity(makeEvidence(DriftType.CONFIANCA, { max_gap: 0.1 })),
-    ).toBe(DriftSeverity.BAIXO);
-    expect(
-      classifySeverity(makeEvidence(DriftType.CONFIANCA, { max_gap: 0.35 })),
-    ).toBe(DriftSeverity.MEDIO);
-    expect(
-      classifySeverity(makeEvidence(DriftType.CONFIANCA, { max_gap: 0.55 })),
-    ).toBe(DriftSeverity.ALTO);
-    expect(
-      classifySeverity(makeEvidence(DriftType.CONFIANCA, { max_gap: 0.8 })),
-    ).toBe(DriftSeverity.CRITICO);
+    expect(classifySeverity(makeEvidence(DriftType.CONFIANCA, { max_gap: 0.1 }))).toBe(
+      DriftSeverity.BAIXO,
+    );
+    expect(classifySeverity(makeEvidence(DriftType.CONFIANCA, { max_gap: 0.35 }))).toBe(
+      DriftSeverity.MEDIO,
+    );
+    expect(classifySeverity(makeEvidence(DriftType.CONFIANCA, { max_gap: 0.55 }))).toBe(
+      DriftSeverity.ALTO,
+    );
+    expect(classifySeverity(makeEvidence(DriftType.CONFIANCA, { max_gap: 0.8 }))).toBe(
+      DriftSeverity.CRITICO,
+    );
   });
 
   it('LINGUAGEM: offensive=true → critico independente de hint', () => {
@@ -132,9 +129,9 @@ describe('classifySeverity (deterministic, per type)', () => {
         }),
       ),
     ).toBe(DriftSeverity.CRITICO);
-    expect(
-      classifySeverity(makeEvidence(DriftType.LINGUAGEM, { offensive: false })),
-    ).toBe(DriftSeverity.BAIXO);
+    expect(classifySeverity(makeEvidence(DriftType.LINGUAGEM, { offensive: false }))).toBe(
+      DriftSeverity.BAIXO,
+    );
   });
 
   it('Unknown drift_type: hint válido → hint; senão baixo', () => {
@@ -157,19 +154,13 @@ describe('classifySeverity (deterministic, per type)', () => {
   // P8d §7 — papel_drift floor rules (determinísticas)
   it('PAPEL_DRIFT: 1 off_role → BAIXO, 2 → MEDIO, 3 → ALTO, 5+ → CRITICO', () => {
     expect(
-      classifySeverity(
-        makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a'] }),
-      ),
+      classifySeverity(makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a'] })),
     ).toBe(DriftSeverity.BAIXO);
     expect(
-      classifySeverity(
-        makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a', 'b'] }),
-      ),
+      classifySeverity(makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a', 'b'] })),
     ).toBe(DriftSeverity.MEDIO);
     expect(
-      classifySeverity(
-        makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a', 'b', 'c'] }),
-      ),
+      classifySeverity(makeEvidence(DriftType.PAPEL_DRIFT, { off_role_examples: ['a', 'b', 'c'] })),
     ).toBe(DriftSeverity.ALTO);
     expect(
       classifySeverity(
@@ -196,7 +187,8 @@ describe('classifySeverity (deterministic, per type)', () => {
     // Caso real do seed: role_descriptor = core_immutable.identity_block (prosa longa).
     // A divergência de papéis NÃO pode ser detectada se um dos lados não é um slug
     // de papel validado — portanto a promoção a critico não deve acontecer.
-    const prosaDeclarada = 'Sou a Maia, assistente financeira inteligente para pessoas físicas e pequenas empresas, especializada em controle de gastos, planejamento orçamentário e análise de fluxo de caixa.';
+    const prosaDeclarada =
+      'Sou a Maia, assistente financeira inteligente para pessoas físicas e pequenas empresas, especializada em controle de gastos, planejamento orçamentário e análise de fluxo de caixa.';
     expect(
       classifySeverity(
         makeEvidence(DriftType.PAPEL_DRIFT, {
@@ -215,7 +207,8 @@ describe('classifySeverity (deterministic, per type)', () => {
         makeEvidence(DriftType.PAPEL_DRIFT, {
           off_role_examples: ['a', 'b', 'c'],
           declared_role: 'atendimento_financeiro_pf',
-          observed_role_inferred: 'Parece que o agente está atuando como consultor jurídico especializado',
+          observed_role_inferred:
+            'Parece que o agente está atuando como consultor jurídico especializado',
         }),
       ),
     ).toBe(DriftSeverity.ALTO); // observed não é slug → rolesDiverge=false → piso ALTO
@@ -257,9 +250,7 @@ describe('classifySeverity (deterministic, per type)', () => {
   });
 
   it('PAPEL_DRIFT: sem off_role nem hint → BAIXO (default)', () => {
-    expect(
-      classifySeverity(makeEvidence(DriftType.PAPEL_DRIFT, {})),
-    ).toBe(DriftSeverity.BAIXO);
+    expect(classifySeverity(makeEvidence(DriftType.PAPEL_DRIFT, {}))).toBe(DriftSeverity.BAIXO);
   });
 });
 
@@ -359,9 +350,7 @@ describe('decideAndApply', () => {
     expect(transArgs.rollback_reason).toBe('mensagem ofensiva detectada');
     expect(transArgs.approved_by).toBe('auto:drift_critico');
 
-    expect(createAlertMock.mock.calls[0]![0].decision).toBe(
-      DriftDecision.ROLLBACK,
-    );
+    expect(createAlertMock.mock.calls[0]![0].decision).toBe(DriftDecision.ROLLBACK);
   });
 
   it('CONFIANCA max_gap=0.8 → critico → rollback', async () => {
@@ -470,16 +459,8 @@ describe('decideAndApply', () => {
 
   it('batch collapse: [alto, critico] same profile → rollback aplicado, alto descartado com superseded_by', async () => {
     transitionOk();
-    const evAlto = makeEvidence(
-      DriftType.VALORES,
-      { violated_principles: [0] },
-      'alto evidence',
-    );
-    const evCritico = makeEvidence(
-      DriftType.LINGUAGEM,
-      { offensive: true },
-      'critico evidence',
-    );
+    const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] }, 'alto evidence');
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico evidence');
 
     const out = await runDecideAndApply({
       evidences: [evAlto, evCritico],
@@ -518,16 +499,8 @@ describe('decideAndApply', () => {
 
   it('batch collapse: [critico, alto] same profile (ordem invertida) → mesmo resultado, rollback aplicado', async () => {
     transitionOk();
-    const evCritico = makeEvidence(
-      DriftType.LINGUAGEM,
-      { offensive: true },
-      'critico evidence',
-    );
-    const evAlto = makeEvidence(
-      DriftType.VALORES,
-      { violated_principles: [0] },
-      'alto evidence',
-    );
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico evidence');
+    const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] }, 'alto evidence');
 
     const out = await runDecideAndApply({
       evidences: [evCritico, evAlto],
@@ -553,16 +526,8 @@ describe('decideAndApply', () => {
 
   it('batch collapse: [alto, alto] same profile → primeiro alto vence (tie-break por índice), segundo descartado', async () => {
     transitionOk();
-    const ev1 = makeEvidence(
-      DriftType.VALORES,
-      { violated_principles: [0] },
-      'alto 1',
-    );
-    const ev2 = makeEvidence(
-      DriftType.VALORES,
-      { violated_principles: [1, 2] },
-      'alto 2',
-    );
+    const ev1 = makeEvidence(DriftType.VALORES, { violated_principles: [0] }, 'alto 1');
+    const ev2 = makeEvidence(DriftType.VALORES, { violated_principles: [1, 2] }, 'alto 2');
 
     const out = await runDecideAndApply({
       evidences: [ev1, ev2],
@@ -694,16 +659,8 @@ describe('decideAndApply', () => {
       throw new Error('db down');
     });
 
-    const evAlto = makeEvidence(
-      DriftType.VALORES,
-      { violated_principles: [0] },
-      'alto evidence',
-    );
-    const evCritico = makeEvidence(
-      DriftType.LINGUAGEM,
-      { offensive: true },
-      'critico evidence',
-    );
+    const evAlto = makeEvidence(DriftType.VALORES, { violated_principles: [0] }, 'alto evidence');
+    const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true }, 'critico evidence');
 
     const out = await runDecideAndApply({
       evidences: [evAlto, evCritico],
@@ -1029,9 +986,7 @@ describe('decideAndApply', () => {
     expect(out[0]!.severity).toBe(DriftSeverity.CRITICO);
     expect(out[0]!.decision).toBe(DriftDecision.ROLLBACK);
     expect(out[0]!.applied).toBe(false);
-    expect(out[0]!.applied_error).toBe(
-      'stale:expected=active,actual=frozen;active_replaced',
-    );
+    expect(out[0]!.applied_error).toBe('stale:expected=active,actual=frozen;active_replaced');
     expect(out[0]!.alert_id).toMatch(/^alert-/);
 
     expect(transitionMock).toHaveBeenCalledTimes(1);
@@ -1070,9 +1025,7 @@ describe('decideAndApply', () => {
 
     expect(out).toHaveLength(1);
     expect(out[0]!.applied).toBe(false);
-    expect(out[0]!.applied_error).toBe(
-      'stale:expected=active,actual=frozen;reactivated',
-    );
+    expect(out[0]!.applied_error).toBe('stale:expected=active,actual=frozen;reactivated');
     expect(out[0]!.alert_id).toMatch(/^alert-/);
 
     expect(transitionMock).toHaveBeenCalledTimes(1);
@@ -1139,9 +1092,7 @@ describe('decideAndApply', () => {
     });
 
     expect(out[0]!.applied).toBe(false);
-    expect(out[0]!.applied_error).toBe(
-      'stale:expected=active,actual=frozen;target_missing',
-    );
+    expect(out[0]!.applied_error).toBe('stale:expected=active,actual=frozen;target_missing');
 
     expect(transitionMock).toHaveBeenCalledTimes(1);
     expect(escalateRollbackIfStillFrozenMock).toHaveBeenCalledTimes(1);
@@ -1188,9 +1139,7 @@ describe('decideAndApply', () => {
       expected_from: 'active',
       actual: 'frozen',
     });
-    escalateRollbackIfStillFrozenMock.mockRejectedValueOnce(
-      new Error('connection reset'),
-    );
+    escalateRollbackIfStillFrozenMock.mockRejectedValueOnce(new Error('connection reset'));
 
     const evCritico = makeEvidence(DriftType.LINGUAGEM, { offensive: true });
 

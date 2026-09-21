@@ -45,9 +45,7 @@ import { OWNERSHIP_PROVEN_LINE_STATES } from './readiness.js';
 import { assertProvisioningScope, assertTenantScope } from './scope.js';
 import type { OnboardingStep } from './state-machine.js';
 
-type Tx = Parameters<
-  Parameters<typeof import('@/db/client.js').withTx>[0]
->[0];
+type Tx = Parameters<Parameters<typeof import('@/db/client.js').withTx>[0]>[0];
 
 // ── Vocabulário de enum/status que a saga ESCREVE ────────────────────────────
 //
@@ -235,11 +233,9 @@ export async function applyProvisionTenant(
 ): Promise<StepApplication> {
   assertTenantScope(payload.tenant_id);
   if (run.tenant_id && run.tenant_id !== payload.tenant_id) {
-    throw new OnboardingError(
-      'scope_mismatch',
-      'a run já está vinculada a outro tenant',
-      { run_tenant: run.tenant_id },
-    );
+    throw new OnboardingError('scope_mismatch', 'a run já está vinculada a outro tenant', {
+      run_tenant: run.tenant_id,
+    });
   }
 
   // ON CONFLICT DO NOTHING + SELECT: reexecutar o passo com uma chave nova
@@ -261,7 +257,11 @@ export async function applyProvisionTenant(
     result: { tenant_id: tenant.id, status: tenant.status },
     scope_patch: { tenant_id: tenant.id },
     summary: { tenant_id: tenant.id },
-    audit: { action: 'onboarding_tenant_provisioned', resource_type: 'tenant', resource_id: tenant.id },
+    audit: {
+      action: 'onboarding_tenant_provisioned',
+      resource_type: 'tenant',
+      resource_id: tenant.id,
+    },
   };
 }
 
@@ -461,7 +461,11 @@ export async function applyProvisionAgent(
     result: { agent_id: agent.id, status: agent.status, seed_profile_version: 1 },
     scope_patch: { agent_id: agent.id },
     summary: { agent_id: agent.id },
-    audit: { action: 'onboarding_agent_provisioned', resource_type: 'agent', resource_id: agent.id },
+    audit: {
+      action: 'onboarding_agent_provisioned',
+      resource_type: 'agent',
+      resource_id: agent.id,
+    },
   };
 }
 
@@ -574,7 +578,11 @@ export async function applyCapabilityPacks(
   return {
     result: { granted_packs: packs, denied_tools: denied },
     summary: { pack_count: packs.length },
-    audit: { action: 'onboarding_packs_applied', resource_type: 'agent_tool_grants', resource_id: agent_id },
+    audit: {
+      action: 'onboarding_packs_applied',
+      resource_type: 'agent_tool_grants',
+      resource_id: agent_id,
+    },
   };
 }
 
@@ -591,7 +599,9 @@ export async function applyConfigureRole(
   await tx
     .update(roles)
     .set({ is_default: false, updated_at: new Date() })
-    .where(and(eq(roles.tenant_id, tenant_id), eq(roles.agent_id, agent_id), eq(roles.is_default, true)));
+    .where(
+      and(eq(roles.tenant_id, tenant_id), eq(roles.agent_id, agent_id), eq(roles.is_default, true)),
+    );
 
   await tx
     .insert(roles)
@@ -751,7 +761,11 @@ export async function applyDeclareChannel(
   return {
     result: { channel_id: channel.id, channel_type: channel.channel_type, active: channel.active },
     summary: { channel_id: channel.id },
-    audit: { action: 'onboarding_channel_declared', resource_type: 'channel', resource_id: channel.id },
+    audit: {
+      action: 'onboarding_channel_declared',
+      resource_type: 'channel',
+      resource_id: channel.id,
+    },
   };
 }
 
@@ -783,7 +797,11 @@ export async function applyConfirmChannelReady(
     return {
       result: {},
       deny: { code: 'channel_not_found', message: 'linha não encontrada neste (tenant, agente)' },
-      audit: { action: 'onboarding_channel_confirmed', resource_type: 'channel', resource_id: null },
+      audit: {
+        action: 'onboarding_channel_confirmed',
+        resource_type: 'channel',
+        resource_id: null,
+      },
     };
   }
   if (state !== 'connected' && state !== 'verified_offline') {
@@ -993,14 +1011,15 @@ export async function applyActivate(
         message:
           'nenhuma linha integralmente válida para ativar — a configuração mudou entre a avaliação e a escrita',
       },
-      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: agent_id },
+      audit: {
+        action: 'onboarding_agent_activated',
+        resource_type: 'agent',
+        resource_id: agent_id,
+      },
     };
   }
 
-  if (
-    approved.length !== rederived.length ||
-    approved.some((id, i) => id !== rederived[i])
-  ) {
+  if (approved.length !== rederived.length || approved.some((id, i) => id !== rederived[i])) {
     return {
       result: { activated_channels: 0 },
       summary: { activated_channels: 0 },
@@ -1009,7 +1028,11 @@ export async function applyActivate(
         message:
           'o conjunto de linhas válidas divergiu do que o readiness aprovou — nada foi ativado',
       },
-      audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: agent_id },
+      audit: {
+        action: 'onboarding_agent_activated',
+        resource_type: 'agent',
+        resource_id: agent_id,
+      },
     };
   }
 
@@ -1064,9 +1087,7 @@ export async function applyActivate(
     // Quem ESTAVA roteando é o que a governança precisa registrar. Reafirmar
     // `false` sobre `false` é no-op semântico, não uma decisão.
     const wasActive = [
-      ...new Set(
-        governedRows.filter((r) => excluded.includes(r.id) && r.active).map((r) => r.id),
-      ),
+      ...new Set(governedRows.filter((r) => excluded.includes(r.id) && r.active).map((r) => r.id)),
     ].sort();
 
     const deactivated = await tx

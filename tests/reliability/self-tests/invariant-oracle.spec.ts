@@ -96,7 +96,9 @@ describe('#510 oracle — o CASO DE CONTROLE', () => {
     const limpa = foto({
       turnos: [t, turnoBase({ status: 'running', outcome: null, stream_key: 'stream-2' })],
       saidas: [saidaBase({ turn_id: t.id })],
-      auditorias: [{ id: randomUUID(), tenant_id: T, agent_id: A, acao: 'turn_claimed', alvo_id: t.id }],
+      auditorias: [
+        { id: randomUUID(), tenant_id: T, agent_id: A, acao: 'turn_claimed', alvo_id: t.id },
+      ],
     });
     expect(verificarInvariantes(limpa, { exigirConvergencia: false })).toEqual([]);
   });
@@ -174,7 +176,13 @@ describe('#510 oracle — segurança', () => {
         turnos: [turnoBase({ tenant_id: T_INTRUSO, agent_id: A_INTRUSO })],
         saidas: [saidaBase({ tenant_id: T_INTRUSO, agent_id: A_INTRUSO })],
         auditorias: [
-          { id: randomUUID(), tenant_id: T_INTRUSO, agent_id: A_INTRUSO, acao: 'turn_claimed', alvo_id: null },
+          {
+            id: randomUUID(),
+            tenant_id: T_INTRUSO,
+            agent_id: A_INTRUSO,
+            acao: 'turn_claimed',
+            alvo_id: null,
+          },
         ],
       }),
     );
@@ -201,9 +209,9 @@ describe('#510 oracle — segurança', () => {
 
 describe('#510 oracle — turno e FIFO', () => {
   it('DETECTA status fora da máquina de estados de #503', () => {
-    expect(nomes(foto({ turnos: [turnoBase({ status: 'quase_pronto', outcome: null })] }))).toContain(
-      'turno.status_conhecido',
-    );
+    expect(
+      nomes(foto({ turnos: [turnoBase({ status: 'quase_pronto', outcome: null })] })),
+    ).toContain('turno.status_conhecido');
   });
 
   it('DETECTA outcome que o estado terminal não admite', () => {
@@ -220,7 +228,11 @@ describe('#510 oracle — turno e FIFO', () => {
 
   it('DETECTA claim gravado pela metade', () => {
     expect(
-      nomes(foto({ turnos: [turnoBase({ status: 'running', outcome: null, claim_token: randomUUID() })] })),
+      nomes(
+        foto({
+          turnos: [turnoBase({ status: 'running', outcome: null, claim_token: randomUUID() })],
+        }),
+      ),
     ).toContain('turno.claim_completo');
   });
 
@@ -274,8 +286,22 @@ describe('#510 oracle — turno e FIFO', () => {
     const violacoes = verificarInvariantes(
       foto({
         turnos: [
-          turnoBase({ status: 'claimed', outcome: null, stream_key: 'quente', claim_token: randomUUID(), claimed_by: 'w1', lease_expires_at: new Date().toISOString() }),
-          turnoBase({ status: 'running', outcome: null, stream_key: 'quente', claim_token: randomUUID(), claimed_by: 'w2', lease_expires_at: new Date().toISOString() }),
+          turnoBase({
+            status: 'claimed',
+            outcome: null,
+            stream_key: 'quente',
+            claim_token: randomUUID(),
+            claimed_by: 'w1',
+            lease_expires_at: new Date().toISOString(),
+          }),
+          turnoBase({
+            status: 'running',
+            outcome: null,
+            stream_key: 'quente',
+            claim_token: randomUUID(),
+            claimed_by: 'w2',
+            lease_expires_at: new Date().toISOString(),
+          }),
         ],
       }),
     );
@@ -423,7 +449,8 @@ describe('#510 oracle — progresso e fence (duas fotos)', () => {
 // O COLETOR — a única parte que precisa de banco
 // ---------------------------------------------------------------------------
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 d('#510 oracle — o coletor lê o estado durável REAL', () => {
@@ -437,7 +464,10 @@ d('#510 oracle — o coletor lê o estado durável REAL', () => {
       [T, A],
       [T_INTRUSO, A_INTRUSO],
     ]) {
-      await pool.query('INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING', [t]);
+      await pool.query(
+        'INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING',
+        [t],
+      );
       await pool.query(
         'INSERT INTO agents(id, tenant_id, nome) VALUES ($1, $2, $1) ON CONFLICT (id) DO NOTHING',
         [a, t],

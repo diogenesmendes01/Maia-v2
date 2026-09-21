@@ -97,8 +97,7 @@ export interface TranscriptSummary {
   pending_actions: string[];
 }
 
-const DEFAULT_PURPOSE =
-  'decisões tomadas, fatos relevantes e pendências em aberto';
+const DEFAULT_PURPOSE = 'decisões tomadas, fatos relevantes e pendências em aberto';
 const DEFAULT_MAX_CHARS = 500;
 
 /**

@@ -112,9 +112,7 @@ describe('maia doctor · redaction', () => {
 
 describe('maia doctor · JSON contract', () => {
   it('carries a stable schema version and the run envelope', () => {
-    const parsed = JSON.parse(
-      renderJson(run([outcome()]), meta, {}),
-    ) as Record<string, unknown>;
+    const parsed = JSON.parse(renderJson(run([outcome()]), meta, {})) as Record<string, unknown>;
     expect(parsed.schema_version).toBe(DOCTOR_SCHEMA_VERSION);
     expect(Object.keys(parsed).sort()).toEqual(
       [
@@ -207,13 +205,19 @@ describe('maia doctor · JSON contract', () => {
 
 describe('maia doctor · human format', () => {
   it('prints one [STATUS] id line per check, with duration', () => {
-    const human = renderHuman(run([outcome({ id: 'postgres.connectivity', duration_ms: 18 })]), meta, {});
+    const human = renderHuman(
+      run([outcome({ id: 'postgres.connectivity', duration_ms: 18 })]),
+      meta,
+      {},
+    );
     expect(human).toMatch(/\[PASS] postgres\.connectivity\s+18ms/);
   });
 
   it('shows remediation for a failure and the NOT-READY verdict', () => {
     const human = renderHuman(
-      run([outcome({ status: 'fail', summary: 'schema atrasado', remediation: ['rode o migrator'] })]),
+      run([
+        outcome({ status: 'fail', summary: 'schema atrasado', remediation: ['rode o migrator'] }),
+      ]),
       meta,
       {},
     );
@@ -242,7 +246,12 @@ describe('maia doctor · human format', () => {
    */
   it('an ADVISORY fail under --strict: the text and the exit code agree', () => {
     const r = run([
-      outcome({ id: 'redis.persistence', status: 'fail', criticality: 'advisory', summary: 'AOF quebrado' }),
+      outcome({
+        id: 'redis.persistence',
+        status: 'fail',
+        criticality: 'advisory',
+        summary: 'AOF quebrado',
+      }),
     ]);
     expect(exitCodeFor(r, true)).toBe(1);
     expect(renderHuman(r, { ...meta, strict: true }, {})).toContain('NÃO PRONTO');

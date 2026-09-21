@@ -33,7 +33,10 @@ const SECRET_PATTERNS: readonly { name: string; re: RegExp }[] = [
   // Bare connection strings (no credentials but still topology + db name).
   { name: 'db_uri', re: /\b(?:postgres|postgresql|redis|rediss|amqp|mongodb):\/\/\S+/gi },
   // Pre-signed URLs — the query string IS the credential.
-  { name: 'presigned_url', re: /\bhttps?:\/\/\S*[?&](?:X-Amz-Signature|X-Amz-Credential|Signature|AWSAccessKeyId)=\S*/gi },
+  {
+    name: 'presigned_url',
+    re: /\bhttps?:\/\/\S*[?&](?:X-Amz-Signature|X-Amz-Credential|Signature|AWSAccessKeyId)=\S*/gi,
+  },
   // Provider API keys / access-key ids.
   { name: 'anthropic_key', re: /\bsk-ant-[A-Za-z0-9_-]{8,}/g },
   { name: 'openai_key', re: /\bsk-(?!ant-)[A-Za-z0-9_-]{16,}/g },

@@ -189,11 +189,13 @@ describe('issue #519 — coletor de backlog do onboarding_expirer', () => {
 
     const [corpoA, corpoB] = await Promise.all([a, b]);
 
-    expect(source, 'o segundo scrape furou o single-flight e consultou de novo').toHaveBeenCalledTimes(1);
     expect(
-      corpoA,
-      'o scrape A não enxergou a leitura que ele mesmo esperou',
-    ).toMatch(/^maia_onboarding_expiry_backlog 42$/m);
+      source,
+      'o segundo scrape furou o single-flight e consultou de novo',
+    ).toHaveBeenCalledTimes(1);
+    expect(corpoA, 'o scrape A não enxergou a leitura que ele mesmo esperou').toMatch(
+      /^maia_onboarding_expiry_backlog 42$/m,
+    );
     expect(
       corpoB,
       'o scrape B publicou valor velho (ou NaN) enquanto a leitura corrente ainda corria',

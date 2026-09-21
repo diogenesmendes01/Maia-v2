@@ -43,12 +43,7 @@ const CATEGORIES = [
   'evaluator',
 ] as const;
 
-const EXECUTION_MODES = [
-  'prompt_only',
-  'procedure_adapter',
-  'tool_mediated',
-  'evaluator',
-] as const;
+const EXECUTION_MODES = ['prompt_only', 'procedure_adapter', 'tool_mediated', 'evaluator'] as const;
 
 type Category = (typeof CATEGORIES)[number];
 type ExecutionMode = (typeof EXECUTION_MODES)[number];
@@ -93,9 +88,7 @@ const DEFAULT_JSON: Record<JsonField, string> = {
   runtime_hints: '{}',
 };
 
-type ParseResult =
-  | { ok: true; value: unknown }
-  | { ok: false; error: string };
+type ParseResult = { ok: true; value: unknown } | { ok: false; error: string };
 
 function parseJsonField(raw: string, kind: 'object' | 'array'): ParseResult {
   let value: unknown;
@@ -129,18 +122,14 @@ export function SkillForm({
 }) {
   const [descriptor, setDescriptor] = React.useState('');
   const [category, setCategory] = React.useState<Category>('classify');
-  const [executionMode, setExecutionMode] =
-    React.useState<ExecutionMode>('prompt_only');
+  const [executionMode, setExecutionMode] = React.useState<ExecutionMode>('prompt_only');
   const [goal, setGoal] = React.useState('');
   const [whenToUse, setWhenToUse] = React.useState('');
-  const [jsonFields, setJsonFields] =
-    React.useState<Record<JsonField, string>>(DEFAULT_JSON);
+  const [jsonFields, setJsonFields] = React.useState<Record<JsonField, string>>(DEFAULT_JSON);
   const [allowedTools, setAllowedTools] = React.useState<string[]>([]);
   const [policyDescriptors, setPolicyDescriptors] = React.useState<string[]>([]);
   const [reason, setReason] = React.useState('');
-  const [jsonErrors, setJsonErrors] = React.useState<
-    Partial<Record<JsonField, string>>
-  >({});
+  const [jsonErrors, setJsonErrors] = React.useState<Partial<Record<JsonField, string>>>({});
 
   const isEvaluator = executionMode === 'evaluator';
 
@@ -216,9 +205,7 @@ export function SkillForm({
         // Evaluator → força vazio independente de seleção antiga; também
         // remove qualquer ferramenta que não esteja mais habilitada para o
         // servidor não rejeitar a proposta inteira.
-        allowed_tools: isEvaluator
-          ? []
-          : allowedTools.filter((name) => enabledToolNames.has(name)),
+        allowed_tools: isEvaluator ? [] : allowedTools.filter((name) => enabledToolNames.has(name)),
         policy_descriptors: policyDescriptors,
         success_criteria: parsed.success_criteria as Array<Record<string, unknown>>,
         failure_modes: parsed.failure_modes as Array<Record<string, unknown>>,
@@ -237,9 +224,9 @@ export function SkillForm({
       title="Propor nova skill"
       description={
         <>
-          A proposta cria uma versão <code className="font-mono">proposed</code>{' '}
-          para o agente <code className="font-mono">{agentId}</code>. Ative-a
-          pelo detalhe da skill depois de revisar.
+          A proposta cria uma versão <code className="font-mono">proposed</code> para o agente{' '}
+          <code className="font-mono">{agentId}</code>. Ative-a pelo detalhe da skill depois de
+          revisar.
         </>
       }
       size="xl"
@@ -271,10 +258,7 @@ export function SkillForm({
 
         <div className="grid grid-cols-2 gap-3">
           <Field label="Categoria">
-            <Select
-              value={category}
-              onChange={(e) => setCategory(e.target.value as Category)}
-            >
+            <Select value={category} onChange={(e) => setCategory(e.target.value as Category)}>
               {CATEGORIES.map((c) => (
                 <option key={c} value={c}>
                   {c}
@@ -297,19 +281,11 @@ export function SkillForm({
         </div>
 
         <Field label="Objetivo" required>
-          <Textarea
-            value={goal}
-            onChange={(e) => setGoal(e.target.value)}
-            rows={2}
-          />
+          <Textarea value={goal} onChange={(e) => setGoal(e.target.value)} rows={2} />
         </Field>
 
         <Field label="Quando usar" required>
-          <Textarea
-            value={whenToUse}
-            onChange={(e) => setWhenToUse(e.target.value)}
-            rows={2}
-          />
+          <Textarea value={whenToUse} onChange={(e) => setWhenToUse(e.target.value)} rows={2} />
         </Field>
 
         {/* Seletor de allowed_tools — alimentado pelo Catálogo de Ferramentas. */}
@@ -319,8 +295,8 @@ export function SkillForm({
           </span>
           {isEvaluator ? (
             <Alert tone="warning">
-              Skills em modo evaluator não podem declarar ferramentas — a
-              seleção fica desabilitada e é enviada vazia.
+              Skills em modo evaluator não podem declarar ferramentas — a seleção fica desabilitada
+              e é enviada vazia.
             </Alert>
           ) : catalogQuery.isLoading ? (
             <p className="text-xs text-zinc-500">Carregando catálogo de ferramentas…</p>
@@ -333,9 +309,7 @@ export function SkillForm({
               {tools.map((t) => (
                 <label
                   key={t.name}
-                  className={`flex items-center gap-2 text-sm ${
-                    t.enabled ? '' : 'opacity-50'
-                  }`}
+                  className={`flex items-center gap-2 text-sm ${t.enabled ? '' : 'opacity-50'}`}
                 >
                   {/* Ferramenta desabilitada (flag desligada) não pode ser
                       marcada — o checkbox fica desabilitado e o servidor a
@@ -348,9 +322,7 @@ export function SkillForm({
                     className="h-4 w-4 rounded-sm border-zinc-300 text-brand-600 focus:ring-brand-500"
                   />
                   <code className="font-mono text-xs">{t.name}</code>
-                  {!t.enabled && (
-                    <span className="text-xs text-zinc-400">(desabilitada)</span>
-                  )}
+                  {!t.enabled && <span className="text-xs text-zinc-400">(desabilitada)</span>}
                 </label>
               ))}
               {tools.length === 0 && (
@@ -359,9 +331,7 @@ export function SkillForm({
             </div>
           )}
           {!isEvaluator && allowedTools.length > 0 && (
-            <p className="mt-1 text-xs text-zinc-500">
-              Selecionadas: {allowedTools.join(', ')}
-            </p>
+            <p className="mt-1 text-xs text-zinc-500">Selecionadas: {allowedTools.join(', ')}</p>
           )}
         </div>
 
@@ -377,11 +347,7 @@ export function SkillForm({
         </div>
 
         {(Object.keys(JSON_FIELD_KIND) as JsonField[]).map((field) => (
-          <Field
-            key={field}
-            label={JSON_FIELD_LABEL[field]}
-            error={jsonErrors[field] ?? null}
-          >
+          <Field key={field} label={JSON_FIELD_LABEL[field]} error={jsonErrors[field] ?? null}>
             <Textarea
               value={jsonFields[field]}
               onChange={(e) => setJson(field, e.target.value)}
@@ -401,11 +367,7 @@ export function SkillForm({
               : null
           }
         >
-          <Textarea
-            value={reason}
-            onChange={(e) => setReason(e.target.value)}
-            rows={2}
-          />
+          <Textarea value={reason} onChange={(e) => setReason(e.target.value)} rows={2} />
         </Field>
 
         {proposeMutation.error && (

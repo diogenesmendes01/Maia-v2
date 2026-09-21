@@ -6,19 +6,8 @@ import { trpc } from '../../trpc/client.js';
 import { PageHeader } from '../../components/ui/page-header.js';
 import { Field, Select } from '../../components/ui/field.js';
 import { Tabs } from '../../components/ui/tabs.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../components/ui/table.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState } from '../../components/ui/states.js';
 import { IconBrain } from '../../components/ui/icons.js';
 
 type Tab = 'memory_review' | 'facts' | 'rules';
@@ -30,10 +19,7 @@ export default function KnowledgePage() {
   const [agentId, setAgentId] = React.useState('');
   const [tab, setTab] = React.useState<Tab>('memory_review');
 
-  const agentsQuery = trpc.agents.list.useQuery(
-    { tenantId },
-    { enabled: tenantId !== '' },
-  );
+  const agentsQuery = trpc.agents.list.useQuery({ tenantId }, { enabled: tenantId !== '' });
 
   const memoryQuery = trpc.knowledge.listMemoryNeedsReview.useQuery(
     { tenantId, agentId, limit: 100 },
@@ -137,10 +123,7 @@ export default function KnowledgePage() {
             onRetry={() => void factsQuery.refetch()}
           />
         ) : factItems.length === 0 ? (
-          <EmptyState
-            icon={<IconBrain size={28} />}
-            title="Nenhum fato neste escopo"
-          />
+          <EmptyState icon={<IconBrain size={28} />} title="Nenhum fato neste escopo" />
         ) : (
           <TableShell>
             <Table>
@@ -166,15 +149,9 @@ export default function KnowledgePage() {
       ) : rulesQuery.isLoading ? (
         <LoadingState />
       ) : rulesQuery.error ? (
-        <ErrorState
-          message={rulesQuery.error.message}
-          onRetry={() => void rulesQuery.refetch()}
-        />
+        <ErrorState message={rulesQuery.error.message} onRetry={() => void rulesQuery.refetch()} />
       ) : ruleItems.length === 0 ? (
-        <EmptyState
-          icon={<IconBrain size={28} />}
-          title="Nenhuma regra ativa"
-        />
+        <EmptyState icon={<IconBrain size={28} />} title="Nenhuma regra ativa" />
       ) : (
         <TableShell>
           <Table>

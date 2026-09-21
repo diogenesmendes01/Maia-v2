@@ -102,95 +102,98 @@ async function clearRealTenantChannels(): Promise<void> {
   await pg.pool.query('DELETE FROM channels WHERE tenant_id = $1', [REAL_TENANT]);
 }
 
-d('channelsRepo.findPrimaryCatchAllChannel — cross-channel_type isolation on REAL Postgres (PR #417 🔴 CRITICAL)', () => {
-  beforeAll(async () => {
-    pg = await startPostgresContainer();
-    previousDatabaseUrl = process.env.DATABASE_URL;
-    process.env.DATABASE_URL = pg.uri;
-    repositoriesMod = await import('@/db/repositories.js');
-    dbClientMod = await import('@/db/client.js');
-    await seedRealTenantParents();
-  }, /* image pull on first run */ 180_000);
+d(
+  'channelsRepo.findPrimaryCatchAllChannel — cross-channel_type isolation on REAL Postgres (PR #417 🔴 CRITICAL)',
+  () => {
+    beforeAll(async () => {
+      pg = await startPostgresContainer();
+      previousDatabaseUrl = process.env.DATABASE_URL;
+      process.env.DATABASE_URL = pg.uri;
+      repositoriesMod = await import('@/db/repositories.js');
+      dbClientMod = await import('@/db/client.js');
+      await seedRealTenantParents();
+    }, /* image pull on first run */ 180_000);
 
-  afterAll(async () => {
-    if (dbClientMod) await dbClientMod.shutdownDb().catch(() => undefined);
-    if (pg) await stopPostgresContainer(pg);
-    if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
-    else process.env.DATABASE_URL = previousDatabaseUrl;
-  });
-
-  beforeEach(async () => {
-    await clearRealTenantChannels();
-  });
-
-  it('baseline (only the migration-seeded primary/primary whatsapp channel) → single-tenant, returns the catch-all', async () => {
-    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
-      channel_type: 'whatsapp',
-    });
-    expect(out.multi_tenant).toBe(false);
-    expect(out.channel).not.toBeNull();
-    expect(out.channel!.tenant_id).toBe('primary');
-    expect(out.channel!.agent_id).toBe('primary');
-    // external_id is unchanged by the rehome (081 only re-points tenant/agent);
-    // the seeded catch-all keeps its inert placeholder id from migration 035.
-    expect(out.channel!.external_id).toBe('default-channel');
-  });
-
-  // ── THE CRITICAL REGRESSION (cross-channel_type) ───────────────────────────
-  it('🔴 CRITICAL: a real tenant with an ACTIVE *telegram* channel makes a *whatsapp* probe fail-closed (multi_tenant:true)', async () => {
-    await insertRealTenantChannel({
-      channel_type: 'telegram',
-      external_id: 'tg-real-417',
-      active: true,
+    afterAll(async () => {
+      if (dbClientMod) await dbClientMod.shutdownDb().catch(() => undefined);
+      if (pg) await stopPostgresContainer(pg);
+      if (previousDatabaseUrl === undefined) delete process.env.DATABASE_URL;
+      else process.env.DATABASE_URL = previousDatabaseUrl;
     });
 
-    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
-      channel_type: 'whatsapp', // DIFFERENT type than the real tenant's channel
+    beforeEach(async () => {
+      await clearRealTenantChannels();
     });
 
-    // Against the OLD `WHERE channel_type = 'whatsapp'` discriminator this
-    // returned { multi_tenant:false, channel:<default> } (the LEAK). The GLOBAL
-    // probe (no channel_type filter) sees the telegram tenant → fail-closed.
-    expect(out.multi_tenant).toBe(true);
-    expect(out.channel).toBeNull();
-  });
-
-  it('a real tenant with an ACTIVE whatsapp channel makes a whatsapp probe fail-closed (same-type, multi_tenant:true)', async () => {
-    await insertRealTenantChannel({
-      channel_type: 'whatsapp',
-      external_id: '+5511777770417',
-      active: true,
+    it('baseline (only the migration-seeded primary/primary whatsapp channel) → single-tenant, returns the catch-all', async () => {
+      const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
+        channel_type: 'whatsapp',
+      });
+      expect(out.multi_tenant).toBe(false);
+      expect(out.channel).not.toBeNull();
+      expect(out.channel!.tenant_id).toBe('primary');
+      expect(out.channel!.agent_id).toBe('primary');
+      // external_id is unchanged by the rehome (081 only re-points tenant/agent);
+      // the seeded catch-all keeps its inert placeholder id from migration 035.
+      expect(out.channel!.external_id).toBe('default-channel');
     });
 
-    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
-      channel_type: 'whatsapp',
-    });
-    expect(out.multi_tenant).toBe(true);
-    expect(out.channel).toBeNull();
-  });
+    // ── THE CRITICAL REGRESSION (cross-channel_type) ───────────────────────────
+    it('🔴 CRITICAL: a real tenant with an ACTIVE *telegram* channel makes a *whatsapp* probe fail-closed (multi_tenant:true)', async () => {
+      await insertRealTenantChannel({
+        channel_type: 'telegram',
+        external_id: 'tg-real-417',
+        active: true,
+      });
 
-  it('a real tenant whose only channel is INACTIVE (telegram) does NOT trip the discriminator → single-tenant, returns catch-all', async () => {
-    await insertRealTenantChannel({
-      channel_type: 'telegram',
-      external_id: 'tg-inactive-417',
-      active: false, // offboarded tenant — must not strand the single-tenant bot
+      const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
+        channel_type: 'whatsapp', // DIFFERENT type than the real tenant's channel
+      });
+
+      // Against the OLD `WHERE channel_type = 'whatsapp'` discriminator this
+      // returned { multi_tenant:false, channel:<default> } (the LEAK). The GLOBAL
+      // probe (no channel_type filter) sees the telegram tenant → fail-closed.
+      expect(out.multi_tenant).toBe(true);
+      expect(out.channel).toBeNull();
     });
 
-    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
-      channel_type: 'whatsapp',
-    });
-    expect(out.multi_tenant).toBe(false);
-    expect(out.channel).not.toBeNull();
-    expect(out.channel!.tenant_id).toBe('primary');
-  });
+    it('a real tenant with an ACTIVE whatsapp channel makes a whatsapp probe fail-closed (same-type, multi_tenant:true)', async () => {
+      await insertRealTenantChannel({
+        channel_type: 'whatsapp',
+        external_id: '+5511777770417',
+        active: true,
+      });
 
-  it('catch-all is channel_type-scoped: a telegram probe with no telegram default returns no channel (seed missing), still single-tenant', async () => {
-    // Only the whatsapp default exists (migration 035 seeds whatsapp only); a
-    // telegram inbound finds no telegram catch-all but is still single-tenant.
-    const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
-      channel_type: 'telegram',
+      const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
+        channel_type: 'whatsapp',
+      });
+      expect(out.multi_tenant).toBe(true);
+      expect(out.channel).toBeNull();
     });
-    expect(out.multi_tenant).toBe(false);
-    expect(out.channel).toBeNull();
-  });
-});
+
+    it('a real tenant whose only channel is INACTIVE (telegram) does NOT trip the discriminator → single-tenant, returns catch-all', async () => {
+      await insertRealTenantChannel({
+        channel_type: 'telegram',
+        external_id: 'tg-inactive-417',
+        active: false, // offboarded tenant — must not strand the single-tenant bot
+      });
+
+      const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
+        channel_type: 'whatsapp',
+      });
+      expect(out.multi_tenant).toBe(false);
+      expect(out.channel).not.toBeNull();
+      expect(out.channel!.tenant_id).toBe('primary');
+    });
+
+    it('catch-all is channel_type-scoped: a telegram probe with no telegram default returns no channel (seed missing), still single-tenant', async () => {
+      // Only the whatsapp default exists (migration 035 seeds whatsapp only); a
+      // telegram inbound finds no telegram catch-all but is still single-tenant.
+      const out = await repositoriesMod.channelsRepo.findPrimaryCatchAllChannel({
+        channel_type: 'telegram',
+      });
+      expect(out.multi_tenant).toBe(false);
+      expect(out.channel).toBeNull();
+    });
+  },
+);

@@ -20,35 +20,35 @@ const {
   triggerRecoveryMock,
   persistMock,
 } = vi.hoisted(() => {
-    const state: {
-      sockets: Array<{ handlers: Map<string, (...args: never[]) => unknown>; end: () => void }>;
-    } = { sockets: [] };
-    return {
-      handlerState: state,
-      auditMock: vi.fn(async () => undefined),
-      auditContexts: [] as Array<{ tenant_id: string; agent_id: string } | null>,
-      triggerRecoveryMock: vi.fn(async () => undefined),
-      persistMock: vi.fn(async () => undefined),
-      managerMock: {
-        register: vi.fn(),
-        markState: vi.fn(),
-        isEnabled: vi.fn(() => true),
-      },
-      makeSocketMock: vi.fn(() => {
-        const sock = {
-          ev: {
-            on: (event: string, handler: (...args: never[]) => unknown) => {
-              state.sockets[state.sockets.length - 1]!.handlers.set(event, handler);
-            },
+  const state: {
+    sockets: Array<{ handlers: Map<string, (...args: never[]) => unknown>; end: () => void }>;
+  } = { sockets: [] };
+  return {
+    handlerState: state,
+    auditMock: vi.fn(async () => undefined),
+    auditContexts: [] as Array<{ tenant_id: string; agent_id: string } | null>,
+    triggerRecoveryMock: vi.fn(async () => undefined),
+    persistMock: vi.fn(async () => undefined),
+    managerMock: {
+      register: vi.fn(),
+      markState: vi.fn(),
+      isEnabled: vi.fn(() => true),
+    },
+    makeSocketMock: vi.fn(() => {
+      const sock = {
+        ev: {
+          on: (event: string, handler: (...args: never[]) => unknown) => {
+            state.sockets[state.sockets.length - 1]!.handlers.set(event, handler);
           },
-          end: vi.fn(),
-          user: { id: '5511900002222:1@s.whatsapp.net' },
-        };
-        state.sockets.push({ handlers: new Map(), end: sock.end });
-        return sock;
-      }),
-    };
-  });
+        },
+        end: vi.fn(),
+        user: { id: '5511900002222:1@s.whatsapp.net' },
+      };
+      state.sockets.push({ handlers: new Map(), end: sock.end });
+      return sock;
+    }),
+  };
+});
 
 vi.mock('@whiskeysockets/baileys', () => ({
   default: makeSocketMock,
@@ -280,9 +280,8 @@ describe('listLocalLineSessions — tabela de roteamento do stop', () => {
   });
 
   it('uma linha PARADA sai da lista imediatamente', async () => {
-    const { listLocalLineSessions, stopLineSession } = await import(
-      '../../../src/gateway/line-sessions.js'
-    );
+    const { listLocalLineSessions, stopLineSession } =
+      await import('../../../src/gateway/line-sessions.js');
     await _internal.startLineSession(CHANNEL);
     stopLineSession(CHANNEL.id);
     // Continuar publicando posse de um socket morto faria o comando de stop

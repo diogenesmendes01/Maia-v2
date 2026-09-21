@@ -69,11 +69,16 @@ function defaultSpec(): SoulBiasProposalSpec {
 beforeEach(() => {
   for (const k of Object.keys(biasState)) delete biasState[k];
 
-  listProposedMock = vi.fn(async () => Object.values(biasState).filter((b) => b.status === 'proposed'));
-  findActiveForScopeMock = vi.fn(async () => Object.values(biasState).filter((b) => b.status === 'active'));
+  listProposedMock = vi.fn(async () =>
+    Object.values(biasState).filter((b) => b.status === 'proposed'),
+  );
+  findActiveForScopeMock = vi.fn(async () =>
+    Object.values(biasState).filter((b) => b.status === 'active'),
+  );
   // findByProposalId searches ALL statuses — this is what makes replay-safety work.
-  findByProposalIdMock = vi.fn(async (proposal_id: string) =>
-    Object.values(biasState).find((b) => b.proposal_id === proposal_id) ?? null
+  findByProposalIdMock = vi.fn(
+    async (proposal_id: string) =>
+      Object.values(biasState).find((b) => b.proposal_id === proposal_id) ?? null,
   );
 
   proposeMock = vi.fn(async (input: { proposal_id?: string; principle: string }) => {
@@ -187,7 +192,10 @@ describe('processSoulBiasProposalApproval (P8b worker)', () => {
   });
 
   it('falha de activate surfaceia o reason do repo', async () => {
-    activateMock = vi.fn(async () => ({ ok: false as const, reason: 'one_active_constraint_violation' as const }));
+    activateMock = vi.fn(async () => ({
+      ok: false as const,
+      reason: 'one_active_constraint_violation' as const,
+    }));
     const { processSoulBiasProposalApproval } = await import('@/workers/soul-bias-activator.js');
     const r = await processSoulBiasProposalApproval({
       proposal_id: 'prop-3',

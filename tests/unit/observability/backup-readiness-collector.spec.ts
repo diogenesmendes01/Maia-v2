@@ -15,10 +15,7 @@ import {
   type BackupReadinessCollectorDeps,
 } from '../../../src/observability/backup-readiness-collector.js';
 import { renderPrometheus, _resetForTests as resetMetrics } from '../../../src/lib/metrics.js';
-import {
-  resolveBackupProfile,
-  type BackupConfigInput,
-} from '../../../src/ops/backup/profile.js';
+import { resolveBackupProfile, type BackupConfigInput } from '../../../src/ops/backup/profile.js';
 import type { DrillEvidenceFacts } from '../../../src/ops/backup/drill-schedule.js';
 
 const NOW = new Date('2026-08-11T12:00:00.000Z');
@@ -230,9 +227,7 @@ describe('the gauge is actually registered on /metrics', () => {
     // above, which registers the collector itself.
     resetMetrics();
     _resetBackupReadinessCollectorForTests();
-    const { registerRuntimeObservability } = await import(
-      '../../../src/observability/register.js'
-    );
+    const { registerRuntimeObservability } = await import('../../../src/observability/register.js');
     await registerRuntimeObservability();
     const body = await renderPrometheus();
     expect(body).toMatch(/^maia_restore_drill_check_level \d$/m);

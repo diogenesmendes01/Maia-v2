@@ -46,8 +46,7 @@ export const BOLETO_WRITE_RISK_POLICY_DESCRIPTORS = [
   HUMAN_CONFIRMATION_POLICY,
 ] as const;
 
-export type BoletoWriteRiskPolicyDescriptor =
-  (typeof BOLETO_WRITE_RISK_POLICY_DESCRIPTORS)[number];
+export type BoletoWriteRiskPolicyDescriptor = (typeof BOLETO_WRITE_RISK_POLICY_DESCRIPTORS)[number];
 
 /**
  * Issue #437 — the subset of #416 write/risk descriptors that are ACTIVE and
@@ -86,5 +85,4 @@ export const CONFIRM_BEFORE_WRITE_GOVERNED_TOOLS = [
   'refund_create',
 ] as const;
 
-export type ConfirmBeforeWriteGovernedTool =
-  (typeof CONFIRM_BEFORE_WRITE_GOVERNED_TOOLS)[number];
+export type ConfirmBeforeWriteGovernedTool = (typeof CONFIRM_BEFORE_WRITE_GOVERNED_TOOLS)[number];

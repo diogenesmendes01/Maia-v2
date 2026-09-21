@@ -460,9 +460,7 @@ d('migration 116 — troca de CHECK em mensagens (#593)', () => {
       expect(cs[0]!.def).not.toContain('evento');
       // E o CHECK estreito volta a MORDER: é o que prova que o down reverteu de
       // fato, e não só trocou o texto da definição.
-      await expect(inserirRowDoFlush(c, 'flush-3')).rejects.toThrow(
-        /violates check constraint/i,
-      );
+      await expect(inserirRowDoFlush(c, 'flush-3')).rejects.toThrow(/violates check constraint/i);
     } finally {
       c.release();
     }
@@ -499,37 +497,34 @@ d('migration 116 — troca de CHECK em mensagens (#593)', () => {
             jsonb_build_object('in_reply_to','x','event_only',true,'flush_reason','iteration_cap'),
             '[{"tool_name":"t"}]'::jsonb`,
     },
-  ])(
-    'row evento com $caso NÃO é do flush: sobrevive e derruba o _down',
-    async ({ sql }) => {
-      const c = await pool.connect();
-      try {
-        for (const s of splitNoTxStatements(up.sql)) await c.query(s);
-        await c.query(
-          `INSERT INTO ${SCHEMA}.mensagens
+  ])('row evento com $caso NÃO é do flush: sobrevive e derruba o _down', async ({ sql }) => {
+    const c = await pool.connect();
+    try {
+      for (const s of splitNoTxStatements(up.sql)) await c.query(s);
+      await c.query(
+        `INSERT INTO ${SCHEMA}.mensagens
              (marca, direcao, tipo, conteudo, midia_url, metadata, ferramentas_chamadas)
            VALUES ('outra-origem', 'out', 'evento', ${sql})`,
-        );
-        const antes = await canonical(c);
+      );
+      const antes = await canonical(c);
 
-        const res = await runLikePsql(c, downSql);
+      const res = await runLikePsql(c, downSql);
 
-        expect(
-          res.ok,
-          'O predicado do DELETE alcançou uma row que NÃO tem o formato do flush. O ' +
-            'arquivo promete apagar só o que `flushUnconfirmedToolSummaries()` cria e ' +
-            'declara que origem desconhecida deve fazê-lo FALHAR — um predicado mais ' +
-            'largo que esse contrato apaga dado alheio em silêncio.',
-        ).toBe(false);
-        expect({
-          eventos: await eventoRowIds(c),
-          constraint: (await canonical(c))?.def ?? null,
-        }).toEqual({ eventos: ['outra-origem'], constraint: antes!.def });
-      } finally {
-        c.release();
-      }
-    },
-  );
+      expect(
+        res.ok,
+        'O predicado do DELETE alcançou uma row que NÃO tem o formato do flush. O ' +
+          'arquivo promete apagar só o que `flushUnconfirmedToolSummaries()` cria e ' +
+          'declara que origem desconhecida deve fazê-lo FALHAR — um predicado mais ' +
+          'largo que esse contrato apaga dado alheio em silêncio.',
+      ).toBe(false);
+      expect({
+        eventos: await eventoRowIds(c),
+        constraint: (await canonical(c))?.def ?? null,
+      }).toEqual({ eventos: ['outra-origem'], constraint: antes!.def });
+    } finally {
+      c.release();
+    }
+  });
 
   it('o _down também limpa o nome temporário deixado por um _up interrompido', async () => {
     // Quarto estado de crash do `_up`: morreu entre os dois statements da fase 3

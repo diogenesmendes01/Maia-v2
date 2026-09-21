@@ -5,15 +5,14 @@
  * person owned by agent B. This suite proves the repository rejects both a
  * foreign base row and a corrupt foreign row on the joined side.
  */
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { randomInt, randomUUID } from "node:crypto";
-import pg from "pg";
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { randomInt, randomUUID } from 'node:crypto';
+import pg from 'pg';
 
-import { runWithTenantContext } from "@/db/tenant-context.js";
+import { runWithTenantContext } from '@/db/tenant-context.js';
 
 const SHOULD_RUN =
-  !!process.env.TEST_DB_URL &&
-  process.env.DATABASE_URL === process.env.TEST_DB_URL;
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 const RUN_ID = randomUUID().slice(0, 8);
@@ -29,13 +28,12 @@ let conversaA: string;
 let conversaB: string;
 let conversaCorrompida: string;
 
-d("conversasRepo.byIdWithPessoa — real DB leak proof", () => {
+d('conversasRepo.byIdWithPessoa — real DB leak proof', () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
-    await pool.query(
-      `INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`,
-      [TENANT],
-    );
+    await pool.query(`INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, [
+      TENANT,
+    ]);
     await pool.query(
       `INSERT INTO agents(id, tenant_id, nome)
        VALUES ($1, $3, $1), ($2, $3, $2)
@@ -49,13 +47,7 @@ d("conversasRepo.byIdWithPessoa — real DB leak proof", () => {
          ($1, $2, 'A', $4, 'cliente', 'ativa'),
          ($1, $3, 'B', $5, 'cliente', 'ativa')
        RETURNING id, agent_id`,
-      [
-        TENANT,
-        AGENT_A,
-        AGENT_B,
-        `+55119${PHONE_BASE}`,
-        `+55119${PHONE_BASE + 1}`,
-      ],
+      [TENANT, AGENT_A, AGENT_B, `+55119${PHONE_BASE}`, `+55119${PHONE_BASE + 1}`],
     );
     pessoaA = people.rows.find((row) => row.agent_id === AGENT_A)!.id;
     pessoaB = people.rows.find((row) => row.agent_id === AGENT_B)!.id;
@@ -69,11 +61,9 @@ d("conversasRepo.byIdWithPessoa — real DB leak proof", () => {
        RETURNING id, metadata->>'scope_test' AS marker`,
       [TENANT, AGENT_A, AGENT_B, pessoaA, pessoaB],
     );
-    conversaA = conversations.rows.find((row) => row.marker === "mine")!.id;
-    conversaB = conversations.rows.find((row) => row.marker === "foreign")!.id;
-    conversaCorrompida = conversations.rows.find(
-      (row) => row.marker === "corrupt_join",
-    )!.id;
+    conversaA = conversations.rows.find((row) => row.marker === 'mine')!.id;
+    conversaB = conversations.rows.find((row) => row.marker === 'foreign')!.id;
+    conversaCorrompida = conversations.rows.find((row) => row.marker === 'corrupt_join')!.id;
   });
 
   afterAll(async () => {
@@ -85,32 +75,29 @@ d("conversasRepo.byIdWithPessoa — real DB leak proof", () => {
     await pool.end();
   });
 
-  it("returns only a conversation and person owned by the active tenant+agent", async () => {
-    const { conversasRepo } = await import("@/db/repositories.js");
-    const result = await runWithTenantContext(
-      { tenant_id: TENANT, agent_id: AGENT_A },
-      () => conversasRepo.byIdWithPessoa(conversaA),
+  it('returns only a conversation and person owned by the active tenant+agent', async () => {
+    const { conversasRepo } = await import('@/db/repositories.js');
+    const result = await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT_A }, () =>
+      conversasRepo.byIdWithPessoa(conversaA),
     );
 
     expect(result?.conversa.id).toBe(conversaA);
     expect(result?.pessoa.id).toBe(pessoaA);
   });
 
-  it("hides a foreign conversation even when its id is known", async () => {
-    const { conversasRepo } = await import("@/db/repositories.js");
-    const result = await runWithTenantContext(
-      { tenant_id: TENANT, agent_id: AGENT_A },
-      () => conversasRepo.byIdWithPessoa(conversaB),
+  it('hides a foreign conversation even when its id is known', async () => {
+    const { conversasRepo } = await import('@/db/repositories.js');
+    const result = await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT_A }, () =>
+      conversasRepo.byIdWithPessoa(conversaB),
     );
 
     expect(result).toBeNull();
   });
 
-  it("hides a foreign person referenced by an otherwise-owned conversation", async () => {
-    const { conversasRepo } = await import("@/db/repositories.js");
-    const result = await runWithTenantContext(
-      { tenant_id: TENANT, agent_id: AGENT_A },
-      () => conversasRepo.byIdWithPessoa(conversaCorrompida),
+  it('hides a foreign person referenced by an otherwise-owned conversation', async () => {
+    const { conversasRepo } = await import('@/db/repositories.js');
+    const result = await runWithTenantContext({ tenant_id: TENANT, agent_id: AGENT_A }, () =>
+      conversasRepo.byIdWithPessoa(conversaCorrompida),
     );
 
     expect(result).toBeNull();

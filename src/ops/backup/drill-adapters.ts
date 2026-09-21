@@ -39,11 +39,7 @@ import { resolveArtifactObjectKey, resolveArtifactPath } from './artifact-path.j
 import { sha256File } from './checksum.js';
 import { decryptFile, parseBackupKeyring } from './encryption.js';
 import { backupManifestKeyring } from './manifest-keyring.js';
-import {
-  assertAdminTarget,
-  assertDrillTarget,
-  type RestoreDrillPorts,
-} from './drill.js';
+import { assertAdminTarget, assertDrillTarget, type RestoreDrillPorts } from './drill.js';
 import { RESTORE_DRILL_PROBES, type ProbeContext, type ProbeRow } from './drill-probes.js';
 
 /** Where staged (downloaded / decrypted) artifacts live during a drill. */

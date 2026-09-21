@@ -146,8 +146,7 @@ export const RECONCILIATION_DISPOSITIONS = [
   'dead_letter',
 ] as const;
 
-export type ReconciliationDisposition =
-  (typeof RECONCILIATION_DISPOSITIONS)[number];
+export type ReconciliationDisposition = (typeof RECONCILIATION_DISPOSITIONS)[number];
 
 /**
  * Rótulos de `maia_outbound_reconciliation_total{result}`.
@@ -221,9 +220,7 @@ export type ReconciliationInput = {
  * vez de lançar deixaria o defeito virar uma fila humana silenciosamente
  * crescente.
  */
-export function reconciliationDisposition(
-  input: ReconciliationInput,
-): ReconciliationDisposition {
+export function reconciliationDisposition(input: ReconciliationInput): ReconciliationDisposition {
   if (!isDeliveryUnknown(input.outcome)) {
     throw new TypeError(
       `reconciliationDisposition: '${input.outcome}' não é um desfecho da família ` +
@@ -271,8 +268,7 @@ export const OUTBOUND_DEAD_LETTER_REASONS = [
   'reconciliation_timeout',
 ] as const;
 
-export type OutboundDeadLetterReason =
-  (typeof OUTBOUND_DEAD_LETTER_REASONS)[number];
+export type OutboundDeadLetterReason = (typeof OUTBOUND_DEAD_LETTER_REASONS)[number];
 
 // =====================================================================
 // 4. REARMAMENTO MANUAL — a falha #12 da issue-mãe, como tipo
@@ -291,8 +287,7 @@ export const MANUAL_REARM_SOURCE_STATUSES = [
   'delivery_unknown',
 ] as const;
 
-export type ManualRearmSourceStatus =
-  (typeof MANUAL_REARM_SOURCE_STATUSES)[number];
+export type ManualRearmSourceStatus = (typeof MANUAL_REARM_SOURCE_STATUSES)[number];
 
 /** Por que um rearmamento manual foi recusado. Fechado. */
 export const MANUAL_REARM_REFUSALS = [
@@ -340,8 +335,7 @@ export function manualRearmDuplicateRisk(input: {
   if (input.outcome === null) return false;
   if (!isDeliveryUnknown(input.outcome)) return false;
   return (
-    providerIdempotencySupport(input.channel, input.payload_type) !==
-    PROVIDER_IDEMPOTENCY_NATIVE
+    providerIdempotencySupport(input.channel, input.payload_type) !== PROVIDER_IDEMPOTENCY_NATIVE
   );
 }
 
@@ -364,9 +358,7 @@ export function manualRearmRefusal(input: {
   acknowledge_duplicate_risk?: boolean;
   duplicate_risk: boolean;
 }): ManualRearmRefusal | null {
-  if (
-    !(MANUAL_REARM_SOURCE_STATUSES as readonly string[]).includes(input.status)
-  ) {
+  if (!(MANUAL_REARM_SOURCE_STATUSES as readonly string[]).includes(input.status)) {
     return 'status_not_rearmable';
   }
   if (input.reason.trim().length === 0) return 'reason_missing';
@@ -431,8 +423,7 @@ export const OUTBOUND_TURN_INCONSISTENCY_KINDS = [
   'outbound_without_live_turn',
 ] as const;
 
-export type OutboundTurnInconsistencyKind =
-  (typeof OUTBOUND_TURN_INCONSISTENCY_KINDS)[number];
+export type OutboundTurnInconsistencyKind = (typeof OUTBOUND_TURN_INCONSISTENCY_KINDS)[number];
 
 // =====================================================================
 // 6. ORIGEM DO REARMAMENTO

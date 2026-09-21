@@ -15,7 +15,9 @@ const inputSchema = z.object({
   entidade_id: z
     .string()
     .uuid()
-    .describe('UUID opaco da entidade dona da transação. Obrigatório: define contra qual perfil a permissão é checada.'),
+    .describe(
+      'UUID opaco da entidade dona da transação. Obrigatório: define contra qual perfil a permissão é checada.',
+    ),
   transacao_id: z.string().uuid().describe('UUID opaco da transação a cancelar.'),
   motivo: z
     .string()
@@ -67,7 +69,9 @@ export const cancelTransactionTool: Tool<typeof inputSchema, typeof outputSchema
   auditedInTx: (result) =>
     'ok' in result && result.ok === true && result.already_cancelled !== true,
   extractAlvoId: (result) =>
-    'transacao_id' in result && typeof result.transacao_id === 'string' ? result.transacao_id : null,
+    'transacao_id' in result && typeof result.transacao_id === 'string'
+      ? result.transacao_id
+      : null,
   handler: async (args, ctx) => {
     const tx = await transacoesRepo.byId(args.transacao_id);
     if (!tx) return { error: 'not_found' };

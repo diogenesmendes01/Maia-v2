@@ -7,29 +7,15 @@ import ChannelPolicyModal from './_components/channel-policy-modal.js';
 import ChannelCreateModal from './_components/channel-create-modal.js';
 import RoleCreateModal from './_components/role-create-modal.js';
 import LinePairingModal from './_components/line-pairing-modal.js';
-import LineActionModal, {
-  type LineActionKind,
-} from './_components/line-action-modal.js';
+import LineActionModal, { type LineActionKind } from './_components/line-action-modal.js';
 import { presentState, presentReason, primaryAction } from './_components/line-state.js';
 import { PageHeader } from '../../../components/ui/page-header.js';
 import { Badge } from '../../../components/ui/badge.js';
 import { Button } from '../../../components/ui/button.js';
 import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
 import { Field, Select } from '../../../components/ui/field.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../../components/ui/table.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-  Alert,
-} from '../../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState, Alert } from '../../../components/ui/states.js';
 import { IconMessage } from '../../../components/ui/icons.js';
 
 /**
@@ -108,8 +94,7 @@ export default function ChannelsSetupPage() {
       <div>
         <PageHeader title="Canais" />
         <Alert tone="danger" title="Acesso restrito">
-          Editar canais e políticas exige o papel{' '}
-          <code className="font-mono">founder</code> ou{' '}
+          Editar canais e políticas exige o papel <code className="font-mono">founder</code> ou{' '}
           <code className="font-mono">owner</code>. Seu papel atual é{' '}
           <code className="font-mono">{role || '(nenhum)'}</code>.
         </Alert>
@@ -155,11 +140,7 @@ export default function ChannelsSetupPage() {
         )}
 
         <Field label="Agente" className="w-56">
-          <Select
-            value={agentId}
-            onChange={(e) => setAgentId(e.target.value)}
-            disabled={!tenantId}
-          >
+          <Select value={agentId} onChange={(e) => setAgentId(e.target.value)} disabled={!tenantId}>
             <option value="">Selecione…</option>
             {(agentsQuery.data?.items ?? []).map((a) => (
               <option key={a.id} value={a.id}>
@@ -194,8 +175,8 @@ export default function ChannelsSetupPage() {
                   <Alert tone="warning" title="Pareamento pelo console indisponível">
                     O QR e o código de pareamento só trafegam cifrados. Configure{' '}
                     <code className="font-mono">MAIA_STAGING_KEYRING</code> e{' '}
-                    <code className="font-mono">MAIA_STAGING_ACTIVE_KEY_ID</code> no runtime e
-                    no console para habilitar. Os estados abaixo continuam válidos.
+                    <code className="font-mono">MAIA_STAGING_ACTIVE_KEY_ID</code> no runtime e no
+                    console para habilitar. Os estados abaixo continuam válidos.
                   </Alert>
                 </div>
               )}
@@ -252,9 +233,7 @@ export default function ChannelsSetupPage() {
                                 {st.label}
                               </Badge>
                               {reason && (
-                                <span className="mt-1 block text-2xs text-zinc-400">
-                                  {reason}
-                                </span>
+                                <span className="mt-1 block text-2xs text-zinc-400">{reason}</span>
                               )}
                             </Td>
                             <Td>
@@ -266,9 +245,7 @@ export default function ChannelsSetupPage() {
                             </Td>
                             <Td>
                               {line.policy_ready ? (
-                                <Badge tone="success">
-                                  papel padrão: {line.default_role_key}
-                                </Badge>
+                                <Badge tone="success">papel padrão: {line.default_role_key}</Badge>
                               ) : line.has_policy ? (
                                 <Badge tone="danger">papel padrão inativo</Badge>
                               ) : (
@@ -361,11 +338,7 @@ export default function ChannelsSetupPage() {
               title="Papéis do agente"
               description="Modos operacionais que a política de canal pode ativar. O primeiro papel criado vira o padrão."
               actions={
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={() => setShowRoleCreate(true)}
-                >
+                <Button size="sm" variant="secondary" onClick={() => setShowRoleCreate(true)}>
                   Novo papel
                 </Button>
               }
@@ -383,11 +356,7 @@ export default function ChannelsSetupPage() {
                   title="Nenhum papel ainda para este agente"
                   description="A política de canal exige um papel padrão — crie o primeiro."
                   action={
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => setShowRoleCreate(true)}
-                    >
+                    <Button size="sm" variant="secondary" onClick={() => setShowRoleCreate(true)}>
                       Novo papel
                     </Button>
                   }

@@ -157,10 +157,7 @@ async function readLegacyAgentFactModel(key: string): Promise<string | null> {
     const distinctCount = Number(distinctRows[0]?.distinct_count ?? '0');
 
     if (distinctCount > 1) {
-      logger.error(
-        { distinct_count: distinctCount, key },
-        'llm_settings.legacy_fallback_conflict',
-      );
+      logger.error({ distinct_count: distinctCount, key }, 'llm_settings.legacy_fallback_conflict');
       // Fail-closed: refuse to promote any single tenant's choice
       // process-wide. Caller falls back to env default.
       return null;
@@ -186,18 +183,12 @@ async function readLegacyAgentFactModel(key: string): Promise<string | null> {
     if (rows.length === 0) return null;
     const model = extractModel(rows[0]!.valor);
     if (model) {
-      logger.warn(
-        { source: 'agent_facts', key },
-        'llm_settings.legacy_fallback_used',
-      );
+      logger.warn({ source: 'agent_facts', key }, 'llm_settings.legacy_fallback_used');
       return model;
     }
     return null;
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, key },
-      'llm_settings.legacy_read_failed',
-    );
+    logger.warn({ err: (err as Error).message, key }, 'llm_settings.legacy_read_failed');
     return null;
   }
 }
@@ -340,10 +331,7 @@ async function readMainModelWithSource(): Promise<LLMModelRead> {
       return { value: model, source: 'global' };
     }
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, key: KEY_MAIN },
-      'llm_settings.global_read_failed',
-    );
+    logger.warn({ err: (err as Error).message, key: KEY_MAIN }, 'llm_settings.global_read_failed');
   }
 
   // (2) Rolling-deploy / pre-062 fallback: legacy agent_facts. Source
@@ -382,10 +370,7 @@ async function readFastModelWithSource(): Promise<LLMModelRead> {
       return { value: model, source: 'global' };
     }
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, key: KEY_FAST },
-      'llm_settings.global_read_failed',
-    );
+    logger.warn({ err: (err as Error).message, key: KEY_FAST }, 'llm_settings.global_read_failed');
   }
 
   const legacy = await readLegacyAgentFactModel(KEY_FAST);
@@ -405,10 +390,7 @@ export async function getCurrentLLMSettings(): Promise<{
   main: LLMModelRead;
   fast: LLMModelRead;
 }> {
-  const [main, fast] = await Promise.all([
-    readMainModelWithSource(),
-    readFastModelWithSource(),
-  ]);
+  const [main, fast] = await Promise.all([readMainModelWithSource(), readFastModelWithSource()]);
   return { main, fast };
 }
 

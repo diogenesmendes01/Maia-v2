@@ -19,10 +19,7 @@ export type RedactionClass = 'standard' | 'debug' | 'minimal';
 
 export type BodyStatus = 'pending' | 'persisted' | 'orphaned';
 
-export type RedactionApplied =
-  | 'standard_v1'
-  | 'debug_encrypted_v1'
-  | 'minimal_v1';
+export type RedactionApplied = 'standard_v1' | 'debug_encrypted_v1' | 'minimal_v1';
 
 /**
  * P8a ExecutionContextPacket — stubbed shape. Real type lives in

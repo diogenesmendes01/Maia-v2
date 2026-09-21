@@ -95,9 +95,7 @@ vi.mock('../../../src/gateway/bot-detection.js', () => ({
 }));
 
 const { ingressUpsertMessage } = await import('../../../src/gateway/baileys.js');
-const { StreamIdentityUnresolvedError } = await import(
-  '../../../src/runtime/turns/stream-key.js'
-);
+const { StreamIdentityUnresolvedError } = await import('../../../src/runtime/turns/stream-key.js');
 
 const WAID = 'WAID-STREAM-DROP-1';
 
@@ -131,19 +129,14 @@ beforeEach(() => {
 
 describe('#505 — identidade de stream irresolúvel derruba o ingresso com trilha', () => {
   it('não vira erro opaco, NÃO enfileira, audita e mede', async () => {
-    createInboundMock.mockRejectedValue(
-      new StreamIdentityUnresolvedError('missing_channel'),
-    );
+    createInboundMock.mockRejectedValue(new StreamIdentityUnresolvedError('missing_channel'));
 
     // O desfecho é o MESMO que este arquivo já dá a toda falha de resolução —
     // derrubar a mensagem COM trilha. O que NÃO pode acontecer é o erro
     // escapar até o `catch` do listener e virar `baileys.handle_failed`, que
     // perde o motivo tipado e some com o audit.
     await expect(ingressUpsertMessage(textMsg())).resolves.toBe('handled');
-    expect(loggerMock.error).not.toHaveBeenCalledWith(
-      expect.anything(),
-      'baileys.handle_failed',
-    );
+    expect(loggerMock.error).not.toHaveBeenCalledWith(expect.anything(), 'baileys.handle_failed');
 
     // A mensagem NÃO seguiu para a fila.
     expect(enqueueAgentMock).not.toHaveBeenCalled();
@@ -192,10 +185,7 @@ describe('#505 — identidade de stream irresolúvel derruba o ingresso com tril
     // isso inventaria uma decisão de fronteira que ninguém tomou.
     createInboundMock.mockRejectedValue(new Error('conexão caiu'));
     await expect(ingressUpsertMessage(textMsg())).resolves.toBe('dropped');
-    expect(loggerMock.error).toHaveBeenCalledWith(
-      expect.anything(),
-      'baileys.handle_failed',
-    );
+    expect(loggerMock.error).toHaveBeenCalledWith(expect.anything(), 'baileys.handle_failed');
     expect(auditMock).not.toHaveBeenCalledWith(
       expect.objectContaining({ acao: 'stream_ingress_rejected' }),
     );

@@ -56,11 +56,9 @@ const COMPOSED_AT_RUNTIME: Record<string, string> = {
   // `{proposal.approvals.length} de {proposal.required_roles.length} aprovações`
   '1 de 2 aprovações': 'src/admin-ui/app/proposals/[id]/page.tsx',
   // `Rejeitar ${ids.length} proposta(s) em massa?`
-  'Rejeitar 3 proposta(s) em massa?':
-    'src/admin-ui/app/inbox/_components/bulk-reject-modal.tsx',
+  'Rejeitar 3 proposta(s) em massa?': 'src/admin-ui/app/inbox/_components/bulk-reject-modal.tsx',
   // `Selecionar ${p.descriptor}` — o descritor é o título da proposta semeada.
-  'Selecionar Jornada E2E — proposta simples':
-    'src/admin-ui/app/inbox/_components/inbox-table.tsx',
+  'Selecionar Jornada E2E — proposta simples': 'src/admin-ui/app/inbox/_components/inbox-table.tsx',
   // `Selecionar todas` existe no fonte; este é o único rótulo de checkbox
   // que NÃO é composto — fica de fora do allowlist de propósito.
 };
@@ -131,8 +129,9 @@ describe('contrato de cópia entre specs e2e e o console (#481)', () => {
       specFiles.flatMap((f) => extractCopySelectors(readFileSync(join(E2E_DIR, f), 'utf8'))),
     );
     const unused = Object.keys(COMPOSED_AT_RUNTIME).filter((s) => !allSelectors.has(s));
-    expect(unused, `entradas do allowlist não usadas por nenhuma spec: ${unused.join(', ')}`).toEqual(
-      [],
-    );
+    expect(
+      unused,
+      `entradas do allowlist não usadas por nenhuma spec: ${unused.join(', ')}`,
+    ).toEqual([]);
   });
 });

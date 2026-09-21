@@ -35,7 +35,8 @@ describe('safeExtractAndParseJson — success paths', () => {
   });
 
   it('extracts the JSON object out of surrounding LLM prose', () => {
-    const text = 'Claro! Aqui está o JSON pedido:\n{"matches":false,"confidence":0.2,"reason":"x"}\nEspero ter ajudado.';
+    const text =
+      'Claro! Aqui está o JSON pedido:\n{"matches":false,"confidence":0.2,"reason":"x"}\nEspero ter ajudado.';
     const out = safeExtractAndParseJson(text, SampleSchema);
     expect(out).toEqual({ matches: false, confidence: 0.2, reason: 'x' });
   });

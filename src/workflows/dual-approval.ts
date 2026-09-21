@@ -35,9 +35,7 @@ export const DualApprovalContext = z.object({
     args: z.record(z.unknown()),
   }),
   requester_pessoa_id: z.string().uuid(),
-  signatures: z
-    .array(z.object({ pessoa_id: z.string().uuid(), at: z.string() }))
-    .default([]),
+  signatures: z.array(z.object({ pessoa_id: z.string().uuid(), at: z.string() })).default([]),
   reason: z.string().optional(),
 });
 

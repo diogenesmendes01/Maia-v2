@@ -1,13 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { db } from '@/db/client.js';
-import {
-  tenants,
-  agents,
-  transacoes,
-  entidades,
-  contas_bancarias,
-  pessoas,
-} from '@/db/schema.js';
+import { tenants, agents, transacoes, entidades, contas_bancarias, pessoas } from '@/db/schema.js';
 import { tenantsRepo, transacoesRepo, pessoasRepo } from '@/db/repositories.js';
 import {
   runWithTenantContext,
@@ -40,9 +33,7 @@ d('Tenant isolation (P0)', () => {
     // herdam o tenant_id do contexto onde foram criadas (não 'default').
     const tenantIds = ['t-a', 't-b'];
     await db.delete(transacoes).where(inArray(transacoes.tenant_id, tenantIds));
-    await db
-      .delete(contas_bancarias)
-      .where(like(contas_bancarias.apelido, 'Conta-test-%'));
+    await db.delete(contas_bancarias).where(like(contas_bancarias.apelido, 'Conta-test-%'));
     await db.delete(entidades).where(like(entidades.nome, 'TestEnt-%'));
     // findByPhone test seeds a pessoa under agent-a; drop it before agents to
     // satisfy pessoas_agent_id_fkey.
@@ -96,9 +87,8 @@ d('Tenant isolation (P0)', () => {
       await transacoesRepo.create(fixture);
     });
 
-    const visibleToB = await runWithTenantContext(
-      { tenant_id: 't-b', agent_id: 'agent-b' },
-      () => transacoesRepo.listRecent(),
+    const visibleToB = await runWithTenantContext({ tenant_id: 't-b', agent_id: 'agent-b' }, () =>
+      transacoesRepo.listRecent(),
     );
 
     expect(visibleToB.find((t) => t.descricao === 'TESTE A')).toBeUndefined();
@@ -125,33 +115,28 @@ d('Tenant isolation (P0)', () => {
   it('pessoasRepo.findByPhone is isolated by tenant (PR #75 #C2)', async () => {
     const sharedPhone = '+5511999990123';
 
-    await runWithTenantContext(
-      { tenant_id: 't-a', agent_id: 'agent-a' },
-      async () => {
-        await pessoasRepo.create({
-          nome: 'Pessoa A',
-          telefone_whatsapp: sharedPhone,
-          tipo: 'funcionario',
-          email: null,
-          cpf: null,
-          status: 'ativa',
-          preferencias: {},
-          metadata: {},
-        } as Parameters<typeof pessoasRepo.create>[0]);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 't-a', agent_id: 'agent-a' }, async () => {
+      await pessoasRepo.create({
+        nome: 'Pessoa A',
+        telefone_whatsapp: sharedPhone,
+        tipo: 'funcionario',
+        email: null,
+        cpf: null,
+        status: 'ativa',
+        preferencias: {},
+        metadata: {},
+      } as Parameters<typeof pessoasRepo.create>[0]);
+    });
 
     // Tenant B searches for the SAME phone — must NOT see Tenant A's pessoa.
-    const seenByB = await runWithTenantContext(
-      { tenant_id: 't-b', agent_id: 'agent-b' },
-      () => pessoasRepo.findByPhone(sharedPhone),
+    const seenByB = await runWithTenantContext({ tenant_id: 't-b', agent_id: 'agent-b' }, () =>
+      pessoasRepo.findByPhone(sharedPhone),
     );
     expect(seenByB).toBeNull();
 
     // Tenant A still sees their own row.
-    const seenByA = await runWithTenantContext(
-      { tenant_id: 't-a', agent_id: 'agent-a' },
-      () => pessoasRepo.findByPhone(sharedPhone),
+    const seenByA = await runWithTenantContext({ tenant_id: 't-a', agent_id: 'agent-a' }, () =>
+      pessoasRepo.findByPhone(sharedPhone),
     );
     expect(seenByA).not.toBeNull();
     expect(seenByA?.tenant_id).toBe('t-a');

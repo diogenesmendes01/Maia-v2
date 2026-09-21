@@ -110,14 +110,12 @@ vi.mock('drizzle-orm', () => {
     },
   });
   const and = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
+    __pred: (row: Row) => conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
   });
   // Pass-through stubs for operators the production code may import even if
   // unused on the UPDATE paths under test.
   const or = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
+    __pred: (row: Row) => conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
   });
   const inArray = (col: unknown, vals: unknown[]): PredObj => ({
     __pred: (row: Row) => {
@@ -164,14 +162,12 @@ vi.mock('drizzle-orm', () => {
     }
     if (text.includes('LEAST(1.00, confianca + 0.10)')) {
       return {
-        __sqlEval: (row) =>
-          Math.min(1.0, Number(row.confianca) + 0.1),
+        __sqlEval: (row) => Math.min(1.0, Number(row.confianca) + 0.1),
       };
     }
     if (text.includes('GREATEST(0.00, confianca - 0.20)')) {
       return {
-        __sqlEval: (row) =>
-          Math.max(0.0, Number(row.confianca) - 0.2),
+        __sqlEval: (row) => Math.max(0.0, Number(row.confianca) - 0.2),
       };
     }
     return { __sqlEval: () => undefined };
@@ -329,7 +325,10 @@ class SelectBuilder {
     return this;
   }
   private exec(): Row[] {
-    return tableOf(this._table).filter(this._pred).slice(0, this._limit).map((r) => ({ ...r }));
+    return tableOf(this._table)
+      .filter(this._pred)
+      .slice(0, this._limit)
+      .map((r) => ({ ...r }));
   }
   then(resolve: (v: Row[]) => unknown, reject?: (e: unknown) => unknown) {
     try {
@@ -354,8 +353,7 @@ function makeDbHandle() {
 
 vi.mock('@/db/client.js', () => {
   const db = makeDbHandle();
-  const withTx = async (fn: (tx: unknown) => Promise<unknown>) =>
-    fn(makeDbHandle());
+  const withTx = async (fn: (tx: unknown) => Promise<unknown>) => fn(makeDbHandle());
   return { db, withTx };
 });
 
@@ -397,7 +395,7 @@ function baseRule(over: Row): Row {
 function seedTwoTenants() {
   tableOf(rulesTable).push(
     baseRule({ id: 'rule_A_alpha', tenant_id: 'tenant-A', agent_id: 'agent-A', tipo: 'foo' }),
-    baseRule({ id: 'rule_A_beta',  tenant_id: 'tenant-A', agent_id: 'agent-A', tipo: 'bar' }),
+    baseRule({ id: 'rule_A_beta', tenant_id: 'tenant-A', agent_id: 'agent-A', tipo: 'bar' }),
   );
   tableOf(rulesTable).push(
     baseRule({ id: 'rule_B_gamma', tenant_id: 'tenant-B', agent_id: 'agent-B', tipo: 'foo' }),
@@ -416,7 +414,7 @@ function seedTwoTenantsReverse() {
   );
   tableOf(rulesTable).push(
     baseRule({ id: 'rule_A_alpha', tenant_id: 'tenant-A', agent_id: 'agent-A', tipo: 'foo' }),
-    baseRule({ id: 'rule_A_beta',  tenant_id: 'tenant-A', agent_id: 'agent-A', tipo: 'bar' }),
+    baseRule({ id: 'rule_A_beta', tenant_id: 'tenant-A', agent_id: 'agent-A', tipo: 'bar' }),
   );
 }
 
@@ -571,9 +569,9 @@ describe('Issue #230 — procedural memory rule mutations are tenant/agent-scope
       seedTwoTenants();
       const { rulesRepo } = await import('@/db/repositories.js');
       await runWithTenantContext(A_CTX, async () => {
-        await expect(
-          rulesRepo.setStatus('rule_B_gamma', { ativa: false }),
-        ).rejects.toMatchObject({ code: 'rule_not_in_scope' });
+        await expect(rulesRepo.setStatus('rule_B_gamma', { ativa: false })).rejects.toMatchObject({
+          code: 'rule_not_in_scope',
+        });
       });
       expect(findRow('rule_B_gamma')!.ativa).toBe(true);
     });
@@ -582,9 +580,9 @@ describe('Issue #230 — procedural memory rule mutations are tenant/agent-scope
       seedTwoTenants();
       const { rulesRepo } = await import('@/db/repositories.js');
       await runWithTenantContext(B_CTX, async () => {
-        await expect(
-          rulesRepo.setStatus('rule_A_alpha', { ativa: false }),
-        ).rejects.toMatchObject({ code: 'rule_not_in_scope' });
+        await expect(rulesRepo.setStatus('rule_A_alpha', { ativa: false })).rejects.toMatchObject({
+          code: 'rule_not_in_scope',
+        });
       });
       expect(findRow('rule_A_alpha')!.ativa).toBe(true);
     });
@@ -606,9 +604,9 @@ describe('Issue #230 — procedural memory rule mutations are tenant/agent-scope
         // Even with no actual changes (only updated_at), the cross-tenant
         // attempt MUST surface as rule_not_in_scope — the guard is the WHERE
         // clause, not the SET payload.
-        await expect(
-          rulesRepo.setStatus('rule_B_gamma', {}),
-        ).rejects.toMatchObject({ code: 'rule_not_in_scope' });
+        await expect(rulesRepo.setStatus('rule_B_gamma', {})).rejects.toMatchObject({
+          code: 'rule_not_in_scope',
+        });
       });
     });
   });

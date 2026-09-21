@@ -30,7 +30,10 @@ export const linguagemDetector: DriftDetector = {
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 
-    const sample = agentMessages.slice(-20).map((m) => `- ${m.text}`).join('\n');
+    const sample = agentMessages
+      .slice(-20)
+      .map((m) => `- ${m.text}`)
+      .join('\n');
 
     const system = [
       'Você audita o vocabulário e registro linguístico do agente.',
@@ -62,7 +65,7 @@ export const linguagemDetector: DriftDetector = {
         reasoning?: string;
       };
       if (!parsed.drift_detected) return null;
-      const severity_hint = parsed.offensive ? 'critico' : parsed.severity_hint ?? 'baixo';
+      const severity_hint = parsed.offensive ? 'critico' : (parsed.severity_hint ?? 'baixo');
       return {
         drift_type: DriftType.LINGUAGEM,
         detected_by: 'drift_detector_linguagem',

@@ -17,11 +17,7 @@ export type MonthEndPolicy =
   | 'nearest_previous'
   | 'nearest_next';
 
-export type MissedRunPolicy =
-  | 'fire_all'
-  | 'fire_latest_only'
-  | 'skip_all'
-  | 'escalate_to_owner';
+export type MissedRunPolicy = 'fire_all' | 'fire_latest_only' | 'skip_all' | 'escalate_to_owner';
 
 export type OccurrenceStatus =
   | 'pending'

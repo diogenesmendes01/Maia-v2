@@ -11,10 +11,7 @@ import {
   type RestoreDrillScheduleInput,
   type RestoreDrillTickPorts,
 } from '../../../src/ops/backup/drill-schedule.js';
-import {
-  resolveBackupProfile,
-  type BackupConfigInput,
-} from '../../../src/ops/backup/profile.js';
+import { resolveBackupProfile, type BackupConfigInput } from '../../../src/ops/backup/profile.js';
 
 /**
  * Issue #536 — the restore drill as a SCHEDULED gate.
@@ -66,8 +63,7 @@ function prodCfg(over: Partial<BackupConfigInput> = {}): BackupConfigInput {
 }
 
 const devProfile = (over: Partial<BackupConfigInput> = {}) => resolveBackupProfile(cfg(over));
-const prodProfile = (over: Partial<BackupConfigInput> = {}) =>
-  resolveBackupProfile(prodCfg(over));
+const prodProfile = (over: Partial<BackupConfigInput> = {}) => resolveBackupProfile(prodCfg(over));
 
 function schedule(over: Partial<RestoreDrillScheduleInput> = {}) {
   return restoreDrillDue({
@@ -94,8 +90,9 @@ describe('restoreDrillDue — the interval is a MAX AGE, not a schedule', () => 
 
   it('becomes due at 75% of the interval — BEFORE the evidence expires', () => {
     const dueAt = INTERVAL_HOURS * DRILL_DUE_FRACTION;
-    expect(schedule({ last_restore_drill_at: new Date(NOW.getTime() - (dueAt - 1) * HOURS) }).due)
-      .toBe(false);
+    expect(
+      schedule({ last_restore_drill_at: new Date(NOW.getTime() - (dueAt - 1) * HOURS) }).due,
+    ).toBe(false);
     const d = schedule({
       last_restore_drill_at: new Date(NOW.getTime() - (dueAt + 1) * HOURS),
     });
@@ -248,11 +245,13 @@ function facts(over: Partial<DrillEvidenceFacts> = {}): DrillEvidenceFacts {
   };
 }
 
-function harness(opts: {
-  facts?: DrillEvidenceFacts;
-  readFacts?: () => Promise<DrillEvidenceFacts>;
-  runDrill?: () => Promise<DrillInvocation>;
-} = {}) {
+function harness(
+  opts: {
+    facts?: DrillEvidenceFacts;
+    readFacts?: () => Promise<DrillEvidenceFacts>;
+    runDrill?: () => Promise<DrillInvocation>;
+  } = {},
+) {
   const logs: LogLine[] = [];
   let drillCalls = 0;
   const ports: RestoreDrillTickPorts = {
@@ -444,9 +443,7 @@ describe('runRestoreDrillTick — single-flight and residue', () => {
     expect(res.outcome).toBe('not_due');
     expect(h.drills()).toBe(0);
     // Not silent: the refusal is louder than the drill would have been.
-    expect(h.logs.find((l) => l.event === 'restore_drill.blocked_by_residue')?.level).toBe(
-      'error',
-    );
+    expect(h.logs.find((l) => l.event === 'restore_drill.blocked_by_residue')?.level).toBe('error');
     expect(res.drill_check_level).toBe('FAIL');
   });
 });

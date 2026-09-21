@@ -98,10 +98,7 @@ export const channelsRepo = {
     return rows[0] ?? null;
   },
 
-  async findByExternal(
-    channel_type: string,
-    external_id: string,
-  ): Promise<Channel | null> {
+  async findByExternal(channel_type: string, external_id: string): Promise<Channel | null> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     const rows = await db
@@ -233,8 +230,7 @@ export const channelsRepo = {
   async findPrimaryCatchAllChannel(args: {
     channel_type: string;
   }): Promise<
-    | { multi_tenant: true; channel: null }
-    | { multi_tenant: false; channel: Channel | null }
+    { multi_tenant: true; channel: null } | { multi_tenant: false; channel: Channel | null }
   > {
     return withTx(async (tx) => {
       // 1. GLOBAL discriminator — any ACTIVE channel owned by a tenant OTHER
@@ -372,8 +368,7 @@ export const channelsRepo = {
     };
     audit: { actor_id: string; actor_role: string; reason: string };
   }): Promise<
-    | { ok: true; channel: Channel }
-    | { ok: false; reason: 'duplicate' | 'invalid_line' }
+    { ok: true; channel: Channel } | { ok: false; reason: 'duplicate' | 'invalid_line' }
   > {
     // §2 (spec roteamento v4) — declarado→verificado: um canal whatsapp NOVO
     // nasce INATIVO ('declarado'); só a PairingSession (§2.5), ao provar a
@@ -593,13 +588,7 @@ export const rolesRepo = {
     const rows = await db
       .select()
       .from(roles)
-      .where(
-        and(
-          eq(roles.tenant_id, tenant_id),
-          eq(roles.agent_id, agent_id),
-          eq(roles.id, id),
-        ),
-      )
+      .where(and(eq(roles.tenant_id, tenant_id), eq(roles.agent_id, agent_id), eq(roles.id, id)))
       .limit(1);
     return rows[0] ?? null;
   },
@@ -645,11 +634,7 @@ export const rolesRepo = {
       .select()
       .from(roles)
       .where(
-        and(
-          eq(roles.tenant_id, tenant_id),
-          eq(roles.agent_id, agent_id),
-          eq(roles.active, true),
-        ),
+        and(eq(roles.tenant_id, tenant_id), eq(roles.agent_id, agent_id), eq(roles.active, true)),
       );
   },
 
@@ -740,13 +725,7 @@ export const rolesRepo = {
     const result = await db
       .update(roles)
       .set({ active: false, updated_at: new Date() })
-      .where(
-        and(
-          eq(roles.tenant_id, tenant_id),
-          eq(roles.agent_id, agent_id),
-          eq(roles.id, id),
-        ),
-      )
+      .where(and(eq(roles.tenant_id, tenant_id), eq(roles.agent_id, agent_id), eq(roles.id, id)))
       .returning({ id: roles.id });
     return { rowCount: result.length };
   },
@@ -768,9 +747,7 @@ export const channelPoliciesRepo = {
       channel_id: input.channel_id,
       default_role_id: input.default_role_id,
       switch_behavior: input.switch_behavior,
-      ...(input.announce_mode !== undefined
-        ? { announce_mode: input.announce_mode }
-        : {}),
+      ...(input.announce_mode !== undefined ? { announce_mode: input.announce_mode } : {}),
       ...(input.by_context_guards !== undefined
         ? { by_context_guards: input.by_context_guards as object }
         : {}),
@@ -802,10 +779,7 @@ export const channelPoliciesRepo = {
     return rows[0] ?? null;
   },
 
-  async update(
-    id: string,
-    patch: Partial<NewChannelPolicy>,
-  ): Promise<ChannelPolicy> {
+  async update(id: string, patch: Partial<NewChannelPolicy>): Promise<ChannelPolicy> {
     // Strip any tenant/agent the caller might have supplied — context wins.
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
@@ -877,9 +851,7 @@ export const roleSelectorDecisionsRepo = {
       decided_by: input.decided_by,
       suggested_strength: input.suggested_strength ?? null,
       suggested_confidence:
-        input.suggested_confidence !== undefined
-          ? String(input.suggested_confidence)
-          : null,
+        input.suggested_confidence !== undefined ? String(input.suggested_confidence) : null,
       reason: input.reason ?? null,
       switch_count_in_conversation: input.switch_count_in_conversation ?? 0,
     });
@@ -890,9 +862,7 @@ export const roleSelectorDecisionsRepo = {
     return row!;
   },
 
-  async listByConversation(
-    conversa_id: string,
-  ): Promise<RoleSelectorDecisionRow[]> {
+  async listByConversation(conversa_id: string): Promise<RoleSelectorDecisionRow[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     return db
@@ -934,10 +904,7 @@ export const roleSelectorDecisionsRepo = {
   // [P88-H4 cooldown_turns] Counts decisions in this conversation in the
   // last N turns (i.e., the N most recent decisions). Used by the policy
   // decider to enforce `cooldown_turns` — require N turns between switches.
-  async countSwitchesInLastNTurns(args: {
-    conversa_id: string;
-    n: number;
-  }): Promise<number> {
+  async countSwitchesInLastNTurns(args: { conversa_id: string; n: number }): Promise<number> {
     if (args.n <= 0) return 0;
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();

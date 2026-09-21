@@ -88,12 +88,9 @@ export default function InboxTable({
                   />
                 )}
                 <div className="min-w-0 grow">
-                  <p className="truncate text-sm font-medium text-zinc-900">
-                    {p.descriptor}
-                  </p>
+                  <p className="truncate text-sm font-medium text-zinc-900">{p.descriptor}</p>
                   <p className="mt-0.5 text-xs text-zinc-500">
-                    {TYPE_LABELS[p.type]} ·{' '}
-                    <span className="font-mono">{p.proposed_by}</span> ·{' '}
+                    {TYPE_LABELS[p.type]} · <span className="font-mono">{p.proposed_by}</span> ·{' '}
                     <span title={new Date(p.proposed_at).toLocaleString('pt-BR')}>
                       {formatRelativeAge(p.proposed_at)}
                     </span>
@@ -153,9 +150,7 @@ export default function InboxTable({
                   </Td>
                 )}
                 <Td className="max-w-xs">
-                  <span className="block truncate font-medium text-zinc-900">
-                    {p.descriptor}
-                  </span>
+                  <span className="block truncate font-medium text-zinc-900">{p.descriptor}</span>
                 </Td>
                 <Td className="text-zinc-600">{TYPE_LABELS[p.type]}</Td>
                 <Td>

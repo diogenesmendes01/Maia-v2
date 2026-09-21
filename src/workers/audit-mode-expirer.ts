@@ -38,13 +38,11 @@ export async function runAuditModeExpirer(): Promise<void> {
 
   for (const { tenant_id, agent_id } of tuples) {
     try {
-      const expired = await runWithTenantContext(
-        { tenant_id, agent_id },
-        () => expireAuditModes(),
-      );
+      const expired = await runWithTenantContext({ tenant_id, agent_id }, () => expireAuditModes());
       total_expired += expired;
       agents_processed++;
-      if (expired > 0) logger.info({ tenant_id, agent_id, expired }, 'audit_mode_expirer.tenant_done');
+      if (expired > 0)
+        logger.info({ tenant_id, agent_id, expired }, 'audit_mode_expirer.tenant_done');
     } catch (err) {
       // Fail-isolated per (tenant, agent).
       agents_failed++;

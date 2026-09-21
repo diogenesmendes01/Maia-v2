@@ -111,12 +111,11 @@ export async function liftLockdown(actor_pessoa_id: string): Promise<{ restored:
   const rows = await db
     .select()
     .from(entity_states)
-    .where(
-      and(eq(entity_states.tenant_id, tenant_id), eq(entity_states.agent_id, agent_id)),
-    );
+    .where(and(eq(entity_states.tenant_id, tenant_id), eq(entity_states.agent_id, agent_id)));
   for (const row of rows) {
     const flags = (row.flags as Record<string, unknown>) ?? {};
-    const snapshot = (flags[LOCKDOWN_KEY] as Array<{ id: string; status_before: string }> | undefined) ?? [];
+    const snapshot =
+      (flags[LOCKDOWN_KEY] as Array<{ id: string; status_before: string }> | undefined) ?? [];
     for (const s of snapshot) {
       await db
         .update(permissoes)

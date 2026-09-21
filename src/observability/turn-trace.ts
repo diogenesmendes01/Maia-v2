@@ -267,9 +267,7 @@ export async function traceTurnDecision(
   // Attempt-scoped PK so a retry of the same turn does not collide with the
   // envelope attempt 1 already wrote (review round 1 [P1]).
   const attempt = tryGetCorrelation()?.attempt ?? 1;
-  const trace_id = root_trace_id
-    ? envelopeTraceIdForAttempt(root_trace_id, attempt)
-    : null;
+  const trace_id = root_trace_id ? envelopeTraceIdForAttempt(root_trace_id, attempt) : null;
   if (!trace_id) {
     // Non-UUID trace id (a standalone caller that never opened a correlation
     // scope). Skip rather than crash the turn on a UUID column.
@@ -345,16 +343,9 @@ export async function traceTurnDecision(
           side_effect_level: decision.side_effect_level,
         },
       }).catch((e) =>
-        logger.error(
-          { err: (e as Error).message },
-          'runtime_trace.divergent_replay_audit_failed',
-        ),
+        logger.error({ err: (e as Error).message }, 'runtime_trace.divergent_replay_audit_failed'),
       );
-      throw new MandatoryTraceEnvelopeError(
-        err,
-        input.base.tenant_id,
-        decision.side_effect_level,
-      );
+      throw new MandatoryTraceEnvelopeError(err, input.base.tenant_id, decision.side_effect_level);
     }
 
     counter(METRIC.TRACE_COVERAGE, {
@@ -371,11 +362,7 @@ export async function traceTurnDecision(
       // FAIL-LOUD, as a TYPED error the caller recognises as a block. Throwing
       // the raw DB error here is what let the turn continue to ReAct in the
       // previous revision (review round 1 [P1]).
-      throw new MandatoryTraceEnvelopeError(
-        err,
-        input.base.tenant_id,
-        decision.side_effect_level,
-      );
+      throw new MandatoryTraceEnvelopeError(err, input.base.tenant_id, decision.side_effect_level);
     }
     return null;
   }

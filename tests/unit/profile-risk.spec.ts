@@ -87,10 +87,18 @@ describe('classifyProfileChangeRisk — tabela por campo canônico', () => {
     ],
     ['style.language', (b) => (b.style.language = 'en-US'), 'low'],
     ['style.rhythm', (b) => (b.style.rhythm = { pace: 'slow' }), 'medium'],
-    ['metadata.effective_from', (b) => (b.metadata.effective_from = '2026-08-01T00:00:00.000Z'), 'low'],
+    [
+      'metadata.effective_from',
+      (b) => (b.metadata.effective_from = '2026-08-01T00:00:00.000Z'),
+      'low',
+    ],
     ['metadata.created_by', (b) => (b.metadata.created_by = 'user-2'), 'low'],
     // Linhagem, não conteúdo — classificada low mas NUNCA omitida do diff.
-    ['metadata.previous_version_id', (b) => (b.metadata.previous_version_id = 'version-other'), 'low'],
+    [
+      'metadata.previous_version_id',
+      (b) => (b.metadata.previous_version_id = 'version-other'),
+      'low',
+    ],
   ];
 
   it.each(cases)('mudança em %s ⇒ risco %s', (path, apply, expected) => {
@@ -267,11 +275,7 @@ describe('diff deriva do MESMO walker (single source of truth)', () => {
     });
     const result = classifyProfileChangeRisk(legacyBody(), proposed);
     const paths = result.changes.map((c) => c.path).sort();
-    expect(paths).toEqual([
-      'identity.learned_voice_modifiers',
-      'schema_version',
-      'style.rhythm',
-    ]);
+    expect(paths).toEqual(['identity.learned_voice_modifiers', 'schema_version', 'style.rhythm']);
     expect(result.risk).toBe('medium');
   });
 

@@ -71,7 +71,10 @@ describe('cancel_reminder tool (spec 18)', () => {
     );
     expect(result).toEqual({ cancelled: true, cancelled_occurrence_count: 3 });
     expect(auditMock).toHaveBeenCalledTimes(1);
-    const call = auditMock.mock.calls[0]![0] as { acao: string; metadata: { reason: string; cancelled_occurrences: string[] } };
+    const call = auditMock.mock.calls[0]![0] as {
+      acao: string;
+      metadata: { reason: string; cancelled_occurrences: string[] };
+    };
     expect(call.acao).toBe('series_cancelled');
     expect(call.metadata.reason).toBe('mudei de ideia');
     expect(call.metadata.cancelled_occurrences).toEqual(['o1', 'o2', 'o3']);

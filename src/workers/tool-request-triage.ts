@@ -195,10 +195,7 @@ async function escoposComGapDeToolAberto(): Promise<
     })
     .from(agent_capability_gaps)
     .where(
-      and(
-        eq(agent_capability_gaps.tipo, TIPO_DE_GAP),
-        isNull(agent_capability_gaps.resolved_at),
-      ),
+      and(eq(agent_capability_gaps.tipo, TIPO_DE_GAP), isNull(agent_capability_gaps.resolved_at)),
     );
 }
 

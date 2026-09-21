@@ -27,7 +27,11 @@ const mockSkill = {
     system_prompt: 'You can call tools.',
     tool_schemas: [
       { name: 'query_balance', description: 'Get balance', input_schema: { type: 'object' } },
-      { name: 'unauthorized_tool', description: 'Should be filtered', input_schema: { type: 'object' } },
+      {
+        name: 'unauthorized_tool',
+        description: 'Should be filtered',
+        input_schema: { type: 'object' },
+      },
     ],
   },
   allowed_tools: ['query_balance'],
@@ -52,21 +56,25 @@ describe('toolMediatedMode', () => {
       model: 'x',
     });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx });
+      const out = await toolMediatedMode({
+        skill: mockSkill,
+        input: {},
+        resolvedPolicies: [],
+        ...stableCtx,
+      });
       expect(out.answer).toBe('R$1000');
       expect(out._tools_called).toEqual([]);
     });
   });
 
   it('throws if dispatcher not configured but tool requested', async () => {
-    vi.mocked(callLLM)
-      .mockResolvedValueOnce({
-        content: null,
-        tool_uses: [{ id: 't1', tool: 'query_balance', args: {} }],
-        stop_reason: 'tool_use',
-        usage: { input_tokens: 5, output_tokens: 5 },
-        model: 'x',
-      });
+    vi.mocked(callLLM).mockResolvedValueOnce({
+      content: null,
+      tool_uses: [{ id: 't1', tool: 'query_balance', args: {} }],
+      stop_reason: 'tool_use',
+      usage: { input_tokens: 5, output_tokens: 5 },
+      model: 'x',
+    });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       await expect(
         toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx }),
@@ -92,7 +100,12 @@ describe('toolMediatedMode', () => {
         model: 'x',
       });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx });
+      const out = await toolMediatedMode({
+        skill: mockSkill,
+        input: {},
+        resolvedPolicies: [],
+        ...stableCtx,
+      });
       expect(out.answer).toBe('saldo é 1234');
       expect(out._tools_called).toEqual(['query_balance']);
     });
@@ -116,7 +129,12 @@ describe('toolMediatedMode', () => {
         model: 'x',
       });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
-      const out = await toolMediatedMode({ skill: mockSkill, input: {}, resolvedPolicies: [], ...stableCtx });
+      const out = await toolMediatedMode({
+        skill: mockSkill,
+        input: {},
+        resolvedPolicies: [],
+        ...stableCtx,
+      });
       // unauthorized_tool was rejected, never made it into _tools_called.
       expect(out._tools_called).toEqual([]);
     });

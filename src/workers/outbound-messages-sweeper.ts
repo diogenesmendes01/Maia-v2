@@ -110,11 +110,7 @@ import { outbound_messages } from '@/db/schema.js';
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
 import { incCounter } from '@/lib/metrics.js';
-import {
-  runWithTenantContext,
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 
 type TenantAgentRow = { tenant_id: string; agent_id: string };
 
@@ -156,10 +152,7 @@ async function tryAcquireSweepLock(): Promise<AcquiredLock | null> {
   try {
     client = await pool.connect();
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'outbound_messages_sweeper.lock_acquire_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'outbound_messages_sweeper.lock_acquire_failed');
     return null;
   }
 
@@ -176,10 +169,7 @@ async function tryAcquireSweepLock(): Promise<AcquiredLock | null> {
     }
   } catch (err) {
     client.release();
-    logger.warn(
-      { err: (err as Error).message },
-      'outbound_messages_sweeper.lock_acquire_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'outbound_messages_sweeper.lock_acquire_failed');
     return null;
   }
 
@@ -188,10 +178,10 @@ async function tryAcquireSweepLock(): Promise<AcquiredLock | null> {
       if (released) return;
       released = true;
       try {
-        await client.query(
-          `SELECT pg_advisory_unlock(hashtextextended($1, $2))`,
-          [OUTBOUND_SWEEPER_LOCK_KEY, OUTBOUND_SWEEPER_LOCK_NAMESPACE.toString()],
-        );
+        await client.query(`SELECT pg_advisory_unlock(hashtextextended($1, $2))`, [
+          OUTBOUND_SWEEPER_LOCK_KEY,
+          OUTBOUND_SWEEPER_LOCK_NAMESPACE.toString(),
+        ]);
       } catch (err) {
         logger.warn(
           { err: (err as Error).message },
@@ -339,11 +329,7 @@ async function runSweepInner(
 
   const promoted = promotedRows.rows.length;
   if (promoted > 0) {
-    incCounter(
-      'maia_outbound_ledger_sweeper_promoted_total',
-      { tenant_id, agent_id },
-      promoted,
-    );
+    incCounter('maia_outbound_ledger_sweeper_promoted_total', { tenant_id, agent_id }, promoted);
   }
 
   // (B) Retention cleanup: terminais antigas → DELETE.
@@ -388,11 +374,7 @@ async function runSweepInner(
   }
 
   if (cleaned > 0) {
-    incCounter(
-      'maia_outbound_ledger_sweeper_cleaned_total',
-      { tenant_id, agent_id },
-      cleaned,
-    );
+    incCounter('maia_outbound_ledger_sweeper_cleaned_total', { tenant_id, agent_id }, cleaned);
     // Agregado por tenant (housekeeping); ops_alert pra surfaçar no
     // dashboard mas sem flood — cleanup acontece todo tick, é esperado.
     logger.warn(
@@ -425,8 +407,7 @@ async function runSweepInner(
 export async function runOutboundMessagesSweeper(): Promise<void> {
   const stalePendingSec = config.OUTBOUND_SWEEPER_STALE_PENDING_SEC;
   const retentionDays = config.OUTBOUND_SWEEPER_RETENTION_DAYS;
-  const recoveryLimitPerTenant =
-    config.OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT;
+  const recoveryLimitPerTenant = config.OUTBOUND_SWEEPER_RECOVERY_LIMIT_PER_TENANT;
   const retentionBatchSize = config.OUTBOUND_SWEEPER_RETENTION_BATCH_SIZE;
 
   // (#292 blocker #3) Single-flight: only one worker instance sweeps at a time.
@@ -458,12 +439,7 @@ export async function runOutboundMessagesSweeper(): Promise<void> {
     for (const { tenant_id, agent_id } of tenants) {
       try {
         const stats = await runWithTenantContext({ tenant_id, agent_id }, () =>
-          runSweepInner(
-            stalePendingSec,
-            retentionDays,
-            recoveryLimitPerTenant,
-            retentionBatchSize,
-          ),
+          runSweepInner(stalePendingSec, retentionDays, recoveryLimitPerTenant, retentionBatchSize),
         );
         totalPromoted += stats.promoted;
         totalCleaned += stats.cleaned;

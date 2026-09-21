@@ -7,7 +7,12 @@ import { tmpdir } from 'node:os';
 const SANDBOX = join(tmpdir(), 'maia-pdf-flow-test-' + Date.now());
 
 const { flagState, dbState } = vi.hoisted(() => ({
-  flagState: { FEATURE_PDF_REPORTS: true, FEATURE_VIEW_ONCE_SENSITIVE: false, FEATURE_ONE_TAP: false, FEATURE_PENDING_GATE: false },
+  flagState: {
+    FEATURE_PDF_REPORTS: true,
+    FEATURE_VIEW_ONCE_SENSITIVE: false,
+    FEATURE_ONE_TAP: false,
+    FEATURE_PENDING_GATE: false,
+  },
   dbState: { conversaResult: [] as unknown[] },
 }));
 
@@ -32,7 +37,9 @@ const getRoleById = vi.fn();
 // falha ANTES do canal (pré-envio, fail-closed), que é o comportamento certo em
 // produção e um falso vermelho aqui.
 vi.mock('../../src/gateway/baileys.js', () => ({
-  sendOutboundText, sendOutboundDocument, isBaileysConnected: () => true,
+  sendOutboundText,
+  sendOutboundDocument,
+  isBaileysConnected: () => true,
   MEDIA_ROOT: SANDBOX,
 }));
 // Fase 0 do roteamento multi-linha (spec 2026-07-09 §1.6): todo envio físico
@@ -83,9 +90,7 @@ vi.mock('../../src/db/repositories.js', () => ({
   pendingQuestionsRepo: { findActiveSnapshot: vi.fn() },
   conversasRepo: {
     byIdWithPessoa: vi.fn(async () => {
-      const row = dbState.conversaResult[0] as
-        | { conversas: unknown; pessoas: unknown }
-        | undefined;
+      const row = dbState.conversaResult[0] as { conversas: unknown; pessoas: unknown } | undefined;
       return row ? { conversa: row.conversas, pessoa: row.pessoas } : null;
     }),
     touch: vi.fn(),
@@ -102,23 +107,35 @@ vi.mock('../../src/db/repositories.js', () => ({
     record: vi.fn().mockResolvedValue(undefined),
   },
   selfStateRepo: { getActive: vi.fn().mockResolvedValue(null) },
-  factsRepo: { listForScopes: vi.fn().mockResolvedValue([]), listMentionableForScopes: vi.fn().mockResolvedValue([]) },
+  factsRepo: {
+    listForScopes: vi.fn().mockResolvedValue([]),
+    listMentionableForScopes: vi.fn().mockResolvedValue([]),
+  },
   rulesRepo: { listActive: vi.fn().mockResolvedValue([]) },
   entityStatesRepo: { byId: vi.fn().mockResolvedValue(null), byIds: vi.fn().mockResolvedValue([]) },
   entidadesRepo: { byIds: vi.fn().mockResolvedValue([]) },
 }));
 vi.mock('../../src/db/client.js', () => {
   const fakeQuery = {
-    from: () => fakeQuery, innerJoin: () => fakeQuery, where: () => fakeQuery,
+    from: () => fakeQuery,
+    innerJoin: () => fakeQuery,
+    where: () => fakeQuery,
     limit: () => Promise.resolve(dbState.conversaResult),
   };
-  return { db: { select: () => fakeQuery }, withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})) };
+  return {
+    db: { select: () => fakeQuery },
+    withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
+  };
 });
 // `mensagens` is needed by the channel-resolution probe in runAgentForMensagem
 // (it reads `mensagens.metadata` before the resolver). Without it the probe
 // deref throws and, post-#417 fail-closed, that propagates instead of being
 // silently swallowed.
-vi.mock('../../src/db/schema.js', () => ({ conversas: {}, pessoas: {}, mensagens: { metadata: {}, id: {} } }));
+vi.mock('../../src/db/schema.js', () => ({
+  conversas: {},
+  pessoas: {},
+  mensagens: { metadata: {}, id: {} },
+}));
 vi.mock('drizzle-orm', () => ({ eq: () => ({}) }));
 vi.mock('../../src/governance/audit.js', () => ({ audit }));
 vi.mock('../../src/lib/logger.js', () => ({
@@ -139,69 +156,77 @@ vi.mock('../../src/config/env.js', () => ({
 vi.mock('../../src/tools/_dispatcher.js', () => ({ dispatchTool }));
 vi.mock('../../src/lib/claude.js', () => ({ callLLM }));
 vi.mock('../../src/agent/prompt-builder.js', () => ({
-  buildPrompt, PROMPT_TOKEN_BUDGET_INPUT: 11000, PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
+  buildPrompt,
+  PROMPT_TOKEN_BUDGET_INPUT: 11000,
+  PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
 }));
 vi.mock('../../src/agent/pending-gate.js', () => ({
   checkPendingFirst: vi.fn().mockResolvedValue({ kind: 'no_pending' }),
 }));
 vi.mock('../../src/identity/resolver.js', () => ({ resolveIdentity: vi.fn() }));
 vi.mock('../../src/identity/quarantine.js', () => ({
-  handleQuarantineFirstContact: vi.fn(), handleOwnerIdentityReply: vi.fn(),
+  handleQuarantineFirstContact: vi.fn(),
+  handleOwnerIdentityReply: vi.fn(),
 }));
 vi.mock('../../src/governance/permissions.js', () => ({
   resolveScope: vi.fn().mockResolvedValue({ entidades: [], byEntity: new Map() }),
 }));
-vi.mock("../../src/cognitive-graph/orchestrator.js", () => ({
+vi.mock('../../src/cognitive-graph/orchestrator.js', () => ({
   runNodes: vi.fn().mockResolvedValue({ nodes: {} }),
 }));
-vi.mock("../../src/gateway/rate-limit.js", () => ({
-  checkRateLimit: vi.fn().mockResolvedValue({ kind: "allow" }),
+vi.mock('../../src/gateway/rate-limit.js', () => ({
+  checkRateLimit: vi.fn().mockResolvedValue({ kind: 'allow' }),
   formatPoliteReply: vi.fn(),
 }));
 vi.mock('../../src/gateway/presence.js', () => ({
   startTyping: vi.fn(() => ({ stop: vi.fn() })),
-  sendReaction: vi.fn(), quotedReplyContext: vi.fn(), sendPoll: vi.fn(),
+  sendReaction: vi.fn(),
+  quotedReplyContext: vi.fn(),
+  sendPoll: vi.fn(),
 }));
-vi.mock('../../src/workflows/pending-questions.js', () => ({ getActivePending: vi.fn().mockReturnValue(null) }));
+vi.mock('../../src/workflows/pending-questions.js', () => ({
+  getActivePending: vi.fn().mockReturnValue(null),
+}));
 vi.mock('../../src/agent/reflection.js', () => ({
   detectCorrection: vi.fn().mockReturnValue(false),
-  reflectOnCorrection: vi.fn(), findPreviousAssistantMessage: vi.fn(),
+  reflectOnCorrection: vi.fn(),
+  findPreviousAssistantMessage: vi.fn(),
 }));
 
 const PESSOA = {
-  id: "p1",
-  telefone_whatsapp: "+5511888888888",
-  nome: "Owner",
-  tenant_id: "primary",
-  agent_id: "primary",
-  tipo: "owner",
-  status: "ativa",
+  id: 'p1',
+  telefone_whatsapp: '+5511888888888',
+  nome: 'Owner',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  tipo: 'owner',
+  status: 'ativa',
   preferencias: {},
 } as never;
 const CONVERSA = {
-  id: "c1",
-  pessoa_id: "p1",
-  status: "ativa",
-  channel_id: "ch-1",
+  id: 'c1',
+  pessoa_id: 'p1',
+  status: 'ativa',
+  channel_id: 'ch-1',
 } as never;
 const AUDIENCE_PROFILE = {
-  id: "aud-1",
-  tenant_id: "primary",
-  agent_id: "primary",
-  pessoa_id: "p1",
-  audience_type: "owner",
-  trust_level: "trusted_internal",
-  status: "active",
+  id: 'aud-1',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  pessoa_id: 'p1',
+  audience_type: 'owner',
+  trust_level: 'trusted_internal',
+  status: 'active',
   permission_profile_ids: [],
   labels: [],
   metadata: {},
 } as never;
 const DEFAULT_ROLE = {
-  id: "role-default",
-  tenant_id: "primary",
-  agent_id: "primary",
-  role_key: "default",
-  display_name: "Default",
+  id: 'role-default',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  role_key: 'default',
+  display_name: 'Default',
   description: null,
   prompt_addendum: null,
   granted_packs: [],
@@ -210,23 +235,23 @@ const DEFAULT_ROLE = {
   metadata: {},
 } as never;
 const CHANNEL_POLICY = {
-  id: "policy-1",
-  tenant_id: "primary",
-  agent_id: "primary",
-  channel_id: "ch-1",
-  default_role_id: "role-default",
-  switch_behavior: "fixed",
-  announce_mode: "never",
+  id: 'policy-1',
+  tenant_id: 'primary',
+  agent_id: 'primary',
+  channel_id: 'ch-1',
+  default_role_id: 'role-default',
+  switch_behavior: 'fixed',
+  announce_mode: 'never',
   by_context_guards: {},
   allowed_role_ids: [],
 } as never;
 const INBOUND = {
-  id: "in1",
-  conversa_id: "c1",
-  direcao: "in" as const,
-  tipo: "texto" as const,
-  conteudo: "manda extrato",
-  metadata: { whatsapp_id: "WAID-IN" },
+  id: 'in1',
+  conversa_id: 'c1',
+  direcao: 'in' as const,
+  tipo: 'texto' as const,
+  conteudo: 'manda extrato',
+  metadata: { whatsapp_id: 'WAID-IN' },
   processada_em: null,
 };
 
@@ -245,12 +270,17 @@ describe('agent loop — PDF flow (B3b)', () => {
   });
 
   beforeEach(async () => {
-    callLLM.mockReset(); dispatchTool.mockReset();
-    sendOutboundText.mockReset(); sendOutboundDocument.mockReset();
-    audit.mockReset(); createMensagem.mockReset();
-    findById.mockReset(); findMensagem.mockReset(); markProcessed.mockReset();
+    callLLM.mockReset();
+    dispatchTool.mockReset();
+    sendOutboundText.mockReset();
+    sendOutboundDocument.mockReset();
+    audit.mockReset();
+    createMensagem.mockReset();
+    findById.mockReset();
+    findMensagem.mockReset();
+    markProcessed.mockReset();
     recentInConversation.mockReset().mockResolvedValue([]);
-    buildPrompt.mockResolvedValue({ system: "s", messages: [] });
+    buildPrompt.mockResolvedValue({ system: 's', messages: [] });
     findAudienceProfile.mockReset().mockResolvedValue(AUDIENCE_PROFILE);
     getChannelPolicy.mockReset().mockResolvedValue(CHANNEL_POLICY);
     listActiveRoles.mockReset().mockResolvedValue([DEFAULT_ROLE]);
@@ -280,7 +310,11 @@ describe('agent loop — PDF flow (B3b)', () => {
       fileName: 'extrato-empresa-x-2026-04.pdf',
       mimetype: 'application/pdf',
       tipo: 'extrato',
-      summary: { period: '01/04/2026 a 30/04/2026', rowCount: 3, totals: { receita: 100, despesa: 50, lucro: 50 } },
+      summary: {
+        period: '01/04/2026 a 30/04/2026',
+        rowCount: 3,
+        totals: { receita: 100, despesa: 50, lucro: 50 },
+      },
     });
 
     const { runAgentForMensagem } = core();
@@ -298,7 +332,7 @@ describe('agent loop — PDF flow (B3b)', () => {
     // nenhuma segunda tentativa encontraria. O objeto vive sob
     // `<MEDIA_ROOT>/outbound/<tenant>/<agent>/<pessoa>/<sha>.pdf`.
     expect(path).not.toBe(pdfPath);
-    expect(path).toContain(join(SANDBOX, "outbound"));
+    expect(path).toContain(join(SANDBOX, 'outbound'));
     expect(path).toMatch(/[\\/][0-9a-f]{64}\.pdf$/);
     expect(opts).toMatchObject({
       mimetype: 'application/pdf',
@@ -324,10 +358,15 @@ describe('agent loop — PDF flow (B3b)', () => {
       usage: { input_tokens: 100, output_tokens: 10 },
     });
     callLLM.mockResolvedValueOnce({
-      content: 'Aqui está', tool_uses: [], usage: { input_tokens: 50, output_tokens: 20 },
+      content: 'Aqui está',
+      tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 20 },
     });
     dispatchTool.mockResolvedValue({
-      path: pdfPath, fileName: 'x.pdf', mimetype: 'application/pdf', tipo: 'extrato',
+      path: pdfPath,
+      fileName: 'x.pdf',
+      mimetype: 'application/pdf',
+      tipo: 'extrato',
       summary: { period: '01/04/2026 a 30/04/2026' },
     });
     const { runAgentForMensagem } = core();
@@ -345,10 +384,15 @@ describe('agent loop — PDF flow (B3b)', () => {
       usage: { input_tokens: 100, output_tokens: 10 },
     });
     callLLM.mockResolvedValueOnce({
-      content: longText, tool_uses: [], usage: { input_tokens: 50, output_tokens: 20 },
+      content: longText,
+      tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 20 },
     });
     dispatchTool.mockResolvedValue({
-      path: pdfPath, fileName: 'x.pdf', mimetype: 'application/pdf', tipo: 'extrato',
+      path: pdfPath,
+      fileName: 'x.pdf',
+      mimetype: 'application/pdf',
+      tipo: 'extrato',
       summary: { period: '01/04/2026 a 30/04/2026' },
     });
     const { runAgentForMensagem } = core();
@@ -359,7 +403,9 @@ describe('agent loop — PDF flow (B3b)', () => {
 
   it('non-generate_report turn falls through to sendOutboundText (existing behaviour)', async () => {
     callLLM.mockResolvedValueOnce({
-      content: 'plain reply', tool_uses: [], usage: { input_tokens: 50, output_tokens: 20 },
+      content: 'plain reply',
+      tool_uses: [],
+      usage: { input_tokens: 50, output_tokens: 20 },
     });
     const { runAgentForMensagem } = core();
     await runAgentForMensagem('in1');

@@ -55,10 +55,7 @@ const storage = new AsyncLocalStorage<TurnHandle>();
  * escopos é o que garante que "tem posse" e "tem turno para commitar" sejam a
  * mesma região do código, por construção.
  */
-export function runWithOutboundTurnScope<T>(
-  handle: TurnHandle,
-  fn: () => Promise<T>,
-): Promise<T> {
+export function runWithOutboundTurnScope<T>(handle: TurnHandle, fn: () => Promise<T>): Promise<T> {
   return storage.run(handle, fn);
 }
 

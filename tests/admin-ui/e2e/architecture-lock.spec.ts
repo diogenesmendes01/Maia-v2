@@ -47,10 +47,7 @@ test.describe('Trava de arquitetura', () => {
     ).toBeVisible();
   });
 
-  test('trava vinda da CLASSE de aprovação bloqueia igual à do spec', async ({
-    page,
-    context,
-  }) => {
+  test('trava vinda da CLASSE de aprovação bloqueia igual à do spec', async ({ page, context }) => {
     // Regressão da #623. A fixture não declara trava nenhuma no spec: a trava
     // é da classe `capability_dangerous_tool` (`architectureLocks:
     // ['tool_blast_radius']` na matriz). A tela lia `proposal.locks` (só as

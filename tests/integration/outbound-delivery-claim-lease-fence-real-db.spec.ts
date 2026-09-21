@@ -97,10 +97,9 @@ function fakeLine(p: Provedor): LineOutput {
     async sendText(_jid: string, _text: string, opts?: { messageId?: string }) {
       p.chamadas += 1;
       p.chavesRecebidas.push(opts?.messageId ?? null);
-      const { rows } = await pool.query(
-        `SELECT status FROM outbound_messages WHERE id = $1`,
-        [outboundId],
-      );
+      const { rows } = await pool.query(`SELECT status FROM outbound_messages WHERE id = $1`, [
+        outboundId,
+      ]);
       p.statusNoEnvio.push((rows[0]?.status as string | undefined) ?? 'ausente');
       if (p.lancaDepoisDeAceitar) throw p.lancaDepoisDeAceitar;
       return `3EB0${randomUUID().replace(/-/g, '').slice(0, 18).toUpperCase()}`;
@@ -576,10 +575,9 @@ d('#632 — claim/lease/fence da entrega (Postgres real)', () => {
       const { rows: desfecho } = await pool.query<{
         delivery_outcome: string | null;
         last_error_code: string | null;
-      }>(
-        `SELECT delivery_outcome, last_error_code FROM outbound_messages WHERE id = $1`,
-        [outboundId],
-      );
+      }>(`SELECT delivery_outcome, last_error_code FROM outbound_messages WHERE id = $1`, [
+        outboundId,
+      ]);
       expect(desfecho[0]!.delivery_outcome).toBe('cancelled_before_send');
       expect(desfecho[0]!.last_error_code).toBe('channel_ownership_lost');
 
@@ -700,9 +698,9 @@ d('#632 — claim/lease/fence da entrega (Postgres real)', () => {
 
     // A ponte síncrona não pode passar por cima: #631 sobrescrevia o desfecho
     // do worker sem sequer perceber, porque não havia fence nenhum.
-    await expect(
-      comoEscopo(() => beginInlineDelivery(outboundId, 60_000)),
-    ).rejects.toBeInstanceOf(DeliveryFenceError);
+    await expect(comoEscopo(() => beginInlineDelivery(outboundId, 60_000))).rejects.toBeInstanceOf(
+      DeliveryFenceError,
+    );
 
     const l = await linha();
     expect(l.claim_token).toBe(worker.ok ? worker.claim.claim_token : null);

@@ -9,25 +9,18 @@
 import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/index.js';
-import {
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import type {
   KnowledgeOrigin,
   KnowledgeScope,
 } from '@/control-plane/knowledge-state-machine/types.js';
 
 const inputSchema = z.object({
-  escopo: z
-    .string()
-    .regex(/^(global|tenant|pessoa:[0-9a-f-]+|entidade:[0-9a-f-]+)$/),
+  escopo: z.string().regex(/^(global|tenant|pessoa:[0-9a-f-]+|entidade:[0-9a-f-]+)$/),
   chave: z.string().min(1).max(120),
   valor: z.unknown(),
   texto: z.string().min(1).max(2000),
-  fonte: z
-    .enum(['configurado', 'aprendido', 'inferido'])
-    .default('aprendido'),
+  fonte: z.enum(['configurado', 'aprendido', 'inferido']).default('aprendido'),
   confianca: z.number().min(0).max(1).default(0.6),
   sensibilidade: z.enum(['low', 'medium', 'high']).optional(),
 });
@@ -57,9 +50,7 @@ function mapEscopoToScope(escopo: string): {
   return { scope: 'agent' };
 }
 
-function fonteToOrigin(
-  fonte: 'configurado' | 'aprendido' | 'inferido',
-): KnowledgeOrigin {
+function fonteToOrigin(fonte: 'configurado' | 'aprendido' | 'inferido'): KnowledgeOrigin {
   if (fonte === 'configurado') return 'human_approved';
   if (fonte === 'inferido') return 'tool_callback';
   return 'llm_inference';
@@ -106,9 +97,7 @@ export const proposeFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
       confidence: args.confianca,
       origin: fonteToOrigin(args.fonte),
       source: 'tool:propose_fact',
-      ...(args.sensibilidade !== undefined
-        ? { sensitivity_hint: args.sensibilidade }
-        : {}),
+      ...(args.sensibilidade !== undefined ? { sensitivity_hint: args.sensibilidade } : {}),
       // Codex round-2 finding 2: persist the legacy escopo/chave verbatim
       // so factsRepo.listForScopes / listMentionableForScopes (which look
       // for `pessoa:<id>` / `entidade:<id>`) can find the row after a
@@ -122,8 +111,7 @@ export const proposeFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
     // Output shape narrows to {ephemeral, pending_review} — the only two
     // initial states propose() can return. If somehow a wider value comes
     // through (e.g. fallback short-circuit), normalise to pending_review.
-    const initial_status =
-      result.initial_status === 'ephemeral' ? 'ephemeral' : 'pending_review';
+    const initial_status = result.initial_status === 'ephemeral' ? 'ephemeral' : 'pending_review';
 
     return {
       proposal_id: result.proposal_id,

@@ -47,12 +47,8 @@ vi.mock('../../src/gateway/queue.js', () => ({
 describe('tool-catalog artifact — in sync with the registry (drift guard)', () => {
   it('committed TOOL_CATALOG deep-equals a fresh in-memory generation', async () => {
     const { buildToolCatalog } = await import('../../src/tools/_registry.js');
-    const { describeZodObject } = await import(
-      '../../src/tools/describe-schema.js'
-    );
-    const { TOOL_CATALOG } = await import(
-      '../../src/admin-ui/generated/tool-catalog.js'
-    );
+    const { describeZodObject } = await import('../../src/tools/describe-schema.js');
+    const { TOOL_CATALOG } = await import('../../src/admin-ui/generated/tool-catalog.js');
 
     // Reproduce EXACTLY what scripts/gen-tool-catalog.ts writes (minus the
     // `enabled` runtime field, which the artifact deliberately omits).
@@ -82,23 +78,17 @@ describe('tool-catalog artifact — in sync with the registry (drift guard)', ()
   });
 
   it('every committed entry carries the expected static shape (no enabled)', async () => {
-    const { TOOL_CATALOG } = await import(
-      '../../src/admin-ui/generated/tool-catalog.js'
-    );
+    const { TOOL_CATALOG } = await import('../../src/admin-ui/generated/tool-catalog.js');
     expect(TOOL_CATALOG.length).toBeGreaterThan(0);
     for (const entry of TOOL_CATALOG) {
       expect(typeof entry.name).toBe('string');
       expect(typeof entry.description).toBe('string');
-      expect(['none', 'read', 'write', 'communication']).toContain(
-        entry.side_effect,
-      );
+      expect(['none', 'read', 'write', 'communication']).toContain(entry.side_effect);
       expect(typeof entry.sensitive).toBe('boolean');
       expect(Array.isArray(entry.required_actions)).toBe(true);
       expect(Array.isArray(entry.inputs)).toBe(true);
       // feature_flag is a string NAME or null.
-      expect(
-        entry.feature_flag === null || typeof entry.feature_flag === 'string',
-      ).toBe(true);
+      expect(entry.feature_flag === null || typeof entry.feature_flag === 'string').toBe(true);
       // `enabled` is runtime-only — it must NOT be baked into the artifact.
       expect(entry).not.toHaveProperty('enabled');
     }

@@ -72,9 +72,7 @@ function makeCtx(opts?: {
       runtimeTraceRepo: {
         async list(args: Record<string, unknown>) {
           listCalls.push(args);
-          return (
-            opts?.listResult ?? { items: [envelopeRow()], hasMore: false, nextCursor: null }
-          );
+          return opts?.listResult ?? { items: [envelopeRow()], hasMore: false, nextCursor: null };
         },
         async get(args: Record<string, unknown>) {
           getCalls.push(args);
@@ -169,9 +167,7 @@ describe('traces.listTraces', () => {
 
   it('rejects an out-of-range limit (Zod)', async () => {
     const { ctx } = makeCtx();
-    await expect(
-      tracesRouter.createCaller(ctx).listTraces({ limit: 5000 }),
-    ).rejects.toThrow();
+    await expect(tracesRouter.createCaller(ctx).listTraces({ limit: 5000 })).rejects.toThrow();
   });
 
   it('rejects an unknown decision value (Zod)', async () => {

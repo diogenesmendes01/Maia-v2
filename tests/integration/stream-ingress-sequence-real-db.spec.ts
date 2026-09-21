@@ -59,7 +59,6 @@ const TELEFONE = '+5511988887777';
 
 let pool: pg.Pool;
 
-
 const inA = <T>(fn: () => Promise<T>): Promise<T> =>
   runWithTenantContext({ tenant_id: T_A, agent_id: A_A }, fn);
 const inB = <T>(fn: () => Promise<T>): Promise<T> =>
@@ -175,7 +174,9 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
   it('ingressos sequenciais recebem 1, 2, 3 na mesma stream', async () => {
     const rows = [];
     for (let i = 0; i < 3; i++) {
-      rows.push(await inA(() => repos().mensagensRepo.createInbound(inbound(), { withTurn: true })));
+      rows.push(
+        await inA(() => repos().mensagensRepo.createInbound(inbound(), { withTurn: true })),
+      );
     }
     expect(rows.map((r) => r.row.ingress_seq)).toEqual([1, 2, 3]);
     expect(new Set(rows.map((r) => r.row.stream_key))).toEqual(new Set([chaveEsperada(T_A, A_A)]));
@@ -240,8 +241,12 @@ d('#505 — sequência de ingresso por stream (DB real)', () => {
     // buraco permanente.
     const wa = `wa-corrida-${randomUUID()}`;
     const [x, y] = await Promise.all([
-      inA(() => repos().mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true })),
-      inA(() => repos().mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true })),
+      inA(() =>
+        repos().mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true }),
+      ),
+      inA(() =>
+        repos().mensagensRepo.createInbound(inbound({ whatsapp_id: wa }), { withTurn: true }),
+      ),
     ]);
     expect(x.row.id).toBe(y.row.id);
     expect(x.row.ingress_seq).toBe(y.row.ingress_seq);

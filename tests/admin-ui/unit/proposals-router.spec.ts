@@ -44,12 +44,7 @@ type AuditRow = {
 
 type Proposal = {
   id: string;
-  type:
-    | 'policy_rule'
-    | 'soul_bias'
-    | 'skill'
-    | 'capability_proposal'
-    | 'knowledge_proposal';
+  type: 'policy_rule' | 'soul_bias' | 'skill' | 'capability_proposal' | 'knowledge_proposal';
   descriptor: string;
   risk: 'low' | 'medium' | 'high' | 'critical';
   source: string;
@@ -152,12 +147,7 @@ function makeRepoMock(proposals: Proposal[]) {
   };
 }
 
-function callerFor(
-  role: string,
-  tenantId: string,
-  userId: string,
-  proposals: Proposal[],
-) {
+function callerFor(role: string, tenantId: string, userId: string, proposals: Proposal[]) {
   const repos = makeRepoMock(proposals);
   const ctx = {
     session: { user: { id: userId, role, tenant_id: tenantId } },
@@ -224,9 +214,7 @@ describe('proposalsRouter.approve — role gate', () => {
 
 describe('proposalsRouter.approve — dual-approval gate (Codex #101 — destructive must NOT single-ship)', () => {
   it('first founder approving a destructive proposal does NOT activate it', async () => {
-    const { caller, repos } = callerFor('founder', 'tenant-A', 'founder-1', [
-      DESTRUCTIVE_PROPOSAL,
-    ]);
+    const { caller, repos } = callerFor('founder', 'tenant-A', 'founder-1', [DESTRUCTIVE_PROPOSAL]);
     const res = await caller.approve({
       id: DESTRUCTIVE_PROPOSAL.id,
       comment: 'approving as first founder; awaiting second',

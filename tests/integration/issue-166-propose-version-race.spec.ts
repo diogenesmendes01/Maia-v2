@@ -25,7 +25,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 const T = 'issue166-tenant';
@@ -52,7 +53,10 @@ if (SHOULD_RUN) {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
     const c = await pool.connect();
     try {
-      await c.query(`INSERT INTO tenants(id, nome) VALUES ($1, 'Issue 166 Tenant') ON CONFLICT (id) DO NOTHING`, [T]);
+      await c.query(
+        `INSERT INTO tenants(id, nome) VALUES ($1, 'Issue 166 Tenant') ON CONFLICT (id) DO NOTHING`,
+        [T],
+      );
       await c.query(
         `INSERT INTO agents(id, tenant_id, nome) VALUES ($1, $2, 'Issue 166 Agent') ON CONFLICT (id) DO NOTHING`,
         [A, T],
@@ -81,7 +85,6 @@ if (SHOULD_RUN) {
 }
 
 d('operationalProfileVersionsRepo.proposeAndAuditAtomic (concurrency, real DB)', () => {
-
   it('two concurrent proposals commit as distinct sequential versions', async () => {
     const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
 
@@ -562,76 +565,81 @@ d('cross-allocator concurrency: seedNewActiveAtomic + approveAndActivateAtomic',
   });
 });
 
-d('mixed-allocator concurrency: proposeAndAuditAtomic + operationalProfileVersionsRepo.create', () => {
-  /**
-   * Codex Adversarial Review of PR #171 round 2 #2 — `operationalProfileVersionsRepo.create`
-   * previously did `MAX(version)+1` WITHOUT locking the agent row, so it
-   * could race against `proposeAndAuditAtomic` (which DOES lock) and produce
-   * a unique-index collision. Both writers now go through
-   * `acquireNextVersionForAgent` (shared FOR UPDATE on the agents row).
-   *
-   * This test fires both writers concurrently and asserts they each commit
-   * a distinct sequential version with no collision.
-   */
-  it('proposeAndAuditAtomic + create concurrent against same agent → distinct versions', async () => {
-    const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
-    const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
+d(
+  'mixed-allocator concurrency: proposeAndAuditAtomic + operationalProfileVersionsRepo.create',
+  () => {
+    /**
+     * Codex Adversarial Review of PR #171 round 2 #2 — `operationalProfileVersionsRepo.create`
+     * previously did `MAX(version)+1` WITHOUT locking the agent row, so it
+     * could race against `proposeAndAuditAtomic` (which DOES lock) and produce
+     * a unique-index collision. Both writers now go through
+     * `acquireNextVersionForAgent` (shared FOR UPDATE on the agents row).
+     *
+     * This test fires both writers concurrently and asserts they each commit
+     * a distinct sequential version with no collision.
+     */
+    it('proposeAndAuditAtomic + create concurrent against same agent → distinct versions', async () => {
+      const { operationalProfileVersionsRepo } = await import('../../src/db/repositories.js');
+      const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
 
-    // Seed v1 so concurrent writers must allocate v2 and v3.
-    const c0 = await pool.connect();
-    try {
-      await c0.query(
-        `INSERT INTO agent_operational_profile_versions
+      // Seed v1 so concurrent writers must allocate v2 and v3.
+      const c0 = await pool.connect();
+      try {
+        await c0.query(
+          `INSERT INTO agent_operational_profile_versions
            (tenant_id, agent_id, version, status, profile_body, proposed_by, proposed_reason)
          VALUES ($1, $2, 1, 'proposed', '{}'::jsonb, $3, 'seed')`,
-        [T, A, ACTOR],
-      );
-    } finally {
-      c0.release();
-    }
+          [T, A, ACTOR],
+        );
+      } finally {
+        c0.release();
+      }
 
-    // `operationalProfileVersionsRepo.create` reads tenant/agent from
-    // AsyncLocalStorage — wrap in `runWithTenantContext`.
-    const createCall = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
-      operationalProfileVersionsRepo.create({
-        profile_body: {
-          metadata: { previous_version_id: null },
-        } as unknown as Parameters<typeof operationalProfileVersionsRepo.create>[0]['profile_body'],
+      // `operationalProfileVersionsRepo.create` reads tenant/agent from
+      // AsyncLocalStorage — wrap in `runWithTenantContext`.
+      const createCall = runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
+        operationalProfileVersionsRepo.create({
+          profile_body: {
+            metadata: { previous_version_id: null },
+          } as unknown as Parameters<
+            typeof operationalProfileVersionsRepo.create
+          >[0]['profile_body'],
+          proposed_by: ACTOR,
+          proposed_reason: 'create call',
+        }),
+      );
+      const proposeCall = operationalProfileVersionsRepo.proposeAndAuditAtomic({
+        tenant_id: T,
+        agent_id: A,
+        profile_body: {},
         proposed_by: ACTOR,
-        proposed_reason: 'create call',
-      }),
-    );
-    const proposeCall = operationalProfileVersionsRepo.proposeAndAuditAtomic({
-      tenant_id: T,
-      agent_id: A,
-      profile_body: {},
-      proposed_by: ACTOR,
-      proposed_reason: 'propose call',
-      previous_active_id: null,
-      actor_id: ACTOR,
-      actor_role: 'founder',
-    });
+        proposed_reason: 'propose call',
+        previous_active_id: null,
+        actor_id: ACTOR,
+        actor_role: 'founder',
+      });
 
-    const [createRes, proposeRes] = await Promise.all([createCall, proposeCall]);
+      const [createRes, proposeRes] = await Promise.all([createCall, proposeCall]);
 
-    expect('agent_missing' in proposeRes).toBe(false);
-    if ('agent_missing' in proposeRes) throw new Error('unreachable');
+      expect('agent_missing' in proposeRes).toBe(false);
+      if ('agent_missing' in proposeRes) throw new Error('unreachable');
 
-    // Both writers must have produced distinct versions in {2, 3}.
-    const versions = [createRes.version, proposeRes.version.version].sort((x, y) => x - y);
-    expect(versions).toEqual([2, 3]);
+      // Both writers must have produced distinct versions in {2, 3}.
+      const versions = [createRes.version, proposeRes.version.version].sort((x, y) => x - y);
+      expect(versions).toEqual([2, 3]);
 
-    // And exactly 3 rows total: the seed + the 2 newly-allocated.
-    const c1 = await pool.connect();
-    try {
-      const r = await c1.query<{ count: string }>(
-        `SELECT COUNT(*)::text AS count FROM agent_operational_profile_versions
+      // And exactly 3 rows total: the seed + the 2 newly-allocated.
+      const c1 = await pool.connect();
+      try {
+        const r = await c1.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM agent_operational_profile_versions
           WHERE tenant_id = $1 AND agent_id = $2`,
-        [T, A],
-      );
-      expect(r.rows[0]!.count).toBe('3');
-    } finally {
-      c1.release();
-    }
-  });
-});
+          [T, A],
+        );
+        expect(r.rows[0]!.count).toBe('3');
+      } finally {
+        c1.release();
+      }
+    });
+  },
+);

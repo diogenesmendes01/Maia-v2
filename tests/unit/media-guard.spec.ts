@@ -62,9 +62,7 @@ describe('media-guard — constants', () => {
 describe('media-guard — containment (assertContainedRegularFile)', () => {
   it('rejects a ../ traversal that escapes the media root', async () => {
     writeFileSync(join(base, 'secret.env'), 'API_KEY=leak');
-    const code = await codeOf(
-      assertContainedRegularFile(root, join(root, '..', 'secret.env')),
-    );
+    const code = await codeOf(assertContainedRegularFile(root, join(root, '..', 'secret.env')));
     expect(code).toBe('outside_media_root');
   });
 
@@ -176,11 +174,19 @@ describe('media-guard — sniffMime / extensionForMime', () => {
     expect(sniffMime(JPEG)).toBe('image/jpeg');
     expect(sniffMime(OGG)).toBe('audio/ogg');
     expect(sniffMime(PDF)).toBe('application/pdf');
-    expect(sniffMime(Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP')]))).toBe('image/webp');
-    expect(sniffMime(Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE')]))).toBe('audio/wav');
+    expect(
+      sniffMime(Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WEBP')])),
+    ).toBe('image/webp');
+    expect(
+      sniffMime(Buffer.concat([Buffer.from('RIFF'), Buffer.alloc(4), Buffer.from('WAVE')])),
+    ).toBe('audio/wav');
     expect(sniffMime(Buffer.concat([Buffer.from('ID3'), Buffer.alloc(16)]))).toBe('audio/mpeg');
-    expect(sniffMime(Buffer.concat([Buffer.from([0xff, 0xfb]), Buffer.alloc(16)]))).toBe('audio/mpeg');
-    expect(sniffMime(Buffer.concat([Buffer.alloc(4), Buffer.from('ftypM4A '), Buffer.alloc(8)]))).toBe('audio/mp4');
+    expect(sniffMime(Buffer.concat([Buffer.from([0xff, 0xfb]), Buffer.alloc(16)]))).toBe(
+      'audio/mpeg',
+    );
+    expect(
+      sniffMime(Buffer.concat([Buffer.alloc(4), Buffer.from('ftypM4A '), Buffer.alloc(8)])),
+    ).toBe('audio/mp4');
     expect(sniffMime(Buffer.from('plain text that is long enough'))).toBeNull();
   });
 

@@ -90,9 +90,7 @@ describe('issue #535 — versioned dashboards', () => {
   });
 
   it('every recording rule a panel references exists in slo.rules.yml', () => {
-    const defined = new Set(
-      [...RULES.matchAll(/- record: (maia:[a-z_0-9:]+)/g)].map((m) => m[1]!),
-    );
+    const defined = new Set([...RULES.matchAll(/- record: (maia:[a-z_0-9:]+)/g)].map((m) => m[1]!));
     const missing = new Set<string>();
     for (const file of FILES) {
       for (const expr of expressions(load(file))) {
@@ -152,9 +150,7 @@ describe('issue #535 — versioned dashboards', () => {
       for (const expr of expressions(load(file))) {
         if (!expr.includes('maia_db_pool')) continue;
         if (expr.startsWith('maia:')) continue; // recording rule already scopes it
-        expect(expr, `${file} aggregates maia_db_pool without instance`).toContain(
-          'instance',
-        );
+        expect(expr, `${file} aggregates maia_db_pool without instance`).toContain('instance');
       }
     }
   });
@@ -163,8 +159,10 @@ describe('issue #535 — versioned dashboards', () => {
     for (const file of FILES) {
       for (const panel of load(file).panels ?? []) {
         if (panel.type === 'row') continue;
-        expect(panel.description, `${file}: panel "${panel.title}" has no description`)
-          .toBeTruthy();
+        expect(
+          panel.description,
+          `${file}: panel "${panel.title}" has no description`,
+        ).toBeTruthy();
       }
     }
   });

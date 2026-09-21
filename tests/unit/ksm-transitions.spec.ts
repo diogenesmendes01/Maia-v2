@@ -38,43 +38,23 @@ describe('P10a ALLOWED_TRANSITIONS table', () => {
   });
 
   it('pending_review transitions to active/verified/revoked', () => {
-    expect(ALLOWED_TRANSITIONS.pending_review).toEqual([
-      'active',
-      'verified',
-      'revoked',
-    ]);
+    expect(ALLOWED_TRANSITIONS.pending_review).toEqual(['active', 'verified', 'revoked']);
   });
 
   it('ephemeral transitions to observed/deprecated/revoked', () => {
-    expect(ALLOWED_TRANSITIONS.ephemeral).toEqual([
-      'observed',
-      'deprecated',
-      'revoked',
-    ]);
+    expect(ALLOWED_TRANSITIONS.ephemeral).toEqual(['observed', 'deprecated', 'revoked']);
   });
 
   it('observed transitions to reinforced/deprecated/revoked', () => {
-    expect(ALLOWED_TRANSITIONS.observed).toEqual([
-      'reinforced',
-      'deprecated',
-      'revoked',
-    ]);
+    expect(ALLOWED_TRANSITIONS.observed).toEqual(['reinforced', 'deprecated', 'revoked']);
   });
 
   it('reinforced transitions to verified/deprecated/revoked', () => {
-    expect(ALLOWED_TRANSITIONS.reinforced).toEqual([
-      'verified',
-      'deprecated',
-      'revoked',
-    ]);
+    expect(ALLOWED_TRANSITIONS.reinforced).toEqual(['verified', 'deprecated', 'revoked']);
   });
 
   it('verified transitions only to active/deprecated/revoked (no-downgrade)', () => {
-    expect(ALLOWED_TRANSITIONS.verified).toEqual([
-      'active',
-      'deprecated',
-      'revoked',
-    ]);
+    expect(ALLOWED_TRANSITIONS.verified).toEqual(['active', 'deprecated', 'revoked']);
     expect(ALLOWED_TRANSITIONS.verified).not.toContain('reinforced');
     expect(ALLOWED_TRANSITIONS.verified).not.toContain('observed');
     expect(ALLOWED_TRANSITIONS.verified).not.toContain('ephemeral');
@@ -115,66 +95,38 @@ describe('P10a assertAllowedTransition', () => {
   });
 
   it('rejects no-downgrade attempts from verified', () => {
-    expect(() => assertAllowedTransition('verified', 'reinforced')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('verified', 'observed')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('verified', 'ephemeral')).toThrow(
-      IllegalTransitionError,
-    );
+    expect(() => assertAllowedTransition('verified', 'reinforced')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('verified', 'observed')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('verified', 'ephemeral')).toThrow(IllegalTransitionError);
   });
 
   it('rejects no-downgrade attempts from active', () => {
-    expect(() => assertAllowedTransition('active', 'verified')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('active', 'reinforced')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('active', 'observed')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('active', 'ephemeral')).toThrow(
-      IllegalTransitionError,
-    );
+    expect(() => assertAllowedTransition('active', 'verified')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('active', 'reinforced')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('active', 'observed')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('active', 'ephemeral')).toThrow(IllegalTransitionError);
   });
 
   it('rejects ephemeral skipping levels', () => {
-    expect(() => assertAllowedTransition('ephemeral', 'verified')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('ephemeral', 'active')).toThrow(
-      IllegalTransitionError,
-    );
+    expect(() => assertAllowedTransition('ephemeral', 'verified')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('ephemeral', 'active')).toThrow(IllegalTransitionError);
     expect(() => assertAllowedTransition('ephemeral', 'reinforced')).toThrow(
       IllegalTransitionError,
     );
   });
 
   it('rejects deprecated → anything except revoked', () => {
-    expect(() => assertAllowedTransition('deprecated', 'active')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('deprecated', 'verified')).toThrow(
-      IllegalTransitionError,
-    );
+    expect(() => assertAllowedTransition('deprecated', 'active')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('deprecated', 'verified')).toThrow(IllegalTransitionError);
     expect(() => assertAllowedTransition('deprecated', 'ephemeral')).toThrow(
       IllegalTransitionError,
     );
   });
 
   it('rejects every transition out of revoked', () => {
-    expect(() => assertAllowedTransition('revoked', 'active')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('revoked', 'deprecated')).toThrow(
-      IllegalTransitionError,
-    );
-    expect(() => assertAllowedTransition('revoked', 'ephemeral')).toThrow(
-      IllegalTransitionError,
-    );
+    expect(() => assertAllowedTransition('revoked', 'active')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('revoked', 'deprecated')).toThrow(IllegalTransitionError);
+    expect(() => assertAllowedTransition('revoked', 'ephemeral')).toThrow(IllegalTransitionError);
   });
 
   it('carries from/to on IllegalTransitionError for audit', () => {
@@ -193,9 +145,7 @@ describe('P10a assertAllowedTransition', () => {
 });
 
 describe('P10a property: graph invariants (BFS-exhaustive)', () => {
-  function bfsReachable(
-    start: KnowledgeLifecycleStatus,
-  ): Set<KnowledgeLifecycleStatus> {
+  function bfsReachable(start: KnowledgeLifecycleStatus): Set<KnowledgeLifecycleStatus> {
     const reached = new Set<KnowledgeLifecycleStatus>([start]);
     const queue: KnowledgeLifecycleStatus[] = [start];
     while (queue.length) {

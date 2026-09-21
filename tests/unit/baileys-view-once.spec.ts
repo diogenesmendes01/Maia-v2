@@ -76,7 +76,9 @@ describe('sendOutboundText — view_once envelope contract', () => {
   it('passes { text, viewOnce: true } when opts.view_once && FEATURE_VIEW_ONCE_SENSITIVE', async () => {
     const mod = baileys();
     mod._internal._setSocketForTests(fakeSocket as never, true);
-    await mod.sendOutboundText('5511999999999@s.whatsapp.net', 'Saldo R$ 1.234', { view_once: true });
+    await mod.sendOutboundText('5511999999999@s.whatsapp.net', 'Saldo R$ 1.234', {
+      view_once: true,
+    });
     expect(sendMessage).toHaveBeenCalledTimes(1);
     expect(sendMessage).toHaveBeenCalledWith(
       '5511999999999@s.whatsapp.net',

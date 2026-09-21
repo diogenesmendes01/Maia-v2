@@ -38,9 +38,9 @@ function mkEnv(overrides?: Partial<CreateDecisionEngineEnv>): CreateDecisionEngi
     getBodySync: vi.fn().mockReturnValue(null),
   };
   const skillsRepo: SkillsRepo = {
-    findActive: vi.fn().mockResolvedValue([
-      { id: 'skill_x', category: 'respond', priority: 1, status: 'active' },
-    ]),
+    findActive: vi
+      .fn()
+      .mockResolvedValue([{ id: 'skill_x', category: 'respond', priority: 1, status: 'active' }]),
     find: vi.fn().mockResolvedValue({
       id: 'skill_x',
       category: 'respond',
@@ -106,8 +106,6 @@ describe('P11 — runDecisionEngineIfEnabled shim (always-on)', () => {
     );
     expect(r.engine_ran).toBe(false);
     expect(r.skip_reason).toBe('engine_error');
-    expect(metrics.increment).toHaveBeenCalledWith(
-      'decision_engine.error_fallback',
-    );
+    expect(metrics.increment).toHaveBeenCalledWith('decision_engine.error_fallback');
   });
 });

@@ -19,9 +19,10 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 // Bypass async-storage check on the facade unit (irrelevant for these tests —
 // we're inspecting the resolver-level SQL emission, not facade routing).
 vi.mock('@/db/tenant-context.js', async () => {
-  const actual = await vi.importActual<typeof import('../../../src/db/tenant-context.js')>(
-    '@/db/tenant-context.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('../../../src/db/tenant-context.js')>(
+      '@/db/tenant-context.js',
+    );
   return {
     ...actual,
     tryGetCurrentContext: () => null,
@@ -90,11 +91,7 @@ function makeExecuteCapture() {
               if (Array.isArray(c.value)) return `[${c.value.map(String).join(',')}]`;
               if (c.name) return c.name;
               return JSON.stringify(c, (_k, v) =>
-                typeof v === 'object' && v !== null
-                  ? Array.isArray(v)
-                    ? v
-                    : '[obj]'
-                  : v,
+                typeof v === 'object' && v !== null ? (Array.isArray(v) ? v : '[obj]') : v,
               );
             }
             return String(chunk);
@@ -283,7 +280,12 @@ describe('Cross-tenant isolation — all resolvers, all access patterns', () => 
         { tenant_id: TENANT_A, limit: 10 },
         { tenant_id: TENANT_A, scope: ['tenant' as const], limit: 10 },
         { tenant_id: TENANT_A, keys: ['k1'], limit: 10 },
-        { tenant_id: TENANT_A, scope: ['tenant' as const, 'domain' as const], keys: ['k1', 'k2'], limit: 10 },
+        {
+          tenant_id: TENANT_A,
+          scope: ['tenant' as const, 'domain' as const],
+          keys: ['k1', 'k2'],
+          limit: 10,
+        },
       ];
       for (const v of variants) {
         captured.sql = [];

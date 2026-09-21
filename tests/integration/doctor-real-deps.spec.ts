@@ -29,11 +29,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
-import {
-  doctorPostgresPool,
-  readOnlyPostgres,
-  READ_ONLY_SQLSTATE,
-} from '@/ops/doctor/postgres.js';
+import { doctorPostgresPool, readOnlyPostgres, READ_ONLY_SQLSTATE } from '@/ops/doctor/postgres.js';
 import {
   SchemaEvaluationAbortedError,
   withReadOnlySchemaTransaction,
@@ -178,7 +174,11 @@ d('maia doctor · dependências reais', () => {
         DATABASE_URL: DB_URL,
         REDIS_URL,
       });
-      const a = JSON.parse(first.out) as { schema_version: string; run_id: string; checks: unknown[] };
+      const a = JSON.parse(first.out) as {
+        schema_version: string;
+        run_id: string;
+        checks: unknown[];
+      };
       const b = JSON.parse(second.out) as { run_id: string };
       expect(a.schema_version).toBe('1.1');
       expect(a.checks.length).toBeGreaterThan(0);
@@ -436,10 +436,10 @@ d('maia doctor · dependências reais', () => {
     }, 30_000);
 
     it('--skip marca SKIP com aviso visível, nunca sucesso silencioso', async () => {
-      const { out } = await runCli(
-        ['--online', '--only', 'redis', '--skip', 'redis.persistence'],
-        { DATABASE_URL: DB_URL, REDIS_URL },
-      );
+      const { out } = await runCli(['--online', '--only', 'redis', '--skip', 'redis.persistence'], {
+        DATABASE_URL: DB_URL,
+        REDIS_URL,
+      });
       expect(out).toContain('[SKIP] redis.persistence');
       expect(out).toContain('DESABILITADO');
     }, 30_000);

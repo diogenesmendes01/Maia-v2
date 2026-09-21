@@ -93,9 +93,7 @@ export async function withReadOnlySchemaTransaction<T>(
   evaluate: (roPool: ReadOnlyPool) => Promise<T>,
   options: ReadOnlySchemaOptions = {},
 ): Promise<T> {
-  const timeoutMs = Math.trunc(
-    options.statementTimeoutMs ?? SCHEMA_READINESS_STATEMENT_TIMEOUT_MS,
-  );
+  const timeoutMs = Math.trunc(options.statementTimeoutMs ?? SCHEMA_READINESS_STATEMENT_TIMEOUT_MS);
   const signal = options.signal;
   const client = await pool.connect();
   let abandoned = false;

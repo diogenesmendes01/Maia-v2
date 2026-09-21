@@ -15,10 +15,7 @@ import { assertSafeAuthDir } from '@/setup/auth-dir-path.js';
 // can honour, so the boot gate asks it instead of restating the formula (which
 // is how the two would drift). Same direction as the `@/setup` import above —
 // this module stays pure, it just does not re-implement other modules' rules.
-import {
-  DRILL_TICK_HOURS,
-  minHonourableDrillIntervalHours,
-} from '@/ops/backup/drill-schedule.js';
+import { DRILL_TICK_HOURS, minHonourableDrillIntervalHours } from '@/ops/backup/drill-schedule.js';
 // Mesma direção dos imports acima: a regra de lease PERGUNTA ao contrato de
 // claim qual relação é segura, em vez de reescrever a fórmula (que é como as
 // duas divergiriam).
@@ -187,10 +184,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
     });
   }
 
-  if (
-    str(c.OWNER_TELEFONE_WHATSAPP) &&
-    c.OWNER_TELEFONE_WHATSAPP === c.WHATSAPP_NUMBER_MAIA
-  ) {
+  if (str(c.OWNER_TELEFONE_WHATSAPP) && c.OWNER_TELEFONE_WHATSAPP === c.WHATSAPP_NUMBER_MAIA) {
     push({
       scope: 'boot',
       severity: 'error',
@@ -439,10 +433,8 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
           severity: 'error',
           variable: 'BACKUP_RESTORE_DRILL_INTERVAL_HOURS',
           rule: 'backup/drill-interval-feasible',
-          message:
-            `BACKUP_RESTORE_DRILL_INTERVAL_HOURS=${drillIntervalHours} cannot be honoured by the restore-drill scheduler, which needs at least ${floorHours}h here: it wakes every ${DRILL_TICK_HOURS}h and starts the drill at 75% of the interval, leaving 25% for a drill bounded by BACKUP_UPLOAD_TIMEOUT_MS (${Math.round(drillUploadMs / 60_000)}min) + BACKUP_RESTORE_TIMEOUT_MS (${Math.round(drillRestoreMs / 60_000)}min). The evidence would expire before it could be refreshed — do not advertise a maximum evidence age the architecture cannot meet.`,
-          remediation:
-            `Use BACKUP_RESTORE_DRILL_INTERVAL_HOURS >= ${floorHours}, ou reduza BACKUP_UPLOAD_TIMEOUT_MS/BACKUP_RESTORE_TIMEOUT_MS (o piso é derivado deles e da cadência do tick).`,
+          message: `BACKUP_RESTORE_DRILL_INTERVAL_HOURS=${drillIntervalHours} cannot be honoured by the restore-drill scheduler, which needs at least ${floorHours}h here: it wakes every ${DRILL_TICK_HOURS}h and starts the drill at 75% of the interval, leaving 25% for a drill bounded by BACKUP_UPLOAD_TIMEOUT_MS (${Math.round(drillUploadMs / 60_000)}min) + BACKUP_RESTORE_TIMEOUT_MS (${Math.round(drillRestoreMs / 60_000)}min). The evidence would expire before it could be refreshed — do not advertise a maximum evidence age the architecture cannot meet.`,
+          remediation: `Use BACKUP_RESTORE_DRILL_INTERVAL_HOURS >= ${floorHours}, ou reduza BACKUP_UPLOAD_TIMEOUT_MS/BACKUP_RESTORE_TIMEOUT_MS (o piso é derivado deles e da cadência do tick).`,
         });
       }
     }
@@ -463,8 +455,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
         rule: 'backup/retention-ordering',
         message:
           'cloud retention is shorter than local retention while off-site is required — the authoritative copy would expire before the local one.',
-        remediation:
-          'Aumente BACKUP_RETENTION_CLOUD_DAYS para >= BACKUP_RETENTION_LOCAL_DAYS.',
+        remediation: 'Aumente BACKUP_RETENTION_CLOUD_DAYS para >= BACKUP_RETENTION_LOCAL_DAYS.',
       });
     }
   }
@@ -478,8 +469,7 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       severity: 'warning',
       variable: 'RETENTION_DRY_RUN',
       rule: 'retention/dry-run-disabled',
-      message:
-        'RETENTION_DRY_RUN=false: o executor de retenção pode APAGAR dados neste ambiente.',
+      message: 'RETENTION_DRY_RUN=false: o executor de retenção pode APAGAR dados neste ambiente.',
       remediation:
         'Confirme que a política de retenção foi aprovada pelo jurídico/DPO e que as contagens do dry-run foram conferidas — ver docs/architecture/concerns/data-retention-matrix.md.',
     });
@@ -657,7 +647,8 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       rule: 'routing/multi-line-mode',
       message:
         'MAIA_MULTI_LINE=true com MAIA_CHANNEL_ROUTING_MODE=shadow: o transporte por linha ficaria ligado enquanto o roteamento ainda cai no catch-all legado.',
-      remediation: 'Use MAIA_CHANNEL_ROUTING_MODE=exact_first (ou strict) junto com MAIA_MULTI_LINE=true.',
+      remediation:
+        'Use MAIA_CHANNEL_ROUTING_MODE=exact_first (ou strict) junto com MAIA_MULTI_LINE=true.',
     });
   }
   if (routingMode === 'strict') {
@@ -681,7 +672,8 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       rule: 'probe/routing-prerequisite',
       message:
         'MAIA_SYNTHETIC_PROBE=true sob MAIA_CHANNEL_ROUTING_MODE=shadow: o worker falha fechado (no-op + audit synthetic_probe_prereq_unmet).',
-      remediation: 'Suba MAIA_CHANNEL_ROUTING_MODE para exact_first ou strict antes de ligar a sonda.',
+      remediation:
+        'Suba MAIA_CHANNEL_ROUTING_MODE para exact_first ou strict antes de ligar a sonda.',
     });
   }
 
@@ -907,7 +899,8 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
       variable: 'ALLOW_DEV_AUTH',
       rule: 'admin-ui/dev-auth-forbidden',
       message: `ALLOW_DEV_AUTH=true é proibido no profile ${profile}: o login por token compartilhado ignora o IdP.`,
-      remediation: 'Deixe ALLOW_DEV_AUTH=false e configure OIDC_* (issuer https, client id/secret, tenant slugs).',
+      remediation:
+        'Deixe ALLOW_DEV_AUTH=false e configure OIDC_* (issuer https, client id/secret, tenant slugs).',
     });
   }
 
@@ -931,7 +924,10 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
   // OIDC_TENANT_SLUGS nunca pode cair no literal `default` (invariante Maia §2/§8).
   const slugs = str(raw.OIDC_TENANT_SLUGS);
   if (slugs) {
-    const parsed = slugs.split(',').map((s) => s.trim()).filter(Boolean);
+    const parsed = slugs
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
     if (parsed.length === 0) {
       push({
         scope: 'contract',

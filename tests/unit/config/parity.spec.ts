@@ -64,28 +64,25 @@ const DEPLOYMENT_FILES = [
 ];
 
 describe('contract ↔ deployment parity (#515)', () => {
-  it.each(DEPLOYMENT_FILES)(
-    '%s references no unknown or removed Maia variable',
-    (file) => {
-      const offenders: string[] = [];
-      for (const key of referencedEnvKeys(read(file))) {
-        if (NON_CONTRACT_DEPLOYMENT_KEYS.has(key)) continue;
-        if (findTombstone(key)) {
-          offenders.push(`${key} (REMOVIDA — tombstone)`);
-          continue;
-        }
-        if (findSpec(key)) continue;
-        if (isMaiaNamespacedKey(key) && isUnknownMaiaKey(key)) {
-          offenders.push(`${key} (desconhecida no contrato)`);
-        }
+  it.each(DEPLOYMENT_FILES)('%s references no unknown or removed Maia variable', (file) => {
+    const offenders: string[] = [];
+    for (const key of referencedEnvKeys(read(file))) {
+      if (NON_CONTRACT_DEPLOYMENT_KEYS.has(key)) continue;
+      if (findTombstone(key)) {
+        offenders.push(`${key} (REMOVIDA — tombstone)`);
+        continue;
       }
-      expect(
-        offenders,
-        `${file} names variables the contract does not know: ${offenders.join(', ')}. ` +
-          'Declare-as em src/config/contract.ts ou remova-as do deploy.',
-      ).toEqual([]);
-    },
-  );
+      if (findSpec(key)) continue;
+      if (isMaiaNamespacedKey(key) && isUnknownMaiaKey(key)) {
+        offenders.push(`${key} (desconhecida no contrato)`);
+      }
+    }
+    expect(
+      offenders,
+      `${file} names variables the contract does not know: ${offenders.join(', ')}. ` +
+        'Declare-as em src/config/contract.ts ou remova-as do deploy.',
+    ).toEqual([]);
+  });
 
   it('every variable the runtime container receives is declared for the runtime service', () => {
     const compose = read('compose.prod.yml');
@@ -129,16 +126,13 @@ describe('Node/npm version parity (#515)', () => {
     expect(pkg.engines.npm).toContain('11.5.2');
   });
 
-  it.each(['Dockerfile', 'src/admin-ui/Dockerfile'])(
-    '%s builds on the same Node line',
-    (file) => {
-      const froms = [...read(file).matchAll(/^FROM\s+node:(\d+)/gm)].map((m) => m[1]);
-      expect(froms.length).toBeGreaterThan(0);
-      for (const major of froms) {
-        expect(major, `${file} pins node:${major}, .nvmrc says ${NODE_MAJOR}`).toBe(NODE_MAJOR);
-      }
-    },
-  );
+  it.each(['Dockerfile', 'src/admin-ui/Dockerfile'])('%s builds on the same Node line', (file) => {
+    const froms = [...read(file).matchAll(/^FROM\s+node:(\d+)/gm)].map((m) => m[1]);
+    expect(froms.length).toBeGreaterThan(0);
+    for (const major of froms) {
+      expect(major, `${file} pins node:${major}, .nvmrc says ${NODE_MAJOR}`).toBe(NODE_MAJOR);
+    }
+  });
 
   it('README and AGENTS.md document the same line they pin', () => {
     const readme = read('README.md');

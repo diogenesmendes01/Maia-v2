@@ -8,9 +8,7 @@ import { describe, it, expect } from 'vitest';
 import { buildPromptFromPacket } from '@/runtime/prompt/build-prompt-from-packet.js';
 import type { ExecutionContextPacket } from '@/runtime/context-packet/types.js';
 
-const minimalPacket = (
-  overrides?: Partial<ExecutionContextPacket>,
-): ExecutionContextPacket => ({
+const minimalPacket = (overrides?: Partial<ExecutionContextPacket>): ExecutionContextPacket => ({
   trace_id: 't1',
   tenant_id: 'tenant1',
   agent_id: 'agent1',
@@ -230,9 +228,7 @@ describe('buildPromptFromPacket', () => {
               proactive_use: true,
             },
           ],
-          behavioral_hints: [
-            { aspect: 'ritmo', suggestion: 'mais devagar', strength: 0.6 },
-          ],
+          behavioral_hints: [{ aspect: 'ritmo', suggestion: 'mais devagar', strength: 0.6 }],
           truncated: false,
         },
       }),

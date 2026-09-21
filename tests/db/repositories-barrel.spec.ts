@@ -20,7 +20,9 @@ vi.mock('../../src/db/client.js', () => ({
       from: vi.fn(() => ({ where: vi.fn(() => ({ limit: vi.fn(() => []) })) })),
     })),
     insert: vi.fn(() => ({ values: vi.fn(() => ({ returning: vi.fn(async () => []) })) })),
-    update: vi.fn(() => ({ set: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(async () => []) })) })) })),
+    update: vi.fn(() => ({
+      set: vi.fn(() => ({ where: vi.fn(() => ({ returning: vi.fn(async () => []) })) })),
+    })),
     delete: vi.fn(() => ({ where: vi.fn(async () => []) })),
   },
   withTx: vi.fn(),

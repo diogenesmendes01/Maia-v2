@@ -23,4 +23,6 @@ setInterval(() => {
   process.stdout.write(`##fi-pulso## ${JSON.stringify({ n })}\n`);
 }, 50);
 
-process.stdout.write(`${LINHA_PRONTO} ${JSON.stringify({ pid: process.pid, papel: 'pulsante' })}\n`);
+process.stdout.write(
+  `${LINHA_PRONTO} ${JSON.stringify({ pid: process.pid, papel: 'pulsante' })}\n`,
+);

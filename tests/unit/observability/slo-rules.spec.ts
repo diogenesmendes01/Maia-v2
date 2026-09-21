@@ -120,10 +120,9 @@ describe('issue #514 — SLO rules ↔ code drift guard', () => {
   it('every metric the rules reference is actually emitted somewhere', () => {
     const known = new Set<string>([...METRIC_NAMES, ...Object.keys(PRE_EXISTING_METRICS)]);
     const unknown = referencedMetrics(rules).filter((m) => !known.has(m));
-    expect(
-      unknown,
-      `rules reference metrics that nothing emits: ${unknown.join(', ')}`,
-    ).toEqual([]);
+    expect(unknown, `rules reference metrics that nothing emits: ${unknown.join(', ')}`).toEqual(
+      [],
+    );
   });
 
   it('every alert declares a severity and points at a runbook', () => {
@@ -194,9 +193,7 @@ describe('issue #514 — SLO rules ↔ code drift guard', () => {
         .split('\n')
         .filter((line) => !/^\s*#/.test(line))
         .join('\n');
-      return [...code.matchAll(/maia_turn_completed_total(\{[^}]*\})?/g)].map(
-        (m) => m[1] ?? '',
-      );
+      return [...code.matchAll(/maia_turn_completed_total(\{[^}]*\})?/g)].map((m) => m[1] ?? '');
     }
 
     it('no selector aggregates the counter without an outcome filter', () => {
@@ -256,10 +253,9 @@ describe('issue #514 — SLO rules ↔ code drift guard', () => {
     const runbook = readFileSync(RUNBOOK_PATH, 'utf8');
     const alerts = [...rules.matchAll(/- alert: (\w+)/g)].map((m) => m[1]!);
     const undocumented = alerts.filter((a) => !runbook.includes(a));
-    expect(
-      undocumented,
-      `alerts with no operator guidance: ${undocumented.join(', ')}`,
-    ).toEqual([]);
+    expect(undocumented, `alerts with no operator guidance: ${undocumented.join(', ')}`).toEqual(
+      [],
+    );
   });
 
   it('no alert leaks a high-cardinality id through an annotation template', () => {
@@ -335,7 +331,8 @@ describe('issue #534 — alerta de `resync_failed` preserva `instance`', () => {
     // `avg(...)`, ou uma razão sobre o total de releituras. Qualquer um deles
     // apaga o `instance` — e uma réplica divergente entre vinte, que é o caso
     // do alerta, some.
-    const AGGREGATORS = /\b(sum|avg|min|max|count|count_values|topk|bottomk|quantile|group|stddev|stdvar)\s*(by|without)?\s*(\([^)]*\))?\s*\(/;
+    const AGGREGATORS =
+      /\b(sum|avg|min|max|count|count_values|topk|bottomk|quantile|group|stddev|stdvar)\s*(by|without)?\s*(\([^)]*\))?\s*\(/;
     for (const name of Object.keys(RESYNC_ALERTS)) {
       const expr = exprOf(alertBlock(name));
       expect(expr, `${name} agrega a série e perde o \`instance\`: ${expr}`).not.toMatch(

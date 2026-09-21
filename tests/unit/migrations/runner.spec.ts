@@ -39,7 +39,8 @@ const TX_B = 'CREATE TABLE b (id TEXT);\n';
 /** `self` mode: the file owns its transaction, so the ledger cannot join it. */
 const SELF_TX = 'BEGIN;\nCREATE TABLE c (id TEXT);\nCOMMIT;\n';
 /** `none` mode: CONCURRENTLY DDL, which Postgres refuses inside a transaction. */
-const NO_TX = '-- maia:no-transaction\nCREATE INDEX CONCURRENTLY i1 ON a (id);\nCREATE INDEX CONCURRENTLY i2 ON a (id);\n';
+const NO_TX =
+  '-- maia:no-transaction\nCREATE INDEX CONCURRENTLY i1 ON a (id);\nCREATE INDEX CONCURRENTLY i2 ON a (id);\n';
 /**
  * `self` mode WITHOUT the guarantee: the same `BEGIN;` as `SELF_TX`, but a
  * statement outside the envelope. The DDL is durable before that statement runs.
@@ -159,7 +160,8 @@ describe('runMigrations — no-transaction path', () => {
     const events: { event: string; detail: Record<string, unknown> }[] = [];
     const db = new FakeDb({
       failOnSql: (sql) => {
-        if (sql.includes('i2')) throw Object.assign(new Error('deadlock detected'), { code: '40P01' });
+        if (sql.includes('i2'))
+          throw Object.assign(new Error('deadlock detected'), { code: '40P01' });
       },
     });
     const result = await runMigrations(deps(db, events));
@@ -183,7 +185,9 @@ describe('runMigrations — no-transaction path', () => {
 
   it('blocks every subsequent run while the dirty row stands', async () => {
     await write('001_idx.sql', NO_TX);
-    const db = new FakeDb({ rows: [{ id: '001_idx.sql', status: 'dirty', checksum_sha256: migrationChecksum(NO_TX) }] });
+    const db = new FakeDb({
+      rows: [{ id: '001_idx.sql', status: 'dirty', checksum_sha256: migrationChecksum(NO_TX) }],
+    });
     const result = await runMigrations(deps(db));
     expect(result.outcome).toBe('blocked');
     expect(result.blockers.map((b) => b.kind)).toContain('dirty_migration');
@@ -236,7 +240,8 @@ describe('runMigrations — transactional failure', () => {
     await write('002_b.sql', TX_B);
     const db = new FakeDb({
       failOnSql: (sql) => {
-        if (sql.includes('CREATE TABLE a')) throw Object.assign(new Error('relation exists'), { code: '42P07' });
+        if (sql.includes('CREATE TABLE a'))
+          throw Object.assign(new Error('relation exists'), { code: '42P07' });
       },
     });
     const result = await runMigrations(deps(db));
@@ -262,7 +267,14 @@ describe('runMigrations — transactional failure', () => {
   it('never downgrades an already-applied row when recording a failure', async () => {
     await write('001_a.sql', TX_A);
     const db = new FakeDb({
-      rows: [{ id: '001_a.sql', status: 'applied', checksum_sha256: migrationChecksum(TX_A), checksum_source: 'computed' }],
+      rows: [
+        {
+          id: '001_a.sql',
+          status: 'applied',
+          checksum_sha256: migrationChecksum(TX_A),
+          checksum_source: 'computed',
+        },
+      ],
     });
     await runMigrations(deps(db));
     expect(db.ledger.get('001_a.sql')!.status).toBe('applied');
@@ -275,7 +287,14 @@ describe('runMigrations — fail-closed gates', () => {
     await write('002_b.sql', TX_B);
     const events: { event: string; detail: Record<string, unknown> }[] = [];
     const db = new FakeDb({
-      rows: [{ id: '001_a.sql', status: 'applied', checksum_sha256: 'f'.repeat(64), checksum_source: 'computed' }],
+      rows: [
+        {
+          id: '001_a.sql',
+          status: 'applied',
+          checksum_sha256: 'f'.repeat(64),
+          checksum_source: 'computed',
+        },
+      ],
     });
     const result = await runMigrations(deps(db, events));
 
@@ -291,8 +310,18 @@ describe('runMigrations — fail-closed gates', () => {
     await write('001_a.sql', TX_A);
     const db = new FakeDb({
       rows: [
-        { id: '001_a.sql', status: 'applied', checksum_sha256: migrationChecksum(TX_A), checksum_source: 'computed' },
-        { id: '099_ghost.sql', status: 'applied', checksum_sha256: 'a'.repeat(64), checksum_source: 'computed' },
+        {
+          id: '001_a.sql',
+          status: 'applied',
+          checksum_sha256: migrationChecksum(TX_A),
+          checksum_source: 'computed',
+        },
+        {
+          id: '099_ghost.sql',
+          status: 'applied',
+          checksum_sha256: 'a'.repeat(64),
+          checksum_source: 'computed',
+        },
       ],
     });
     const result = await runMigrations(deps(db));
@@ -410,7 +439,9 @@ describe('runMigrations — crash recovery and checksum adoption', () => {
     expect(db.ledger.get('001_idx.sql')!.error_class).toBe('orphaned_running');
     expect(result.outcome).toBe('blocked');
     expect(db.executedSql).toEqual([]);
-    expect(events.find((e) => e.event === 'migration.dirty')?.detail.cause).toBe('orphaned_running');
+    expect(events.find((e) => e.event === 'migration.dirty')?.detail.cause).toBe(
+      'orphaned_running',
+    );
   });
 
   it('adopts checksums for pre-checksum rows and marks them `backfilled`', async () => {
@@ -493,7 +524,11 @@ describe('repairMigration', () => {
   it('refuses without a reason — the reason IS the audit trail', async () => {
     await write('001_idx.sql', NO_TX);
     const db = new FakeDb({ rows: [{ id: '001_idx.sql', status: 'dirty' }] });
-    const result = await repairMigration(deps(db), { id: '001_idx.sql', outcome: 'applied', reason: '   ' });
+    const result = await repairMigration(deps(db), {
+      id: '001_idx.sql',
+      outcome: 'applied',
+      reason: '   ',
+    });
     expect(result.ok).toBe(false);
     expect(db.ledger.get('001_idx.sql')!.status).toBe('dirty');
   });
@@ -534,9 +569,20 @@ describe('repairMigration', () => {
   it('refuses to rewrite a healthy applied row', async () => {
     await write('001_a.sql', TX_A);
     const db = new FakeDb({
-      rows: [{ id: '001_a.sql', status: 'applied', checksum_sha256: migrationChecksum(TX_A), checksum_source: 'computed' }],
+      rows: [
+        {
+          id: '001_a.sql',
+          status: 'applied',
+          checksum_sha256: migrationChecksum(TX_A),
+          checksum_source: 'computed',
+        },
+      ],
     });
-    const result = await repairMigration(deps(db), { id: '001_a.sql', outcome: 'pending', reason: 'oops' });
+    const result = await repairMigration(deps(db), {
+      id: '001_a.sql',
+      outcome: 'pending',
+      reason: 'oops',
+    });
     expect(result.ok).toBe(false);
     expect(db.ledger.get('001_a.sql')!.status).toBe('applied');
   });
@@ -682,7 +728,8 @@ describe('runMigrations — `status` on the failure path describes the ledger AF
     await write('003_c.sql', TX_C);
     const db = new FakeDb({
       failOnSql: (sql) => {
-        if (sql.includes('CREATE TABLE b')) throw Object.assign(new Error('boom'), { code: '42P07' });
+        if (sql.includes('CREATE TABLE b'))
+          throw Object.assign(new Error('boom'), { code: '42P07' });
       },
     });
 
@@ -802,8 +849,8 @@ describe('runMigrations — the self-transactional envelope guardrail', () => {
       terminalLedgerStatusFor({ transactionMode: 'self', transactionEnvelope: 'unverifiable' }),
     ).toBe('dirty');
     // No transaction at all: a partial change is the expected failure mode.
-    expect(terminalLedgerStatusFor({ transactionMode: 'none', transactionEnvelope: 'absent' })).toBe(
-      'dirty',
-    );
+    expect(
+      terminalLedgerStatusFor({ transactionMode: 'none', transactionEnvelope: 'absent' }),
+    ).toBe('dirty');
   });
 });

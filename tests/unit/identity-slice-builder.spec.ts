@@ -195,9 +195,7 @@ describe('identity-slice-builder (§5)', () => {
   });
 
   it('handles malformed profile_body defensively', async () => {
-    getActiveMock.mockResolvedValue(
-      makeProfile({ identity: {} as Record<string, unknown> }),
-    );
+    getActiveMock.mockResolvedValue(makeProfile({ identity: {} as Record<string, unknown> }));
     const slice = await buildIdentitySlice({ depth: 'minimal' });
     if (!slice) throw new Error('expected slice');
     expect(slice.role_descriptor).toBe('unset');
@@ -272,8 +270,9 @@ describe('identity-slice-builder (§5)', () => {
       },
     });
     // Direct-embed legacy layer left by migration 061.
-    (profile.profile_body as unknown as Record<string, unknown>).core_immutable =
-      { principles: ['transparência radical', 'preservar a evidência'] };
+    (profile.profile_body as unknown as Record<string, unknown>).core_immutable = {
+      principles: ['transparência radical', 'preservar a evidência'],
+    };
     getActiveMock.mockResolvedValue(profile);
     const slice = await buildIdentitySlice({ depth: 'full' });
     if (!slice) throw new Error('expected slice');

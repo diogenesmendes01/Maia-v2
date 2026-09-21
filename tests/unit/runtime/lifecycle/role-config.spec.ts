@@ -22,10 +22,7 @@ import {
   configGroupsForRole,
   roleReadsConfigGroup,
 } from '../../../../src/runtime/lifecycle/role-config.js';
-import {
-  DEFAULT_JOB_GROUPS,
-  JOB_GROUPS,
-} from '../../../../src/workers/job-contract.js';
+import { DEFAULT_JOB_GROUPS, JOB_GROUPS } from '../../../../src/workers/job-contract.js';
 
 /** Grupos que existem no contrato E têm ao menos uma variável do `runtime`. */
 const RUNTIME_GROUPS: ConfigGroup[] = [
@@ -88,7 +85,9 @@ describe('least privilege por process role (#513 §10)', () => {
    * `startWorkers(1)`), ele NÃO precisa de chave de LLM.
    */
   it('o scheduler default não precisa de chave de LLM; ligar `cognition` muda isso', () => {
-    const padrao = new Set(configGroupsForRole('scheduler', DEFAULT_JOB_GROUPS).flatMap(varsOfGroup));
+    const padrao = new Set(
+      configGroupsForRole('scheduler', DEFAULT_JOB_GROUPS).flatMap(varsOfGroup),
+    );
     expect(padrao.has('ANTHROPIC_API_KEY')).toBe(false);
 
     const comCognicao = new Set(

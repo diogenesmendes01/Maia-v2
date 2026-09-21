@@ -95,10 +95,7 @@ async function refresh(): Promise<void> {
       // carrega a DSN inteira, e habilitar debug para investigar Postgres é
       // exatamente quando ela seria escrita. Mesmo recorte sanitizado e
       // bounded do worker desta área, agora compartilhado — sem `cause`.
-      logger.debug(
-        { err: safeFailure(err) },
-        'onboarding_expiry_collector.refresh_failed',
-      );
+      logger.debug({ err: safeFailure(err) }, 'onboarding_expiry_collector.refresh_failed');
     } finally {
       inFlight = null;
     }
@@ -124,9 +121,7 @@ function read(field: keyof OnboardingExpiryBacklog): () => Promise<number> {
  * substituiria, nunca empilharia), e a flag impede que ciclos repetidos de
  * `buildServer()` em teste troquem a fonte por baixo de um snapshot vivo.
  */
-export function registerOnboardingExpiryGauges(
-  backlogSource: OnboardingExpiryBacklogSource,
-): void {
+export function registerOnboardingExpiryGauges(backlogSource: OnboardingExpiryBacklogSource): void {
   source = backlogSource;
   if (registered) return;
   gauge(METRIC.ONBOARDING_EXPIRY_BACKLOG, read('backlog'));

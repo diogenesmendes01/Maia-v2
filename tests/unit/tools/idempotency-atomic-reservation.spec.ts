@@ -70,10 +70,7 @@ const { recorder } = vi.hoisted(() => ({
     }>,
     releaseReservationCalls: [] as Array<{ key: string; reservation_token: string }>,
     handlerCalls: 0,
-    handlerImpl: (async () => ({ ok: true })) as (
-      args: unknown,
-      ctx: unknown,
-    ) => Promise<unknown>,
+    handlerImpl: (async () => ({ ok: true })) as (args: unknown, ctx: unknown) => Promise<unknown>,
   },
 }));
 
@@ -95,12 +92,10 @@ vi.mock('@/db/repositories.js', () => ({
         return recorder.markCompletedResult;
       },
     ),
-    releaseReservation: vi.fn(
-      async (input: { key: string; reservation_token: string }) => {
-        recorder.releaseReservationCalls.push(input);
-        return true;
-      },
-    ),
+    releaseReservation: vi.fn(async (input: { key: string; reservation_token: string }) => {
+      recorder.releaseReservationCalls.push(input);
+      return true;
+    }),
     // Legacy paths kept for backward compat; dispatcher should NOT touch
     // them in the post-#298 flow.
     lookup: vi.fn(async () => null),

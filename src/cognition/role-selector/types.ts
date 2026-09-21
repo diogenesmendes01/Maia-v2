@@ -19,8 +19,8 @@ export type RoleSelectorInput = {
   available_roles: Role[];
   policy: ChannelPolicy;
   conversa_id?: string;
-  channel_id?: string;   // propagado para audit (role_selector_decisions.channel_id)
-  turno_id?: string;     // opcional, propagado para audit
+  channel_id?: string; // propagado para audit (role_selector_decisions.channel_id)
+  turno_id?: string; // opcional, propagado para audit
   /**
    * Issue #507 (achado 2 da revisão do dono) — cancelamento da tentativa de
    * turno, vindo do node do grafo já composto com o timeout de 3 s do node.

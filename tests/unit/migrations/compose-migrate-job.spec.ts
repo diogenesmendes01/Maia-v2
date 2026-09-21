@@ -21,7 +21,13 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { asMap, asString, interpolate, parseComposeFile, type ComposeNode } from './_compose-yaml.js';
+import {
+  asMap,
+  asString,
+  interpolate,
+  parseComposeFile,
+  type ComposeNode,
+} from './_compose-yaml.js';
 import { loadServiceConfig } from '@/config/load.js';
 import { CONTRACT_ENTRIES, entriesForService } from '@/config/contract.js';
 
@@ -49,20 +55,27 @@ function service(path: string, name: string): Record<string, ComposeNode> {
 
 describe.each(FILES)('$label — one-shot migrate job (#516)', ({ label, path }) => {
   it('declares a `migrate` service', () => {
-    expect(Object.keys(servicesOf(path)), `${label} must declare a "${JOB}" service`).toContain(JOB);
+    expect(Object.keys(servicesOf(path)), `${label} must declare a "${JOB}" service`).toContain(
+      JOB,
+    );
   });
 
   it('the job runs the migration CLI — one shot, not a server', () => {
     const job = service(path, JOB);
     const command = job.command;
-    expect(Array.isArray(command), `${label}: services.${JOB}.command must be an exec-form list`).toBe(true);
+    expect(
+      Array.isArray(command),
+      `${label}: services.${JOB}.command must be an exec-form list`,
+    ).toBe(true);
     // `db:migrate` is `tsx scripts/migrate.ts` with the default subcommand
     // `up` (package.json). Asserting the script name rather than the argv
     // keeps this from breaking when the CLI grows a flag.
     expect((command as string[]).join(' ')).toContain('db:migrate');
     // A job serves no traffic: publishing a port would mean it is expected to
     // stay up, which contradicts `service_completed_successfully`.
-    expect(Object.keys(job), `${label}: the ${JOB} job must not publish ports`).not.toContain('ports');
+    expect(Object.keys(job), `${label}: the ${JOB} job must not publish ports`).not.toContain(
+      'ports',
+    );
   });
 
   it('the job has a restart policy that lets it COMPLETE', () => {
@@ -85,7 +98,10 @@ describe.each(FILES)('$label — one-shot migrate job (#516)', ({ label, path })
   });
 
   it.each(GATED)('%s does not start until the job completes successfully', (name) => {
-    const dependsOn = asMap(service(path, name).depends_on, `${label}: services.${name}.depends_on`);
+    const dependsOn = asMap(
+      service(path, name).depends_on,
+      `${label}: services.${name}.depends_on`,
+    );
     expect(
       Object.keys(dependsOn),
       `${label}: services.${name} must depend on the "${JOB}" job`,
@@ -114,7 +130,10 @@ describe.each(FILES)('$label — one-shot migrate job (#516)', ({ label, path })
   it('the job reaches the database through the same URL the app uses', () => {
     const jobEnv = asMap(service(path, JOB).environment, `${label}: services.${JOB}.environment`);
     const appEnv = asMap(service(path, 'app').environment, `${label}: services.app.environment`);
-    const jobUrl = asString(jobEnv.DATABASE_URL, `${label}: services.${JOB}.environment.DATABASE_URL`);
+    const jobUrl = asString(
+      jobEnv.DATABASE_URL,
+      `${label}: services.${JOB}.environment.DATABASE_URL`,
+    );
     expect(
       jobUrl,
       `${label}: the ${JOB} job and the app must resolve the SAME DATABASE_URL — ` +
@@ -131,7 +150,9 @@ describe('docker-compose.yml (dev) — the local flow keeps working', () => {
     // the integration-test flow must never be able to drag the job in.
     for (const name of ['postgres', 'redis']) {
       const svc = service(DEV, name);
-      expect(Object.keys(svc), `services.${name} must have no depends_on`).not.toContain('depends_on');
+      expect(Object.keys(svc), `services.${name} must have no depends_on`).not.toContain(
+        'depends_on',
+      );
     }
   });
 
@@ -186,7 +207,9 @@ describe('compose.prod.yml — the job gets the migrator subset and nothing else
   it('every contract variable it does receive is one the migrator may read', () => {
     const allowed = new Set(entriesForService('migrator').map((s) => s.name));
     const contractNames = new Set(CONTRACT_ENTRIES.map((s) => s.name));
-    const leaked = Object.keys(resolvedJobEnv()).filter((k) => contractNames.has(k) && !allowed.has(k));
+    const leaked = Object.keys(resolvedJobEnv()).filter(
+      (k) => contractNames.has(k) && !allowed.has(k),
+    );
     expect(leaked, `variables outside the migrator subset: ${leaked.join(', ')}`).toEqual([]);
   });
 
@@ -266,7 +289,9 @@ describe('scripts/smoke-migrate-image.sh — the gate exercises what compose.pro
     const declared = (job.command as string[]).join(' ');
     const pinned = /^MIGRATE_COMMAND=\((.+)\)$/m.exec(script)?.[1];
     expect(pinned, 'the smoke script must declare MIGRATE_COMMAND=(...)').toBeDefined();
-    expect(pinned, `the smoke runs "${pinned}" but compose.prod.yml runs "${declared}"`).toBe(declared);
+    expect(pinned, `the smoke runs "${pinned}" but compose.prod.yml runs "${declared}"`).toBe(
+      declared,
+    );
   });
 
   it('runs under the same uid and the same read-only rootfs', () => {
@@ -282,7 +307,9 @@ describe('scripts/smoke-migrate-image.sh — the gate exercises what compose.pro
   });
 
   it('injects exactly the variables the job receives — no more, no fewer', () => {
-    const declared = Object.keys(asMap(job.environment, 'prod: services.migrate.environment')).sort();
+    const declared = Object.keys(
+      asMap(job.environment, 'prod: services.migrate.environment'),
+    ).sort();
     // Scoped to the `migrator_env_flags()` body on purpose: the script also
     // passes `-e POSTGRES_*` to the EPHEMERAL Postgres container, and a regex
     // over the whole file happily counts those too — which is how the first

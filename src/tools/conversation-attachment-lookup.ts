@@ -91,7 +91,9 @@ export const conversationAttachmentLookupTool: Tool<typeof inputSchema, typeof o
     }
 
     const rows = await mensagensRepo.recentInConversation(ctx.conversa.id, args.limit);
-    const hints = (args.attachment_hints ?? []).map((h) => h.toLowerCase()).filter((h) => h.length > 0);
+    const hints = (args.attachment_hints ?? [])
+      .map((h) => h.toLowerCase())
+      .filter((h) => h.length > 0);
 
     const attachments = rows
       .filter((m) => Boolean(m.midia_url))

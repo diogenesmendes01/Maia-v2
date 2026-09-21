@@ -155,9 +155,7 @@ d('#511 batch repos — isolation and constant cost', () => {
         tk.entidades.push(theirs);
 
         const { entityStatesRepo } = await loadRepos();
-        const rows = await runWithTenantContext(A, () =>
-          entityStatesRepo.byIds([mine, theirs]),
-        );
+        const rows = await runWithTenantContext(A, () => entityStatesRepo.byIds([mine, theirs]));
 
         expect(rows.map((r) => r.entidade_id)).toEqual([mine]);
         expect(rows[0]!.saldo_consolidado).toBe('111.00');
@@ -315,9 +313,9 @@ d('#511 batch repos — isolation and constant cost', () => {
         ]);
 
         expect(joined.map((r) => r.entidade.id).sort()).toEqual(ents.map((e) => e.id).sort());
-        expect(
-          joined.filter((r) => r.state !== null).map((r) => r.state!.entidade_id),
-        ).toEqual(states.map((s) => s.entidade_id));
+        expect(joined.filter((r) => r.state !== null).map((r) => r.state!.entidade_id)).toEqual(
+          states.map((s) => s.entidade_id),
+        );
         // An entity with no state row is present with `state: null`, which is
         // what lets the scope block render its name while the state block skips
         // it — the exact behaviour the two-read version had.
@@ -612,7 +610,11 @@ d('#511 batch repos — isolation and constant cost', () => {
       const tk = newTracker();
       try {
         tk.hints.push(
-          await mkHint(c, A, { scope_type: 'agent', subject_id: null, hint_text: 'should-not-leak' }),
+          await mkHint(c, A, {
+            scope_type: 'agent',
+            subject_id: null,
+            hint_text: 'should-not-leak',
+          }),
         );
 
         const { behavioralHintRepo } = await loadRepos();

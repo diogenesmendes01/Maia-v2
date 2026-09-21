@@ -5,12 +5,7 @@ import { trpc } from '../../../trpc/client.js';
 import { Card, CardHeader, CardBody } from '../../../components/ui/card.js';
 import { Badge } from '../../../components/ui/badge.js';
 import { Button } from '../../../components/ui/button.js';
-import {
-  Alert,
-  EmptyState,
-  ErrorState,
-  LoadingState,
-} from '../../../components/ui/states.js';
+import { Alert, EmptyState, ErrorState, LoadingState } from '../../../components/ui/states.js';
 import { IconWrench } from '../../../components/ui/icons.js';
 
 /**
@@ -153,8 +148,8 @@ function Evidencia({
         {(detalhe.data?.membros ?? []).map((m) => (
           <li key={m.member_id} className="flex flex-wrap items-center justify-between gap-2">
             <span className="text-xs text-zinc-700">
-              {m.is_representative ? <Badge tone="brand">representante</Badge> : null}{' '}
-              {m.intent} · {m.occurrences} ocorrência(s) · similaridade {m.similaridade}
+              {m.is_representative ? <Badge tone="brand">representante</Badge> : null} {m.intent} ·{' '}
+              {m.occurrences} ocorrência(s) · similaridade {m.similaridade}
             </span>
             {m.is_representative ? null : (
               <Button
@@ -181,21 +176,15 @@ function Evidencia({
               o que chega pelo transporte tRPC é a string ISO — e o construtor
               de `Date` não aceita `Date` na tipagem padrão. */}
           O agente foi avisado em {new Date(String(a.notified_at)).toLocaleString('pt-BR')} de que{' '}
-          <code>{a.tool_name}</code> passou a existir — a lacuna fechou porque a ferramenta
-          está registrada <strong>e</strong> concedida a este agente.
+          <code>{a.tool_name}</code> passou a existir — a lacuna fechou porque a ferramenta está
+          registrada <strong>e</strong> concedida a este agente.
         </p>
       ))}
     </div>
   );
 }
 
-export default function ToolRequests({
-  tenantId,
-  agentId,
-}: {
-  tenantId: string;
-  agentId: string;
-}) {
+export default function ToolRequests({ tenantId, agentId }: { tenantId: string; agentId: string }) {
   const utils = trpc.useUtils();
   const query = trpc.toolRequests.list.useQuery(
     { tenantId, agentId },
@@ -224,20 +213,18 @@ export default function ToolRequests({
   return (
     <div className="space-y-4">
       <Alert tone="info">
-        Quando o agente esbarra numa ferramenta que <strong>não existe</strong>, o
-        pedido chega aqui — já agrupado com os pedidos parecidos e com o contador
-        de demanda que o backend calculou. <strong>Aceitar</strong> abre uma issue
-        para o time de desenvolvimento e <strong>nada mais</strong>: nenhuma tool é
-        registrada, nenhuma capability é concedida. O agente especifica; humanos
-        implementam e instalam. A lacuna fecha sozinha quando a ferramenta
-        realmente existir e estiver concedida a este agente — e o agente é avisado.
+        Quando o agente esbarra numa ferramenta que <strong>não existe</strong>, o pedido chega aqui
+        — já agrupado com os pedidos parecidos e com o contador de demanda que o backend calculou.{' '}
+        <strong>Aceitar</strong> abre uma issue para o time de desenvolvimento e{' '}
+        <strong>nada mais</strong>: nenhuma tool é registrada, nenhuma capability é concedida. O
+        agente especifica; humanos implementam e instalam. A lacuna fecha sozinha quando a
+        ferramenta realmente existir e estiver concedida a este agente — e o agente é avisado.
       </Alert>
 
       {repoSlug === null ? (
         <Alert tone="warning">
-          <code>MAIA_TOOL_REQUEST_ISSUE_REPO</code> não está configurado. Sem
-          destino explícito nenhuma issue é aberta — efeito externo não tem
-          destino implícito.
+          <code>MAIA_TOOL_REQUEST_ISSUE_REPO</code> não está configurado. Sem destino explícito
+          nenhuma issue é aberta — efeito externo não tem destino implícito.
         </Alert>
       ) : null}
 
@@ -274,18 +261,15 @@ export default function ToolRequests({
                     </Badge>
                     <Badge tone="neutral">{item.total_occurrences} ocorrência(s)</Badge>
                     {item.nomes_propostos.length > 1 ? (
-                      <Badge tone="neutral">
-                        {item.nomes_propostos.length} nomes propostos
-                      </Badge>
+                      <Badge tone="neutral">{item.nomes_propostos.length} nomes propostos</Badge>
                     ) : null}
                   </div>
 
                   {item.contract_state === 'divergent' ? (
                     <p className="text-xs text-zinc-600">
-                      Os pedidos agrupados discordam sobre o contrato. Nenhum
-                      rascunho venceu e <strong>não há contrato fundido</strong> —
-                      os conflitos vão nomeados no corpo da issue, e a decisão é
-                      do dev.
+                      Os pedidos agrupados discordam sobre o contrato. Nenhum rascunho venceu e{' '}
+                      <strong>não há contrato fundido</strong> — os conflitos vão nomeados no corpo
+                      da issue, e a decisão é do dev.
                     </p>
                   ) : null}
 

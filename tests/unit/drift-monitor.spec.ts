@@ -31,17 +31,14 @@ const activeProfileByTuple = new Map<string, { id: string } | null>();
 // ordem em que `getActive()` foi chamado — base da asserção de isolamento.
 const contextsSeen: Array<{ tenant_id: string; agent_id: string }> = [];
 
-const {
-  runAllDriftDetectorsMock,
-  decideAndApplyMock,
-  loggerInfoMock,
-  loggerWarnMock,
-} = vi.hoisted(() => ({
-  runAllDriftDetectorsMock: vi.fn(),
-  decideAndApplyMock: vi.fn(),
-  loggerInfoMock: vi.fn(),
-  loggerWarnMock: vi.fn(),
-}));
+const { runAllDriftDetectorsMock, decideAndApplyMock, loggerInfoMock, loggerWarnMock } = vi.hoisted(
+  () => ({
+    runAllDriftDetectorsMock: vi.fn(),
+    decideAndApplyMock: vi.fn(),
+    loggerInfoMock: vi.fn(),
+    loggerWarnMock: vi.fn(),
+  }),
+);
 
 vi.mock('@/lib/logger.js', () => ({
   logger: {
@@ -53,17 +50,14 @@ vi.mock('@/lib/logger.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     operationalProfileVersionsRepo: {
       ...actual.operationalProfileVersionsRepo,
       getActive: vi.fn(async () => {
-        const { getCurrentTenant, getCurrentAgent } = await import(
-          '@/db/tenant-context.js'
-        );
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         const tid = getCurrentTenant();
         const aid = getCurrentAgent();
         contextsSeen.push({ tenant_id: tid, agent_id: aid });
@@ -168,9 +162,7 @@ describe('runDriftMonitor', () => {
     expect(decideAndApplyMock).not.toHaveBeenCalled();
 
     // "no_drift" log com tenant_id + agent_id REAIS presentes
-    const noDriftCall = loggerInfoMock.mock.calls.find(
-      (c) => c[1] === 'drift_monitor.no_drift',
-    );
+    const noDriftCall = loggerInfoMock.mock.calls.find((c) => c[1] === 'drift_monitor.no_drift');
     expect(noDriftCall).toBeDefined();
     expect((noDriftCall![0] as Record<string, unknown>).tenant_id).toBe('tenant-a');
     expect((noDriftCall![0] as Record<string, unknown>).agent_id).toBe('agent-1');
@@ -206,9 +198,7 @@ describe('runDriftMonitor', () => {
     expect(call.active_profile_id).toBe('prof-a');
 
     // log "tenant_done" presente com alerts=2 e agent_id real
-    const tenantDone = loggerInfoMock.mock.calls.find(
-      (c) => c[1] === 'drift_monitor.tenant_done',
-    );
+    const tenantDone = loggerInfoMock.mock.calls.find((c) => c[1] === 'drift_monitor.tenant_done');
     expect(tenantDone).toBeDefined();
     expect((tenantDone![0] as Record<string, unknown>).alerts).toBe(2);
     expect((tenantDone![0] as Record<string, unknown>).agent_id).toBe('agent-1');

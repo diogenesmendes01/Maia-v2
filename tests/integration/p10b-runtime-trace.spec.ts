@@ -15,40 +15,46 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { dbInsertValuesMock, dbExecuteMock, dbTransactionMock, txInsertValuesMock, txOnConflictMock, isEnabledMock } =
-  vi.hoisted(() => {
-    const txOnConflictMock = vi.fn().mockResolvedValue(undefined);
-    const txInsertValuesMock = vi.fn();
-    return {
-      dbInsertValuesMock: vi.fn(),
-      dbExecuteMock: vi.fn(),
-      dbTransactionMock: vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
-        const tx = {
-          insert: vi.fn(() => ({
-            values: vi.fn((row: unknown) => {
-              txInsertValuesMock(row);
-              return {
-                then: (resolve: (v: unknown) => void) => resolve(undefined),
-                onConflictDoNothing: () => {
-                  txOnConflictMock();
-                  // #514 round 2: RETURNING is how the writer detects a replay.
-                  const rows = [{ trace_id: 'inserted' }];
-                  return {
-                    then: (r: (v: unknown) => void) => r(rows),
-                    returning: () => Promise.resolve(rows),
-                  };
-                },
-              };
-            }),
-          })),
-        };
-        await fn(tx);
-      }),
-      txInsertValuesMock,
-      txOnConflictMock,
-      isEnabledMock: vi.fn(),
-    };
-  });
+const {
+  dbInsertValuesMock,
+  dbExecuteMock,
+  dbTransactionMock,
+  txInsertValuesMock,
+  txOnConflictMock,
+  isEnabledMock,
+} = vi.hoisted(() => {
+  const txOnConflictMock = vi.fn().mockResolvedValue(undefined);
+  const txInsertValuesMock = vi.fn();
+  return {
+    dbInsertValuesMock: vi.fn(),
+    dbExecuteMock: vi.fn(),
+    dbTransactionMock: vi.fn(async (fn: (tx: unknown) => Promise<void>) => {
+      const tx = {
+        insert: vi.fn(() => ({
+          values: vi.fn((row: unknown) => {
+            txInsertValuesMock(row);
+            return {
+              then: (resolve: (v: unknown) => void) => resolve(undefined),
+              onConflictDoNothing: () => {
+                txOnConflictMock();
+                // #514 round 2: RETURNING is how the writer detects a replay.
+                const rows = [{ trace_id: 'inserted' }];
+                return {
+                  then: (r: (v: unknown) => void) => r(rows),
+                  returning: () => Promise.resolve(rows),
+                };
+              },
+            };
+          }),
+        })),
+      };
+      await fn(tx);
+    }),
+    txInsertValuesMock,
+    txOnConflictMock,
+    isEnabledMock: vi.fn(),
+  };
+});
 
 vi.mock('@/db/client.js', () => ({
   db: {
@@ -98,7 +104,9 @@ const basePacket = (text: string) => ({
   user_layer: { nome: 'Mariana' },
 });
 
-const baseInput = (overrides: Partial<{ redaction_class: 'standard' | 'debug' | 'minimal' }> = {}) => ({
+const baseInput = (
+  overrides: Partial<{ redaction_class: 'standard' | 'debug' | 'minimal' }> = {},
+) => ({
   trace_id: 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa',
   tenant_id: 'tenant-a',
   agent_id: 'agent-1',
@@ -201,8 +209,12 @@ describe('P10b runtime trace — integration (6 scenarios)', () => {
       attempt: aEnv.attempt,
       signature_version: 2,
     };
-    expect(verifyHmac('tenant-alpha', aEnv.hmac_key_version, payload, aEnv.envelope_hmac)).toBe(true);
-    expect(verifyHmac('tenant-beta', aEnv.hmac_key_version, payload, aEnv.envelope_hmac)).toBe(false);
+    expect(verifyHmac('tenant-alpha', aEnv.hmac_key_version, payload, aEnv.envelope_hmac)).toBe(
+      true,
+    );
+    expect(verifyHmac('tenant-beta', aEnv.hmac_key_version, payload, aEnv.envelope_hmac)).toBe(
+      false,
+    );
     // And production stamped the version on the row it inserted.
     expect(aEnv.signature_version).toBe(2);
     const inserted = txInsertValuesMock.mock.calls
@@ -229,5 +241,4 @@ describe('P10b runtime trace — integration (6 scenarios)', () => {
     // Queue is empty because trace() threw before enqueueBody.
     expect(_peekQueueSize()).toBe(0);
   });
-
 });

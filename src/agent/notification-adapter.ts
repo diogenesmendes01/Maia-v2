@@ -26,9 +26,7 @@ export type NotifyResult = {
   notified: boolean;
 };
 
-export async function notifyOwnerForGap(args: {
-  gap: AgentCapabilityGap;
-}): Promise<NotifyResult> {
+export async function notifyOwnerForGap(args: { gap: AgentCapabilityGap }): Promise<NotifyResult> {
   const level = args.gap.current_level as GapLevel;
 
   // INVARIANTE P5 §9 (gate #7): silent JAMAIS notifica o owner.

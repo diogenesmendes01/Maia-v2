@@ -478,7 +478,9 @@ export const outboundDeliveryRepo = {
                sent_at             = ${confirmed ? sql`now()` : sql`sent_at`},
                provider_timestamp  = ${confirmed ? sql`now()` : sql`provider_timestamp`},
                next_attempt_at     = ${
-                 retryable ? sql`now() + make_interval(secs => ${retrySeconds})` : sql`next_attempt_at`
+                 retryable
+                   ? sql`now() + make_interval(secs => ${retrySeconds})`
+                   : sql`next_attempt_at`
                },
                claimed_by          = ${mantemPosse ? sql`claimed_by` : sql`NULL`},
                claim_token         = ${mantemPosse ? sql`claim_token` : sql`NULL`},

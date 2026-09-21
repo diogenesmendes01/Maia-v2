@@ -8,15 +8,12 @@
 import { and, asc, eq, isNotNull, sql } from 'drizzle-orm';
 import { createHash } from 'node:crypto';
 import { db } from '../client.js';
-import {
-  mcp_servers,
-  mcp_server_tools,
-  type McpServer,
-  type McpServerTool,
-} from '../schema.js';
+import { mcp_servers, mcp_server_tools, type McpServer, type McpServerTool } from '../schema.js';
 
 export function mcpSchemaHash(inputSchema: unknown): string {
-  return createHash('sha256').update(JSON.stringify(inputSchema ?? {})).digest('hex');
+  return createHash('sha256')
+    .update(JSON.stringify(inputSchema ?? {}))
+    .digest('hex');
 }
 
 /** Pack id dinâmico de um server MCP (grant por agente — spec §2). */
@@ -59,9 +56,7 @@ export const mcpServersRepo = {
     const rows = await db
       .select()
       .from(mcp_servers)
-      .where(
-        and(eq(mcp_servers.id, args.server_id), eq(mcp_servers.tenant_id, args.tenant_id)),
-      )
+      .where(and(eq(mcp_servers.id, args.server_id), eq(mcp_servers.tenant_id, args.tenant_id)))
       .limit(1);
     return rows[0] ?? null;
   },
@@ -83,9 +78,7 @@ export const mcpServersRepo = {
     const [row] = await db
       .update(mcp_servers)
       .set({ status: args.status, updated_at: new Date() })
-      .where(
-        and(eq(mcp_servers.id, args.server_id), eq(mcp_servers.tenant_id, args.tenant_id)),
-      )
+      .where(and(eq(mcp_servers.id, args.server_id), eq(mcp_servers.tenant_id, args.tenant_id)))
       .returning();
     return row ?? null;
   },
@@ -102,9 +95,7 @@ export const mcpServersRepo = {
     const rows = await db
       .update(mcp_servers)
       .set(set)
-      .where(
-        and(eq(mcp_servers.id, args.server_id), eq(mcp_servers.tenant_id, args.tenant_id)),
-      )
+      .where(and(eq(mcp_servers.id, args.server_id), eq(mcp_servers.tenant_id, args.tenant_id)))
       .returning({ id: mcp_servers.id });
     return rows.length > 0;
   },
@@ -150,10 +141,7 @@ export const mcpServersRepo = {
 };
 
 export const mcpServerToolsRepo = {
-  async listByServer(args: {
-    tenant_id: string;
-    server_id: string;
-  }): Promise<McpServerTool[]> {
+  async listByServer(args: { tenant_id: string; server_id: string }): Promise<McpServerTool[]> {
     return db
       .select()
       .from(mcp_server_tools)
@@ -248,10 +236,7 @@ export const mcpServerToolsRepo = {
         updated_at: new Date(),
       })
       .where(
-        and(
-          eq(mcp_server_tools.id, args.tool_id),
-          eq(mcp_server_tools.tenant_id, args.tenant_id),
-        ),
+        and(eq(mcp_server_tools.id, args.tool_id), eq(mcp_server_tools.tenant_id, args.tenant_id)),
       )
       .returning();
     return row ?? null;
@@ -263,7 +248,11 @@ export const mcpServerToolsRepo = {
    */
   async listExecutable(args: {
     tenant_id: string;
-  }): Promise<Array<McpServerTool & { server_name: string; server_url: string; auth_secret_ref: string | null }>> {
+  }): Promise<
+    Array<
+      McpServerTool & { server_name: string; server_url: string; auth_secret_ref: string | null }
+    >
+  > {
     const rows = await db
       .select({
         tool: mcp_server_tools,

@@ -195,10 +195,7 @@ export async function checkBotAndMaybeBlock(tel: string): Promise<boolean> {
     // to the structured warn so a real Redis bug doesn't hide behind the
     // fail-open behaviour.
     recordRedisError('bot_detection.incr', { tenant_id, agent_id });
-    logger.warn(
-      { err: (err as Error).message, tenant_id, agent_id },
-      'bot_detection.redis_failed',
-    );
+    logger.warn({ err: (err as Error).message, tenant_id, agent_id }, 'bot_detection.redis_failed');
     return false;
   }
   if (count <= THRESHOLD) return false;
@@ -220,9 +217,6 @@ export async function checkBotAndMaybeBlock(tel: string): Promise<boolean> {
     pessoa_id: pessoa.id,
     metadata: { count, window_seconds: WINDOW_SECONDS },
   });
-  logger.warn(
-    { pessoa_id: pessoa.id, count, tenant_id, agent_id },
-    'bot_detection.auto_blocked',
-  );
+  logger.warn({ pessoa_id: pessoa.id, count, tenant_id, agent_id }, 'bot_detection.auto_blocked');
   return true;
 }

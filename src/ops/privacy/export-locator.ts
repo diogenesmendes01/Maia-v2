@@ -277,10 +277,7 @@ export async function proveExportArtifact(
   } catch {
     throw new UnsafeExportLocatorError('stat_failed', locator);
   }
-  const expectedReal = path.join(
-    path.resolve(realRoot),
-    `${locator}${EXPORT_ARTIFACT_SUFFIX}`,
-  );
+  const expectedReal = path.join(path.resolve(realRoot), `${locator}${EXPORT_ARTIFACT_SUFFIX}`);
   if (realTarget !== expectedReal) {
     throw new UnsafeExportLocatorError('escapes_export_root', locator);
   }

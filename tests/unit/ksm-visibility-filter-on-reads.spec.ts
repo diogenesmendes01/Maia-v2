@@ -61,7 +61,7 @@ vi.mock('@/db/client.js', () => {
         return { rows: [] };
       },
     },
-    withTx: async <T,>(fn: (tx: unknown) => Promise<T>) => fn({}),
+    withTx: async <T>(fn: (tx: unknown) => Promise<T>) => fn({}),
   };
 });
 
@@ -71,7 +71,7 @@ vi.mock('@/db/tenant-context.js', () => ({
 }));
 
 vi.mock('@/db/tenant-guard.js', () => ({
-  applyTenantGuard: <T,>(input: T) => input,
+  applyTenantGuard: <T>(input: T) => input,
 }));
 
 // Lazy-import so the mock is wired before the repo file evaluates.

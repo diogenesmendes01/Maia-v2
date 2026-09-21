@@ -694,9 +694,10 @@ describe('findProblems — teto de severidade (max_severity)', () => {
       expect(findProblems([{ ...FINDING, severity: s }], [OK], '2026-08-14'), s).toEqual([]);
     }
     for (const s of ['high', 'critical']) {
-      expect(findProblems([{ ...FINDING, severity: s }], [OK], '2026-08-14').join('\n'), s).toContain(
-        'severidade ACIMA do teto aceito',
-      );
+      expect(
+        findProblems([{ ...FINDING, severity: s }], [OK], '2026-08-14').join('\n'),
+        s,
+      ).toContain('severidade ACIMA do teto aceito');
     }
   });
 

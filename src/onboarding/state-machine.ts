@@ -373,7 +373,10 @@ export function allowedStepsFrom(
  * a resposta) precisa poder ser encerrada pelo operador; o que o cancelamento
  * NÃO faz é desprovisionar recurso já usado (ver `compensation` no doc).
  */
-export function planCancellation(from: OnboardingState): { from: OnboardingState; to: 'cancelled' } {
+export function planCancellation(from: OnboardingState): {
+  from: OnboardingState;
+  to: 'cancelled';
+} {
   if (isTerminalState(from)) {
     throw new OnboardingError(
       'run_terminal',

@@ -57,7 +57,10 @@ describe('computeApprovalState — dual approval', () => {
 
   it('enforces distinct-approver invariant: same user cannot fill both slots', () => {
     const state = computeApprovalState('prop-4', 'soul_bias_core_value', []);
-    const afterOwner = applyApproval(state, mkApproval({ approver_user_id: 'user-a', approver_role: 'owner' }));
+    const afterOwner = applyApproval(
+      state,
+      mkApproval({ approver_user_id: 'user-a', approver_role: 'owner' }),
+    );
     expect(() =>
       applyApproval(
         afterOwner,

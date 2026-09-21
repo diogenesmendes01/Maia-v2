@@ -279,15 +279,15 @@ d('#630 — migração 121: outbox durável em outbound_messages', () => {
     await expect(inserir(rowDuravel({ status: 'inventado' }))).rejects.toThrow(
       /outbound_messages_status_check/,
     );
-    await expect(
-      inserir(rowDuravel({ turn_id: turn, payload_type: 'image' })),
-    ).rejects.toThrow(/outbound_messages_payload_type_check/);
-    await expect(
-      inserir(rowDuravel({ turn_id: turn, payload_type: 'video' })),
-    ).rejects.toThrow(/outbound_messages_payload_type_check/);
-    await expect(
-      inserir(rowDuravel({ delivery_outcome: 'talvez' })),
-    ).rejects.toThrow(/outbound_messages_delivery_outcome_check/);
+    await expect(inserir(rowDuravel({ turn_id: turn, payload_type: 'image' }))).rejects.toThrow(
+      /outbound_messages_payload_type_check/,
+    );
+    await expect(inserir(rowDuravel({ turn_id: turn, payload_type: 'video' }))).rejects.toThrow(
+      /outbound_messages_payload_type_check/,
+    );
+    await expect(inserir(rowDuravel({ delivery_outcome: 'talvez' }))).rejects.toThrow(
+      /outbound_messages_delivery_outcome_check/,
+    );
     await expect(inserir(rowDuravel({ channel: 'telepatia' }))).rejects.toThrow(
       /outbound_messages_channel_check/,
     );
@@ -336,9 +336,9 @@ d('#630 — migração 121: outbox durável em outbound_messages', () => {
 
   it('sequence_in_turn e attempt não podem ser negativos', async () => {
     const turn = await criarTurno(T, A);
-    await expect(
-      inserir(rowDuravel({ turn_id: turn, sequence_in_turn: -1 })),
-    ).rejects.toThrow(/outbound_messages_sequence_in_turn_check/);
+    await expect(inserir(rowDuravel({ turn_id: turn, sequence_in_turn: -1 }))).rejects.toThrow(
+      /outbound_messages_sequence_in_turn_check/,
+    );
     await expect(inserir(rowDuravel({ attempt: -1 }))).rejects.toThrow(
       /outbound_messages_attempt_check/,
     );

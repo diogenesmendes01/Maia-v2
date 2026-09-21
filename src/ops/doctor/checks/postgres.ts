@@ -31,7 +31,8 @@ import { pass, skip, type DoctorCheck, type DoctorContext, type DoctorResult } f
 function noPostgresHandle(): DoctorResult {
   return {
     status: 'fail',
-    summary: 'nenhum handle de Postgres foi aberto: `--online` foi pedido e DATABASE_URL está ausente ou vazia',
+    summary:
+      'nenhum handle de Postgres foi aberto: `--online` foi pedido e DATABASE_URL está ausente ou vazia',
     evidence: { handle_open: false, requested_online: true },
     remediation: [
       'Defina DATABASE_URL no ambiente DESTE container e rode de novo com `--online`.',
@@ -153,7 +154,11 @@ export const serverVersionCheck: DoctorCheck = {
       return {
         status: 'fail',
         summary: `PostgreSQL ${version} está abaixo do piso suportado`,
-        evidence: { server_version: version, server_version_num: num, minimum: MINIMUM_PG_SERVER_VERSION_NUM },
+        evidence: {
+          server_version: version,
+          server_version_num: num,
+          minimum: MINIMUM_PG_SERVER_VERSION_NUM,
+        },
         remediation: [
           'Suba o servidor para a linha 16 antes de aplicar migrations desta release (`compose.prod.yml` fixa `postgres:16`).',
         ],
@@ -261,9 +266,7 @@ export const clockDriftCheck: DoctorCheck = {
     // `clock_timestamp()`, not `now()`: `now()` is the TRANSACTION start time
     // and would fold our own round trip into the "drift".
     const before = Date.now();
-    const rows = await ctx.postgres.query<{ ts: Date | string }>(
-      'SELECT clock_timestamp() AS ts',
-    );
+    const rows = await ctx.postgres.query<{ ts: Date | string }>('SELECT clock_timestamp() AS ts');
     const after = Date.now();
     const raw = rows[0]?.ts;
     const serverMs = raw instanceof Date ? raw.getTime() : Date.parse(String(raw));
@@ -273,7 +276,11 @@ export const clockDriftCheck: DoctorCheck = {
     // Half the round trip is the honest correction for one-way latency.
     const localMs = before + (after - before) / 2;
     const drift = Math.round(serverMs - localMs);
-    const evidence = { drift_ms: drift, round_trip_ms: after - before, threshold_ms: CLOCK_DRIFT_WARN_MS };
+    const evidence = {
+      drift_ms: drift,
+      round_trip_ms: after - before,
+      threshold_ms: CLOCK_DRIFT_WARN_MS,
+    };
     if (Math.abs(drift) > CLOCK_DRIFT_WARN_MS) {
       return {
         status: 'warn',

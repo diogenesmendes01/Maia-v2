@@ -36,11 +36,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 // repo mocks can read the current (tenant, agent) SYNCHRONOUSLY. A dynamic
 // `await import` inside a mock would add microtask hops that desynchronise the
 // fire-and-forget proposer in cenário 1 from `flushMicrotasks()`.
-import {
-  runWithTenantContext,
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { GapLevel } from '@/types/enums.js';
 // Runtime import (not type-only): the open-gap enumeration assertion below
 // checks the production query targets THIS exact table object. `@/db/schema.js`
@@ -354,9 +350,7 @@ function wireRepoImplementations() {
     monitorContextsSeen.push({ tenant_id: tid, agent_id: aid });
     return Object.values(gapsState).filter(
       (g) =>
-        g.tenant_id === tid &&
-        g.agent_id === aid &&
-        levels.includes(g.current_level as GapLevel),
+        g.tenant_id === tid && g.agent_id === aid && levels.includes(g.current_level as GapLevel),
     );
   });
 
@@ -464,9 +458,7 @@ function wireRepoImplementations() {
   );
 
   // capabilityProposalsRepo.getById — direct lookup.
-  capabilityProposalsGetById.mockImplementation(
-    async (id: string) => proposalsState[id] ?? null,
-  );
+  capabilityProposalsGetById.mockImplementation(async (id: string) => proposalsState[id] ?? null);
 
   // capabilityProposalsRepo.transition — full state-machine emulation.
   capabilityProposalsTransition.mockImplementation(
@@ -608,9 +600,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
       contexto: null,
     });
 
-    const { runGapEscalationMonitor } = await import(
-      '@/workers/gap-escalation-monitor.js'
-    );
+    const { runGapEscalationMonitor } = await import('@/workers/gap-escalation-monitor.js');
 
     // Step 1: bump freq to 3 → silent → dashboard.
     gapsState[gapId]!.frequency_score = 3;
@@ -618,9 +608,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     await flushMicrotasks();
 
     expect(gapsState[gapId]!.current_level).toBe(GapLevel.DASHBOARD);
-    const step1Changed = loggerInfo.mock.calls.find(
-      (c) => c[1] === 'gap_escalation.changed',
-    );
+    const step1Changed = loggerInfo.mock.calls.find((c) => c[1] === 'gap_escalation.changed');
     expect(step1Changed).toBeDefined();
     expect(step1Changed![0]).toMatchObject({
       from: GapLevel.SILENT,
@@ -666,9 +654,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     await flushMicrotasks();
 
     expect(gapsState[gapId]!.current_level).toBe(GapLevel.MENTIONABLE);
-    const step2Changed = loggerInfo.mock.calls.find(
-      (c) => c[1] === 'gap_escalation.changed',
-    );
+    const step2Changed = loggerInfo.mock.calls.find((c) => c[1] === 'gap_escalation.changed');
     expect(step2Changed).toBeDefined();
     expect(step2Changed![0]).toMatchObject({
       from: GapLevel.DASHBOARD,
@@ -691,9 +677,7 @@ describe('P5 dialogical acquisition — end-to-end', () => {
 
     expect(gapsState[gapId]!.current_level).toBe(GapLevel.PROPOSED);
 
-    const step3Changed = loggerInfo.mock.calls.find(
-      (c) => c[1] === 'gap_escalation.changed',
-    );
+    const step3Changed = loggerInfo.mock.calls.find((c) => c[1] === 'gap_escalation.changed');
     expect(step3Changed).toBeDefined();
     expect(step3Changed![0]).toMatchObject({
       from: GapLevel.MENTIONABLE,
@@ -719,214 +703,197 @@ describe('P5 dialogical acquisition — end-to-end', () => {
       (c) => c[1] === 'gap_escalation.proposal_created',
     );
     expect(proposalLog).toBeDefined();
-    expect((proposalLog![0] as Record<string, unknown>).proposal_id).toBe(
-      proposals[0]!.id,
-    );
+    expect((proposalLog![0] as Record<string, unknown>).proposal_id).toBe(proposals[0]!.id);
   });
 
   // ---------- Cenário 2 ----------
   it('cenário 2: owner aprova proposta (draft → submitted → approved → delivered); invalid transition rejected', async () => {
-    await runWithTenantContext(
-      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
-      async () => {
-        // Pre-seed a draft proposal in mocked state.
-        const seeded = makeProposal({ id: 'prop-flow-1', status: 'draft' });
-        proposalsState['prop-flow-1'] = seeded;
+    await runWithTenantContext({ tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID }, async () => {
+      // Pre-seed a draft proposal in mocked state.
+      const seeded = makeProposal({ id: 'prop-flow-1', status: 'draft' });
+      proposalsState['prop-flow-1'] = seeded;
 
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
 
-        // draft → submitted
-        const r1 = await capabilityProposalsRepo.transition({
-          id: 'prop-flow-1',
-          to: 'submitted',
-        });
-        expect(r1.ok).toBe(true);
-        if (r1.ok) {
-          expect(r1.updated.status).toBe('submitted');
-          expect(r1.updated.submitted_at).toBeInstanceOf(Date);
-        }
+      // draft → submitted
+      const r1 = await capabilityProposalsRepo.transition({
+        id: 'prop-flow-1',
+        to: 'submitted',
+      });
+      expect(r1.ok).toBe(true);
+      if (r1.ok) {
+        expect(r1.updated.status).toBe('submitted');
+        expect(r1.updated.submitted_at).toBeInstanceOf(Date);
+      }
 
-        // submitted → approved (with decided_by)
-        const r2 = await capabilityProposalsRepo.transition({
-          id: 'prop-flow-1',
-          to: 'approved',
-          decided_by: 'owner-1',
-        });
-        expect(r2.ok).toBe(true);
-        if (r2.ok) {
-          expect(r2.updated.status).toBe('approved');
-          expect(r2.updated.decided_by).toBe('owner-1');
-          expect(r2.updated.decided_at).toBeInstanceOf(Date);
-        }
+      // submitted → approved (with decided_by)
+      const r2 = await capabilityProposalsRepo.transition({
+        id: 'prop-flow-1',
+        to: 'approved',
+        decided_by: 'owner-1',
+      });
+      expect(r2.ok).toBe(true);
+      if (r2.ok) {
+        expect(r2.updated.status).toBe('approved');
+        expect(r2.updated.decided_by).toBe('owner-1');
+        expect(r2.updated.decided_at).toBeInstanceOf(Date);
+      }
 
-        // approved → delivered (with delivery_artifact_ref)
-        const r3 = await capabilityProposalsRepo.transition({
-          id: 'prop-flow-1',
-          to: 'delivered',
-          delivery_artifact_ref: 'pr-123',
-        });
-        expect(r3.ok).toBe(true);
-        if (r3.ok) {
-          expect(r3.updated.status).toBe('delivered');
-          expect(r3.updated.delivery_artifact_ref).toBe('pr-123');
-          expect(r3.updated.delivered_at).toBeInstanceOf(Date);
-        }
+      // approved → delivered (with delivery_artifact_ref)
+      const r3 = await capabilityProposalsRepo.transition({
+        id: 'prop-flow-1',
+        to: 'delivered',
+        delivery_artifact_ref: 'pr-123',
+      });
+      expect(r3.ok).toBe(true);
+      if (r3.ok) {
+        expect(r3.updated.status).toBe('delivered');
+        expect(r3.updated.delivery_artifact_ref).toBe('pr-123');
+        expect(r3.updated.delivered_at).toBeInstanceOf(Date);
+      }
 
-        // Invalid path: re-seed a draft and try submitted → delivered directly.
-        proposalsState['prop-flow-2'] = makeProposal({
-          id: 'prop-flow-2',
-          status: 'submitted',
-        });
-        const bad = await capabilityProposalsRepo.transition({
-          id: 'prop-flow-2',
-          to: 'delivered',
-        });
-        expect(bad.ok).toBe(false);
-        if (!bad.ok) {
-          expect(bad.reason).toBe('invalid_transition');
-        }
-        // State unchanged.
-        expect(proposalsState['prop-flow-2']!.status).toBe('submitted');
-      },
-    );
+      // Invalid path: re-seed a draft and try submitted → delivered directly.
+      proposalsState['prop-flow-2'] = makeProposal({
+        id: 'prop-flow-2',
+        status: 'submitted',
+      });
+      const bad = await capabilityProposalsRepo.transition({
+        id: 'prop-flow-2',
+        to: 'delivered',
+      });
+      expect(bad.ok).toBe(false);
+      if (!bad.ok) {
+        expect(bad.reason).toBe('invalid_transition');
+      }
+      // State unchanged.
+      expect(proposalsState['prop-flow-2']!.status).toBe('submitted');
+    });
   });
 
   // ---------- Cenário 3 ----------
   it('cenário 3: test loop pass — 2 echo_test scenarios passam → outcome=pass, no revert', async () => {
-    await runWithTenantContext(
-      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
-      async () => {
-        // 2 scenarios where `when` contains `then` → echo_test passes.
-        proposalsState['prop-pass'] = makeProposal({
-          id: 'prop-pass',
-          gap_id: 'gap-pass',
-          status: 'delivered',
-          test_scenarios: [
-            {
-              name: 'feliz-1',
-              given: 'sistema online',
-              when: 'consulta retorna status disponivel',
-              then: 'status disponivel',
-            },
-            {
-              name: 'feliz-2',
-              given: 'sistema online',
-              when: 'consulta devolve status enviado',
-              then: 'status enviado',
-            },
-          ],
-        });
+    await runWithTenantContext({ tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID }, async () => {
+      // 2 scenarios where `when` contains `then` → echo_test passes.
+      proposalsState['prop-pass'] = makeProposal({
+        id: 'prop-pass',
+        gap_id: 'gap-pass',
+        status: 'delivered',
+        test_scenarios: [
+          {
+            name: 'feliz-1',
+            given: 'sistema online',
+            when: 'consulta retorna status disponivel',
+            then: 'status disponivel',
+          },
+          {
+            name: 'feliz-2',
+            given: 'sistema online',
+            when: 'consulta devolve status enviado',
+            then: 'status enviado',
+          },
+        ],
+      });
 
-        const { runCapabilityTests } = await import(
-          '@/cognition/capability-test-runner.js'
-        );
-        const r = await runCapabilityTests({ proposal_id: 'prop-pass' });
+      const { runCapabilityTests } = await import('@/cognition/capability-test-runner.js');
+      const r = await runCapabilityTests({ proposal_id: 'prop-pass' });
 
-        expect(r.outcome).toBe('pass');
-        expect(r.result_id).toBeTruthy();
-        expect(capabilityGapsCreate).not.toHaveBeenCalled();
+      expect(r.outcome).toBe('pass');
+      expect(r.result_id).toBeTruthy();
+      expect(capabilityGapsCreate).not.toHaveBeenCalled();
 
-        // capability_test_result row recorded with triggered_revert=false.
-        const recordCall = capabilityTestResultsRecord.mock.calls[0]?.[0] as {
-          proposal_id: string;
-          outcome: string;
-          scenarios_passed: number;
-          scenarios_failed: number;
-          triggered_revert: boolean;
-          technical_gap_id?: string;
-        };
-        expect(recordCall.proposal_id).toBe('prop-pass');
-        expect(recordCall.outcome).toBe('pass');
-        expect(recordCall.scenarios_passed).toBe(2);
-        expect(recordCall.scenarios_failed).toBe(0);
-        expect(recordCall.triggered_revert).toBe(false);
-        expect(recordCall.technical_gap_id).toBeUndefined();
+      // capability_test_result row recorded with triggered_revert=false.
+      const recordCall = capabilityTestResultsRecord.mock.calls[0]?.[0] as {
+        proposal_id: string;
+        outcome: string;
+        scenarios_passed: number;
+        scenarios_failed: number;
+        triggered_revert: boolean;
+        technical_gap_id?: string;
+      };
+      expect(recordCall.proposal_id).toBe('prop-pass');
+      expect(recordCall.outcome).toBe('pass');
+      expect(recordCall.scenarios_passed).toBe(2);
+      expect(recordCall.scenarios_failed).toBe(0);
+      expect(recordCall.triggered_revert).toBe(false);
+      expect(recordCall.technical_gap_id).toBeUndefined();
 
-        // Stored row reflects the same outcome.
-        const stored = Object.values(testResultsState)[0]!;
-        expect(stored.outcome).toBe('pass');
-        expect(stored.triggered_revert).toBe(false);
-        expect(stored.technical_gap_id).toBeNull();
-        // Issue #346: the result row is scoped to the REAL (tenant, agent) the
-        // test loop ran under — never `'default'`.
-        expect(stored.tenant_id).toBe(TEST_TENANT_ID);
-        expect(stored.agent_id).toBe(TEST_AGENT_ID);
-        expect(stored.tenant_id).not.toBe('default');
-        expect(stored.agent_id).not.toBe('default');
-      },
-    );
+      // Stored row reflects the same outcome.
+      const stored = Object.values(testResultsState)[0]!;
+      expect(stored.outcome).toBe('pass');
+      expect(stored.triggered_revert).toBe(false);
+      expect(stored.technical_gap_id).toBeNull();
+      // Issue #346: the result row is scoped to the REAL (tenant, agent) the
+      // test loop ran under — never `'default'`.
+      expect(stored.tenant_id).toBe(TEST_TENANT_ID);
+      expect(stored.agent_id).toBe(TEST_AGENT_ID);
+      expect(stored.tenant_id).not.toBe('default');
+      expect(stored.agent_id).not.toBe('default');
+    });
   });
 
   // ---------- Cenário 4 ----------
   it('cenário 4: test loop fail → revert path cria gap technical com prefixo [técnica]', async () => {
-    await runWithTenantContext(
-      { tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID },
-      async () => {
-        // 1 scenario where `when` does NOT contain `then` → fail.
-        proposalsState['prop-fail'] = makeProposal({
-          id: 'prop-fail',
-          gap_id: 'gap-original',
-          status: 'delivered',
-          title: 'Rastreador',
-          test_scenarios: [
-            {
-              name: 'cenario-falha',
-              given: 'sistema online',
-              when: 'algo completamente diferente do esperado',
-              then: 'resultado-X',
-            },
-          ],
-        });
+    await runWithTenantContext({ tenant_id: TEST_TENANT_ID, agent_id: TEST_AGENT_ID }, async () => {
+      // 1 scenario where `when` does NOT contain `then` → fail.
+      proposalsState['prop-fail'] = makeProposal({
+        id: 'prop-fail',
+        gap_id: 'gap-original',
+        status: 'delivered',
+        title: 'Rastreador',
+        test_scenarios: [
+          {
+            name: 'cenario-falha',
+            given: 'sistema online',
+            when: 'algo completamente diferente do esperado',
+            then: 'resultado-X',
+          },
+        ],
+      });
 
-        const { runCapabilityTests } = await import(
-          '@/cognition/capability-test-runner.js'
-        );
-        const r = await runCapabilityTests({ proposal_id: 'prop-fail' });
+      const { runCapabilityTests } = await import('@/cognition/capability-test-runner.js');
+      const r = await runCapabilityTests({ proposal_id: 'prop-fail' });
 
-        expect(r.outcome).toBe('fail');
-        expect(r.result_id).toBeTruthy();
+      expect(r.outcome).toBe('fail');
+      expect(r.result_id).toBeTruthy();
 
-        // capabilityGapsRepo.create called for the technical gap.
-        expect(capabilityGapsCreate).toHaveBeenCalledTimes(1);
-        const createArgs = capabilityGapsCreate.mock.calls[0]?.[0] as {
-          capability_description: string;
-          tipo: string;
-          contexto: string;
-        };
-        expect(createArgs.tipo).toBe('technical');
-        expect(createArgs.capability_description.startsWith('[técnica]')).toBe(true);
-        expect(createArgs.capability_description).toContain('Rastreador');
+      // capabilityGapsRepo.create called for the technical gap.
+      expect(capabilityGapsCreate).toHaveBeenCalledTimes(1);
+      const createArgs = capabilityGapsCreate.mock.calls[0]?.[0] as {
+        capability_description: string;
+        tipo: string;
+        contexto: string;
+      };
+      expect(createArgs.tipo).toBe('technical');
+      expect(createArgs.capability_description.startsWith('[técnica]')).toBe(true);
+      expect(createArgs.capability_description).toContain('Rastreador');
 
-        // Test result row: triggered_revert=true + technical_gap_id populated.
-        const recordCall = capabilityTestResultsRecord.mock.calls[0]?.[0] as {
-          proposal_id: string;
-          outcome: string;
-          scenarios_failed: number;
-          triggered_revert: boolean;
-          technical_gap_id: string;
-        };
-        expect(recordCall.proposal_id).toBe('prop-fail');
-        expect(recordCall.outcome).toBe('fail');
-        expect(recordCall.scenarios_failed).toBe(1);
-        expect(recordCall.triggered_revert).toBe(true);
-        expect(recordCall.technical_gap_id).toBeTruthy();
+      // Test result row: triggered_revert=true + technical_gap_id populated.
+      const recordCall = capabilityTestResultsRecord.mock.calls[0]?.[0] as {
+        proposal_id: string;
+        outcome: string;
+        scenarios_failed: number;
+        triggered_revert: boolean;
+        technical_gap_id: string;
+      };
+      expect(recordCall.proposal_id).toBe('prop-fail');
+      expect(recordCall.outcome).toBe('fail');
+      expect(recordCall.scenarios_failed).toBe(1);
+      expect(recordCall.triggered_revert).toBe(true);
+      expect(recordCall.technical_gap_id).toBeTruthy();
 
-        // The created gap exists in state with tipo=technical.
-        const createdGap = Object.values(gapsState).find(
-          (g) => g.id === recordCall.technical_gap_id,
-        );
-        expect(createdGap).toBeDefined();
-        expect(createdGap!.tipo).toBe('technical');
-        expect(createdGap!.capability_description.startsWith('[técnica]')).toBe(true);
-        // Issue #346: the revert-derived gap is owned by the REAL (tenant,
-        // agent) the test loop ran under — never `'default'`. The technical gap
-        // must stay scoped to the agent whose capability failed.
-        expect(createdGap!.tenant_id).toBe(TEST_TENANT_ID);
-        expect(createdGap!.agent_id).toBe(TEST_AGENT_ID);
-        expect(createdGap!.tenant_id).not.toBe('default');
-        expect(createdGap!.agent_id).not.toBe('default');
-      },
-    );
+      // The created gap exists in state with tipo=technical.
+      const createdGap = Object.values(gapsState).find((g) => g.id === recordCall.technical_gap_id);
+      expect(createdGap).toBeDefined();
+      expect(createdGap!.tipo).toBe('technical');
+      expect(createdGap!.capability_description.startsWith('[técnica]')).toBe(true);
+      // Issue #346: the revert-derived gap is owned by the REAL (tenant,
+      // agent) the test loop ran under — never `'default'`. The technical gap
+      // must stay scoped to the agent whose capability failed.
+      expect(createdGap!.tenant_id).toBe(TEST_TENANT_ID);
+      expect(createdGap!.agent_id).toBe(TEST_AGENT_ID);
+      expect(createdGap!.tenant_id).not.toBe('default');
+      expect(createdGap!.agent_id).not.toBe('default');
+    });
   });
 
   // ---------- Cenário 5 ----------
@@ -952,5 +919,4 @@ describe('P5 dialogical acquisition — end-to-end', () => {
     );
     expect(queuedLog).toBeUndefined();
   });
-
 });

@@ -40,10 +40,7 @@
  *     omits the wrapper to assert the loud-failure path.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 import { buildCacheKey } from '@/lib/cache-key.js';
 
 // ---------------------------------------------------------------------------
@@ -99,9 +96,7 @@ vi.mock('@/lib/redis.js', () => ({
 
 // Pull production code AFTER mocks are installed so the redis import binds
 // to our stub.
-const { pushMessage, readRecent } = await import(
-  '@/memory/working.js'
-);
+const { pushMessage, readRecent } = await import('@/memory/working.js');
 
 const TENANT_A = '11111111-1111-1111-1111-111111111111';
 const AGENT_A = 'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa';
@@ -127,12 +122,9 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
   // -------------------------------------------------------------------------
   describe('pushMessage', () => {
     it('emits a key prefixed with both tenant_id and agent_id', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'hello');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'hello');
+      });
 
       // All three ops (rpush + ltrim + expire) target the SAME key — the
       // production function passes one `key` local through all three calls.
@@ -152,12 +144,9 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
     //      needed — and a `:`-bearing id can no longer alias across slots.
     // -------------------------------------------------------------------------
     it('issue #287: keys equal the buildCacheKey composition; `:` in tenant_id cannot alias', async () => {
-      await runWithTenantContext(
-        { tenant_id: 'acme:dev', agent_id: 'prod' },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'hello');
-        },
-      );
+      await runWithTenantContext({ tenant_id: 'acme:dev', agent_id: 'prod' }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'hello');
+      });
       const dataKey = keysOf('rpush')[0]!;
       const markerKey = keysOf('set')[0]!;
       expect(dataKey).toBe(
@@ -173,34 +162,23 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
     });
 
     it('the TTL/collision marker key is ALSO tenant+agent scoped (#317 B4)', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'hello');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'hello');
+      });
       // The Redis-backed TTL marker (#317) must carry the SAME tenant+agent
       // prefix as the data key — it is per-conversation state and the inviolable
       // isolation invariant applies. A non-scoped marker would let a foreign
       // tenant's marker collide on a shared conversa_id.
-      expect(keysOf('set')).toEqual([
-        `nx_ttl:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`,
-      ]);
+      expect(keysOf('set')).toEqual([`nx_ttl:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`]);
     });
 
     it('marker key differs across tenants for the same conversa_id (#317 B4)', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'a');
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'b');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'a');
+      });
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'b');
+      });
       const setKeys = keysOf('set');
       expect(setKeys).toEqual([
         `nx_ttl:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`,
@@ -209,27 +187,17 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
     });
 
     it('same conversa_id under different tenants produces DIFFERENT keys', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'tenant A message');
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'tenant B message');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'tenant A message');
+      });
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'tenant B message');
+      });
 
       const rpushKeys = keysOf('rpush');
       expect(rpushKeys).toHaveLength(2);
-      expect(rpushKeys[0]).toBe(
-        `working:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`,
-      );
-      expect(rpushKeys[1]).toBe(
-        `working:${TENANT_B}:${AGENT_B}:conv:${CONV_SHARED}:messages`,
-      );
+      expect(rpushKeys[0]).toBe(`working:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`);
+      expect(rpushKeys[1]).toBe(`working:${TENANT_B}:${AGENT_B}:conv:${CONV_SHARED}:messages`);
       expect(rpushKeys[0]).not.toBe(rpushKeys[1]);
     });
 
@@ -237,18 +205,12 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
       // Defense-in-depth: agents within the same tenant must also be
       // isolated. This catches a regression where someone strips agent_id
       // from the prefix thinking tenant_id is enough.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'agent A');
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_B },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'agent B (same tenant)');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'agent A');
+      });
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_B }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'agent B (same tenant)');
+      });
 
       const rpushKeys = keysOf('rpush');
       expect(rpushKeys).toHaveLength(2);
@@ -286,31 +248,23 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
           return calls.find((c) => c.op === 'lrange')?.key;
         },
       );
-      expect(keyUsed).toBe(
-        `working:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`,
-      );
+      expect(keyUsed).toBe(`working:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`);
     });
 
     it('ADVERSARIAL: stale tenant-B data under shared conversa_id is unreachable from tenant-A read', async () => {
       // Simulate a tenant-B write landing in Redis under its (correctly
       // scoped) key. We capture the exact key tenant-B wrote to.
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'TENANT_B_SECRET_PAYLOAD');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'TENANT_B_SECRET_PAYLOAD');
+      });
       const tenantBWriteKey = calls.find((c) => c.op === 'rpush')?.key;
 
       // Clear the recorder and have tenant-A read using the SAME conversa_id.
       calls.length = 0;
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await readRecent(CONV_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await readRecent(CONV_SHARED);
+      });
 
       const tenantAReadKey = calls.find((c) => c.op === 'lrange')?.key;
 
@@ -320,45 +274,31 @@ describe('issue #231 — working memory Redis keys are tenant+agent scoped', () 
       expect(tenantAReadKey).toBeDefined();
       expect(tenantBWriteKey).toBeDefined();
       expect(tenantAReadKey).not.toBe(tenantBWriteKey);
-      expect(tenantAReadKey).toBe(
-        `working:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`,
-      );
-      expect(tenantBWriteKey).toBe(
-        `working:${TENANT_B}:${AGENT_B}:conv:${CONV_SHARED}:messages`,
-      );
+      expect(tenantAReadKey).toBe(`working:${TENANT_A}:${AGENT_A}:conv:${CONV_SHARED}:messages`);
+      expect(tenantBWriteKey).toBe(`working:${TENANT_B}:${AGENT_B}:conv:${CONV_SHARED}:messages`);
     });
 
     it('SYMMETRY: B→A is also isolated', async () => {
       // Inverse of the previous test — proves the property is symmetric
       // and we didn't just hard-code tenant-A as a "primary" path.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await pushMessage(CONV_SHARED, 'user', 'TENANT_A_SECRET_PAYLOAD');
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await pushMessage(CONV_SHARED, 'user', 'TENANT_A_SECRET_PAYLOAD');
+      });
       const tenantAWriteKey = calls.find((c) => c.op === 'rpush')?.key;
 
       calls.length = 0;
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await readRecent(CONV_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await readRecent(CONV_SHARED);
+      });
 
       const tenantBReadKey = calls.find((c) => c.op === 'lrange')?.key;
       expect(tenantBReadKey).not.toBe(tenantAWriteKey);
-      expect(tenantBReadKey).toBe(
-        `working:${TENANT_B}:${AGENT_B}:conv:${CONV_SHARED}:messages`,
-      );
+      expect(tenantBReadKey).toBe(`working:${TENANT_B}:${AGENT_B}:conv:${CONV_SHARED}:messages`);
     });
 
     it('throws MissingTenantContextError when called without tenant context', async () => {
-      await expect(readRecent(CONV_SHARED)).rejects.toThrow(
-        MissingTenantContextError,
-      );
+      await expect(readRecent(CONV_SHARED)).rejects.toThrow(MissingTenantContextError);
       expect(redisStub.lrange).not.toHaveBeenCalled();
     });
   });

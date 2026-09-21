@@ -74,11 +74,7 @@ import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js'
 import { logger } from '@/lib/logger.js';
 import { config } from '@/config/env.js';
 import { incCounter } from '@/lib/metrics.js';
-import {
-  runWithTenantContext,
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 
 /**
  * GLOBAL single-flight advisory-lock namespace. Distinct from
@@ -105,10 +101,7 @@ async function tryAcquireRelayerLock(): Promise<AcquiredLock | null> {
   try {
     client = await pool.connect();
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'idempotency_outbox_relayer.lock_acquire_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'idempotency_outbox_relayer.lock_acquire_failed');
     return null;
   }
 
@@ -125,10 +118,7 @@ async function tryAcquireRelayerLock(): Promise<AcquiredLock | null> {
     }
   } catch (err) {
     client.release();
-    logger.warn(
-      { err: (err as Error).message },
-      'idempotency_outbox_relayer.lock_acquire_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'idempotency_outbox_relayer.lock_acquire_failed');
     return null;
   }
 
@@ -137,10 +127,10 @@ async function tryAcquireRelayerLock(): Promise<AcquiredLock | null> {
       if (released) return;
       released = true;
       try {
-        await client.query(
-          `SELECT pg_advisory_unlock(hashtextextended($1, $2))`,
-          [OUTBOX_RELAYER_LOCK_KEY, OUTBOX_RELAYER_LOCK_NAMESPACE.toString()],
-        );
+        await client.query(`SELECT pg_advisory_unlock(hashtextextended($1, $2))`, [
+          OUTBOX_RELAYER_LOCK_KEY,
+          OUTBOX_RELAYER_LOCK_NAMESPACE.toString(),
+        ]);
       } catch (err) {
         logger.warn(
           { err: (err as Error).message },
@@ -189,12 +179,10 @@ async function dispatchEffect(
       const line = await forCurrentAgentChannel(null);
       // #634 — exceção INVENTARIADA (`workers.idempotency_relayer`): este é um
       // SEGUNDO outbox durável, sem `turn_id`, e já com chave determinística.
-      const providerRef = await withDeclaredEgressException(
-        'workers.idempotency_relayer',
-        () =>
-          line.sendText(effect.jid, effect.text, {
-            ...(dedupKey ? { messageId: dedupKey } : {}),
-          }),
+      const providerRef = await withDeclaredEgressException('workers.idempotency_relayer', () =>
+        line.sendText(effect.jid, effect.text, {
+          ...(dedupKey ? { messageId: dedupKey } : {}),
+        }),
       );
       if (providerRef === null) {
         // Gateway not connected — transient. Throw so the row is retried.
@@ -219,7 +207,13 @@ function backoffSeconds(attempts: number): number {
   return Math.min(raw, max);
 }
 
-type RelayStats = { sent: number; retried: number; failed: number; invalid: number; cleaned: number };
+type RelayStats = {
+  sent: number;
+  retried: number;
+  failed: number;
+  invalid: number;
+  cleaned: number;
+};
 
 /**
  * Per-tenant relay pass. ASSUMES the caller opened runWithTenantContext for

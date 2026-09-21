@@ -55,15 +55,8 @@ import {
   MAX_REGEX_PATTERN,
   MAX_TOTAL_PREDICATE_NODES,
 } from './constants.js';
-import {
-  isFieldPathTooDeep,
-  resolveFieldPath,
-} from './field-path.js';
-import {
-  compileSafeRegex,
-  isPatternMarkedInvalid,
-  isPatternMarkedUnsafe,
-} from './regex-cache.js';
+import { isFieldPathTooDeep, resolveFieldPath } from './field-path.js';
+import { compileSafeRegex, isPatternMarkedInvalid, isPatternMarkedUnsafe } from './regex-cache.js';
 import type {
   PolicyDecision,
   PolicyEvaluationDiagnostics,
@@ -147,13 +140,7 @@ export function evaluate(
     });
   }
 
-  const leafResult = evalPredicate(
-    rule_body.predicate,
-    context,
-    state,
-    0,
-    '$.predicate',
-  );
+  const leafResult = evalPredicate(rule_body.predicate, context, state, 0, '$.predicate');
 
   // Any recorded error forces evaluation_error regardless of the boolean.
   if (state.errors.length > 0 || leafResult === 'err') {
@@ -603,12 +590,7 @@ function applyOperator(
 function deepEqual(a: unknown, b: unknown): boolean {
   if (a === b) return true;
   // Both must be of the same kind; null/undefined handled above by `===`.
-  if (
-    a === null ||
-    b === null ||
-    typeof a !== typeof b ||
-    typeof a !== 'object'
-  ) {
+  if (a === null || b === null || typeof a !== typeof b || typeof a !== 'object') {
     return false;
   }
   if (Array.isArray(a)) {
@@ -652,12 +634,7 @@ function containsOp(left: unknown, right: unknown): boolean {
   return false;
 }
 
-function matchesOp(
-  left: unknown,
-  right: unknown,
-  state: EvalState,
-  path: string,
-): LeafTriState {
+function matchesOp(left: unknown, right: unknown, state: EvalState, path: string): LeafTriState {
   if (typeof right !== 'string') return false;
   // Runtime guard: cap pattern string length even if validator was bypassed.
   if (right.length > MAX_REGEX_PATTERN) {

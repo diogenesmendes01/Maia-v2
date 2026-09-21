@@ -17,15 +17,15 @@ import type {
 } from './types.js';
 
 const VISIBILITY_TABLE: Record<KnowledgeLifecycleStatus, KnowledgeVisibilityResult> = {
-  proposed:       { visible: false, weight: 0.0, label: null },
+  proposed: { visible: false, weight: 0.0, label: null },
   pending_review: { visible: false, weight: 0.0, label: null },
-  ephemeral:      { visible: true,  weight: 0.3, label: '[novo, baixa confiança]' },
-  observed:       { visible: true,  weight: 0.5, label: '[observado]' },
-  reinforced:     { visible: true,  weight: 0.7, label: '[reforçado]' },
-  verified:       { visible: true,  weight: 0.9, label: '[verificado]' },
-  active:         { visible: true,  weight: 1.0, label: '[ativo]' },
-  deprecated:     { visible: false, weight: 0.0, label: null },
-  revoked:        { visible: false, weight: 0.0, label: null },
+  ephemeral: { visible: true, weight: 0.3, label: '[novo, baixa confiança]' },
+  observed: { visible: true, weight: 0.5, label: '[observado]' },
+  reinforced: { visible: true, weight: 0.7, label: '[reforçado]' },
+  verified: { visible: true, weight: 0.9, label: '[verificado]' },
+  active: { visible: true, weight: 1.0, label: '[ativo]' },
+  deprecated: { visible: false, weight: 0.0, label: null },
+  revoked: { visible: false, weight: 0.0, label: null },
 };
 
 export function knowledgeIsVisible(
@@ -44,10 +44,7 @@ export function knowledgeIsVisible(
  * Convenience accessor for tests + consumers that need to enumerate the
  * full visibility table. Returns a shallow copy to prevent mutation.
  */
-export function getVisibilityTable(): Record<
-  KnowledgeLifecycleStatus,
-  KnowledgeVisibilityResult
-> {
+export function getVisibilityTable(): Record<KnowledgeLifecycleStatus, KnowledgeVisibilityResult> {
   return { ...VISIBILITY_TABLE };
 }
 

@@ -122,9 +122,9 @@ describe('subject scoping', () => {
   });
 
   it('a subject-scoped hold DOES block a class-wide purge (it would sweep the subject away)', () => {
-    expect(
-      evaluateHold([hold({ subject_ref: 'subj-a' })], query({ subject_ref: null })).held,
-    ).toBe(true);
+    expect(evaluateHold([hold({ subject_ref: 'subj-a' })], query({ subject_ref: null })).held).toBe(
+      true,
+    );
   });
 
   it('a broad hold blocks a purge of any subject', () => {

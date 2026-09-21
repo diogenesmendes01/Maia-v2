@@ -244,15 +244,15 @@ describe('112 — the drill teardown verdict is its own axis (issue #536, review
   });
 
   it('constrains the vocabulary in the database, not only in TypeScript', () => {
-    expect(sql112).toMatch(
-      /CHECK \(cleanup_status IN \('unknown', 'clean', 'unsafe'\)\)/,
-    );
+    expect(sql112).toMatch(/CHECK \(cleanup_status IN \('unknown', 'clean', 'unsafe'\)\)/);
   });
 
   it('indexes the residue question, which is the one asked in an incident', () => {
     // Partial: the healthy answer is zero rows, so a full index over a column
     // that is 99% `clean` would not serve the query it exists for.
-    expect(sql112).toMatch(/CREATE INDEX IF NOT EXISTS restore_drills_unsafe_idx[\s\S]*?WHERE cleanup_status = 'unsafe'/);
+    expect(sql112).toMatch(
+      /CREATE INDEX IF NOT EXISTS restore_drills_unsafe_idx[\s\S]*?WHERE cleanup_status = 'unsafe'/,
+    );
   });
 
   it('adds a column instead of overloading failure_code', () => {

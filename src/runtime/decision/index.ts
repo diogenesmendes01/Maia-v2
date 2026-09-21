@@ -20,10 +20,7 @@ import { SkillSelectorImpl } from './skill-selector.js';
 import { WorkflowSelectorImpl } from './workflow-selector.js';
 import { RiskScorerStubImpl } from './risk-scorer.js';
 import { scoreTurn } from './turn-risk-scorer.js';
-import type {
-  DecisionPacket,
-  RiskLevel as ContextRiskLevel,
-} from '../context-packet/types.js';
+import type { DecisionPacket, RiskLevel as ContextRiskLevel } from '../context-packet/types.js';
 import type { RiskScorer } from './types.js';
 import type { LLMGate, ToolKind, TopicSignal } from '@/shared/risk/types.js';
 
@@ -54,8 +51,14 @@ import type { LLMGate, ToolKind, TopicSignal } from '@/shared/risk/types.js';
 // keeps requires_human_review=false for the decision-engine integration contracts,
 // and still allows the gate to elevate when Haiku sees additional context.
 const FINANCIAL_INTENT_LABELS = new Set([
-  'transfer_intent', 'cancel_request', 'change_password', 'delete_account',
-  'balance_query', 'profile_update', 'payment', 'transaction',
+  'transfer_intent',
+  'cancel_request',
+  'change_password',
+  'delete_account',
+  'balance_query',
+  'profile_update',
+  'payment',
+  'transaction',
 ]);
 
 /** Approximate topic from intent label when no explicit _risk_topic is provided. */
@@ -79,12 +82,11 @@ export class TurnRiskScorerAdapter implements RiskScorer {
     const intentHints = input.intent as IntentWithRiskHints;
 
     // Resolve topic: prefer explicit hint, fall back to label heuristic.
-    const topic: TopicSignal = (intentHints._risk_topic as TopicSignal | undefined)
-      ?? topicFromLabel(input.intent.label);
+    const topic: TopicSignal =
+      (intentHints._risk_topic as TopicSignal | undefined) ?? topicFromLabel(input.intent.label);
 
     // Resolve tool_kinds: prefer explicit hint, fall back to empty.
-    const tool_kinds: ToolKind[] = (intentHints._risk_tool_kinds as ToolKind[] | undefined)
-      ?? [];
+    const tool_kinds: ToolKind[] = (intentHints._risk_tool_kinds as ToolKind[] | undefined) ?? [];
 
     const scored = await scoreTurn(
       { topic, tool_kinds },
@@ -188,9 +190,7 @@ export interface CreateDecisionEngineEnv {
  * across requests (per-request state lives in BudgetTracker + PepAudit
  * created inside `run()`).
  */
-export function createDecisionEngine(
-  env: CreateDecisionEngineEnv,
-): DecisionEngine {
+export function createDecisionEngine(env: CreateDecisionEngineEnv): DecisionEngine {
   const earlyPep = new EarlyPepImpl({
     lockdownReader: env.lockdownReader,
     policyRepo: env.policyRepo,

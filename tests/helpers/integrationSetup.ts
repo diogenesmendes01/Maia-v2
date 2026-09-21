@@ -52,7 +52,11 @@ function tcpReachable(host: string, port: number, timeoutMs = 1000): Promise<boo
 }
 
 /** Parse `host:port` from a URL string, returning defaults on failure. */
-function parseHostPort(url: string, defaultHost: string, defaultPort: number): { host: string; port: number } {
+function parseHostPort(
+  url: string,
+  defaultHost: string,
+  defaultPort: number,
+): { host: string; port: number } {
   try {
     const parsed = new URL(url);
     return {
@@ -82,7 +86,7 @@ export async function assertIntegrationDeps(
       host,
       port,
       label: `Postgres (${host}:${port})`,
-      setupScript: "npm run test:integration:setup",
+      setupScript: 'npm run test:integration:setup',
     });
   }
 
@@ -93,7 +97,7 @@ export async function assertIntegrationDeps(
       host,
       port,
       label: `Redis (${host}:${port})`,
-      setupScript: "npm run test:integration:setup",
+      setupScript: 'npm run test:integration:setup',
     });
   }
 

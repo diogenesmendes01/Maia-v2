@@ -38,7 +38,9 @@ export const entidades = pgTable('entidades', {
   // NULL = retrocompat; sem cidade/uf, só feriados nacionais aplicam-se.
   cidade: text('cidade'),
   uf: varchar('uf', { length: 2 }),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -63,13 +65,20 @@ export const holidays = pgTable(
     approved_at: timestamp('approved_at', { withTimezone: true }),
     status: text('status').notNull().default('ativo'),
     source: text('source'),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     tenantDateIdx: index('idx_holidays_tenant_date').on(t.tenant_id, t.month, t.day),
-    tenantRegionalIdx: index('idx_holidays_tenant_regional').on(t.tenant_id, t.type, t.uf, t.cidade),
+    tenantRegionalIdx: index('idx_holidays_tenant_regional').on(
+      t.tenant_id,
+      t.type,
+      t.uf,
+      t.cidade,
+    ),
   }),
 );
 
@@ -85,7 +94,10 @@ export const holiday_entidades = pgTable(
   },
   (t) => ({
     pk: primaryKey({ columns: [t.holiday_id, t.entidade_id] }),
-    tenantEntidadeIdx: index('idx_holiday_entidades_tenant_entidade').on(t.tenant_id, t.entidade_id),
+    tenantEntidadeIdx: index('idx_holiday_entidades_tenant_entidade').on(
+      t.tenant_id,
+      t.entidade_id,
+    ),
   }),
 );
 
@@ -106,7 +118,9 @@ export const contas_bancarias = pgTable('contas_bancarias', {
   tipo: text('tipo').notNull(),
   saldo_atual: numeric('saldo_atual', { precision: 15, scale: 2 }).notNull().default('0'),
   status: text('status').notNull().default('ativa'),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -145,7 +159,9 @@ export const transacoes = pgTable('transacoes', {
   registrado_por: uuid('registrado_por'),
   confianca_ia: numeric('confianca_ia', { precision: 3, scale: 2 }),
   confirmada_em: timestamp('confirmada_em', { withTimezone: true }),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -175,7 +191,9 @@ export const recorrencias = pgTable('recorrencias', {
   frequencia: text('frequencia').notNull().default('mensal'),
   ativa: boolean('ativa').notNull().default(true),
   proxima_em: date('proxima_em'),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -190,7 +208,9 @@ export const contrapartes = pgTable('contrapartes', {
   chave_pix: text('chave_pix'),
   banco_padrao: text('banco_padrao'),
   observacoes: text('observacoes'),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   status: text('status').notNull().default('ativa'),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -212,8 +232,12 @@ export const pessoas = pgTable(
     tipo: text('tipo').notNull(),
     email: text('email'),
     observacoes: text('observacoes'),
-    preferencias: jsonb('preferencias').notNull().default(sql`'{}'::jsonb`),
-    modelo_mental: jsonb('modelo_mental').notNull().default(sql`'{}'::jsonb`),
+    preferencias: jsonb('preferencias')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    modelo_mental: jsonb('modelo_mental')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     status: text('status').notNull().default('ativa'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -256,8 +280,13 @@ export const agent_audience_profiles = pgTable(
       .array()
       .notNull()
       .default(sql`'{}'::text[]`),
-    labels: text('labels').array().notNull().default(sql`'{}'::text[]`),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    labels: text('labels')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -323,8 +352,14 @@ export const agent_tool_grants = pgTable(
       .array()
       .notNull()
       .default(sql`'{baseline.core,domain.calendar}'::text[]`),
-    granted_tools: text('granted_tools').array().notNull().default(sql`'{}'::text[]`),
-    denied_tools: text('denied_tools').array().notNull().default(sql`'{}'::text[]`),
+    granted_tools: text('granted_tools')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    denied_tools: text('denied_tools')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
     granted_by: text('granted_by'),
     reason: text('reason'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -358,8 +393,13 @@ export const permissoes = pgTable(
     entidade_id: uuid('entidade_id'),
     papel: text('papel').notNull(),
     profile_id: text('profile_id').notNull(),
-    acoes_permitidas: text('acoes_permitidas').array().notNull().default(sql`'{}'::text[]`),
-    limites: jsonb('limites').notNull().default(sql`'{}'::jsonb`),
+    acoes_permitidas: text('acoes_permitidas')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    limites: jsonb('limites')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     status: text('status').notNull().default('ativa'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -378,11 +418,18 @@ export const conversas = pgTable('conversas', {
   // linha da conversa. NULL = legado (casa qualquer canal do agente até
   // encerrar). FK composta (tenant, agent, channel) na migração.
   channel_id: uuid('channel_id'),
-  escopo_entidades: uuid('escopo_entidades').array().notNull().default(sql`'{}'::uuid[]`),
+  escopo_entidades: uuid('escopo_entidades')
+    .array()
+    .notNull()
+    .default(sql`'{}'::uuid[]`),
   status: text('status').notNull().default('ativa'),
   contexto_resumido: text('contexto_resumido'),
-  ultima_atividade_em: timestamp('ultima_atividade_em', { withTimezone: true }).notNull().defaultNow(),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  ultima_atividade_em: timestamp('ultima_atividade_em', { withTimezone: true })
+    .notNull()
+    .defaultNow(),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -399,9 +446,13 @@ export const mensagens = pgTable('mensagens', {
   tipo: text('tipo').notNull(),
   conteudo: text('conteudo'),
   midia_url: text('midia_url'),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   processada_em: timestamp('processada_em', { withTimezone: true }),
-  ferramentas_chamadas: jsonb('ferramentas_chamadas').notNull().default(sql`'[]'::jsonb`),
+  ferramentas_chamadas: jsonb('ferramentas_chamadas')
+    .notNull()
+    .default(sql`'[]'::jsonb`),
   tokens_usados: integer('tokens_usados'),
   // 118 (#505, shadow) — identidade da STREAM de ordenação e a posição deste
   // ingresso dentro dela. NULL = row anterior ao protocolo, ou outbound (que
@@ -439,7 +490,9 @@ export const agent_facts = pgTable(
     // shapes win because IF NOT EXISTS in 050 makes column ADDs no-ops.)
     lifecycle_status: text('lifecycle_status').notNull().default('active'),
     evidence_count: integer('evidence_count').notNull().default(1),
-    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    lifecycle_transitions: jsonb('lifecycle_transitions')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -462,9 +515,7 @@ export const agent_facts = pgTable(
     // Created via migration 066 CONCURRENTLY.
     lifecycleInflightIdx: index('idx_agent_facts_lifecycle_inflight')
       .on(t.lifecycle_status, t.updated_at)
-      .where(
-        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
-      ),
+      .where(sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`),
     // Expression index on the coalesced value the promoter's active sweep
     // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
     // btree over the two SEPARATE columns cannot back a range over the
@@ -485,8 +536,12 @@ export const learned_rules = pgTable(
     tipo: text('tipo').notNull(),
     contexto: text('contexto').notNull(),
     acao: text('acao').notNull(),
-    contexto_jsonb: jsonb('contexto_jsonb').notNull().default(sql`'{}'::jsonb`),
-    acoes_jsonb: jsonb('acoes_jsonb').notNull().default(sql`'{}'::jsonb`),
+    contexto_jsonb: jsonb('contexto_jsonb')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    acoes_jsonb: jsonb('acoes_jsonb')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     confianca: numeric('confianca', { precision: 3, scale: 2 }).notNull().default('0.50'),
     acertos: integer('acertos').notNull().default(0),
     erros: integer('erros').notNull().default(0),
@@ -497,7 +552,9 @@ export const learned_rules = pgTable(
     // migration 041; P10a added last_recall_at in migration 050.)
     lifecycle_status: text('lifecycle_status').notNull().default('active'),
     evidence_count: integer('evidence_count').notNull().default(1),
-    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    lifecycle_transitions: jsonb('lifecycle_transitions')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -510,9 +567,7 @@ export const learned_rules = pgTable(
     // Created via migration 066 CONCURRENTLY.
     lifecycleInflightIdx: index('idx_learned_rules_lifecycle_inflight')
       .on(t.lifecycle_status, t.updated_at)
-      .where(
-        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
-      ),
+      .where(sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`),
     // Expression index on the coalesced value the promoter's active sweep
     // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
     // btree over the two SEPARATE columns cannot back a range over the
@@ -532,7 +587,9 @@ export const agent_memories = pgTable('agent_memories', {
   embedding: text('embedding'),
   tipo: text('tipo').notNull(),
   escopo: text('escopo').notNull(),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   ref_tabela: text('ref_tabela'),
   ref_id: uuid('ref_id'),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -554,13 +611,17 @@ export const entity_states = pgTable('entity_states', {
   tenant_id: text('tenant_id').notNull(),
   agent_id: text('agent_id').notNull(),
   workflow_atual: uuid('workflow_atual'),
-  contexto: jsonb('contexto').notNull().default(sql`'{}'::jsonb`),
+  contexto: jsonb('contexto')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   ultima_reconciliacao: timestamp('ultima_reconciliacao', { withTimezone: true }),
   ultimo_briefing: timestamp('ultimo_briefing', { withTimezone: true }),
   proximo_vencimento: date('proximo_vencimento'),
   saldo_consolidado: numeric('saldo_consolidado', { precision: 15, scale: 2 }),
   saldo_atualizado_em: timestamp('saldo_atualizado_em', { withTimezone: true }),
-  flags: jsonb('flags').notNull().default(sql`'{}'::jsonb`),
+  flags: jsonb('flags')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -570,13 +631,17 @@ export const workflows = pgTable('workflows', {
   agent_id: text('agent_id').notNull(),
   tipo: text('tipo').notNull(),
   status: text('status').notNull().default('pendente'),
-  contexto: jsonb('contexto').notNull().default(sql`'{}'::jsonb`),
+  contexto: jsonb('contexto')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   entidade_id: uuid('entidade_id'),
   pessoa_envolvida: uuid('pessoa_envolvida'),
   proxima_acao_em: timestamp('proxima_acao_em', { withTimezone: true }),
   iniciado_em: timestamp('iniciado_em', { withTimezone: true }).notNull().defaultNow(),
   concluido_em: timestamp('concluido_em', { withTimezone: true }),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
 });
 
 // Fase 0 cap. 2 (migration 095) — evidência backend imutável de aprovação.
@@ -669,7 +734,9 @@ export const series = pgTable(
     missed_run_policy: text('missed_run_policy').notNull().default('fire_latest_only'),
     staleness_threshold_hours: integer('staleness_threshold_hours').notNull().default(24),
     exclusive_per_destinatario: boolean('exclusive_per_destinatario').notNull().default(false),
-    contexto_template: jsonb('contexto_template').notNull().default(sql`'{}'::jsonb`),
+    contexto_template: jsonb('contexto_template')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     entidade_id: uuid('entidade_id'),
     owner_pessoa_id: uuid('owner_pessoa_id').notNull(),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -701,8 +768,12 @@ export const occurrences = pgTable(
     started_at: timestamp('started_at', { withTimezone: true }),
     completed_at: timestamp('completed_at', { withTimezone: true }),
     correlation_token: text('correlation_token'),
-    contexto_snapshot: jsonb('contexto_snapshot').notNull().default(sql`'{}'::jsonb`),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    contexto_snapshot: jsonb('contexto_snapshot')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -734,7 +805,9 @@ export const tasks = pgTable(
     ordem: integer('ordem').notNull(),
     kind: text('kind').notNull(),
     status: text('status').notNull().default('pending'),
-    result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    result: jsonb('result')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     started_at: timestamp('started_at', { withTimezone: true }),
     completed_at: timestamp('completed_at', { withTimezone: true }),
   },
@@ -800,13 +873,17 @@ export const pending_questions = pgTable('pending_questions', {
   pessoa_id: uuid('pessoa_id'),
   tipo: text('tipo').notNull(),
   pergunta: text('pergunta').notNull(),
-  opcoes_validas: jsonb('opcoes_validas').notNull().default(sql`'[]'::jsonb`),
+  opcoes_validas: jsonb('opcoes_validas')
+    .notNull()
+    .default(sql`'[]'::jsonb`),
   acao_proposta: jsonb('acao_proposta').notNull(),
   expira_em: timestamp('expira_em', { withTimezone: true }).notNull(),
   status: text('status').notNull().default('aberta'),
   resposta: jsonb('resposta'),
   resolvida_em: timestamp('resolvida_em', { withTimezone: true }),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -932,10 +1009,7 @@ export const outbound_messages = pgTable(
     delivery_outcome: text('delivery_outcome'),
   },
   (t) => ({
-    byTenantCreated: index('idx_outbound_messages_tenant_created').on(
-      t.tenant_id,
-      t.created_at,
-    ),
+    byTenantCreated: index('idx_outbound_messages_tenant_created').on(t.tenant_id, t.created_at),
     // #292 — sweeper hot path (src/workers/outbound-messages-sweeper.ts). Both
     // sweep ops filter `WHERE tenant_id = $ AND agent_id = $ AND status IN (...)
     // AND created_at < cutoff` and ORDER BY created_at. The (tenant_id,
@@ -944,9 +1018,12 @@ export const outbound_messages = pgTable(
     // created_at) lets the equality columns anchor the scan and created_at back
     // the range predicate + the LIMIT's ORDER BY. Created CONCURRENTLY by
     // migration 067 (no-tx) since outbound_messages can be large in prod.
-    byTenantAgentStatusCreated: index(
-      'idx_outbound_messages_tenant_agent_status_created',
-    ).on(t.tenant_id, t.agent_id, t.status, t.created_at),
+    byTenantAgentStatusCreated: index('idx_outbound_messages_tenant_agent_status_created').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.created_at,
+    ),
     // Multi-tenant invariant (#232/#237): tenant+agent scope the dedupe namespace.
     // Two tenants (or two agents in one tenant) can share the same idempotency_key
     // string without colliding; the advisory-lock in upsertPending hashes the same
@@ -1023,9 +1100,7 @@ export const idempotency_effect_outbox = pgTable(
     last_error: text('last_error'),
     // Backoff gate: the relayer only claims a pending row when
     // next_attempt_at <= now(). Pushed forward on each transient failure.
-    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true })
-      .notNull()
-      .defaultNow(),
+    next_attempt_at: timestamp('next_attempt_at', { withTimezone: true }).notNull().defaultNow(),
     // Provider message id / external ref on a successful dispatch (audit).
     provider_ref: text('provider_ref'),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1036,9 +1111,12 @@ export const idempotency_effect_outbox = pgTable(
     // backoff gate elapsed, oldest-first. Equality columns anchor the probe;
     // next_attempt_at backs the range predicate + the LIMIT's ORDER BY.
     // Created CONCURRENTLY by migration 069 (no-tx).
-    byTenantAgentStatusNext: index(
-      'idx_idempotency_effect_outbox_tenant_agent_status_next',
-    ).on(t.tenant_id, t.agent_id, t.status, t.next_attempt_at),
+    byTenantAgentStatusNext: index('idx_idempotency_effect_outbox_tenant_agent_status_next').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.next_attempt_at,
+    ),
     // Retention-path PARTIAL index (PR #326 note (c)): backs the relayer's
     // terminal-row dispatcher enumeration AND the bounded cleanupTerminal DELETE
     // (status IN ('sent','failed') AND updated_at < cutoff, ORDER BY updated_at).
@@ -1076,7 +1154,9 @@ export const system_health_events = pgTable('system_health_events', {
   status: text('status').notNull(),
   duration_ms: integer('duration_ms'),
   error: text('error'),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -1093,7 +1173,9 @@ export const dead_letter_jobs = pgTable('dead_letter_jobs', {
   last_failed_at: timestamp('last_failed_at', { withTimezone: true }).notNull(),
   resolved: boolean('resolved').notNull().default(false),
   resolved_at: timestamp('resolved_at', { withTimezone: true }),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -1121,7 +1203,9 @@ export const import_runs = pgTable(
     candidates: integer('candidates').notNull().default(0),
     novos: integer('novos').notNull().default(0),
     status: text('status').notNull(),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1177,7 +1261,9 @@ export const audit_log = pgTable('audit_log', {
   // Spec 18 §7.5 — per-occurrence audit trail. Nullable; only set by scheduling flows.
   occurrence_id: uuid('occurrence_id'),
   diff: jsonb('diff'),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
@@ -1190,7 +1276,9 @@ export const tenants = pgTable('tenants', {
   id: text('id').primaryKey(),
   nome: text('nome').notNull(),
   status: text('status').notNull().default('active'),
-  metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+  metadata: jsonb('metadata')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
 });
@@ -1202,7 +1290,9 @@ export const agents = pgTable(
     tenant_id: text('tenant_id').notNull(),
     nome: text('nome').notNull(),
     status: text('status').notNull().default('active'),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1239,7 +1329,9 @@ export const cognitive_module_log = pgTable(
     fallback_triggered: boolean('fallback_triggered').notNull().default(false),
     fallback_reason: text('fallback_reason'),
     status: text('status').notNull(),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -1271,7 +1363,10 @@ export const cognitive_candidates = pgTable(
   },
   (t) => ({
     tenantAgentStatusIdx: index('cognitive_candidates_tenant_agent_status_idx').on(
-      t.tenant_id, t.agent_id, t.status, t.created_at,
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.created_at,
     ),
     typeStatusIdx: index('cognitive_candidates_type_status_idx').on(t.candidate_type, t.status),
   }),
@@ -1308,13 +1403,19 @@ export const memory_entry = pgTable(
     lifecycle_status: text('lifecycle_status').notNull().default('active'),
     evidence_count: integer('evidence_count').notNull().default(1),
     confidence: numeric('confidence', { precision: 3, scale: 2 }).notNull().default('1.00'),
-    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    lifecycle_transitions: jsonb('lifecycle_transitions')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    tenantAgentIdx: index('memory_entry_tenant_agent_idx').on(t.tenant_id, t.agent_id, t.created_at),
+    tenantAgentIdx: index('memory_entry_tenant_agent_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.created_at,
+    ),
     interlocutorIdx: index('memory_entry_interlocutor_idx').on(t.interlocutor_id),
     scopeIdx: index('memory_entry_scope_idx').on(t.scope_type, t.subject_id),
     needsReviewIdx: index('memory_entry_needs_review_idx').on(t.needs_review),
@@ -1327,9 +1428,7 @@ export const memory_entry = pgTable(
     // rationale. Created via migration 066 CONCURRENTLY.
     lifecycleInflightIdx: index('idx_memory_entry_lifecycle_inflight')
       .on(t.lifecycle_status, t.updated_at)
-      .where(
-        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
-      ),
+      .where(sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`),
     // Expression index on the coalesced value the promoter's active sweep
     // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
     // btree over the two SEPARATE columns cannot back a range over the
@@ -1364,7 +1463,9 @@ export const behavioral_hint = pgTable(
     lifecycle_status: text('lifecycle_status').notNull().default('active'),
     evidence_count: integer('evidence_count').notNull().default(1),
     confidence: numeric('confidence', { precision: 3, scale: 2 }).notNull().default('1.00'),
-    lifecycle_transitions: jsonb('lifecycle_transitions').notNull().default(sql`'[]'::jsonb`),
+    lifecycle_transitions: jsonb('lifecycle_transitions')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     last_recall_at: timestamp('last_recall_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1386,9 +1487,7 @@ export const behavioral_hint = pgTable(
     // 066 CONCURRENTLY.
     lifecycleInflightIdx: index('idx_behavioral_hint_lifecycle_inflight')
       .on(t.lifecycle_status, t.updated_at)
-      .where(
-        sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`,
-      ),
+      .where(sql`lifecycle_status IN ('ephemeral', 'observed', 'reinforced', 'verified')`),
     // Expression index on the coalesced value the promoter's active sweep
     // ranges over (`COALESCE(last_recall_at, updated_at) < cutoff`). A
     // btree over the two SEPARATE columns cannot back a range over the
@@ -1413,7 +1512,9 @@ export const agent_capabilities_domain = pgTable(
     failure_count: integer('failure_count').notNull().default(0),
     last_success: timestamp('last_success', { withTimezone: true }),
     last_failure: timestamp('last_failure', { withTimezone: true }),
-    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+    failure_modes: jsonb('failure_modes')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -1436,7 +1537,9 @@ export const agent_capabilities_skill = pgTable(
     failure_count: integer('failure_count').notNull().default(0),
     last_success: timestamp('last_success', { withTimezone: true }),
     last_failure: timestamp('last_failure', { withTimezone: true }),
-    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+    failure_modes: jsonb('failure_modes')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -1483,11 +1586,7 @@ export const agent_capability_gaps = pgTable(
     // Índices PARCIAIS na DB (WHERE resolved_at IS NULL / IS NOT NULL);
     // Drizzle não expressa o WHERE, então aqui eles aparecem como comuns.
     abertosIdx: index('caps_gaps_abertos_idx').on(t.tenant_id, t.agent_id, t.current_level),
-    resolvidosIdx: index('caps_gaps_resolvidos_idx').on(
-      t.tenant_id,
-      t.agent_id,
-      t.resolved_at,
-    ),
+    resolvidosIdx: index('caps_gaps_resolvidos_idx').on(t.tenant_id, t.agent_id, t.resolved_at),
   }),
 );
 
@@ -1520,8 +1619,12 @@ export const agent_capability_gap_observations = pgTable(
     conversa_id: uuid('conversa_id'),
     root_trace_id: uuid('root_trace_id'),
     trace_id: uuid('trace_id'),
-    attempted_args: jsonb('attempted_args').notNull().default(sql`'{}'::jsonb`),
-    expected_output: jsonb('expected_output').notNull().default(sql`'{}'::jsonb`),
+    attempted_args: jsonb('attempted_args')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    expected_output: jsonb('expected_output')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     observed_at: timestamp('observed_at', { withTimezone: true }).notNull().defaultNow(),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1567,7 +1670,9 @@ export const tool_request_aggregates = pgTable(
     representative_proposal_id: uuid('representative_proposal_id').notNull(),
     representative_gap_id: uuid('representative_gap_id').notNull(),
     proposed_tool_name: text('proposed_tool_name').notNull(),
-    nomes_propostos: jsonb('nomes_propostos').notNull().default(sql`'[]'::jsonb`),
+    nomes_propostos: jsonb('nomes_propostos')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     member_count: integer('member_count').notNull().default(0),
     total_occurrences: integer('total_occurrences').notNull().default(0),
     // 'single' | 'consistent' | 'divergent' — ver `draft-merge.ts`.
@@ -1576,7 +1681,9 @@ export const tool_request_aggregates = pgTable(
     // `tool_request_aggregates_divergent_has_no_draft` (migração 129) impede
     // que os dois se separem.
     merged_contract_draft: jsonb('merged_contract_draft'),
-    contract_conflicts: jsonb('contract_conflicts').notNull().default(sql`'[]'::jsonb`),
+    contract_conflicts: jsonb('contract_conflicts')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     first_member_at: timestamp('first_member_at', { withTimezone: true }).notNull().defaultNow(),
     last_member_at: timestamp('last_member_at', { withTimezone: true }).notNull().defaultNow(),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -1645,11 +1752,7 @@ export const tool_request_aggregate_members = pgTable(
       t.aggregate_id,
       t.joined_at,
     ),
-    gapIdx: index('tool_request_aggregate_members_gap_idx').on(
-      t.tenant_id,
-      t.agent_id,
-      t.gap_id,
-    ),
+    gapIdx: index('tool_request_aggregate_members_gap_idx').on(t.tenant_id, t.agent_id, t.gap_id),
     gapUnico: unique('tool_request_aggregate_members_gap_unique').on(
       t.tenant_id,
       t.agent_id,
@@ -1698,11 +1801,7 @@ export const tool_request_issues = pgTable(
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    escopoIdx: index('tool_request_issues_scope_idx').on(
-      t.tenant_id,
-      t.agent_id,
-      t.accepted_at,
-    ),
+    escopoIdx: index('tool_request_issues_scope_idx').on(t.tenant_id, t.agent_id, t.accepted_at),
     // Índice PARCIAL na DB (WHERE status = 'pending'); Drizzle não expressa o
     // WHERE, então aqui ele aparece como índice comum — mesma ressalva do
     // `tool_request_aggregate_members_ativos_idx`.
@@ -1732,7 +1831,9 @@ export const tool_request_notifications = pgTable(
     /** NULO quando o pedido nunca teve agregado (`sem_assinatura`, fatia B). */
     aggregate_id: uuid('aggregate_id'),
     tool_name: text('tool_name').notNull(),
-    evidencia: jsonb('evidencia').notNull().default(sql`'{}'::jsonb`),
+    evidencia: jsonb('evidencia')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     notified_at: timestamp('notified_at', { withTimezone: true }).notNull().defaultNow(),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1742,11 +1843,7 @@ export const tool_request_notifications = pgTable(
       t.agent_id,
       t.notified_at,
     ),
-    gapUnico: unique('tool_request_notifications_gap_unique').on(
-      t.tenant_id,
-      t.agent_id,
-      t.gap_id,
-    ),
+    gapUnico: unique('tool_request_notifications_gap_unique').on(t.tenant_id, t.agent_id, t.gap_id),
   }),
 );
 
@@ -1762,12 +1859,24 @@ export const procedure_definitions = pgTable(
     version_number: integer('version_number').notNull().default(1),
     status: text('status').notNull().default('draft'),
     intencao: text('intencao').notNull(),
-    when_apply: jsonb('when_apply').notNull().default(sql`'{}'::jsonb`),
-    when_not_apply: jsonb('when_not_apply').notNull().default(sql`'{}'::jsonb`),
-    steps: jsonb('steps').notNull().default(sql`'[]'::jsonb`),
-    success_criteria: jsonb('success_criteria').notNull().default(sql`'[]'::jsonb`),
-    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
-    tools_referenced: jsonb('tools_referenced').notNull().default(sql`'[]'::jsonb`),
+    when_apply: jsonb('when_apply')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    when_not_apply: jsonb('when_not_apply')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    steps: jsonb('steps')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    success_criteria: jsonb('success_criteria')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    failure_modes: jsonb('failure_modes')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    tools_referenced: jsonb('tools_referenced')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     source: text('source').notNull(),
     /**
      * Domain key consumed by WorkflowSelector (DOMAIN_INTENT_MAP keys:
@@ -1789,7 +1898,12 @@ export const procedure_definitions = pgTable(
   // UNIQUE so drizzle-kit drift detection does not propose dropping them
   // and so the types match what the database actually enforces.
   (t) => ({
-    tenantAgentStatusIdx: index('procedure_def_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.nome),
+    tenantAgentStatusIdx: index('procedure_def_tenant_agent_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.nome,
+    ),
     sourceCandidateIdx: index('procedure_def_source_candidate_idx').on(t.source_candidate_id),
     nameVersionUniq: unique('procedure_def_name_version_uniq').on(
       t.tenant_id,
@@ -1828,13 +1942,20 @@ export const procedure_assignments = pgTable(
     definition_version: integer('definition_version').notNull(),
     target_type: text('target_type').notNull(),
     target_id: text('target_id').notNull(),
-    customizations: jsonb('customizations').notNull().default(sql`'{}'::jsonb`),
+    customizations: jsonb('customizations')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     enabled: boolean('enabled').notNull().default(true),
     activated_at: timestamp('activated_at', { withTimezone: true }).notNull().defaultNow(),
     deactivated_at: timestamp('deactivated_at', { withTimezone: true }),
   },
   (t) => ({
-    targetIdx: index('procedure_assignments_target_idx').on(t.tenant_id, t.target_type, t.target_id, t.enabled),
+    targetIdx: index('procedure_assignments_target_idx').on(
+      t.tenant_id,
+      t.target_type,
+      t.target_id,
+      t.enabled,
+    ),
     defIdx: index('procedure_assignments_def_idx').on(t.definition_id),
     targetUniq: unique('procedure_assignments_target_uniq').on(
       t.tenant_id,
@@ -1892,8 +2013,12 @@ export const procedure_executions = pgTable(
     // but no engine path mutates it in P3b. Reserved for P3c which will emit
     // `state_updated` events with `execution_state` deltas (e.g. coleted slot
     // values across steps) and replay them in `replayState`.
-    execution_state: jsonb('execution_state').notNull().default(sql`'{}'::jsonb`),
-    completed_steps: jsonb('completed_steps').notNull().default(sql`'[]'::jsonb`),
+    execution_state: jsonb('execution_state')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    completed_steps: jsonb('completed_steps')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     started_at: timestamp('started_at', { withTimezone: true }).notNull().defaultNow(),
     last_activity_at: timestamp('last_activity_at', { withTimezone: true }).notNull().defaultNow(),
     ended_at: timestamp('ended_at', { withTimezone: true }),
@@ -1901,9 +2026,19 @@ export const procedure_executions = pgTable(
     notes: text('notes'),
   },
   (t) => ({
-    tenantAgentStatusIdx: index('procedure_exec_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.last_activity_at),
+    tenantAgentStatusIdx: index('procedure_exec_tenant_agent_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.last_activity_at,
+    ),
     conversaIdx: index('procedure_exec_conversa_idx').on(t.conversa_id),
-    inProgressIdx: index('procedure_exec_in_progress_idx').on(t.tenant_id, t.agent_id, t.conversa_id, t.last_activity_at),
+    inProgressIdx: index('procedure_exec_in_progress_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.conversa_id,
+      t.last_activity_at,
+    ),
     // P84-C2: partial UNIQUE constraint enforcing at most one in_progress
     // execution per (tenant, agent, conversa). Declared via raw SQL migration
     // 023 because Drizzle 0.45 doesn't expose partial-unique-index in DSL;
@@ -1920,7 +2055,9 @@ export const procedure_execution_events = pgTable(
     execution_id: uuid('execution_id').notNull(),
     step_id: text('step_id'),
     event_type: text('event_type').notNull(),
-    payload: jsonb('payload').notNull().default(sql`'{}'::jsonb`),
+    payload: jsonb('payload')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     confidence: numeric('confidence', { precision: 4, scale: 3 }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -1939,8 +2076,12 @@ export const procedure_selector_decisions = pgTable(
     conversa_id: uuid('conversa_id'),
     turno_id: uuid('turno_id'),
     current_execution_id: uuid('current_execution_id'),
-    candidates: jsonb('candidates').notNull().default(sql`'[]'::jsonb`),
-    conflicts: jsonb('conflicts').notNull().default(sql`'[]'::jsonb`),
+    candidates: jsonb('candidates')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    conflicts: jsonb('conflicts')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     decision: text('decision').notNull(),
     selected_procedure_id: uuid('selected_procedure_id'),
     decided_by: text('decided_by').notNull(),
@@ -2016,7 +2157,9 @@ export const agent_operational_profile_versions = pgTable(
     agent_id: text('agent_id').notNull(),
     version: integer('version').notNull(),
     status: text('status').notNull(),
-    profile_body: jsonb('profile_body').notNull().default(sql`'{}'::jsonb`),
+    profile_body: jsonb('profile_body')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     // shape: { schema_version, identity{...}, style{...}, metadata{...} } — ver migration 025
     proposed_by: text('proposed_by').notNull(),
     proposed_reason: text('proposed_reason'),
@@ -2055,7 +2198,9 @@ export const soul_biases = pgTable(
     guidance: text('guidance').notNull(),
     origin: text('origin').notNull(),
     strength: numeric('strength', { precision: 4, scale: 3 }).notNull(),
-    activation_context: jsonb('activation_context').notNull().default(sql`'{}'::jsonb`),
+    activation_context: jsonb('activation_context')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     status: text('status').notNull().default('proposed'),
     version: integer('version').notNull(),
     previous_version_id: uuid('previous_version_id'),
@@ -2129,7 +2274,9 @@ export const agent_drift_alerts = pgTable(
     profile_version_id: uuid('profile_version_id'),
     drift_type: text('drift_type').notNull(),
     severity: text('severity').notNull(),
-    evidence: jsonb('evidence').notNull().default(sql`'{}'::jsonb`),
+    evidence: jsonb('evidence')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     detected_by: text('detected_by').notNull(),
     decision: text('decision').notNull(),
     decided_at: timestamp('decided_at', { withTimezone: true }).notNull().defaultNow(),
@@ -2164,7 +2311,9 @@ export const gap_escalation_rules = pgTable(
     mentionable_severity_threshold: integer('mentionable_severity_threshold').notNull().default(5),
     proposed_combined_threshold: integer('proposed_combined_threshold').notNull().default(8),
     proposed_min_distinct_contexts: integer('proposed_min_distinct_contexts').notNull().default(2),
-    cooldown_days_proposed_to_proposed: integer('cooldown_days_proposed_to_proposed').notNull().default(14),
+    cooldown_days_proposed_to_proposed: integer('cooldown_days_proposed_to_proposed')
+      .notNull()
+      .default(14),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -2186,10 +2335,14 @@ export const capability_proposals = pgTable(
     capability_type: text('capability_type').notNull(),
     title: text('title').notNull(),
     description: text('description').notNull(),
-    proposed_spec: jsonb('proposed_spec').notNull().default(sql`'{}'::jsonb`),
+    proposed_spec: jsonb('proposed_spec')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     motivation: text('motivation').notNull(),
     expected_impact: text('expected_impact'),
-    test_scenarios: jsonb('test_scenarios').notNull().default(sql`'[]'::jsonb`),
+    test_scenarios: jsonb('test_scenarios')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     status: text('status').notNull().default('draft'),
     submitted_at: timestamp('submitted_at', { withTimezone: true }),
     decided_at: timestamp('decided_at', { withTimezone: true }),
@@ -2208,7 +2361,12 @@ export const capability_proposals = pgTable(
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    statusIdx: index('cap_proposals_tenant_agent_status_idx').on(t.tenant_id, t.agent_id, t.status, t.created_at),
+    statusIdx: index('cap_proposals_tenant_agent_status_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.status,
+      t.created_at,
+    ),
     gapIdx: index('cap_proposals_gap_idx').on(t.gap_id),
   }),
 );
@@ -2225,17 +2383,26 @@ export const capability_test_results = pgTable(
     proposal_id: uuid('proposal_id').notNull(),
     gap_id: uuid('gap_id'),
     outcome: text('outcome').notNull(),
-    scenarios_run: jsonb('scenarios_run').notNull().default(sql`'[]'::jsonb`),
+    scenarios_run: jsonb('scenarios_run')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     scenarios_passed: integer('scenarios_passed').notNull().default(0),
     scenarios_failed: integer('scenarios_failed').notNull().default(0),
-    details: jsonb('details').notNull().default(sql`'{}'::jsonb`),
+    details: jsonb('details')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     triggered_revert: boolean('triggered_revert').notNull().default(false),
     technical_gap_id: uuid('technical_gap_id'),
     ran_at: timestamp('ran_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     proposalIdx: index('cap_test_results_proposal_idx').on(t.proposal_id, t.ran_at),
-    outcomeIdx: index('cap_test_results_outcome_idx').on(t.tenant_id, t.agent_id, t.outcome, t.ran_at),
+    outcomeIdx: index('cap_test_results_outcome_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.outcome,
+      t.ran_at,
+    ),
   }),
 );
 
@@ -2257,14 +2424,20 @@ export const channels = pgTable(
     // validação fail-fast de boot; garante que a sonda não silencie um recurso
     // não-sintético (o sink exige is_synthetic=true + triplete completo).
     is_synthetic: boolean('is_synthetic').notNull().default(false),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
     tenantAgentIdx: index('channels_tenant_agent_idx').on(t.tenant_id, t.agent_id),
     externalIdx: index('channels_external_idx').on(t.channel_type, t.external_id),
-    externalUq: uniqueIndex('channels_tenant_type_external_uq').on(t.tenant_id, t.channel_type, t.external_id),
+    externalUq: uniqueIndex('channels_tenant_type_external_uq').on(
+      t.tenant_id,
+      t.channel_type,
+      t.external_id,
+    ),
   }),
 );
 
@@ -2307,9 +2480,7 @@ export const channel_line_state = pgTable(
      * estourar `Number.MAX_SAFE_INTEGER` exigiria 9 quatrilhões de trocas de
      * dono na mesma linha.
      */
-    session_fencing_token: bigint('session_fencing_token', { mode: 'number' })
-      .notNull()
-      .default(0),
+    session_fencing_token: bigint('session_fencing_token', { mode: 'number' }).notNull().default(0),
     actor_id: text('actor_id'),
     actor_role: text('actor_role'),
     correlation_id: text('correlation_id'),
@@ -2376,15 +2547,24 @@ export const roles = pgTable(
     // ∩ …` (taxonomy §2 step 7); this column supplies the "active-role packs"
     // factor. The pack ids referenced here are DEFINED by #416 — they may not
     // resolve to a real pack until that lands; the reference is a string contract.
-    granted_packs: text('granted_packs').array().notNull().default(sql`'{}'::text[]`),
+    granted_packs: text('granted_packs')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
     active: boolean('active').notNull().default(true),
     is_default: boolean('is_default').notNull().default(false),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    tenantAgentActiveIdx: index('roles_tenant_agent_active_idx').on(t.tenant_id, t.agent_id, t.active),
+    tenantAgentActiveIdx: index('roles_tenant_agent_active_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.active,
+    ),
     keyUq: uniqueIndex('roles_tenant_agent_key_uq').on(t.tenant_id, t.agent_id, t.role_key),
   }),
 );
@@ -2402,8 +2582,14 @@ export const channel_policies = pgTable(
     default_role_id: uuid('default_role_id').notNull(),
     switch_behavior: text('switch_behavior').notNull(),
     announce_mode: text('announce_mode').notNull().default('affects_user'),
-    by_context_guards: jsonb('by_context_guards').notNull().default(sql`'{"min_confidence_to_switch":0.7,"cooldown_turns":3,"required_strength_delta":0.2,"max_switches_per_conversation":3}'::jsonb`),
-    allowed_role_ids: jsonb('allowed_role_ids').notNull().default(sql`'[]'::jsonb`),
+    by_context_guards: jsonb('by_context_guards')
+      .notNull()
+      .default(
+        sql`'{"min_confidence_to_switch":0.7,"cooldown_turns":3,"required_strength_delta":0.2,"max_switches_per_conversation":3}'::jsonb`,
+      ),
+    allowed_role_ids: jsonb('allowed_role_ids')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
     updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
   },
@@ -2431,8 +2617,12 @@ export const role_selector_decisions = pgTable(
     suggested_role_id: uuid('suggested_role_id'),
     decided_role_id: uuid('decided_role_id').notNull(),
     action: text('action').notNull(),
-    candidates: jsonb('candidates').notNull().default(sql`'[]'::jsonb`),
-    conflicts: jsonb('conflicts').notNull().default(sql`'[]'::jsonb`),
+    candidates: jsonb('candidates')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    conflicts: jsonb('conflicts')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     suggested_by: text('suggested_by').notNull(),
     decided_by: text('decided_by').notNull(),
     suggested_strength: text('suggested_strength'),
@@ -2443,7 +2633,11 @@ export const role_selector_decisions = pgTable(
   },
   (t) => ({
     conversaIdx: index('role_selector_conversa_idx').on(t.conversa_id, t.decided_at),
-    tenantAgentIdx: index('role_selector_tenant_agent_idx').on(t.tenant_id, t.agent_id, t.decided_at),
+    tenantAgentIdx: index('role_selector_tenant_agent_idx').on(
+      t.tenant_id,
+      t.agent_id,
+      t.decided_at,
+    ),
   }),
 );
 
@@ -2517,7 +2711,9 @@ export const policy_rules = pgTable('policy_rules', {
   rule_kind: text('rule_kind').notNull(),
   rule_descriptor: text('rule_descriptor').notNull(),
   rule_body: jsonb('rule_body').notNull(),
-  scope: jsonb('scope').notNull().default(sql`'{}'::jsonb`),
+  scope: jsonb('scope')
+    .notNull()
+    .default(sql`'{}'::jsonb`),
   source_of_truth: text('source_of_truth').notNull(),
   status: text('status').notNull().default('proposed'),
   version: integer('version').notNull(),
@@ -2756,11 +2952,7 @@ export const runtime_trace_bodies = pgTable(
     persisted_at: timestamp('persisted_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
-    tenantIdx: index('runtime_trace_bodies_tenant_idx').on(
-      t.tenant_id,
-      t.agent_id,
-      t.persisted_at,
-    ),
+    tenantIdx: index('runtime_trace_bodies_tenant_idx').on(t.tenant_id, t.agent_id, t.persisted_at),
   }),
 );
 
@@ -2846,15 +3038,13 @@ export type BehavioralHint = typeof behavioral_hint.$inferSelect;
 export type AgentCapabilityDomain = typeof agent_capabilities_domain.$inferSelect;
 export type AgentCapabilitySkill = typeof agent_capabilities_skill.$inferSelect;
 export type AgentCapabilityGap = typeof agent_capability_gaps.$inferSelect;
-export type AgentCapabilityGapObservation =
-  typeof agent_capability_gap_observations.$inferSelect;
+export type AgentCapabilityGapObservation = typeof agent_capability_gap_observations.$inferSelect;
 export type NewAgentCapabilityGapObservation =
   typeof agent_capability_gap_observations.$inferInsert;
 export type ToolRequestAggregate = typeof tool_request_aggregates.$inferSelect;
 export type NewToolRequestAggregate = typeof tool_request_aggregates.$inferInsert;
 export type ToolRequestAggregateMember = typeof tool_request_aggregate_members.$inferSelect;
-export type NewToolRequestAggregateMember =
-  typeof tool_request_aggregate_members.$inferInsert;
+export type NewToolRequestAggregateMember = typeof tool_request_aggregate_members.$inferInsert;
 export type ToolRequestIssue = typeof tool_request_issues.$inferSelect;
 export type NewToolRequestIssue = typeof tool_request_issues.$inferInsert;
 export type ToolRequestNotification = typeof tool_request_notifications.$inferSelect;
@@ -2891,7 +3081,8 @@ export type ProcedureStatusUpdate = {
 };
 
 export type AgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferSelect;
-export type NewAgentOperationalProfileVersion = typeof agent_operational_profile_versions.$inferInsert;
+export type NewAgentOperationalProfileVersion =
+  typeof agent_operational_profile_versions.$inferInsert;
 
 // Single source of truth for the ProfileBody schema version literal.
 // Bump this constant when introducing a new ProfileBody shape (e.g., v3.1.3).
@@ -2992,7 +3183,9 @@ export const synthetic_probe_runs = pgTable(
     // ok | slow | wrong | silent | error — NULL enquanto em voo.
     outcome: text('outcome'),
     latency_ms: integer('latency_ms'),
-    detail: jsonb('detail').notNull().default(sql`'{}'::jsonb`),
+    detail: jsonb('detail')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     // set no estado TERMINAL do run — só então o cleanup pode recolher (§1.5).
     terminal_at: timestamp('terminal_at', { withTimezone: true }),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
@@ -3070,14 +3263,24 @@ export const skills = pgTable(
 
     goal: text('goal').notNull(),
     when_to_use: text('when_to_use').notNull(),
-    procedure: jsonb('procedure').notNull().default(sql`'{}'::jsonb`),
-    constraints: jsonb('constraints').notNull().default(sql`'[]'::jsonb`),
+    procedure: jsonb('procedure')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
+    constraints: jsonb('constraints')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
 
     input_schema: jsonb('input_schema').notNull(),
     output_schema: jsonb('output_schema').notNull(),
 
-    allowed_tools: text('allowed_tools').array().notNull().default(sql`'{}'::text[]`),
-    policy_descriptors: text('policy_descriptors').array().notNull().default(sql`'{}'::text[]`),
+    allowed_tools: text('allowed_tools')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
+    policy_descriptors: text('policy_descriptors')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
 
     // Issue #415 — role → skill axis (`applicable_to_role`, capability-taxonomy.md
     // §5). The role keys (from `roles.role_key`) for which this skill is in scope.
@@ -3088,12 +3291,21 @@ export const skills = pgTable(
     // SCOPING declaration, NOT an authorization: it can only ever REMOVE a
     // candidate, never grant one — execution is still gated by policy + the
     // dispatcher. A skill never owns confirmation/write rules (taxonomy §3, §7).
-    applicable_to_role: text('applicable_to_role').array().notNull().default(sql`'{}'::text[]`),
+    applicable_to_role: text('applicable_to_role')
+      .array()
+      .notNull()
+      .default(sql`'{}'::text[]`),
 
-    success_criteria: jsonb('success_criteria').notNull().default(sql`'[]'::jsonb`),
-    failure_modes: jsonb('failure_modes').notNull().default(sql`'[]'::jsonb`),
+    success_criteria: jsonb('success_criteria')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    failure_modes: jsonb('failure_modes')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
 
-    runtime_hints: jsonb('runtime_hints').notNull().default(sql`'{}'::jsonb`),
+    runtime_hints: jsonb('runtime_hints')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
 
     // Issue #409 — native, typed SkillUsagePolicy (Zod-validated in
     // src/skills/usage-policy.ts). NULLABLE: NULL/`{}` = the conservative
@@ -3567,9 +3779,7 @@ export const agent_turns = pgTable(
   },
   (t) => ({
     scopeIdUq: unique('agent_turns_scope_id_uq').on(t.tenant_id, t.agent_id, t.id),
-    representativeUq: uniqueIndex('agent_turns_representative_uq').on(
-      t.representative_message_id,
-    ),
+    representativeUq: uniqueIndex('agent_turns_representative_uq').on(t.representative_message_id),
     scopeStatusIdx: index('agent_turns_scope_status_next_attempt_idx').on(
       t.tenant_id,
       t.agent_id,
@@ -3833,7 +4043,9 @@ export const restore_drills = pgTable(
     duration_ms: integer('duration_ms'),
     status: text('status').notNull().default('running'),
     /** Booleanos e contagens por probe — nunca valores de linha. */
-    probes: jsonb('probes').notNull().default(sql`'{}'::jsonb`),
+    probes: jsonb('probes')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     tombstones_pending: integer('tombstones_pending'),
     failure_code: text('failure_code'),
     /**
@@ -3911,10 +4123,16 @@ export const privacy_requests = pgTable(
     due_at: timestamp('due_at', { withTimezone: true }),
     completed_at: timestamp('completed_at', { withTimezone: true }),
     denied_reason_code: text('denied_reason_code'),
-    systems_covered: jsonb('systems_covered').notNull().default(sql`'[]'::jsonb`),
-    exceptions: jsonb('exceptions').notNull().default(sql`'[]'::jsonb`),
+    systems_covered: jsonb('systems_covered')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
+    exceptions: jsonb('exceptions')
+      .notNull()
+      .default(sql`'[]'::jsonb`),
     /** Contagens e códigos, nunca o conteúdo excluído. */
-    evidence: jsonb('evidence').notNull().default(sql`'{}'::jsonb`),
+    evidence: jsonb('evidence')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     /** Locator OPACO — jamais uma URL assinada. */
     export_locator: text('export_locator'),
     export_expires_at: timestamp('export_expires_at', { withTimezone: true }),
@@ -4055,7 +4273,9 @@ export const onboarding_runs = pgTable(
     cancelled_at: timestamp('cancelled_at', { withTimezone: true }),
     expires_at: timestamp('expires_at', { withTimezone: true }).notNull(),
     last_error_code: text('last_error_code'),
-    metadata: jsonb('metadata').notNull().default(sql`'{}'::jsonb`),
+    metadata: jsonb('metadata')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     configuration_contract_version: text('configuration_contract_version').notNull(),
     schema_version: text('schema_version').notNull(),
     // migration 113 — a criação da run é um COMANDO MUTÁVEL e portanto
@@ -4096,7 +4316,9 @@ export const onboarding_events = pgTable(
     idempotency_key_hash: text('idempotency_key_hash'),
     from_state: text('from_state'),
     to_state: text('to_state'),
-    summary: jsonb('summary').notNull().default(sql`'{}'::jsonb`),
+    summary: jsonb('summary')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => ({
@@ -4117,7 +4339,9 @@ export const onboarding_step_results = pgTable(
     step: text('step').notNull(),
     idempotency_key_hash: text('idempotency_key_hash').notNull(),
     payload_hash: text('payload_hash').notNull(),
-    result: jsonb('result').notNull().default(sql`'{}'::jsonb`),
+    result: jsonb('result')
+      .notNull()
+      .default(sql`'{}'::jsonb`),
     // migration 113 — o ledger guarda RESULTADOS CONCLUSIVOS TIPADOS, não só
     // sucessos: uma negativa de governança e um cancelamento também são
     // conclusões, e sem elas o retry da mesma chave devolvia `version_conflict`
@@ -4138,7 +4362,6 @@ export const onboarding_step_results = pgTable(
 );
 
 export type OnboardingRunRow = typeof onboarding_runs.$inferSelect;
-
 
 // ---------------------------------------------------------------------------
 // Issue #519 — bootstrap global (migration 136).
@@ -4241,7 +4464,9 @@ export const conversation_controls = pgTable(
     // Default SQL, não `0n`: o drizzle-kit serializa o snapshot com
     // `JSON.stringify`, que lança com BigInt e é engolido pelo gerador (PR #766;
     // `tests/unit/db/schema-defaults-serializable.spec.ts`).
-    control_epoch: bigint('control_epoch', { mode: 'bigint' }).notNull().default(sql`0`),
+    control_epoch: bigint('control_epoch', { mode: 'bigint' })
+      .notNull()
+      .default(sql`0`),
     /** `app_users.id` é text. */
     owner_app_user_id: text('owner_app_user_id'),
     reason_code: text('reason_code'),

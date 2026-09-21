@@ -10,7 +10,8 @@ export class MissingTenantContextError extends Error {
     // Mensagem técnica em PT (target: devs/operadores). Não exposta a end-user.
     // UI deve usar `.code === 'MISSING_TENANT_CONTEXT'` pra traduzir/i18n
     // (PR #75 review, Superpowers finding #11).
-    const base = 'Tenant context não está disponível — toda query precisa rodar dentro de runWithTenantContext';
+    const base =
+      'Tenant context não está disponível — toda query precisa rodar dentro de runWithTenantContext';
     super(reason ? `${base} (${reason})` : base);
     this.name = 'MissingTenantContextError';
   }
@@ -247,7 +248,9 @@ function assertTruthyContext(value: unknown, name: string): asserts value is str
     throw new MissingTenantContextError(`${name} is whitespace-only`);
   }
   if (value !== value.trim()) {
-    throw new MissingTenantContextError(`${name} has surrounding whitespace (strict: trim upstream)`);
+    throw new MissingTenantContextError(
+      `${name} has surrounding whitespace (strict: trim upstream)`,
+    );
   }
 }
 

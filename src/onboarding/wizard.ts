@@ -256,7 +256,13 @@ export type StepOutcome =
       replayed: boolean;
       readiness?: AgentReadiness;
     }
-  | { status: 'denied'; run: OnboardingRunView; code: string; message: string; readiness?: AgentReadiness }
+  | {
+      status: 'denied';
+      run: OnboardingRunView;
+      code: string;
+      message: string;
+      readiness?: AgentReadiness;
+    }
   | { status: 'conflict'; code: string; message: string; run: OnboardingRunView }
   | { status: 'not_found' };
 
@@ -970,9 +976,7 @@ export async function executeOnboardingStep(input: {
     ((scope, ctx) =>
       evaluateAgentReadiness(
         scope,
-        ctx
-          ? { loadFacts: (s) => loadReadinessFactsWith(ctx.tx, s) }
-          : {},
+        ctx ? { loadFacts: (s) => loadReadinessFactsWith(ctx.tx, s) } : {},
       ));
 
   let outcome: CommitStepOutcome;
@@ -1086,7 +1090,11 @@ export async function executeOnboardingStep(input: {
                   code: 'scope_mismatch',
                   message: 'o par confirmado não corresponde ao escopo da run',
                 },
-                audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: run.agent_id },
+                audit: {
+                  action: 'onboarding_agent_activated',
+                  resource_type: 'agent',
+                  resource_id: run.agent_id,
+                },
               };
             }
             // REAVALIAÇÃO sob a trava da run: readiness verde há cinco minutos
@@ -1109,7 +1117,11 @@ export async function executeOnboardingStep(input: {
                   code: 'readiness_blocked',
                   message: `${blockingFailures(readiness).length} check(s) bloqueante(s) reprovado(s)`,
                 },
-                audit: { action: 'onboarding_agent_activated', resource_type: 'agent', resource_id: run.agent_id },
+                audit: {
+                  action: 'onboarding_agent_activated',
+                  resource_type: 'agent',
+                  resource_id: run.agent_id,
+                },
               };
             }
             // O conjunto de canais VALIDADO pelo avaliador viaja junto: a
@@ -1162,8 +1174,7 @@ export async function executeOnboardingStep(input: {
   // veredito novo não é um replay.
   const replayedReadiness =
     (step === 'evaluate_readiness' || step === 'activate') &&
-    ((outcome.outcome === 'denied' && outcome.replayed === true) ||
-      outcome.outcome === 'replayed')
+    ((outcome.outcome === 'denied' && outcome.replayed === true) || outcome.outcome === 'replayed')
       ? reconstituteReadiness(outcome.result)
       : undefined;
 
@@ -1190,15 +1201,17 @@ export async function executeOnboardingStep(input: {
         // é o conjunto re-derivado sob os locks, nunca "os canais do agente".
         // Fail-isolated: a run já concluiu e é durável.
         const activated = outcome.result.activated_channel_ids;
-        if (Array.isArray(activated) && activated.length > 0 && outcome.run.tenant_id && outcome.run.agent_id) {
+        if (
+          Array.isArray(activated) &&
+          activated.length > 0 &&
+          outcome.run.tenant_id &&
+          outcome.run.agent_id
+        ) {
           await startLineSessions(
             { tenant_id: outcome.run.tenant_id, agent_id: outcome.run.agent_id },
             activated.filter((id): id is string => typeof id === 'string'),
           ).catch((err) =>
-            logger.error(
-              { err, run_id: outcome.run.id },
-              'onboarding.start_line_sessions_failed',
-            ),
+            logger.error({ err, run_id: outcome.run.id }, 'onboarding.start_line_sessions_failed'),
           );
         }
       }
@@ -1256,7 +1269,7 @@ export async function executeOnboardingStep(input: {
         // do ledger (`replayedReadiness`). Antes o replay devolvia code/message
         // e mais nada — o operador ficava sabendo que foi recusado sem saber
         // por qual check nem o que corrigir.
-        ...(readiness ?? replayedReadiness
+        ...((readiness ?? replayedReadiness)
           ? { readiness: (readiness ?? replayedReadiness) as AgentReadiness }
           : {}),
       };
@@ -1270,9 +1283,19 @@ function mapOutcome(outcome: CommitStepOutcome): StepOutcome {
     case 'not_found':
       return { status: 'not_found' };
     case 'committed':
-      return { status: 'completed', run: toRunView(outcome.run), result: outcome.result, replayed: false };
+      return {
+        status: 'completed',
+        run: toRunView(outcome.run),
+        result: outcome.result,
+        replayed: false,
+      };
     case 'replayed':
-      return { status: 'completed', run: toRunView(outcome.run), result: outcome.result, replayed: true };
+      return {
+        status: 'completed',
+        run: toRunView(outcome.run),
+        result: outcome.result,
+        replayed: true,
+      };
     case 'payload_conflict':
       return {
         status: 'conflict',

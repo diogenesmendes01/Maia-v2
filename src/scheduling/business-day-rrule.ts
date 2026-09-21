@@ -29,7 +29,7 @@ import {
 const TZ = 'America/Sao_Paulo';
 
 export type ExtendedParsedRRule = LegacyParsed & {
-  byNthWorkday?: number;        // 1..28 | -1
+  byNthWorkday?: number; // 1..28 | -1
   byWorkday?: boolean;
   workdayKind?: BusinessDayKind;
 };

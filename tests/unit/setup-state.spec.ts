@@ -95,7 +95,10 @@ describe('setup-state — hasValidBaileysSession', () => {
   let SANDBOX: string;
 
   beforeEach(async () => {
-    SANDBOX = join(tmpdir(), `maia-setup-state-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    SANDBOX = join(
+      tmpdir(),
+      `maia-setup-state-test-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+    );
     await mkdir(SANDBOX, { recursive: true });
   });
 

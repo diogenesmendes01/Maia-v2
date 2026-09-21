@@ -15,9 +15,8 @@ vi.mock('@/config/feature-flags.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     skillsRepo: {
@@ -83,7 +82,6 @@ describe('detectAndProposeSkill', () => {
       { module_name: 'reflector', occurrences: 4 },
     ]);
   });
-
 
   it('proposes skills for patterns above threshold and not already active', async () => {
     const result = await runWithTenantContext(

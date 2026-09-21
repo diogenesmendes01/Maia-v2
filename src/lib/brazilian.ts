@@ -90,8 +90,7 @@ export type DocumentClassification =
 export function classifyDocument(input: string): DocumentClassification {
   const d = input.replace(/\D/g, '');
   if (d.length === 11) return isValidCPF(d) ? { kind: 'cpf', canonical: d } : { kind: 'invalid' };
-  if (d.length === 14)
-    return isValidCNPJ(d) ? { kind: 'cnpj', canonical: d } : { kind: 'invalid' };
+  if (d.length === 14) return isValidCNPJ(d) ? { kind: 'cnpj', canonical: d } : { kind: 'invalid' };
   return { kind: 'invalid' };
 }
 

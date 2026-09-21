@@ -206,14 +206,34 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
     const key = streamKey();
     // Sequências IGUAIS: sem ordem a impor, o head-of-line (#626) deixa passar
     // e quem decide é o índice — ver o cabeçalho do arquivo.
-    const t1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const t2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const t1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const t2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
 
     const first = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: t1, worker_id: 'replica-1', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: t1,
+        worker_id: 'replica-1',
+        lease_ms: LEASE_MS,
+      }),
     );
     const second = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: t2, worker_id: 'replica-2', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: t2,
+        worker_id: 'replica-2',
+        lease_ms: LEASE_MS,
+      }),
     );
 
     expect(first.ok).toBe(true);
@@ -275,18 +295,36 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
 
   it('claim EXPIRADO é recuperado DENTRO da transação e a stream destrava', async () => {
     const key = streamKey();
-    const morto = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const morto = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
     // Mesma sequência: isola a metade TEMPORAL do head-of-line. Com sequência
     // MAIOR o sucessor seria recusado como `not_head` ANTES de o índice opinar,
     // e este caso deixaria de medir a recuperação — o cenário com sequências
     // distintas está em `turn-head-of-line-real-db.spec.ts`.
-    const sucessor = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const sucessor = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
 
     // Um worker reivindica e MORRE: a lease vence e ninguém a renova.
     expect(
-      (await inA(() =>
-        repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: morto, worker_id: 'zumbi', lease_ms: LEASE_MS }),
-      )).ok,
+      (
+        await inA(() =>
+          repos().agentTurnsRepo.claimNextEligibleTurn({
+            turn_id: morto,
+            worker_id: 'zumbi',
+            lease_ms: LEASE_MS,
+          }),
+        )
+      ).ok,
     ).toBe(true);
     const antes = await readTurn(morto);
     await expireLease(morto);
@@ -330,15 +368,35 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
 
   it('lease VIVA não é recuperada — só a vencida (a recuperação não é um confisco)', async () => {
     const key = streamKey();
-    const vivo = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const vivo = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
     // Sequência igual: quem recusa tem de ser o índice, não o head-of-line.
-    const outro = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const outro = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
 
     await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: vivo, worker_id: 'dono-vivo', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: vivo,
+        worker_id: 'dono-vivo',
+        lease_ms: LEASE_MS,
+      }),
     );
     const negado = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: outro, worker_id: 'intruso', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: outro,
+        worker_id: 'intruso',
+        lease_ms: LEASE_MS,
+      }),
     );
 
     expect(negado.ok).toBe(false);
@@ -349,13 +407,27 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
 
   it('takeover do MESMO turno com lease vencida continua funcionando (regressão #504)', async () => {
     const key = streamKey();
-    const t = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const t = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
     const primeiro = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: t, worker_id: 'w1', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: t,
+        worker_id: 'w1',
+        lease_ms: LEASE_MS,
+      }),
     );
     await expireLease(t);
     const segundo = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: t, worker_id: 'w2', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: t,
+        worker_id: 'w2',
+        lease_ms: LEASE_MS,
+      }),
     );
 
     expect(segundo.ok).toBe(true);
@@ -402,14 +474,34 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
     // turno da tenant A bloquearia a conversa da tenant B — e o bloqueio seria
     // invisível, porque nada na linha de B diria que a causa é de A.
     const key = streamKey();
-    const a = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const b = await turnInStream({ tenant: T_B, agent: A_B, stream_key: key, seq: 1, repos: repos() });
+    const a = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const b = await turnInStream({
+      tenant: T_B,
+      agent: A_B,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
 
     const rA = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: a, worker_id: 'wa', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: a,
+        worker_id: 'wa',
+        lease_ms: LEASE_MS,
+      }),
     );
     const rB = await inB(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: b, worker_id: 'wb', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: b,
+        worker_id: 'wb',
+        lease_ms: LEASE_MS,
+      }),
     );
 
     expect(rA.ok).toBe(true);
@@ -422,14 +514,34 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
     // Sem backfill (decisão da fatia A), turnos históricos têm `stream_key`
     // NULL. Se eles entrassem no índice, TODO o histórico sem stream colapsaria
     // numa única chave e o primeiro claim travaria todos os outros.
-    const t1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: null, seq: 0, repos: repos() });
-    const t2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: null, seq: 0, repos: repos() });
+    const t1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: null,
+      seq: 0,
+      repos: repos(),
+    });
+    const t2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: null,
+      seq: 0,
+      repos: repos(),
+    });
 
     const r1 = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: t1, worker_id: 'w1', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: t1,
+        worker_id: 'w1',
+        lease_ms: LEASE_MS,
+      }),
     );
     const r2 = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: t2, worker_id: 'w2', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: t2,
+        worker_id: 'w2',
+        lease_ms: LEASE_MS,
+      }),
     );
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(true);
@@ -442,22 +554,42 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
     // stream aí faria uma indisponibilidade do provedor de saída parar a
     // conversa inteira.
     const key = streamKey();
-    const t1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const t1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
     // Sequência IGUAL, e aqui a escolha carrega uma decisão de projeto: para a
     // OCUPAÇÃO (esta fatia) `outbound_pending` não prende a stream, mas para a
     // ORDEM (#626) ele prende — um turno ANTERIOR em `outbound_pending` recusa
     // o posterior com `stream_blocked`. As duas coisas são verdadeiras ao mesmo
     // tempo porque respondem a perguntas diferentes; o caso da ordem está em
     // `turn-head-of-line-real-db.spec.ts`.
-    const t2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const t2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
 
     await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: t1, worker_id: 'w1', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: t1,
+        worker_id: 'w1',
+        lease_ms: LEASE_MS,
+      }),
     );
     await pool.query(`UPDATE agent_turns SET status = 'outbound_pending' WHERE id = $1`, [t1]);
 
     const r2 = await inA(() =>
-      repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id: t2, worker_id: 'w2', lease_ms: LEASE_MS }),
+      repos().agentTurnsRepo.claimNextEligibleTurn({
+        turn_id: t2,
+        worker_id: 'w2',
+        lease_ms: LEASE_MS,
+      }),
     );
     expect(r2.ok).toBe(true);
   });
@@ -467,9 +599,21 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
   it('beginTurnExecution (call site de produção) devolve reason=stream_busy', async () => {
     const { beginTurnExecution } = await import('@/runtime/turns/lifecycle.js');
     const key = streamKey();
-    const t1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const t1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
     // Sequência igual — ver o cabeçalho do arquivo.
-    const t2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const t2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
 
     const handleFor = (turn_id: string) =>
       ({
@@ -504,9 +648,21 @@ d('#625 — exclusão de um turno ativo por stream (DB real)', () => {
   it('a recuperação de claim expirado é AUDITADA pelo call site de produção', async () => {
     const { beginTurnExecution } = await import('@/runtime/turns/lifecycle.js');
     const key = streamKey();
-    const morto = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const morto = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
     // Sequência igual — ver o cabeçalho do arquivo.
-    const sucessor = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const sucessor = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
 
     const handleFor = (turn_id: string) =>
       ({

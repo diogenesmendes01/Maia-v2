@@ -52,8 +52,7 @@ const PER_TICK_LIMIT = 100;
  * Build the maturity predicate per-table using the actual column name.
  */
 function maturityFilter(kind: KnowledgeKind, minConfidence: number, minEvidence: number) {
-  const confCol =
-    kind === 'fact' || kind === 'rule' ? sql.raw('confianca') : sql.raw('confidence');
+  const confCol = kind === 'fact' || kind === 'rule' ? sql.raw('confianca') : sql.raw('confidence');
   return sql`evidence_count >= ${minEvidence} AND ${confCol} >= ${minConfidence}`;
 }
 
@@ -81,9 +80,7 @@ const ONE_DAY_MS = 24 * 60 * 60 * 1000;
 async function promote(args: {
   from: KnowledgeLifecycleStatus;
   to: KnowledgeLifecycleStatus;
-  filter:
-    | ReturnType<typeof sql>
-    | ((kind: KnowledgeKind) => ReturnType<typeof sql>);
+  filter: ReturnType<typeof sql> | ((kind: KnowledgeKind) => ReturnType<typeof sql>);
   reason: string;
   decided_by: KnowledgeDecidedBy;
   stats: PromoteStats;
@@ -250,8 +247,7 @@ export async function runKnowledgeStatePromoter(): Promise<void> {
     errors: 0,
   };
 
-  const ageCutoff = (days: number) =>
-    new Date(Date.now() - days * ONE_DAY_MS);
+  const ageCutoff = (days: number) => new Date(Date.now() - days * ONE_DAY_MS);
 
   try {
     // 1. ephemeral → observed (evidence_count >= 1 within last 24h)

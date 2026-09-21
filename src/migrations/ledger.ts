@@ -146,10 +146,7 @@ export async function ensureLedgerSchema(client: LedgerClient): Promise<void> {
  * was applied", with no checksum — which downstream classifies as
  * `checksum_unknown` (blocking) rather than as verified.
  */
-export async function readLedger(
-  client: LedgerClient,
-  shape: LedgerShape,
-): Promise<LedgerEntry[]> {
+export async function readLedger(client: LedgerClient, shape: LedgerShape): Promise<LedgerEntry[]> {
   if (!shape.present) return [];
   if (shape.version === 1) {
     const res = await client.query<{ id: string; applied_at: unknown }>(

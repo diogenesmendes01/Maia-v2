@@ -39,9 +39,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
     KnowledgeConflictError,
     knowledgeRepos: {
       async create(input: { lifecycle_status: string }): Promise<string> {
-        const id = `00000000-0000-0000-0000-${Math.floor(
-          Math.random() * 1e12,
-        )
+        const id = `00000000-0000-0000-0000-${Math.floor(Math.random() * 1e12)
           .toString(16)
           .padStart(12, '0')}`;
         storeFact.set(id, { lifecycle_status: input.lifecycle_status });
@@ -58,9 +56,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: { record: vi.fn().mockResolvedValue(undefined) },
@@ -73,9 +70,8 @@ vi.mock('@/lib/logger.js', () => ({
 
 describe('Finding 3 — slow scorer still completes the insert synchronously', () => {
   it('returns UUID proposal_id + pending_review on scorer timeout', async () => {
-    const { KnowledgeStateMachine } = await import(
-      '@/control-plane/knowledge-state-machine/state-machine.js'
-    );
+    const { KnowledgeStateMachine } =
+      await import('@/control-plane/knowledge-state-machine/state-machine.js');
 
     const result = await KnowledgeStateMachine.propose({
       trace_id: 't',

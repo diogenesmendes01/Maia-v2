@@ -98,9 +98,7 @@ describe('resolvePaymentOccurrence — Blocker 1 (review 2)', () => {
   it('dispatch returns { error }: occurrence marked failed, NO payment_due_confirmed audit, NO next cycle', async () => {
     byIdMock.mockResolvedValue(occ);
     findSeriesMock.mockResolvedValue(series);
-    tasksByOccMock.mockResolvedValue([
-      { id: 't3', kind: 'execute_or_skip', status: 'pending' },
-    ]);
+    tasksByOccMock.mockResolvedValue([{ id: 't3', kind: 'execute_or_skip', status: 'pending' }]);
     pessoasFindByIdMock.mockResolvedValue(owner);
     dispatchToolMock.mockResolvedValue({ error: 'forbidden', details: { rule_id: 'C-001' } });
 
@@ -128,9 +126,7 @@ describe('resolvePaymentOccurrence — Blocker 1 (review 2)', () => {
     );
     // No payment_due_confirmed audit.
     expect(
-      auditMock.mock.calls.some(
-        (c) => (c[0] as { acao: string }).acao === 'payment_due_confirmed',
-      ),
+      auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'payment_due_confirmed'),
     ).toBe(false);
     // Owner alerted via outbox.
     expect(enqueueMock).toHaveBeenCalledWith(
@@ -146,9 +142,7 @@ describe('resolvePaymentOccurrence — Blocker 1 (review 2)', () => {
   it('dispatch throws: same failure-handling path, no confirmed audit', async () => {
     byIdMock.mockResolvedValue(occ);
     findSeriesMock.mockResolvedValue(series);
-    tasksByOccMock.mockResolvedValue([
-      { id: 't3', kind: 'execute_or_skip', status: 'pending' },
-    ]);
+    tasksByOccMock.mockResolvedValue([{ id: 't3', kind: 'execute_or_skip', status: 'pending' }]);
     pessoasFindByIdMock.mockResolvedValue(owner);
     dispatchToolMock.mockRejectedValue(new Error('redis_down'));
 
@@ -160,15 +154,9 @@ describe('resolvePaymentOccurrence — Blocker 1 (review 2)', () => {
       { pessoa: { id: owner.id }, conversa: { id: 'c1' }, mensagem_id: 'm1' },
     );
     expect(r.dispatched_tool).toBeNull();
-    expect(setStatusMock).toHaveBeenCalledWith(
-      occ.id,
-      'failed',
-      expect.any(Object),
-    );
+    expect(setStatusMock).toHaveBeenCalledWith(occ.id, 'failed', expect.any(Object));
     expect(
-      auditMock.mock.calls.some(
-        (c) => (c[0] as { acao: string }).acao === 'payment_due_confirmed',
-      ),
+      auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'payment_due_confirmed'),
     ).toBe(false);
     expect(insertNextMock).not.toHaveBeenCalled();
   });
@@ -176,9 +164,7 @@ describe('resolvePaymentOccurrence — Blocker 1 (review 2)', () => {
   it('dispatch succeeds with no error key: full confirm path runs', async () => {
     byIdMock.mockResolvedValue(occ);
     findSeriesMock.mockResolvedValue(series);
-    tasksByOccMock.mockResolvedValue([
-      { id: 't3', kind: 'execute_or_skip', status: 'pending' },
-    ]);
+    tasksByOccMock.mockResolvedValue([{ id: 't3', kind: 'execute_or_skip', status: 'pending' }]);
     pessoasFindByIdMock.mockResolvedValue(owner);
     dispatchToolMock.mockResolvedValue({ transacao_id: 't-uuid', saldo_apos: 100 });
 
@@ -197,9 +183,7 @@ describe('resolvePaymentOccurrence — Blocker 1 (review 2)', () => {
     );
     expect(setStatusMock).toHaveBeenCalledWith(occ.id, 'completed', { outcome: 'sim' });
     expect(
-      auditMock.mock.calls.some(
-        (c) => (c[0] as { acao: string }).acao === 'payment_due_confirmed',
-      ),
+      auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'payment_due_confirmed'),
     ).toBe(true);
     expect(insertNextMock).toHaveBeenCalledTimes(1);
   });

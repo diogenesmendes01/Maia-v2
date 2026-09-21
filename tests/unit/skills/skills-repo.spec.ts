@@ -55,14 +55,17 @@ function nextId(): string {
   return `skill-${idCounter}`;
 }
 
-function keyOf(s: { tenant_id: string; agent_id: string | null; skill_descriptor: string }): string {
+function keyOf(s: {
+  tenant_id: string;
+  agent_id: string | null;
+  skill_descriptor: string;
+}): string {
   return `${s.tenant_id}:${s.agent_id ?? 'tenant_wide'}:${s.skill_descriptor}`;
 }
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
 
   return {
     ...actual,
@@ -71,9 +74,7 @@ vi.mock('@/db/repositories.js', async () => {
         const tenant_id = input.tenant_id ?? 'default';
         const agent_id = input.agent_id ?? null;
         const k = keyOf({ tenant_id, agent_id, skill_descriptor: input.skill_descriptor });
-        const sameKey = Object.values(skillsState).filter(
-          (s) => keyOf(s) === k,
-        );
+        const sameKey = Object.values(skillsState).filter((s) => keyOf(s) === k);
         const nextVersion = sameKey.reduce((max, s) => Math.max(max, s.version), 0) + 1;
         const id = nextId();
         const row: SkillRow = {
@@ -178,7 +179,8 @@ vi.mock('@/db/repositories.js', async () => {
       },
       async getByDescriptor(descriptor: string, version?: number) {
         const all = Object.values(skillsState).filter(
-          (s) => s.skill_descriptor === descriptor && (version === undefined || s.version === version),
+          (s) =>
+            s.skill_descriptor === descriptor && (version === undefined || s.version === version),
         );
         all.sort((a, b) => b.version - a.version);
         return all[0] ?? null;
@@ -277,7 +279,9 @@ describe('skillsRepo', () => {
       const { skillsRepo } = await import('@/db/repositories.js');
       const v1 = await skillsRepo.propose({ ...baseInput });
       await skillsRepo.activate(v1.id, 'owner');
-      await expect(skillsRepo.activate(v1.id, 'owner')).rejects.toThrow('cannot_activate_from_active');
+      await expect(skillsRepo.activate(v1.id, 'owner')).rejects.toThrow(
+        'cannot_activate_from_active',
+      );
     });
   });
 
@@ -301,9 +305,17 @@ describe('skillsRepo', () => {
   it('listByCategory returns active in category', async () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const { skillsRepo } = await import('@/db/repositories.js');
-      const c1 = await skillsRepo.propose({ ...baseInput, skill_descriptor: 'a', category: 'classify' });
+      const c1 = await skillsRepo.propose({
+        ...baseInput,
+        skill_descriptor: 'a',
+        category: 'classify',
+      });
       await skillsRepo.activate(c1.id, 'owner');
-      const c2 = await skillsRepo.propose({ ...baseInput, skill_descriptor: 'b', category: 'extract' });
+      const c2 = await skillsRepo.propose({
+        ...baseInput,
+        skill_descriptor: 'b',
+        category: 'extract',
+      });
       await skillsRepo.activate(c2.id, 'owner');
       const classify = await skillsRepo.listByCategory('classify');
       expect(classify.length).toBe(1);

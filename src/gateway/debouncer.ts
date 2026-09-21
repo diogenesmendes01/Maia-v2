@@ -1,9 +1,4 @@
-import {
-  redis,
-  isRedisConnected,
-  isRedisOomError,
-  recordRedisOomDegraded,
-} from '@/lib/redis.js';
+import { redis, isRedisConnected, isRedisOomError, recordRedisOomDegraded } from '@/lib/redis.js';
 import { agentQueue } from './queue.js';
 import { withCorrelation } from './job-correlation.js';
 import { config } from '@/config/env.js';
@@ -256,8 +251,7 @@ function scopedKey(phone: string): string {
 
 const STATE_KEY = (scoped: string): string => `agent-debounce:${scoped}`;
 
-export const debounceJobId = (phone: string): string =>
-  `debounce:${scopedKey(phone)}`;
+export const debounceJobId = (phone: string): string => `debounce:${scopedKey(phone)}`;
 
 type DebounceState = {
   /** ms since epoch when the FIRST message of this window was enqueued */
@@ -479,10 +473,7 @@ export async function scheduleDebouncedAgent(params: {
     // persisted in Postgres, no raw ReplyError crash, no double-enqueue).
     if (isRedisOomError(err)) {
       recordRedisOomDegraded('debouncer.write_state', { scoped_key: scoped });
-      logger.warn(
-        { scoped_key: scoped, mensagem_id, redis_oom: true },
-        'debounce.schedule_failed',
-      );
+      logger.warn({ scoped_key: scoped, mensagem_id, redis_oom: true }, 'debounce.schedule_failed');
       throw new DebouncerRedisUnavailableError('scheduleDebouncedAgent', { oom: true });
     }
     // Log here so the failing operation is attributable even if the

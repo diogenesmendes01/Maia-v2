@@ -12,13 +12,7 @@
  * full design rationale.
  */
 
-export const KNOWN_ROLES = new Set([
-  'founder',
-  'compliance_officer',
-  'owner',
-  'analyst',
-  'viewer',
-]);
+export const KNOWN_ROLES = new Set(['founder', 'compliance_officer', 'owner', 'analyst', 'viewer']);
 
 /**
  * Constant-time string comparison. Avoids leaking match-prefix-length through
@@ -234,8 +228,7 @@ export function oidcProviderEnabled(): boolean {
   // Dev/test: https:// always OK; http:// only for loopback hosts so a
   // local IdP (Keycloak, dex, etc.) can be exercised without TLS.
   const isLoopbackHttp =
-    url.protocol === 'http:' &&
-    (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
+    url.protocol === 'http:' && (url.hostname === 'localhost' || url.hostname === '127.0.0.1');
   if (url.protocol !== 'https:' && !isLoopbackHttp) return false;
   if (!clientId) return false;
   if (clientSecret.length < MIN_OIDC_CLIENT_SECRET_LEN) return false;

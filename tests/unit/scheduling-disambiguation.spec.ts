@@ -77,9 +77,7 @@ describe('captureInboundForOutreach — Requirement 6', () => {
     tasksByOccurrenceMock.mockResolvedValue([
       { id: 'task-await', kind: 'await_response', status: 'in_progress' },
     ]);
-    const { captureInboundForOutreach } = await import(
-      '../../src/scheduling/disambiguation.js'
-    );
+    const { captureInboundForOutreach } = await import('../../src/scheduling/disambiguation.js');
     const result = await captureInboundForOutreach({
       sender: sender as never,
       inbound: { id: 'inb-1', conteudo: 'segue _ref: A4F2_' } as never,
@@ -97,9 +95,7 @@ describe('captureInboundForOutreach — Requirement 6', () => {
     tasksByOccurrenceMock.mockResolvedValue([
       { id: 'task-await', kind: 'await_response', status: 'in_progress' },
     ]);
-    const { captureInboundForOutreach } = await import(
-      '../../src/scheduling/disambiguation.js'
-    );
+    const { captureInboundForOutreach } = await import('../../src/scheduling/disambiguation.js');
     const result = await captureInboundForOutreach({
       sender: sender as never,
       inbound: { id: 'inb-2', conteudo: 'segue em anexo' } as never,
@@ -132,9 +128,7 @@ describe('captureInboundForOutreach — Requirement 6', () => {
     conversasFindActiveMock.mockResolvedValue({ id: 'owner-conv' });
     pendingCreateMock.mockResolvedValue({ id: 'pq-1' });
 
-    const { captureInboundForOutreach } = await import(
-      '../../src/scheduling/disambiguation.js'
-    );
+    const { captureInboundForOutreach } = await import('../../src/scheduling/disambiguation.js');
     const result = await captureInboundForOutreach({
       sender: sender as never,
       inbound: { id: 'inb-3', conteudo: 'segue' } as never,
@@ -163,8 +157,7 @@ describe('captureInboundForOutreach — Requirement 6', () => {
     // Audit fired.
     expect(
       auditMock.mock.calls.some(
-        (c) =>
-          (c[0] as { acao: string }).acao === 'outreach_response_disambiguation_required',
+        (c) => (c[0] as { acao: string }).acao === 'outreach_response_disambiguation_required',
       ),
     ).toBe(true);
   });
@@ -178,9 +171,7 @@ describe('captureInboundForOutreach — Requirement 6', () => {
     // No candidates for this sender → no_match.
     listAwaitingForDestinatarioMock.mockResolvedValue([]);
 
-    const { captureInboundForOutreach } = await import(
-      '../../src/scheduling/disambiguation.js'
-    );
+    const { captureInboundForOutreach } = await import('../../src/scheduling/disambiguation.js');
     const result = await captureInboundForOutreach({
       sender: sender as never,
       inbound: { id: 'inb-4', conteudo: 'algo _ref: ZZZZ_' } as never,

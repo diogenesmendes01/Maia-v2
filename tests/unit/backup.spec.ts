@@ -205,7 +205,9 @@ describe('nightly_backup worker', () => {
   });
 
   it('never puts a path, URL or credential in the alert body', async () => {
-    runVerifiedBackupMock.mockResolvedValue(backupResult({ outcome: 'failed', reason: 'dump_failed' }));
+    runVerifiedBackupMock.mockResolvedValue(
+      backupResult({ outcome: 'failed', reason: 'dump_failed' }),
+    );
     const { runNightlyBackup } = await import('../../src/workers/backup.js');
     await runNightlyBackup();
     const body = sendAlertMock.mock.calls[0]![0].body as string;

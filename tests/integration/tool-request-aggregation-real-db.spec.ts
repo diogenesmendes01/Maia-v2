@@ -73,20 +73,14 @@ const novoLixo = (): Lixo => ({ gaps: [] });
 async function limpar(c: pg.PoolClient, l: Lixo) {
   if (l.gaps.length === 0) return;
   const g = [l.gaps];
-  await c.query(
-    'DELETE FROM tool_request_aggregate_members WHERE gap_id = ANY($1::uuid[])',
-    g,
-  );
+  await c.query('DELETE FROM tool_request_aggregate_members WHERE gap_id = ANY($1::uuid[])', g);
   await c.query(
     `DELETE FROM tool_request_aggregates
       WHERE representative_gap_id = ANY($1::uuid[])`,
     g,
   );
   await c.query('DELETE FROM capability_proposals WHERE gap_id = ANY($1::uuid[])', g);
-  await c.query(
-    'DELETE FROM agent_capability_gap_observations WHERE gap_id = ANY($1::uuid[])',
-    g,
-  );
+  await c.query('DELETE FROM agent_capability_gap_observations WHERE gap_id = ANY($1::uuid[])', g);
   await c.query('DELETE FROM agent_capability_gaps WHERE id = ANY($1::uuid[])', g);
 }
 
@@ -113,13 +107,7 @@ async function mkGap(
       `INSERT INTO agent_capability_gap_observations
          (tenant_id, agent_id, gap_id, intent, attempted_args)
        VALUES ($1, $2, $3, $4, $5::jsonb)`,
-      [
-        args.tenant,
-        args.agent,
-        gapId,
-        args.descricao,
-        JSON.stringify(args.args_tentados ?? {}),
-      ],
+      [args.tenant, args.agent, gapId, args.descricao, JSON.stringify(args.args_tentados ?? {})],
     );
   }
   return gapId;
@@ -127,8 +115,7 @@ async function mkGap(
 
 /** Roda o call site de PRODUÇÃO sobre um gap, no escopo dado. */
 async function pedir(c: pg.PoolClient, tenant: string, agent: string, gapId: string) {
-  const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
-    .rows[0];
+  const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId])).rows[0];
   return runWithTenantContext({ tenant_id: tenant, agent_id: agent }, () =>
     proposer().proposeToolRequestForGap({ gap: gap as never }),
   );
@@ -730,10 +717,7 @@ d('#637 — contratos INCOMPATÍVEIS no caminho real: divergente, sem spec inven
       expect(agg.contract_conflicts).toHaveLength(1);
       expect(agg.contract_conflicts[0]!.campo).toBe('competencia');
       expect(agg.contract_conflicts[0]!.lado).toBe('input');
-      expect(agg.contract_conflicts[0]!.zods.sort()).toEqual([
-        'z.number().int()',
-        'z.string()',
-      ]);
+      expect(agg.contract_conflicts[0]!.zods.sort()).toEqual(['z.number().int()', 'z.string()']);
 
       // OS DOIS rascunhos originais continuam legíveis, lado a lado.
       const membros = (
@@ -799,9 +783,7 @@ d('#637 — contratos INCOMPATÍVEIS no caminho real: divergente, sem spec inven
           [r1.aggregate_id],
         )
       ).rows[0]!;
-      expect(marcado.zod_source.startsWith('// PROPOSTA — NÃO É CONTRATO VIGENTE.')).toBe(
-        true,
-      );
+      expect(marcado.zod_source.startsWith('// PROPOSTA — NÃO É CONTRATO VIGENTE.')).toBe(true);
     } finally {
       await limpar(c, lixo);
       c.release();
@@ -823,10 +805,9 @@ d('#637 — contratos INCOMPATÍVEIS no caminho real: divergente, sem spec inven
       // Vindo de um `psql`, sem passar por Zod nenhum: a política de fusão tem
       // metade no banco, exatamente como a marcação de rascunho da 125.
       await expect(
-        c.query(
-          `UPDATE tool_request_aggregates SET contract_state = 'divergent' WHERE id = $1`,
-          [r1.aggregate_id],
-        ),
+        c.query(`UPDATE tool_request_aggregates SET contract_state = 'divergent' WHERE id = $1`, [
+          r1.aggregate_id,
+        ]),
       ).rejects.toThrow(/tool_request_aggregates_divergent_has_no_draft/);
     } finally {
       await limpar(c, lixo);

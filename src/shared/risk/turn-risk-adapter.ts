@@ -236,9 +236,7 @@ export function inferTopicFromText(text: string): TopicSignal {
 export function inferToolKindsFromText(text: string, topic: TopicSignal): ToolKind[] {
   const t = text.toLowerCase();
   const kinds = new Set<ToolKind>();
-  if (
-    includesAny(t, ['irrevers', 'deletar', 'apagar', 'excluir', 'delete', 'remove'])
-  ) {
+  if (includesAny(t, ['irrevers', 'deletar', 'apagar', 'excluir', 'delete', 'remove'])) {
     kinds.add('irreversible');
   }
   if (
@@ -259,8 +257,7 @@ export function inferToolKindsFromText(text: string, topic: TopicSignal): ToolKi
 export function extractTurnRiskSignals(input: ClassifyTurnRiskInput): TurnRiskSignals {
   const text = input.text ?? '';
   const topic = input.topic ?? (text ? inferTopicFromText(text) : undefined);
-  const inferredToolKinds =
-    topic !== undefined && text ? inferToolKindsFromText(text, topic) : [];
+  const inferredToolKinds = topic !== undefined && text ? inferToolKindsFromText(text, topic) : [];
   const mergedToolKinds = [...new Set([...(input.tool_kinds ?? []), ...inferredToolKinds])];
 
   return {

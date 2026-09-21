@@ -30,10 +30,7 @@ import type {
   SkillSelectorResult,
   SkillsRepo,
 } from './types.js';
-import type {
-  BaseContextPacket,
-  DecisionPacket,
-} from '../context-packet/types.js';
+import type { BaseContextPacket, DecisionPacket } from '../context-packet/types.js';
 import { SKILL_MATCH_THRESHOLD, scoreSkillMatch } from './skill-match.js';
 import {
   evaluateUsagePolicy,
@@ -239,12 +236,11 @@ export class SkillSelectorImpl implements SkillSelector {
           policy_source: resolved.source,
         });
       } else {
-        await this.auditDecision(
-          BLOCK_REASON_TO_AUDIT[decision.reason],
-          skill,
-          audience,
-          { ...auditCtx, detail: decision.detail, policy_source: resolved.source },
-        );
+        await this.auditDecision(BLOCK_REASON_TO_AUDIT[decision.reason], skill, audience, {
+          ...auditCtx,
+          detail: decision.detail,
+          policy_source: resolved.source,
+        });
       }
     }
     return admitted;

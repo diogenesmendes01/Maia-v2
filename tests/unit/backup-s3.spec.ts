@@ -67,9 +67,7 @@ describe('uploadBackup', () => {
   it('calls PutObject with the right bucket + key', async () => {
     sendMock.mockResolvedValue({});
     vi.resetModules();
-    const { uploadBackup, _resetS3ClientForTests } = await import(
-      '../../src/workers/backup-s3.js'
-    );
+    const { uploadBackup, _resetS3ClientForTests } = await import('../../src/workers/backup-s3.js');
     _resetS3ClientForTests();
     const url = await uploadBackup('/tmp/maia-2026-05-08T03-00-00.dump');
     expect(sendMock).toHaveBeenCalledOnce();
@@ -91,9 +89,7 @@ describe('uploadBackup', () => {
     configState.BACKUP_S3_ENDPOINT = 'https://s3.us-west-002.backblazeb2.com';
     sendMock.mockResolvedValue({});
     vi.resetModules();
-    const { uploadBackup, _resetS3ClientForTests } = await import(
-      '../../src/workers/backup-s3.js'
-    );
+    const { uploadBackup, _resetS3ClientForTests } = await import('../../src/workers/backup-s3.js');
     _resetS3ClientForTests();
     const url = await uploadBackup('/tmp/x.dump');
     expect(url).toContain('backblazeb2.com');
@@ -121,9 +117,8 @@ describe('listBackupObjectKeys', () => {
       IsTruncated: false,
     });
     vi.resetModules();
-    const { listBackupObjectKeys, _resetS3ClientForTests } = await import(
-      '../../src/workers/backup-s3.js'
-    );
+    const { listBackupObjectKeys, _resetS3ClientForTests } =
+      await import('../../src/workers/backup-s3.js');
     _resetS3ClientForTests();
     expect(await listBackupObjectKeys()).toEqual(['maia/a.dump', 'maia/b.dump']);
   });
@@ -137,9 +132,8 @@ describe('listBackupObjectKeys', () => {
       })
       .mockResolvedValueOnce({ Contents: [{ Key: 'maia/b.dump' }], IsTruncated: false });
     vi.resetModules();
-    const { listBackupObjectKeys, _resetS3ClientForTests } = await import(
-      '../../src/workers/backup-s3.js'
-    );
+    const { listBackupObjectKeys, _resetS3ClientForTests } =
+      await import('../../src/workers/backup-s3.js');
     _resetS3ClientForTests();
     expect(await listBackupObjectKeys()).toEqual(['maia/a.dump', 'maia/b.dump']);
   });
@@ -155,9 +149,8 @@ describe('listBackupObjectKeys', () => {
   it('never deletes — listing is for reconciliation only', async () => {
     sendMock.mockResolvedValueOnce({ Contents: [{ Key: 'maia/a.dump' }], IsTruncated: false });
     vi.resetModules();
-    const { listBackupObjectKeys, _resetS3ClientForTests } = await import(
-      '../../src/workers/backup-s3.js'
-    );
+    const { listBackupObjectKeys, _resetS3ClientForTests } =
+      await import('../../src/workers/backup-s3.js');
     _resetS3ClientForTests();
     await listBackupObjectKeys();
     // Exactly one call: the list. No DeleteObjects.

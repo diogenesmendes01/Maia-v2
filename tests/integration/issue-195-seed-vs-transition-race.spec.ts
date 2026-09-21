@@ -41,7 +41,8 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 const T = 'issue195-tenant';
@@ -578,9 +579,7 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
       }),
     );
 
-    await expect(seedPromise).rejects.toThrow(
-      /seed_atomic_missing_predecessor_expectation/i,
-    );
+    await expect(seedPromise).rejects.toThrow(/seed_atomic_missing_predecessor_expectation/i);
 
     // Verify tx rolled back — only v1 exists, still rolled_back.
     const verify = await pool.connect();
@@ -626,18 +625,16 @@ d('seedNewActiveAtomic vs transition cross-writer race (issue #195, real DB)', (
 
     // No versions seeded for this agent — the reset in beforeEach already
     // truncated. The seed should treat this as an initial allocation.
-    const result = await runWithTenantContext(
-      { tenant_id: T, agent_id: A },
-      async () =>
-        operationalProfileVersionsRepo.seedNewActiveAtomic({
-          profile_body: {
-            metadata: { previous_version_id: null },
-          } as unknown as Parameters<
-            typeof operationalProfileVersionsRepo.seedNewActiveAtomic
-          >[0]['profile_body'],
-          proposed_by: 'p8d-migration',
-          proposed_reason: 'initial seed for brand-new agent',
-        }),
+    const result = await runWithTenantContext({ tenant_id: T, agent_id: A }, async () =>
+      operationalProfileVersionsRepo.seedNewActiveAtomic({
+        profile_body: {
+          metadata: { previous_version_id: null },
+        } as unknown as Parameters<
+          typeof operationalProfileVersionsRepo.seedNewActiveAtomic
+        >[0]['profile_body'],
+        proposed_by: 'p8d-migration',
+        proposed_reason: 'initial seed for brand-new agent',
+      }),
     );
 
     expect(result.new_active.version).toBe(1);

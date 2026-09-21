@@ -85,19 +85,13 @@ export type DataScope = (typeof DATA_SCOPES)[number];
 
 /** Type guards — useful for validating values read from the DB / external input. */
 export function isAudienceType(value: unknown): value is AudienceType {
-  return (
-    typeof value === 'string' && (AUDIENCE_TYPES as readonly string[]).includes(value)
-  );
+  return typeof value === 'string' && (AUDIENCE_TYPES as readonly string[]).includes(value);
 }
 
 export function isTrustLevel(value: unknown): value is TrustLevel {
-  return (
-    typeof value === 'string' && (TRUST_LEVELS as readonly string[]).includes(value)
-  );
+  return typeof value === 'string' && (TRUST_LEVELS as readonly string[]).includes(value);
 }
 
 export function isDataScope(value: unknown): value is DataScope {
-  return (
-    typeof value === 'string' && (DATA_SCOPES as readonly string[]).includes(value)
-  );
+  return typeof value === 'string' && (DATA_SCOPES as readonly string[]).includes(value);
 }

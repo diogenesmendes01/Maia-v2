@@ -18,7 +18,10 @@ import { TypedError } from '@/lib/utils.js';
 import type { Channel } from '@/db/schema.js';
 
 // Mock do repositório — únicos side-effects que importam para o resolver.
-const findByExternalCrossTenantMock = vi.fn<[args: { channel_type: string; external_id: string }], Promise<Channel | null>>();
+const findByExternalCrossTenantMock = vi.fn<
+  [args: { channel_type: string; external_id: string }],
+  Promise<Channel | null>
+>();
 const findPrimaryCatchAllChannelMock = vi.fn();
 vi.mock('@/db/repositories.js', () => ({
   channelsRepo: {
@@ -217,9 +220,7 @@ describe('resolveChannel — modos shadow / exact_first / strict (§1.2)', () =>
   it('shadow: resultado é o LEGADO; divergência do exact pela linha é auditada', async () => {
     configMock.MAIA_CHANNEL_ROUTING_MODE = 'shadow';
     // 1º lookup: exact pela LINHA → canal da linha; 2º: legado pelo remetente → miss.
-    findByExternalCrossTenantMock
-      .mockResolvedValueOnce(lineChannel)
-      .mockResolvedValueOnce(null);
+    findByExternalCrossTenantMock.mockResolvedValueOnce(lineChannel).mockResolvedValueOnce(null);
     findPrimaryCatchAllChannelMock.mockResolvedValueOnce({
       multi_tenant: false,
       channel: makePrimaryChannel(),
@@ -306,9 +307,7 @@ describe('resolveChannel — modos shadow / exact_first / strict (§1.2)', () =>
       bot_line_external_id: LINE,
     });
     expect(out.channel_id).toBe('primary-channel-uuid');
-    expect(auditMock).toHaveBeenCalledWith(
-      expect.objectContaining({ acao: 'legacy_catch_all' }),
-    );
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({ acao: 'legacy_catch_all' }));
   });
 
   it('strict: hit pela linha → triplete exato', async () => {

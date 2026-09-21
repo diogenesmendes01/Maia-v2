@@ -21,9 +21,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
       async create(input: { lifecycle_status: string }): Promise<string> {
         if (createBehavior === 'throws') throw new Error('mock_db_failure');
         if (createBehavior === 'returns_empty') return '';
-        const id = `00000000-0000-0000-0000-${Math.floor(
-          Math.random() * 1e12,
-        )
+        const id = `00000000-0000-0000-0000-${Math.floor(Math.random() * 1e12)
           .toString(16)
           .padStart(12, '0')}`;
         storeFact.set(id, { lifecycle_status: input.lifecycle_status });
@@ -40,9 +38,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -67,9 +64,8 @@ afterEach(() => {
 describe('Finding 3 — propose() insert error behaviour', () => {
   it('insert returning empty id throws', async () => {
     createBehavior = 'returns_empty';
-    const { KnowledgeStateMachine } = await import(
-      '@/control-plane/knowledge-state-machine/state-machine.js'
-    );
+    const { KnowledgeStateMachine } =
+      await import('@/control-plane/knowledge-state-machine/state-machine.js');
     await expect(
       KnowledgeStateMachine.propose({
         trace_id: 't',
@@ -89,9 +85,8 @@ describe('Finding 3 — propose() insert error behaviour', () => {
 
   it('DB insert failure throws (not silent empty id)', async () => {
     createBehavior = 'throws';
-    const { KnowledgeStateMachine } = await import(
-      '@/control-plane/knowledge-state-machine/state-machine.js'
-    );
+    const { KnowledgeStateMachine } =
+      await import('@/control-plane/knowledge-state-machine/state-machine.js');
     await expect(
       KnowledgeStateMachine.propose({
         trace_id: 't',

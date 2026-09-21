@@ -97,12 +97,10 @@ export type OutboundPayloadType = (typeof OUTBOUND_PAYLOAD_TYPES)[number];
 export const OUTBOUND_PAYLOAD_TYPES_UNSUPPORTED = {
   image:
     'LineOutput (src/gateway/line-output.ts) nao declara sendImage; #506 §Out of Scope proibe implementar tipo que a plataforma ainda nao suporta.',
-  video:
-    'LineOutput nao declara sendVideo; mesma razao de image.',
+  video: 'LineOutput nao declara sendVideo; mesma razao de image.',
   interactive_buttons:
     'LineOutput declara sendPoll e nada mais de interativo; botao/lista nao tem primitiva. A unica forma real de interactive e interactive_poll.',
-  interactive_list:
-    'Idem interactive_buttons.',
+  interactive_list: 'Idem interactive_buttons.',
 } as const satisfies Record<string, string>;
 
 /**
@@ -602,14 +600,14 @@ export function deriveProviderIdempotencyKey(
   const digest = sha256(`${PROVIDER_KEY_DOMAIN}\n${keyMaterial(identity)}`);
   switch (channel) {
     case 'whatsapp':
-      return (
-        WHATSAPP_MSG_ID_PREFIX + digest.toUpperCase().slice(0, WHATSAPP_MSG_ID_HEX_LEN)
-      );
+      return WHATSAPP_MSG_ID_PREFIX + digest.toUpperCase().slice(0, WHATSAPP_MSG_ID_HEX_LEN);
     default: {
       // Exaustividade: um canal novo decide o proprio formato aqui.
       const _never: never = channel;
       void _never;
-      throw new TypeError(`outbound key: canal sem formato de chave declarado (${String(channel)})`);
+      throw new TypeError(
+        `outbound key: canal sem formato de chave declarado (${String(channel)})`,
+      );
     }
   }
 }

@@ -130,7 +130,9 @@ describe('maia doctor · runtime.node_version', () => {
 describe('maia doctor · config.admin_boot_gates', () => {
   it('mirrors MIN_OIDC_CLIENT_SECRET_LEN from src/admin-ui/lib/auth-gating.ts', () => {
     const gating = readFileSync(join(ROOT, 'src/admin-ui/lib/auth-gating.ts'), 'utf8');
-    expect(gating).toContain(`export const MIN_OIDC_CLIENT_SECRET_LEN = ${MIN_OIDC_CLIENT_SECRET_LEN};`);
+    expect(gating).toContain(
+      `export const MIN_OIDC_CLIENT_SECRET_LEN = ${MIN_OIDC_CLIENT_SECRET_LEN};`,
+    );
   });
 
   it('mirrors the NEXTAUTH_SECRET floor enforced by resolveSecret()', () => {

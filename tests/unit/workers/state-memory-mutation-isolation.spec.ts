@@ -118,7 +118,9 @@ describe('#355 H4 — cognitiveCandidatesRepo.markConsumed() consumes ONLY the c
     );
 
     const byId = store.rows.filter((r) => r.id === 'shared');
-    expect(byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.status).toBe('consumed');
+    expect(byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.status).toBe(
+      'consumed',
+    );
     expect(byId.find((r) => r.tenant_id === 'tenant-B')!.status).toBe('pending'); // cross-tenant
     expect(byId.find((r) => r.agent_id === 'agent-Z')!.status).toBe('pending'); // cross-agent
     expectBoundTenantAgent(store.lastPredicate());
@@ -161,7 +163,9 @@ describe('#355 H4 — memoryEntryRepo.markReviewed() reviews ONLY the current te
     await runWithTenantContext(A, () => memoryEntryRepo.markReviewed('shared', updates));
 
     const byId = store.rows.filter((r) => r.id === 'shared');
-    expect(byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.needs_review).toBe(false);
+    expect(
+      byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.needs_review,
+    ).toBe(false);
     expect(byId.find((r) => r.tenant_id === 'tenant-B')!.needs_review).toBe(true); // cross-tenant
     expect(byId.find((r) => r.agent_id === 'agent-Z')!.needs_review).toBe(true); // cross-agent
     expectBoundTenantAgent(store.lastPredicate());
@@ -199,7 +203,9 @@ describe('#355 H4 — behavioralHintRepo.revoke() revokes ONLY the current tenan
     await runWithTenantContext(A, () => behavioralHintRepo.revoke('shared'));
 
     const byId = store.rows.filter((r) => r.id === 'shared');
-    expect(byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.revoked_at).not.toBeNull();
+    expect(
+      byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.revoked_at,
+    ).not.toBeNull();
     expect(byId.find((r) => r.tenant_id === 'tenant-B')!.revoked_at).toBeNull(); // cross-tenant
     expect(byId.find((r) => r.agent_id === 'agent-Z')!.revoked_at).toBeNull(); // cross-agent
     expectBoundTenantAgent(store.lastPredicate());
@@ -276,7 +282,9 @@ describe('#355 H4 — procedureTestsRepo.recordRun() records ONLY the current te
     );
 
     const byId = store.rows.filter((r) => r.id === 'shared');
-    expect(byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.last_run_status).toBe('pass');
+    expect(
+      byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')!.last_run_status,
+    ).toBe('pass');
     expect(byId.find((r) => r.tenant_id === 'tenant-B')!.last_run_status).toBeNull(); // cross-tenant
     expect(byId.find((r) => r.agent_id === 'agent-Z')!.last_run_status).toBeNull(); // cross-agent
     expectBoundTenantAgent(store.lastPredicate());
@@ -316,7 +324,9 @@ describe('#355 H4 — procedureTestsRepo.delete() deletes ONLY the current tenan
 
     const byId = store.rows.filter((r) => r.id === 'shared');
     // tenant-A/agent-A row removed; the other two survive.
-    expect(byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A')).toBeUndefined();
+    expect(
+      byId.find((r) => r.tenant_id === 'tenant-A' && r.agent_id === 'agent-A'),
+    ).toBeUndefined();
     expect(byId.find((r) => r.tenant_id === 'tenant-B')).toBeDefined(); // cross-tenant
     expect(byId.find((r) => r.agent_id === 'agent-Z')).toBeDefined(); // cross-agent
     expectBoundTenantAgent(store.lastDeletePredicate());
@@ -357,7 +367,7 @@ describe('#355 H4 — selfStateRepo.getActive() reads ONLY the current tenant/ag
     ...over,
   });
 
-  it('does NOT return another tenant\'s active self_state (even with a higher versao)', async () => {
+  it("does NOT return another tenant's active self_state (even with a higher versao)", async () => {
     // The OLD WHERE (`ativa=true` ordered by versao desc) would return tenant-B's
     // row here because its versao (9) outranks tenant-A's (1) — a cross-tenant read
     // whose id then fed appendLearning's write. The scoped read returns tenant-A's.
@@ -399,10 +409,22 @@ describe('#355 H4 — selfStateRepo.appendLearning() writes ONLY the current ten
     ...over,
   });
 
-  it('appends to tenant-A\'s row and leaves tenant-B (higher versao) UNTOUCHED', async () => {
+  it("appends to tenant-A's row and leaves tenant-B (higher versao) UNTOUCHED", async () => {
     store.reset([
-      row({ id: 'self-A', tenant_id: 'tenant-A', agent_id: 'agent-A', versao: 1, resumo_aprendizados: '' }),
-      row({ id: 'self-B', tenant_id: 'tenant-B', agent_id: 'agent-B', versao: 9, resumo_aprendizados: 'B-private' }),
+      row({
+        id: 'self-A',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        versao: 1,
+        resumo_aprendizados: '',
+      }),
+      row({
+        id: 'self-B',
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        versao: 9,
+        resumo_aprendizados: 'B-private',
+      }),
     ]);
     const { selfStateRepo } = await import('@/db/repositories.js');
 
@@ -420,7 +442,14 @@ describe('#355 H4 — selfStateRepo.appendLearning() writes ONLY the current ten
     // appendLearning is best-effort/predicate-only — getActive returns null for
     // tenant-A (only tenant-B has a row), so it early-returns without writing and
     // WITHOUT throwing (unlike the fail-loud single-row writes).
-    store.reset([row({ id: 'self-B', tenant_id: 'tenant-B', agent_id: 'agent-B', resumo_aprendizados: 'B-private' })]);
+    store.reset([
+      row({
+        id: 'self-B',
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        resumo_aprendizados: 'B-private',
+      }),
+    ]);
     const { selfStateRepo } = await import('@/db/repositories.js');
 
     await expect(
@@ -473,7 +502,7 @@ describe('#355 H4 — entityStatesRepo.byId() reads ONLY the current tenant/agen
   });
 });
 
-describe('#355 H4 — entityStatesRepo.upsert() cannot overwrite another tenant\'s entity_state', () => {
+describe("#355 H4 — entityStatesRepo.upsert() cannot overwrite another tenant's entity_state", () => {
   it('INSERTs (and tenant-stamps) when no row exists for the entidade', async () => {
     store.reset([]);
     const { entityStatesRepo } = await import('@/db/repositories.js');
@@ -491,7 +520,7 @@ describe('#355 H4 — entityStatesRepo.upsert() cannot overwrite another tenant\
     expect(stored.agent_id).toBe('agent-A');
   });
 
-  it('updates the current tenant\'s OWN row on conflict (ownership gate matches)', async () => {
+  it("updates the current tenant's OWN row on conflict (ownership gate matches)", async () => {
     store.reset([
       {
         entidade_id: 'mine',
@@ -536,14 +565,18 @@ describe('#355 H4 — entityStatesRepo.upsert() cannot overwrite another tenant\
     const out = await runWithTenantContext(A, () =>
       // tenant_id matches ALS (applyTenantGuard would reject a mismatch on INSERT);
       // the point under test is that the conflict SET does not carry tenant_id at all.
-      entityStatesRepo.upsert({ entidade_id: 'mine', tenant_id: 'tenant-A', flags: { fresh: true } } as any),
+      entityStatesRepo.upsert({
+        entidade_id: 'mine',
+        tenant_id: 'tenant-A',
+        flags: { fresh: true },
+      } as any),
     );
 
     expect(out.tenant_id).toBe('tenant-A'); // unchanged
     expect((out.flags as Record<string, unknown>).fresh).toBe(true);
   });
 
-  it('FAIL-LOUD — cannot overwrite tenant-B\'s row for a colliding entidade_id', async () => {
+  it("FAIL-LOUD — cannot overwrite tenant-B's row for a colliding entidade_id", async () => {
     // tenant-B owns the entity_state for `collide`. tenant-A upserts the SAME
     // entidade_id: the INSERT conflicts on the entidade_id PK, but the conflict
     // ownership WHERE (tenant-A) does NOT match tenant-B's existing row → the SET

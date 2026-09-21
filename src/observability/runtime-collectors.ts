@@ -56,10 +56,26 @@ export function registerDbPoolGauges(pool: PoolStats): void {
     const v = fn();
     return typeof v === 'number' && Number.isFinite(v) ? v : Number.NaN;
   };
-  gauge(METRIC.DB_POOL, read(() => pool.totalCount), { state: 'total' });
-  gauge(METRIC.DB_POOL, read(() => pool.idleCount), { state: 'idle' });
-  gauge(METRIC.DB_POOL, read(() => pool.waitingCount), { state: 'waiting' });
-  gauge(METRIC.DB_POOL, read(() => pool.options?.max), { state: 'max' });
+  gauge(
+    METRIC.DB_POOL,
+    read(() => pool.totalCount),
+    { state: 'total' },
+  );
+  gauge(
+    METRIC.DB_POOL,
+    read(() => pool.idleCount),
+    { state: 'idle' },
+  );
+  gauge(
+    METRIC.DB_POOL,
+    read(() => pool.waitingCount),
+    { state: 'waiting' },
+  );
+  gauge(
+    METRIC.DB_POOL,
+    read(() => pool.options?.max),
+    { state: 'max' },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -152,10 +168,7 @@ async function refresh(): Promise<void> {
       snapshotFresh = true;
     } catch (err) {
       snapshotFresh = false;
-      logger.debug(
-        { err: (err as Error).message },
-        'scheduler_lag_collector.refresh_failed',
-      );
+      logger.debug({ err: (err as Error).message }, 'scheduler_lag_collector.refresh_failed');
     } finally {
       inFlight = null;
     }

@@ -237,9 +237,7 @@ export function normalizeRemoteIdentity(
  * identidade remota em claro (telefone), que é PII.
  */
 export function canonicalStreamMaterial(components: readonly string[]): string {
-  return (
-    lengthPrefixed(STREAM_KEY_NAMESPACE) + components.map(lengthPrefixed).join('')
-  );
+  return lengthPrefixed(STREAM_KEY_NAMESPACE) + components.map(lengthPrefixed).join('');
 }
 
 /**
@@ -253,10 +251,7 @@ export function canonicalStreamMaterial(components: readonly string[]): string {
 export function deriveStreamKey(input: StreamKeyInput): StreamKeyDerivation {
   if (!usableScopeField(input.tenant_id)) return { ok: false, reason: 'missing_tenant' };
   if (!usableScopeField(input.agent_id)) return { ok: false, reason: 'missing_agent' };
-  if (
-    RESERVED_SCOPE_LITERALS.has(input.tenant_id) ||
-    RESERVED_SCOPE_LITERALS.has(input.agent_id)
-  ) {
+  if (RESERVED_SCOPE_LITERALS.has(input.tenant_id) || RESERVED_SCOPE_LITERALS.has(input.agent_id)) {
     return { ok: false, reason: 'reserved_scope_literal' };
   }
 
@@ -324,9 +319,7 @@ export class StreamIdentityUnresolvedError extends Error {
 }
 
 /** `true` para o erro acima, sem depender de `instanceof` cruzando módulos. */
-export function isStreamIdentityUnresolved(
-  err: unknown,
-): err is StreamIdentityUnresolvedError {
+export function isStreamIdentityUnresolved(err: unknown): err is StreamIdentityUnresolvedError {
   return (
     typeof err === 'object' &&
     err !== null &&

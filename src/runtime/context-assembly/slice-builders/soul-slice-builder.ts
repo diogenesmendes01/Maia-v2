@@ -26,11 +26,7 @@ import type { SoulSlice, SoulSliceBias } from '../types/soul-slice.js';
 import type { BaseContextPacket } from '../../context-packet/types.js';
 import { sliceCacheKey, type SliceCache } from '../../context-packet/cache/slice-cache.js';
 import { getTTLForSlice } from '../../context-packet/cache/ttl-policy.js';
-import type {
-  SliceBuilder,
-  SliceBuilderInput,
-  SliceBuilderResult,
-} from './_types.js';
+import type { SliceBuilder, SliceBuilderInput, SliceBuilderResult } from './_types.js';
 
 const RISK_ORDER: Record<'low' | 'medium' | 'high', number> = {
   low: 1,
@@ -311,9 +307,7 @@ export interface SoulBiasRecord {
  * SoulSlice>` contract so the orchestrator can wire it into the parallel
  * assembly pipeline.
  */
-export class SoulSliceBuilder
-  implements SliceBuilder<SoulRequirements, SoulSlice>
-{
+export class SoulSliceBuilder implements SliceBuilder<SoulRequirements, SoulSlice> {
   readonly name = 'soul' as const;
 
   constructor(
@@ -324,20 +318,14 @@ export class SoulSliceBuilder
   cacheKey(base: BaseContextPacket, req: SoulRequirements): string {
     // Builders share the InMemorySliceCache; keep keys in
     // `maia:context:v2:{tenant}:{agent}:soul:{scope_hash}` namespace.
-    const scope = [
-      base.agent_id,
-      req.depth,
-      String(req.max_biases ?? 5),
-    ].join(':');
+    const scope = [base.agent_id, req.depth, String(req.max_biases ?? 5)].join(':');
     // Issue #235: pass agent_id into sliceCacheKey's prefix. agent_id remains
     // in the scope hash too (redundant but harmless) since soul biases were
     // already agent-scoped here.
     return sliceCacheKey(base.tenant_id, base.agent_id, 'soul', scope);
   }
 
-  async build(
-    input: SliceBuilderInput<SoulRequirements>,
-  ): Promise<SliceBuilderResult<SoulSlice>> {
+  async build(input: SliceBuilderInput<SoulRequirements>): Promise<SliceBuilderResult<SoulSlice>> {
     const start = performance.now();
     throwIfAborted(input.signal);
 
@@ -373,11 +361,9 @@ export class SoulSliceBuilder
     // Delegate to the port. The default `soulBiasesRepoPort` reuses
     // `buildSoulSlice` internally for full filtering + rendering; stub
     // ports (tests) short-circuit to empty.
-    const biases = await this.port.listActiveBiases(
-      input.base.tenant_id,
-      input.base.agent_id,
-      { limit: max_biases * 3 + 1 },
-    );
+    const biases = await this.port.listActiveBiases(input.base.tenant_id, input.base.agent_id, {
+      limit: max_biases * 3 + 1,
+    });
     throwIfAborted(input.signal);
 
     const slice = assembleFromBiases(biases, input.base, input.requirements);

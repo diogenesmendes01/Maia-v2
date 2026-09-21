@@ -72,14 +72,22 @@ describe('otlp-overhead-benchmark — parseArgs', () => {
   });
 
   it('--self-test é apelido de --mode self-test e aceita --inject', () => {
-    const o = parseArgs(['--self-test', '--inject', 'on-local.p95_ms=900,on-slow.dropped.queue_full=5']);
+    const o = parseArgs([
+      '--self-test',
+      '--inject',
+      'on-local.p95_ms=900,on-slow.dropped.queue_full=5',
+    ]);
     expect(o.mode).toBe('self-test');
     expect(o.inject).toEqual({ 'on-local.p95_ms': 900, 'on-slow.dropped.queue_full': 5 });
   });
 
   it('--inject fora do self-test é recusado — injetar numa medição vira carimbo', () => {
-    expect(() => parseArgs(['--inject', 'on-local.p95_ms=1'])).toThrow(/--inject só é aceito junto de --self-test/);
-    expect(() => parseArgs(['--mode', 'measure', '--inject', 'off.errors=0'])).toThrow(/--self-test/);
+    expect(() => parseArgs(['--inject', 'on-local.p95_ms=1'])).toThrow(
+      /--inject só é aceito junto de --self-test/,
+    );
+    expect(() => parseArgs(['--mode', 'measure', '--inject', 'off.errors=0'])).toThrow(
+      /--self-test/,
+    );
   });
 
   it('recusa valores inválidos com o nome da flag na mensagem', () => {
@@ -112,7 +120,11 @@ describe('otlp-overhead-benchmark — o gate reprova', () => {
   const cases: Array<[string, Record<string, number>, RegExp]> = [
     ['p95 ligado acima de off × 1,10', { 'on-local.p95_ms': 900 }, /\[on-local\] p95 do turno/],
     ['p99 ligado acima de off × 1,10', { 'on-local.p99_ms': 100 }, /\[on-local\] p99 do turno/],
-    ['throughput ligado abaixo de off × 0,90', { 'on-local.throughput_turns_per_s': 80 }, /\[on-local\] throughput/],
+    [
+      'throughput ligado abaixo de off × 0,90',
+      { 'on-local.throughput_turns_per_s': 80 },
+      /\[on-local\] throughput/,
+    ],
     ['erro novo no braço ligado', { 'on-local.errors': 1 }, /\[on-local\] erros novos/],
     ['turno que não chegou ao modelo', { 'on-local.provider_calls': 10 }, /alcançou o modelo/],
     ['tracing "ligado" sem span no sink', { 'on-local.sink_calls': 0 }, /tracing ligado de fato/],
@@ -121,13 +133,33 @@ describe('otlp-overhead-benchmark — o gate reprova', () => {
     ['descarte com collector saudável', { 'on-local.dropped.transport': 4 }, /descartes = 0/],
     ['on-slow degradando o hot path (p95)', { 'on-slow.p95_ms': 200 }, /\[on-slow\] p95 do turno/],
     ['on-slow degradando o hot path (p99)', { 'on-slow.p99_ms': 200 }, /\[on-slow\] p99 do turno/],
-    ['on-slow derrubando o throughput', { 'on-slow.throughput_turns_per_s': 1 }, /\[on-slow\] throughput/],
+    [
+      'on-slow derrubando o throughput',
+      { 'on-slow.throughput_turns_per_s': 1 },
+      /\[on-slow\] throughput/,
+    ],
     ['span sem destino conhecido', { 'on-slow.spans_received': 6000 }, /perda contabilizada/],
-    ['http_5xx contado diferente do que o collector recusou', { 'on-slow.dropped.http_5xx': 1 }, /perda contabilizada/],
+    [
+      'http_5xx contado diferente do que o collector recusou',
+      { 'on-slow.dropped.http_5xx': 1 },
+      /perda contabilizada/,
+    ],
     ['fila acima do teto', { 'on-slow.queue_depth_max': 4096 }, /fila nunca acima de 2048/],
-    ['collector que não foi lento de fato', { 'on-slow.export_p50_ms': 1 }, /collector degradado de fato/],
-    ['collector que não recusou nada com fail-ratio > 0', { 'on-slow.spans_rejected': 0 }, /collector degradado de fato/],
-    ['off com um sink instalado (o harness contou span onde não devia existir sink)', { 'off.sink_calls': 1 }, /\[off\] curto-circuito provado/],
+    [
+      'collector que não foi lento de fato',
+      { 'on-slow.export_p50_ms': 1 },
+      /collector degradado de fato/,
+    ],
+    [
+      'collector que não recusou nada com fail-ratio > 0',
+      { 'on-slow.spans_rejected': 0 },
+      /collector degradado de fato/,
+    ],
+    [
+      'off com um sink instalado (o harness contou span onde não devia existir sink)',
+      { 'off.sink_calls': 1 },
+      /\[off\] curto-circuito provado/,
+    ],
     ['off com tracing ligado', { 'off.tracing_enabled': 1 }, /\[off\] curto-circuito provado/],
     ['off com bytes no collector', { 'off.bytes': 10 }, /\[off\] curto-circuito provado/],
     ['erro no braço off', { 'off.errors': 2 }, /\[off\] erros = 0/],
@@ -140,8 +172,14 @@ describe('otlp-overhead-benchmark — o gate reprova', () => {
       expect(applied).toHaveLength(Object.keys(inject).length);
       const v = evaluateGate(arms, T);
       const red = failing(v);
-      expect(red.length, `esperava ao menos um critério vermelho: ${JSON.stringify(inject)}`).toBeGreaterThan(0);
-      expect(red.some((l) => label.test(l)), `critério errado ficou vermelho: ${red.join(' | ')}`).toBe(true);
+      expect(
+        red.length,
+        `esperava ao menos um critério vermelho: ${JSON.stringify(inject)}`,
+      ).toBeGreaterThan(0);
+      expect(
+        red.some((l) => label.test(l)),
+        `critério errado ficou vermelho: ${red.join(' | ')}`,
+      ).toBe(true);
       expect(gateExitCode(v, 'gate')).toBe(1);
       expect(gateExitCode(v, 'self-test')).toBe(1);
     });
@@ -181,7 +219,10 @@ describe('otlp-overhead-benchmark — o gate reprova', () => {
   });
 
   it('sem o braço off nada é comparável: tudo que é relativo fica skipped', () => {
-    const v = evaluateGate(syntheticArms(T).filter((a) => a.arm !== 'off'), T);
+    const v = evaluateGate(
+      syntheticArms(T).filter((a) => a.arm !== 'off'),
+      T,
+    );
     expect(v.filter((x) => x.skipped).length).toBeGreaterThanOrEqual(14);
     expect(gateExitCode(v, 'gate')).toBe(1);
   });
@@ -196,8 +237,12 @@ describe('otlp-overhead-benchmark — o gate reprova', () => {
   });
 
   it('--inject recusa braço e campo desconhecidos', () => {
-    expect(() => applyInjection(syntheticArms(T), { 'on-fast.p95_ms': 1 })).toThrow(/braço desconhecido/);
-    expect(() => applyInjection(syntheticArms(T), { 'on-local.nope': 1 })).toThrow(/campo desconhecido/);
+    expect(() => applyInjection(syntheticArms(T), { 'on-fast.p95_ms': 1 })).toThrow(
+      /braço desconhecido/,
+    );
+    expect(() => applyInjection(syntheticArms(T), { 'on-local.nope': 1 })).toThrow(
+      /campo desconhecido/,
+    );
   });
 
   it('cada critério carrega o número medido E o limiar no detalhe', () => {
@@ -211,7 +256,11 @@ describe('otlp-overhead-benchmark — o gate reprova', () => {
   });
 });
 
-function report(arms: ArmResult[], verdicts: ReturnType<typeof evaluateGate>, mode: 'gate' | 'measure' | 'self-test'): Report {
+function report(
+  arms: ArmResult[],
+  verdicts: ReturnType<typeof evaluateGate>,
+  mode: 'gate' | 'measure' | 'self-test',
+): Report {
   return {
     mode,
     self_test: mode === 'self-test',
@@ -304,7 +353,9 @@ describe('otlp-overhead-benchmark — leitores da exposição e agregação', ()
   });
 
   it('countOtlpSpans conta os spans de um ExportTraceServiceRequest', () => {
-    expect(countOtlpSpans({ resourceSpans: [{ scopeSpans: [{ spans: [{}, {}] }, { spans: [{}] }] }] })).toBe(3);
+    expect(
+      countOtlpSpans({ resourceSpans: [{ scopeSpans: [{ spans: [{}, {}] }, { spans: [{}] }] }] }),
+    ).toBe(3);
     expect(countOtlpSpans({})).toBe(0);
     expect(countOtlpSpans(null)).toBe(0);
   });
@@ -327,12 +378,32 @@ describe('otlp-overhead-benchmark — leitores da exposição e agregação', ()
   it('aggregateArm: percentis sobre a união das amostras, contadores somados, fila = máximo', () => {
     const [off] = syntheticArms(T);
     const r1: RoundRun = {
-      result: { ...off!, rounds: [1], turns: 3, wall_ms: 300, sink_calls: 10, dropped: { http_5xx: 1 }, queue_depth_max: 5, metrics_lines_before: 10, metrics_lines_after: 12 },
+      result: {
+        ...off!,
+        rounds: [1],
+        turns: 3,
+        wall_ms: 300,
+        sink_calls: 10,
+        dropped: { http_5xx: 1 },
+        queue_depth_max: 5,
+        metrics_lines_before: 10,
+        metrics_lines_after: 12,
+      },
       latencies: [10, 20, 30],
       export_samples: [1, 2],
     };
     const r2: RoundRun = {
-      result: { ...off!, rounds: [2], turns: 3, wall_ms: 300, sink_calls: 12, dropped: { http_5xx: 2, queue_full: 1 }, queue_depth_max: 9, metrics_lines_before: 12, metrics_lines_after: 12 },
+      result: {
+        ...off!,
+        rounds: [2],
+        turns: 3,
+        wall_ms: 300,
+        sink_calls: 12,
+        dropped: { http_5xx: 2, queue_full: 1 },
+        queue_depth_max: 9,
+        metrics_lines_before: 12,
+        metrics_lines_after: 12,
+      },
       latencies: [40, 50, 60],
       export_samples: [3, 400],
     };

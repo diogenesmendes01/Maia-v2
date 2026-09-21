@@ -70,7 +70,12 @@ async function insertManifest(runId: string): Promise<void> {
     `INSERT INTO backup_manifests
        (backup_run_id, manifest_version, manifest, manifest_sha256, signature, signature_key_version)
      VALUES ($1, 2, $2::jsonb, $3, $4, 1)`,
-    [runId, JSON.stringify({ backup_id: runId, manifest_version: 2 }), 'a'.repeat(64), 'b'.repeat(64)],
+    [
+      runId,
+      JSON.stringify({ backup_id: runId, manifest_version: 2 }),
+      'a'.repeat(64),
+      'b'.repeat(64),
+    ],
   );
 }
 
@@ -265,10 +270,9 @@ d('restore drill evidence round-trip (issue #536)', () => {
 
   it('the database refuses an invented drill status', async () => {
     await expect(
-      pool.query(
-        `INSERT INTO restore_drills (correlation_id, status) VALUES ($1, 'green')`,
-        [CORR],
-      ),
+      pool.query(`INSERT INTO restore_drills (correlation_id, status) VALUES ($1, 'green')`, [
+        CORR,
+      ]),
     ).rejects.toThrow();
   });
 

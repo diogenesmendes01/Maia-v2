@@ -75,7 +75,11 @@ export const TEST_STRATEGIES: Record<string, TestStrategy> = {
       triggered_by: 'evaluator_pipeline',
     });
     if (!candidate.ok) {
-      return { passed: false, observed: candidate.reason ?? 'candidate_failed', reason: candidate.message };
+      return {
+        passed: false,
+        observed: candidate.reason ?? 'candidate_failed',
+        reason: candidate.message,
+      };
     }
     const evalResult = await runSkill({
       skill_descriptor: evaluatorDescriptor,
@@ -124,8 +128,7 @@ export async function runCapabilityTests(args: {
     return { outcome: 'error', result_id: r.id };
   }
 
-  const strategy =
-    TEST_STRATEGIES[args.strategy_key ?? 'echo_test'] ?? TEST_STRATEGIES.echo_test!;
+  const strategy = TEST_STRATEGIES[args.strategy_key ?? 'echo_test'] ?? TEST_STRATEGIES.echo_test!;
   let passed = 0;
   let failed = 0;
   const scenarios_run: Array<TestScenario & TestStrategyResult> = [];

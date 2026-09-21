@@ -10,11 +10,7 @@ import { Button } from '../../../components/ui/button.js';
 import { Badge } from '../../../components/ui/badge.js';
 import { Modal } from '../../../components/ui/modal.js';
 import { Field, Input, Select, Textarea } from '../../../components/ui/field.js';
-import {
-  LoadingState,
-  ErrorState,
-  Alert,
-} from '../../../components/ui/states.js';
+import { LoadingState, ErrorState, Alert } from '../../../components/ui/states.js';
 import { IconArrowLeft } from '../../../components/ui/icons.js';
 
 export default function TraceDetailPage({
@@ -58,10 +54,7 @@ export default function TraceDetailPage({
     return (
       <div>
         {backLink}
-        <ErrorState
-          message={traceQuery.error.message}
-          onRetry={() => void traceQuery.refetch()}
-        />
+        <ErrorState message={traceQuery.error.message} onRetry={() => void traceQuery.refetch()} />
       </div>
     );
   }
@@ -75,8 +68,7 @@ export default function TraceDetailPage({
       <PageHeader
         title={
           <>
-            Trace{' '}
-            <span className="font-mono">{traceId.slice(0, 8)}</span>
+            Trace <span className="font-mono">{traceId.slice(0, 8)}</span>
           </>
         }
         description={
@@ -86,9 +78,7 @@ export default function TraceDetailPage({
         }
         actions={
           !trace.full_snapshot_available && (
-            <Button onClick={() => setShowSnapshotModal(true)}>
-              Solicitar snapshot completo
-            </Button>
+            <Button onClick={() => setShowSnapshotModal(true)}>Solicitar snapshot completo</Button>
           )
         }
       />
@@ -108,10 +98,7 @@ export default function TraceDetailPage({
               <Meta label="Decisão" value={trace.decision} />
               <Meta label="Nível de efeito" value={trace.side_effect_level} />
               <Meta label="Classe de redação" value={trace.redaction_class} />
-              <Meta
-                label="Início"
-                value={new Date(trace.started_at).toLocaleString('pt-BR')}
-              />
+              <Meta label="Início" value={new Date(trace.started_at).toLocaleString('pt-BR')} />
               <Meta
                 label="Conversa"
                 value={trace.conversa_id ? trace.conversa_id.slice(0, 8) : '—'}
@@ -161,46 +148,42 @@ export default function TraceDetailPage({
             </dl>
             {trace.body_integrity === 'invalid' && (
               <Alert tone="danger">
-                O corpo persistido NÃO confere com sua assinatura HMAC. O
-                conteúdo abaixo não é confiável — trate como incidente de
-                integridade.
+                O corpo persistido NÃO confere com sua assinatura HMAC. O conteúdo abaixo não é
+                confiável — trate como incidente de integridade.
               </Alert>
             )}
             {trace.envelope_integrity === 'invalid' && (
               <Alert tone="danger">
-                A assinatura HMAC deste envelope NÃO confere com o conteúdo da
-                linha. Trate como incidente de integridade — não tome decisão
-                com base neste trace. Ver docs/runbooks/observability-slo.md §4.1.
+                A assinatura HMAC deste envelope NÃO confere com o conteúdo da linha. Trate como
+                incidente de integridade — não tome decisão com base neste trace. Ver
+                docs/runbooks/observability-slo.md §4.1.
               </Alert>
             )}
             {trace.envelope_integrity === 'rejected_version' && (
               <Alert tone="warning">
-                Este envelope declara assinatura v{trace.signature_version}, que
-                este ambiente recusa ler
-                (<code>RUNTIME_TRACE_ACCEPT_SIGNATURE_V1=false</code>). Isso NÃO
-                significa adulteração: a assinatura pode ser legítima, mas a v1
-                deixa <code>root_trace_id</code> e <code>attempt</code> fora dela
-                e o ambiente optou por não apresentá-la como evidência. Ver
-                issue #535.
+                Este envelope declara assinatura v{trace.signature_version}, que este ambiente
+                recusa ler (<code>RUNTIME_TRACE_ACCEPT_SIGNATURE_V1=false</code>). Isso NÃO
+                significa adulteração: a assinatura pode ser legítima, mas a v1 deixa{' '}
+                <code>root_trace_id</code> e <code>attempt</code> fora dela e o ambiente optou por
+                não apresentá-la como evidência. Ver issue #535.
               </Alert>
             )}
             {trace.envelope_integrity === 'unknown' && (
               <Alert tone="warning">
-                Não foi possível verificar a assinatura: a chave HMAC v
-                {trace.hmac_key_version} não está configurada neste processo.
-                Ausência de prova não é prova de adulteração.
+                Não foi possível verificar a assinatura: a chave HMAC v{trace.hmac_key_version} não
+                está configurada neste processo. Ausência de prova não é prova de adulteração.
               </Alert>
             )}
             {trace.body_status === 'orphaned' && (
               <Alert tone="danger">
-                O corpo deste trace nunca foi persistido e passou da janela de
-                recuperação. Ver docs/runbooks/p10b-runtime-trace.md.
+                O corpo deste trace nunca foi persistido e passou da janela de recuperação. Ver
+                docs/runbooks/p10b-runtime-trace.md.
               </Alert>
             )}
             {trace.body_encrypted && (
               <Alert tone="warning">
-                Corpo cifrado (classe debug). O conteúdo só é acessível pelo
-                fluxo governado de snapshot.
+                Corpo cifrado (classe debug). O conteúdo só é acessível pelo fluxo governado de
+                snapshot.
               </Alert>
             )}
           </CardBody>
@@ -218,10 +201,10 @@ export default function TraceDetailPage({
             <CardBody>
               {!trace.attempt_grouping_signed && (
                 <Alert tone="warning">
-                  Ao menos uma tentativa desta lista usa assinatura v1, que
-                  deixa <code>root_trace_id</code> e <code>attempt</code> fora do
-                  HMAC. A ORDEM das tentativas não é evidência assinada nessas
-                  linhas; a pertença ao turno continua sendo, via
+                  Ao menos uma tentativa desta lista usa assinatura v1, que deixa{' '}
+                  <code>root_trace_id</code> e <code>attempt</code> fora do HMAC. A ORDEM das
+                  tentativas não é evidência assinada nessas linhas; a pertença ao turno continua
+                  sendo, via
                   <code> turno_id</code>. Ver issue #535.
                 </Alert>
               )}
@@ -260,17 +243,13 @@ export default function TraceDetailPage({
           />
           <CardBody>
             {trace.pep_decisions.length === 0 ? (
-              <p className="text-sm text-zinc-500">
-                Nenhuma decisão PEP neste trace.
-              </p>
+              <p className="text-sm text-zinc-500">Nenhuma decisão PEP neste trace.</p>
             ) : (
               <ul className="space-y-2 text-sm">
                 {trace.pep_decisions.map((d) => (
                   <li key={d.id} className="flex items-baseline gap-2">
                     <Badge tone="neutral">{d.pep}</Badge>
-                    <span className="font-mono text-xs text-zinc-700">
-                      {d.decision}
-                    </span>
+                    <span className="font-mono text-xs text-zinc-700">{d.decision}</span>
                     {d.reason && <span className="text-zinc-600">— {d.reason}</span>}
                   </li>
                 ))}
@@ -323,11 +302,7 @@ function Meta({ label, value }: { label: string; value: string }) {
   );
 }
 
-type SnapshotCategory =
-  | 'debugging'
-  | 'incident_response'
-  | 'audit_review'
-  | 'support';
+type SnapshotCategory = 'debugging' | 'incident_response' | 'audit_review' | 'support';
 
 function SnapshotRequestModal({
   traceId,
@@ -376,11 +351,7 @@ function SnapshotRequestModal({
       }
     >
       <div className="space-y-4">
-        <Field
-          label="Motivo"
-          required
-          hint="Mínimo de 20 caracteres."
-        >
+        <Field label="Motivo" required hint="Mínimo de 20 caracteres.">
           <Textarea
             rows={3}
             value={reason}

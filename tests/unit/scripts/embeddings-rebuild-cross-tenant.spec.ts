@@ -162,9 +162,7 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
   if (/SELECT\s+count\(\*\)::text\s+AS\s+count/i.test(sqlText)) {
     const tenant_id = params[0] as string;
     const agent_id = params[1] as string;
-    const count = store.filter(
-      (r) => r.tenant_id === tenant_id && r.agent_id === agent_id,
-    ).length;
+    const count = store.filter((r) => r.tenant_id === tenant_id && r.agent_id === agent_id).length;
     return { rows: [{ count: String(count) }] };
   }
 
@@ -242,17 +240,15 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
 // and the explicit `pg_advisory_unlock` in `finally` actually targets the
 // same session. The fake tracks every `client.query()` call (lock + unlock)
 // and the `release()` call so tests can assert the lifecycle.
-const lockClientQueryMock = vi.fn(
-  async (sqlText: string, params: unknown[] = []) => {
-    if (/pg_try_advisory_lock\s*\(/i.test(sqlText)) {
-      return { rows: [{ acquired: !lockHeld }], rowCount: 1 };
-    }
-    if (/pg_advisory_unlock\s*\(/i.test(sqlText)) {
-      return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 };
-    }
-    return { rows: [], rowCount: 0 };
-  },
-);
+const lockClientQueryMock = vi.fn(async (sqlText: string, params: unknown[] = []) => {
+  if (/pg_try_advisory_lock\s*\(/i.test(sqlText)) {
+    return { rows: [{ acquired: !lockHeld }], rowCount: 1 };
+  }
+  if (/pg_advisory_unlock\s*\(/i.test(sqlText)) {
+    return { rows: [{ pg_advisory_unlock: true }], rowCount: 1 };
+  }
+  return { rows: [], rowCount: 0 };
+});
 const lockClientReleaseMock = vi.fn(() => undefined);
 const poolConnectMock = vi.fn(async () => ({
   query: lockClientQueryMock,
@@ -451,9 +447,8 @@ function seedTwoTenantsReverse() {
 describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id scoped', () => {
   describe('CLI args — required --tenant and --agent', () => {
     it('REJECTION — parseRequiredArgs throws RequiredArgsError when --tenant is missing', async () => {
-      const { parseRequiredArgs, RequiredArgsError } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { parseRequiredArgs, RequiredArgsError } =
+        await import('@/../scripts/embeddings-rebuild.ts');
       const argv = ['node', 'embeddings-rebuild.ts', '--agent=agent-A'];
       expect(() => parseRequiredArgs(argv)).toThrowError(RequiredArgsError);
       try {
@@ -465,9 +460,8 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
     });
 
     it('REJECTION — parseRequiredArgs throws RequiredArgsError when --agent is missing', async () => {
-      const { parseRequiredArgs, RequiredArgsError } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { parseRequiredArgs, RequiredArgsError } =
+        await import('@/../scripts/embeddings-rebuild.ts');
       const argv = ['node', 'embeddings-rebuild.ts', '--tenant=tenant-A'];
       expect(() => parseRequiredArgs(argv)).toThrowError(RequiredArgsError);
       try {
@@ -479,9 +473,8 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
     });
 
     it('REJECTION — parseRequiredArgs throws when both flags are missing (silent fall-through would be a regression)', async () => {
-      const { parseRequiredArgs, RequiredArgsError } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { parseRequiredArgs, RequiredArgsError } =
+        await import('@/../scripts/embeddings-rebuild.ts');
       // The CLI is `node embeddings-rebuild.ts` with no extra flags. The
       // production code MUST refuse to fall through to any implicit default.
       expect(() => parseRequiredArgs(['node', 'embeddings-rebuild.ts'])).toThrowError(
@@ -491,12 +484,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
     it('ACCEPT — parseRequiredArgs returns the tuple when both flags are present', async () => {
       const { parseRequiredArgs } = await import('@/../scripts/embeddings-rebuild.ts');
-      const argv = [
-        'node',
-        'embeddings-rebuild.ts',
-        '--tenant=tenant-A',
-        '--agent=agent-A',
-      ];
+      const argv = ['node', 'embeddings-rebuild.ts', '--tenant=tenant-A', '--agent=agent-A'];
       expect(parseRequiredArgs(argv)).toEqual({
         tenant_id: 'tenant-A',
         agent_id: 'agent-A',
@@ -509,12 +497,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
     // is preserved: at least one form of each is still required.
     it('ALIAS — parseRequiredArgs accepts --tenant_id / --agent_id forms', async () => {
       const { parseRequiredArgs } = await import('@/../scripts/embeddings-rebuild.ts');
-      const argv = [
-        'node',
-        'embeddings-rebuild.ts',
-        '--tenant_id=tenant-X',
-        '--agent_id=agent-X',
-      ];
+      const argv = ['node', 'embeddings-rebuild.ts', '--tenant_id=tenant-X', '--agent_id=agent-X'];
       expect(parseRequiredArgs(argv)).toEqual({
         tenant_id: 'tenant-X',
         agent_id: 'agent-X',
@@ -537,12 +520,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
     it('MIXED — --tenant + --agent_id (one of each form) is accepted', async () => {
       const { parseRequiredArgs } = await import('@/../scripts/embeddings-rebuild.ts');
-      const argv = [
-        'node',
-        'embeddings-rebuild.ts',
-        '--tenant=tenant-A',
-        '--agent_id=agent-A',
-      ];
+      const argv = ['node', 'embeddings-rebuild.ts', '--tenant=tenant-A', '--agent_id=agent-A'];
       expect(parseRequiredArgs(argv)).toEqual({
         tenant_id: 'tenant-A',
         agent_id: 'agent-A',
@@ -562,9 +540,11 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
     it('parseCliOptions picks up --dry-run, --yes, --batch=10', async () => {
       const { parseCliOptions } = await import('@/../scripts/embeddings-rebuild.ts');
-      expect(
-        parseCliOptions(['node', 'x', '--dry-run', '--yes', '--batch=10']),
-      ).toEqual({ dryRun: true, yes: true, batchSize: 10 });
+      expect(parseCliOptions(['node', 'x', '--dry-run', '--yes', '--batch=10'])).toEqual({
+        dryRun: true,
+        yes: true,
+        batchSize: 10,
+      });
     });
 
     it('parseCliOptions rejects non-positive / non-integer --batch', async () => {
@@ -660,9 +640,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
   describe('rebuildEmbeddingsForTuple — read step', () => {
     it('SUCCESS — tenant-A rebuild only reads tenant-A rows (NEVER tenant-B)', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
       expect(result.updated).toBe(2);
@@ -670,26 +648,20 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
       // Provider must have seen ONLY tenant-A text — NEVER tenant-B's.
       const allProviderTexts = providerCalls.flat();
-      expect(allProviderTexts).toEqual(
-        expect.arrayContaining(['A-alpha-text', 'A-beta-text']),
-      );
+      expect(allProviderTexts).toEqual(expect.arrayContaining(['A-alpha-text', 'A-beta-text']));
       expect(allProviderTexts).not.toContain('B-gamma-text');
       expect(allProviderTexts).not.toContain('B-delta-text');
     });
 
     it('SYMMETRY — tenant-B rebuild only reads tenant-B rows (NEVER tenant-A)', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({ ...B_CTX, batchSize: 32 });
 
       expect(result.updated).toBe(2);
 
       const allProviderTexts = providerCalls.flat();
-      expect(allProviderTexts).toEqual(
-        expect.arrayContaining(['B-gamma-text', 'B-delta-text']),
-      );
+      expect(allProviderTexts).toEqual(expect.arrayContaining(['B-gamma-text', 'B-delta-text']));
       expect(allProviderTexts).not.toContain('A-alpha-text');
       expect(allProviderTexts).not.toContain('A-beta-text');
     });
@@ -698,9 +670,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // The pre-fix failure mode: an unscoped SELECT walking the store in
       // insertion order would surface tenant-B rows for tenant-A's rebuild.
       seedTwoTenantsReverse();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
       expect(result.updated).toBe(2);
@@ -710,18 +680,14 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // provider, even though tenant-B rows are earlier in store order.
       expect(allProviderTexts).not.toContain('B-gamma-text');
       expect(allProviderTexts).not.toContain('B-delta-text');
-      expect(allProviderTexts).toEqual(
-        expect.arrayContaining(['A-alpha-text', 'A-beta-text']),
-      );
+      expect(allProviderTexts).toEqual(expect.arrayContaining(['A-alpha-text', 'A-beta-text']));
     });
 
     it('PROVIDER BATCH ISOLATION — every provider call contains text from ONE tenant only', async () => {
       // Even with multiple batches, each batch is per-tuple — no batch mixes
       // texts across tenants. Use a small batch size to force multiple calls.
       seedTwoTenantsReverse();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 1 });
 
       // Each call's texts should ALL belong to tenant-A. The provider must
@@ -736,9 +702,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
     it('SELECT SQL includes tenant_id AND agent_id predicates', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
       // #289 added tenant_id + agent_id to the SELECT projection so the
@@ -753,18 +717,14 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       expect(selectSql!.sql).toMatch(/tenant_id\s*=/);
       expect(selectSql!.sql).toMatch(/agent_id\s*=/);
       // And the bound params include the routed tuple.
-      expect(selectSql!.params).toEqual(
-        expect.arrayContaining(['tenant-A', 'agent-A']),
-      );
+      expect(selectSql!.params).toEqual(expect.arrayContaining(['tenant-A', 'agent-A']));
     });
   });
 
   describe('rebuildEmbeddingsForTuple — update step', () => {
     it('SUCCESS — tenant-A rebuild only mutates tenant-A rows (NEVER tenant-B)', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
       // Tenant-A rows: now have the provider's vector.
@@ -783,9 +743,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
     it('SYMMETRY — tenant-B rebuild only mutates tenant-B rows (NEVER tenant-A)', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...B_CTX, batchSize: 32 });
 
       const bGamma = store.find((r) => r.id === 'mem_B_gamma');
@@ -801,21 +759,15 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
     it('UPDATE SQL includes tenant_id AND agent_id predicates (defense-in-depth)', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
-      const updateSql = renderedSqls.find((r) =>
-        /^\s*UPDATE\s+agent_memories/i.test(r.sql),
-      );
+      const updateSql = renderedSqls.find((r) => /^\s*UPDATE\s+agent_memories/i.test(r.sql));
       expect(updateSql).toBeDefined();
       expect(updateSql!.sql).toMatch(/tenant_id\s*=/);
       expect(updateSql!.sql).toMatch(/agent_id\s*=/);
       // The bound params include the routed tuple, alongside the id.
-      expect(updateSql!.params).toEqual(
-        expect.arrayContaining(['tenant-A', 'agent-A']),
-      );
+      expect(updateSql!.params).toEqual(expect.arrayContaining(['tenant-A', 'agent-A']));
     });
   });
 
@@ -826,9 +778,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // runs eventually embeds all four rows — but never mixes them in a
       // single provider call or a single UPDATE.
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
 
       const aResult = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
       expect(aResult.updated).toBe(2);
@@ -869,9 +819,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         embedding: null,
         created_at: 2,
       });
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
       expect(result.updated).toBe(0);
       // tenant-B's pending row is UNTOUCHED.
@@ -900,9 +848,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         embedding: null,
         created_at: 2,
       });
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
       expect(result.updated).toBe(1);
 
@@ -927,12 +873,11 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       seedTwoTenants();
       lockHeld = true; // simulate another process holding the lock for this tuple
 
-      const { rebuildEmbeddingsForTuple, ConcurrentRunError } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
+      const { rebuildEmbeddingsForTuple, ConcurrentRunError } =
+        await import('@/../scripts/embeddings-rebuild.ts');
+      await expect(rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 })).rejects.toBeInstanceOf(
+        ConcurrentRunError,
       );
-      await expect(
-        rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
-      ).rejects.toBeInstanceOf(ConcurrentRunError);
 
       // No provider call, no UPDATEs: tenant-A rows still pending.
       expect(providerCalls.length).toBe(0);
@@ -956,9 +901,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       seedTwoTenants();
       lockHeld = false;
 
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
       expect(result.updated).toBe(2);
 
@@ -981,18 +924,14 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // lock leaks until the pool closes the holding connection. We assert
       // the script checks out exactly one pool client per run.
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
       expect(poolConnectMock).toHaveBeenCalledTimes(1);
     });
 
     it('LOCK CALL SHAPE — uses session-level pg_try_advisory_lock with two int4 keys', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
       const acquireCall = lockClientQueryMock.mock.calls.find((c) =>
@@ -1015,9 +954,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
     it('UNLOCK CALL SHAPE — pg_advisory_unlock with the same two int4 keys as the acquire', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
       const acquireCall = lockClientQueryMock.mock.calls.find((c) =>
@@ -1052,14 +989,12 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         return originalImpl(query);
       });
 
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
 
       try {
-        await expect(
-          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
-        ).rejects.toThrow(/simulated update failure/);
+        await expect(rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 })).rejects.toThrow(
+          /simulated update failure/,
+        );
 
         // The lock was acquired; finally must have unlocked it + released client.
         const unlockCalls = lockClientQueryMock.mock.calls.filter((c) =>
@@ -1087,9 +1022,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
   describe('dry-run mode', () => {
     it('DRY-RUN — counts pending rows, never calls provider, never UPDATEs', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({
         ...A_CTX,
         batchSize: 32,
@@ -1106,9 +1039,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // No provider call.
       expect(providerCalls.length).toBe(0);
       // No UPDATE issued (only counts + lock + pending count).
-      const updateSqls = renderedSqls.filter((r) =>
-        /^\s*UPDATE\s+agent_memories/i.test(r.sql),
-      );
+      const updateSqls = renderedSqls.filter((r) => /^\s*UPDATE\s+agent_memories/i.test(r.sql));
       expect(updateSqls.length).toBe(0);
 
       // Rows untouched.
@@ -1126,9 +1057,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         embedding: Array(expectedDim).fill(0.5),
         created_at: 1,
       });
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({
         ...A_CTX,
         dryRun: true,
@@ -1141,14 +1070,10 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
   describe('post-write verification — UPDATE ... RETURNING', () => {
     it('UPDATE SQL uses RETURNING id', async () => {
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
-      const updateSql = renderedSqls.find((r) =>
-        /^\s*UPDATE\s+agent_memories/i.test(r.sql),
-      );
+      const updateSql = renderedSqls.find((r) => /^\s*UPDATE\s+agent_memories/i.test(r.sql));
       expect(updateSql).toBeDefined();
       expect(updateSql!.sql).toMatch(/RETURNING/i);
     });
@@ -1184,9 +1109,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         return originalImpl!(query);
       });
 
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
       // Row was flipped out before UPDATE could match → updated must be 0.
       expect(result.updated).toBe(0);
@@ -1198,16 +1121,14 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
   describe('audit + operator identity', () => {
     it('OPERATOR — getOperatorIdentity reads USER / USERNAME / LOGNAME in order', async () => {
-      const { getOperatorIdentity } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { getOperatorIdentity } = await import('@/../scripts/embeddings-rebuild.ts');
       expect(getOperatorIdentity({ USER: 'alice' })).toBe('alice');
       expect(getOperatorIdentity({ USERNAME: 'bob' })).toBe('bob');
       expect(getOperatorIdentity({ LOGNAME: 'carol' })).toBe('carol');
       // USER takes priority over the others.
-      expect(
-        getOperatorIdentity({ USER: 'alice', USERNAME: 'bob', LOGNAME: 'carol' }),
-      ).toBe('alice');
+      expect(getOperatorIdentity({ USER: 'alice', USERNAME: 'bob', LOGNAME: 'carol' })).toBe(
+        'alice',
+      );
       expect(getOperatorIdentity({})).toBe('unknown');
     });
   });
@@ -1233,9 +1154,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
     it('TRUE — matches when argv[1] resolves to the same file URL as import.meta.url', async () => {
       // POSIX path. `pathToFileURL('/x/y.ts').href` → `file:///x/y.ts`.
       // Importing the production helper itself proves the wiring is sound.
-      const { isDirectInvocation } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { isDirectInvocation } = await import('@/../scripts/embeddings-rebuild.ts');
       const { pathToFileURL } = await import('node:url');
       // Use a synthetic path so the test is deterministic across CI hosts.
       const fakeEntry = '/path/to/embeddings-rebuild.ts';
@@ -1248,9 +1167,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // simulate the production comparison by funnelling a Windows path
       // through pathToFileURL (the same helper production uses) and asserting
       // the round-trip matches.
-      const { isDirectInvocation } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { isDirectInvocation } = await import('@/../scripts/embeddings-rebuild.ts');
       const { pathToFileURL } = await import('node:url');
       // Pre-Windows `pathToFileURL` returns `file:///C:/path/to/file.ts`.
       // On POSIX it also accepts absolute-style paths; the assertion below
@@ -1273,9 +1190,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
     });
 
     it('FALSE — undefined entry (process.argv[1] missing) does not throw', async () => {
-      const { isDirectInvocation } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { isDirectInvocation } = await import('@/../scripts/embeddings-rebuild.ts');
       // Real-world: if the script is somehow loaded with no argv[1] (e.g.
       // a wrapper that strips args), we MUST NOT throw — just return false.
       expect(isDirectInvocation(undefined, 'file:///x.ts')).toBe(false);
@@ -1285,9 +1200,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // Sanity: a different argv[1] yields a different file:// URL, and the
       // comparison correctly returns false. This proves the guard isn't
       // accidentally permissive.
-      const { isDirectInvocation } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { isDirectInvocation } = await import('@/../scripts/embeddings-rebuild.ts');
       const { pathToFileURL } = await import('node:url');
       const metaUrl = pathToFileURL('/scripts/embeddings-rebuild.ts').href;
       expect(isDirectInvocation('/scripts/other.ts', metaUrl)).toBe(false);
@@ -1319,9 +1232,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         // Correct shape for Windows: `file:///C:/...` — three slashes
         // (empty host), drive letter preserved with original case,
         // forward slashes throughout the path.
-        expect(pathToFileURL('C:\\x\\y.ts').href).toMatch(
-          /^file:\/\/\/[A-Za-z]:\//,
-        );
+        expect(pathToFileURL('C:\\x\\y.ts').href).toMatch(/^file:\/\/\/[A-Za-z]:\//);
       }
       // Absolute path → file:///... (three slashes, empty host). The
       // exact path varies by host OS (on Windows it gets the current
@@ -1337,9 +1248,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // a future refactor could silently bypass the helper. We pin the
       // export contract here.
       const mod = await import('@/../scripts/embeddings-rebuild.ts');
-      expect(typeof (mod as Record<string, unknown>).isDirectInvocation).toBe(
-        'function',
-      );
+      expect(typeof (mod as Record<string, unknown>).isDirectInvocation).toBe('function');
     });
   });
 
@@ -1359,9 +1268,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // not raw `db.execute`. We assert by counting how many times the
       // transaction shim was invoked: at least once per non-empty batch.
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       await rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 });
 
       // Two pending tenant-A rows → fits in one batch of 32 → one txn.
@@ -1390,14 +1297,12 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         return originalImpl(query);
       });
 
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
 
       try {
-        await expect(
-          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
-        ).rejects.toThrow(/simulated second-row failure/);
+        await expect(rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 })).rejects.toThrow(
+          /simulated second-row failure/,
+        );
 
         // BOTH rows must remain pending — the first UPDATE was rolled back
         // along with the failing second UPDATE.
@@ -1408,11 +1313,9 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         // The fake restores the pre-txn snapshot; both should be in their
         // pre-rebuild state.
         const isAlphaPreState =
-          aAlpha!.embedding === null ||
-          aAlpha!.embedding!.length !== expectedDim;
+          aAlpha!.embedding === null || aAlpha!.embedding!.length !== expectedDim;
         const isBetaPreState =
-          aBeta!.embedding === null ||
-          aBeta!.embedding!.length !== expectedDim;
+          aBeta!.embedding === null || aBeta!.embedding!.length !== expectedDim;
         expect(isAlphaPreState).toBe(true);
         expect(isBetaPreState).toBe(true);
 
@@ -1427,9 +1330,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
       // Mirror of the rollback test — happy path, both UPDATEs succeed,
       // both rows now embedded, counters reflect the success.
       seedTwoTenants();
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
       const result = await rebuildEmbeddingsForTuple({
         ...A_CTX,
         batchSize: 32,
@@ -1463,14 +1364,12 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         return originalImpl(query);
       });
 
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
 
       try {
-        await expect(
-          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 1 }),
-        ).rejects.toThrow(/simulated second-batch failure/);
+        await expect(rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 1 })).rejects.toThrow(
+          /simulated second-batch failure/,
+        );
 
         // Batch 1 committed (one row embedded). Batch 2 rolled back (the
         // other row still in pre-rebuild state).
@@ -1485,12 +1384,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         expect(pending.length).toBe(1);
 
         // Txn lifecycle: begin → commit → begin → rollback.
-        expect(txnLifecycle).toEqual([
-          'begin',
-          'commit',
-          'begin',
-          'rollback',
-        ]);
+        expect(txnLifecycle).toEqual(['begin', 'commit', 'begin', 'rollback']);
       } finally {
         dbExecuteMock.mockImplementation(originalImpl);
       }
@@ -1511,14 +1405,12 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         return originalImpl(query);
       });
 
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
 
       try {
-        await expect(
-          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
-        ).rejects.toThrow(/simulated batch failure/);
+        await expect(rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 })).rejects.toThrow(
+          /simulated batch failure/,
+        );
 
         const unlockCalls = lockClientQueryMock.mock.calls.filter((c) =>
           /pg_advisory_unlock/i.test(c[0] as string),
@@ -1547,9 +1439,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         return originalImpl(query);
       });
 
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
 
       try {
         let caught: unknown;
@@ -1594,9 +1484,7 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         return originalImpl(query);
       });
 
-      const { rebuildEmbeddingsForTuple } = await import(
-        '@/../scripts/embeddings-rebuild.ts'
-      );
+      const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
 
       try {
         const result = await rebuildEmbeddingsForTuple({
@@ -1642,19 +1530,15 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
 
       try {
         seedTwoTenants();
-        const { rebuildEmbeddingsForTuple } = await import(
-          '@/../scripts/embeddings-rebuild.ts'
+        const { rebuildEmbeddingsForTuple } = await import('@/../scripts/embeddings-rebuild.ts');
+        await expect(rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 })).rejects.toThrow(
+          /provider boom/,
         );
-        await expect(
-          rebuildEmbeddingsForTuple({ ...A_CTX, batchSize: 32 }),
-        ).rejects.toThrow(/provider boom/);
 
         // logger.error should have been called with an object that includes
         // tenant_id + agent_id.
         expect(errorSpy).toHaveBeenCalled();
-        const calls = errorSpy.mock.calls as unknown as Array<
-          [Record<string, unknown>, string]
-        >;
+        const calls = errorSpy.mock.calls as unknown as Array<[Record<string, unknown>, string]>;
         const matchingCall = calls.find(
           (c) =>
             (c[0] as Record<string, unknown>).tenant_id === 'tenant-A' &&
@@ -1662,8 +1546,9 @@ describe('Issue #239 — scripts/embeddings-rebuild.ts is tenant_id+agent_id sco
         );
         expect(matchingCall).toBeDefined();
       } finally {
-        (embeddingsMod as unknown as { getEmbeddingProvider: typeof original }).getEmbeddingProvider =
-          original;
+        (
+          embeddingsMod as unknown as { getEmbeddingProvider: typeof original }
+        ).getEmbeddingProvider = original;
       }
     });
   });
@@ -1740,9 +1625,8 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     // rows 0 and 2 while silently dropping row 1 would be the exact partial-
     // write inconsistency #289 targets. So we expect a throw, zero UPDATEs,
     // and the bad row audited under its own tenant.
-    const { rebuildBatch, ProviderDimensionError } = await import(
-      '@/../scripts/embeddings-rebuild.ts'
-    );
+    const { rebuildBatch, ProviderDimensionError } =
+      await import('@/../scripts/embeddings-rebuild.ts');
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'a' },
@@ -1777,9 +1661,8 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
   });
 
   it('throws ProviderCardinalityError when provider returns fewer vectors than texts', async () => {
-    const { rebuildBatch, ProviderCardinalityError } = await import(
-      '@/../scripts/embeddings-rebuild.ts'
-    );
+    const { rebuildBatch, ProviderCardinalityError } =
+      await import('@/../scripts/embeddings-rebuild.ts');
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
@@ -1810,9 +1693,8 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     // positional contract just as badly as a short response — every index is
     // now suspect — so we must abort the batch before any UPDATE rather than
     // silently using only the first N and discarding the extras.
-    const { rebuildBatch, ProviderCardinalityError } = await import(
-      '@/../scripts/embeddings-rebuild.ts'
-    );
+    const { rebuildBatch, ProviderCardinalityError } =
+      await import('@/../scripts/embeddings-rebuild.ts');
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
@@ -1839,9 +1721,8 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     // WHOLE batch in the pre-scan, BEFORE row-0 (valid) is written. Otherwise
     // row-0 commits while row-1 is dropped — the partial-write inconsistency
     // #289 targets.
-    const { rebuildBatch, ProviderDimensionError } = await import(
-      '@/../scripts/embeddings-rebuild.ts'
-    );
+    const { rebuildBatch, ProviderDimensionError } =
+      await import('@/../scripts/embeddings-rebuild.ts');
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
@@ -1882,9 +1763,8 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     // silently accepts as a zero-similarity row. The empty vector sits at
     // index 1, so this also proves the valid row-0 is NOT written: validation
     // fully precedes mutation, the whole batch aborts, zero UPDATEs.
-    const { rebuildBatch, ProviderDimensionError } = await import(
-      '@/../scripts/embeddings-rebuild.ts'
-    );
+    const { rebuildBatch, ProviderDimensionError } =
+      await import('@/../scripts/embeddings-rebuild.ts');
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
@@ -1923,9 +1803,8 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     // (e.g. a provider that emits null placeholders for failed inputs). The
     // null sits at index 1, so the valid row-0 must NOT be written — the whole
     // batch aborts in the pre-scan, zero UPDATEs.
-    const { rebuildBatch, ProviderDimensionError } = await import(
-      '@/../scripts/embeddings-rebuild.ts'
-    );
+    const { rebuildBatch, ProviderDimensionError } =
+      await import('@/../scripts/embeddings-rebuild.ts');
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
@@ -1962,9 +1841,8 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
     // string/object instead of a number[]). A non-empty string is truthy, so
     // `!vec` is false — only the `!Array.isArray(vec)` clause fires. The bad
     // value sits at index 1, so valid row-0 must NOT be written.
-    const { rebuildBatch, ProviderDimensionError } = await import(
-      '@/../scripts/embeddings-rebuild.ts'
-    );
+    const { rebuildBatch, ProviderDimensionError } =
+      await import('@/../scripts/embeddings-rebuild.ts');
 
     const rows: DimRow[] = [
       { id: 'row-0', tenant_id: 't', agent_id: 'a', conteudo: 'a' },
@@ -1998,12 +1876,7 @@ describe('Issue #289 — rebuildBatch cardinality + dimension validation', () =>
   it('empty batch is a no-op (provider never called)', async () => {
     const { rebuildBatch } = await import('@/../scripts/embeddings-rebuild.ts');
     const provider = makeProvider([]);
-    const result = await rebuildBatch(
-      provider as never,
-      [],
-      expectedDim,
-      execMock as never,
-    );
+    const result = await rebuildBatch(provider as never, [], expectedDim, execMock as never);
     expect(result).toEqual({ updated: 0, skipped: 0 });
     expect(provider.embed).not.toHaveBeenCalled();
     expect(execMock).not.toHaveBeenCalled();

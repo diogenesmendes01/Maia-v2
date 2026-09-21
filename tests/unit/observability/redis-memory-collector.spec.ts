@@ -152,12 +152,7 @@ describe('redis-memory-collector — collectOnce + gauges', () => {
   });
 
   it('reports ratio=0 when maxmemory is 0 (Redis unbounded — no cap)', async () => {
-    const unboundedMemoryInfo = [
-      '# Memory',
-      'used_memory:1000000',
-      'maxmemory:0',
-      '',
-    ].join('\r\n');
+    const unboundedMemoryInfo = ['# Memory', 'used_memory:1000000', 'maxmemory:0', ''].join('\r\n');
     infoMock.mockImplementation((section: string) => {
       if (section === 'memory') return Promise.resolve(unboundedMemoryInfo);
       if (section === 'stats') return Promise.resolve(SAMPLE_STATS_INFO);
@@ -383,12 +378,7 @@ describe('redis-memory-collector — getMemoryUsedRatio (readiness gate input)',
 
   it('crosses the critical threshold exactly at > 0.95', async () => {
     // used/max = 0.96 → above critical; the readiness gate must drain on this.
-    const critical = [
-      '# Memory',
-      'used_memory:96',
-      'maxmemory:100',
-      '',
-    ].join('\r\n');
+    const critical = ['# Memory', 'used_memory:96', 'maxmemory:100', ''].join('\r\n');
     infoMock.mockImplementation((section: string) =>
       Promise.resolve(section === 'memory' ? critical : SAMPLE_STATS_INFO),
     );

@@ -95,9 +95,8 @@ export function registerShutdownSequence(): void {
   lifecycle.registerShutdownStep({
     name: 'turn_context_subscriber',
     run: async () => {
-      const { stopTurnContextCacheInvalidationSubscriber } = await import(
-        '@/agent/turn-context/cache.js'
-      );
+      const { stopTurnContextCacheInvalidationSubscriber } =
+        await import('@/agent/turn-context/cache.js');
       await stopTurnContextCacheInvalidationSubscriber();
     },
   });
@@ -113,9 +112,8 @@ export function registerShutdownSequence(): void {
   lifecycle.registerShutdownStep({
     name: 'llm_settings_subscriber',
     run: async () => {
-      const { stopLLMSettingsInvalidationSubscriber } = await import(
-        '@/lib/llm/cache-invalidation.js'
-      );
+      const { stopLLMSettingsInvalidationSubscriber } =
+        await import('@/lib/llm/cache-invalidation.js');
       await stopLLMSettingsInvalidationSubscriber();
     },
   });

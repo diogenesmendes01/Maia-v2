@@ -28,7 +28,8 @@ import { runWithTenantContext } from '@/db/tenant-context.js';
 const withPrimaryTenant = <T>(fn: () => Promise<T>): Promise<T> =>
   runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, fn);
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 let pool: pg.Pool;

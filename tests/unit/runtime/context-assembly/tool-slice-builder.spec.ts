@@ -13,10 +13,7 @@ import {
 import { InMemorySliceCache } from '@/runtime/context-packet/cache/slice-cache.js';
 import { mockBase, mockDecision } from './_fixture.js';
 
-const descriptor = (
-  name: string,
-  overrides?: Partial<ToolDescriptor>,
-): ToolDescriptor => ({
+const descriptor = (name: string, overrides?: Partial<ToolDescriptor>): ToolDescriptor => ({
   name,
   side_effect_level: 'low',
   requires_confirmation: false,
@@ -26,9 +23,7 @@ const descriptor = (
   ...overrides,
 });
 
-const mkRegistry = (
-  descs: Record<string, ToolDescriptor | null>,
-): ToolRegistryPort => ({
+const mkRegistry = (descs: Record<string, ToolDescriptor | null>): ToolRegistryPort => ({
   async getToolDescriptor(name) {
     return descs[name] ?? null;
   },
@@ -132,10 +127,7 @@ describe('ToolPermissionSliceBuilder', () => {
   });
 
   it('cache hit on second call with same decision', async () => {
-    const builder = new ToolPermissionSliceBuilder(
-      mkRegistry({ t1: descriptor('t1') }),
-      cache,
-    );
+    const builder = new ToolPermissionSliceBuilder(mkRegistry({ t1: descriptor('t1') }), cache);
     const decision = mockDecision({
       tool_permissions: {
         allowed_tools: ['t1'],

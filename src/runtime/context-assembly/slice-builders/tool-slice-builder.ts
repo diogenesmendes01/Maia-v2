@@ -11,17 +11,10 @@
  * Spec §3.9 / Plan Task 11.
  */
 import { createHash } from 'node:crypto';
-import type {
-  BaseContextPacket,
-  ToolPermissionSlice,
-} from '../../context-packet/types.js';
+import type { BaseContextPacket, ToolPermissionSlice } from '../../context-packet/types.js';
 import { sliceCacheKey, type SliceCache } from '../../context-packet/cache/slice-cache.js';
 import { getTTLForSlice } from '../../context-packet/cache/ttl-policy.js';
-import type {
-  SliceBuilder,
-  SliceBuilderInput,
-  SliceBuilderResult,
-} from './_types.js';
+import type { SliceBuilder, SliceBuilderInput, SliceBuilderResult } from './_types.js';
 
 export interface ToolRequirements {
   /** Currently no shaping; future may toggle verbosity. */
@@ -41,9 +34,10 @@ export interface ToolRegistryPort {
   getToolDescriptor(name: string): Promise<ToolDescriptor | null>;
 }
 
-export class ToolPermissionSliceBuilder
-  implements SliceBuilder<ToolRequirements, ToolPermissionSlice>
-{
+export class ToolPermissionSliceBuilder implements SliceBuilder<
+  ToolRequirements,
+  ToolPermissionSlice
+> {
   readonly name = 'tool' as const;
 
   constructor(
@@ -75,8 +69,7 @@ export class ToolPermissionSliceBuilder
 
     const allowed = input.decision.tool_permissions.allowed_tools;
     const blocked = input.decision.tool_permissions.blocked_tools;
-    const requires_confirmation =
-      input.decision.tool_permissions.requires_confirmation;
+    const requires_confirmation = input.decision.tool_permissions.requires_confirmation;
 
     const cacheScope = hashShort({
       allowed,
@@ -133,8 +126,5 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 function hashShort(obj: Record<string, unknown>): string {
-  return createHash('sha256')
-    .update(JSON.stringify(obj))
-    .digest('hex')
-    .substring(0, 12);
+  return createHash('sha256').update(JSON.stringify(obj)).digest('hex').substring(0, 12);
 }

@@ -20,15 +20,8 @@
  */
 import { describe, it, expect, vi } from 'vitest';
 import { RiskLevel } from '@/types/enums.js';
-import {
-  scoreTurnRisk,
-  scoreKnowledgeRisk,
-} from '@/shared/risk/scorer.ts';
-import {
-  RISK_LEVELS_ASCENDING,
-  isAtLeast,
-  compareRiskLevel,
-} from '@/shared/risk/level.ts';
+import { scoreTurnRisk, scoreKnowledgeRisk } from '@/shared/risk/scorer.ts';
+import { RISK_LEVELS_ASCENDING, isAtLeast, compareRiskLevel } from '@/shared/risk/level.ts';
 import type { LLMGate, TurnRiskSignals, KnowledgeRiskSignals } from '@/shared/risk/types.ts';
 
 function gateReturning(suggested: RiskLevel | null, reason = 'mock'): LLMGate {
@@ -37,9 +30,7 @@ function gateReturning(suggested: RiskLevel | null, reason = 'mock'): LLMGate {
 
 describe('scoreTurnRisk — gate orchestration', () => {
   it('heurística não-ambígua → LLM NÃO é chamado', async () => {
-    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(
-      gateReturning(RiskLevel.CRITICAL),
-    );
+    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(gateReturning(RiskLevel.CRITICAL));
     const sig: TurnRiskSignals = {
       topic: 'critical_decision',
       tool_kinds: ['irreversible'],
@@ -52,13 +43,8 @@ describe('scoreTurnRisk — gate orchestration', () => {
   });
 
   it('low não-ambíguo (casual) → LLM NÃO é chamado', async () => {
-    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(
-      gateReturning(RiskLevel.HIGH),
-    );
-    const r = await scoreTurnRisk(
-      { topic: 'casual', tool_kinds: [] },
-      { gate, contextText: 'oi' },
-    );
+    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(gateReturning(RiskLevel.HIGH));
+    const r = await scoreTurnRisk({ topic: 'casual', tool_kinds: [] }, { gate, contextText: 'oi' });
     expect(r.level).toBe(RiskLevel.LOW);
     expect(gate).not.toHaveBeenCalled();
   });
@@ -96,10 +82,7 @@ describe('scoreTurnRisk — gate orchestration', () => {
 
   it('LLM concorda → mantém heurístico, decided_by=heuristic', async () => {
     const gate = gateReturning(RiskLevel.LOW);
-    const r = await scoreTurnRisk(
-      { topic: 'unknown' },
-      { gate, contextText: 'x' },
-    );
+    const r = await scoreTurnRisk({ topic: 'unknown' }, { gate, contextText: 'x' });
     expect(r.level).toBe(RiskLevel.LOW);
     expect(r.decided_by).toBe('heuristic');
     expect(r.llm_attempted_downgrade).toBe(false);
@@ -135,9 +118,7 @@ describe('scoreTurnRisk — gate orchestration', () => {
 
 describe('scoreKnowledgeRisk — gate orchestration', () => {
   it('regra com 1 evidência (ambígua) → LLM consultado', async () => {
-    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(
-      gateReturning(RiskLevel.MEDIUM),
-    );
+    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(gateReturning(RiskLevel.MEDIUM));
     const sig: KnowledgeRiskSignals = {
       knowledge_type: 'regra',
       derived_confidence: 0.6,
@@ -148,9 +129,7 @@ describe('scoreKnowledgeRisk — gate orchestration', () => {
   });
 
   it('procedimento com touches_irreversible (high não-ambíguo) → LLM NÃO chamado', async () => {
-    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(
-      gateReturning(RiskLevel.LOW),
-    );
+    const gate = vi.fn<Parameters<LLMGate>, ReturnType<LLMGate>>(gateReturning(RiskLevel.LOW));
     const sig: KnowledgeRiskSignals = {
       knowledge_type: 'procedimento',
       touches_irreversible: true,
@@ -205,12 +184,31 @@ function pickFrom<T>(rnd: () => number, arr: readonly T[]): T {
 }
 
 function randomTurnSignals(rnd: () => number): TurnRiskSignals {
-  const topics = ['casual', 'operational_simple', 'financial', 'legal', 'health',
-    'critical_decision', 'unknown'] as const;
-  const tools = ['read_local', 'read_external', 'write_local', 'write_external',
-    'transfer', 'irreversible', 'communication'] as const;
-  const overrides = [undefined, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH,
-    RiskLevel.CRITICAL] as const;
+  const topics = [
+    'casual',
+    'operational_simple',
+    'financial',
+    'legal',
+    'health',
+    'critical_decision',
+    'unknown',
+  ] as const;
+  const tools = [
+    'read_local',
+    'read_external',
+    'write_local',
+    'write_external',
+    'transfer',
+    'irreversible',
+    'communication',
+  ] as const;
+  const overrides = [
+    undefined,
+    RiskLevel.LOW,
+    RiskLevel.MEDIUM,
+    RiskLevel.HIGH,
+    RiskLevel.CRITICAL,
+  ] as const;
 
   const tool_kinds: TurnRiskSignals['tool_kinds'] = [];
   const nTools = Math.floor(rnd() * 3);
@@ -229,12 +227,31 @@ function randomTurnSignals(rnd: () => number): TurnRiskSignals {
 
 function randomKnowledgeSignals(rnd: () => number): KnowledgeRiskSignals {
   const ktypes = ['fato', 'regra', 'procedimento', 'lacuna', 'tool_request'] as const;
-  const topics = ['casual', 'operational_simple', 'financial', 'legal', 'health',
-    'critical_decision', 'unknown'] as const;
-  const tools = ['read_local', 'read_external', 'write_local', 'write_external',
-    'transfer', 'irreversible', 'communication'] as const;
-  const overrides = [undefined, RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH,
-    RiskLevel.CRITICAL] as const;
+  const topics = [
+    'casual',
+    'operational_simple',
+    'financial',
+    'legal',
+    'health',
+    'critical_decision',
+    'unknown',
+  ] as const;
+  const tools = [
+    'read_local',
+    'read_external',
+    'write_local',
+    'write_external',
+    'transfer',
+    'irreversible',
+    'communication',
+  ] as const;
+  const overrides = [
+    undefined,
+    RiskLevel.LOW,
+    RiskLevel.MEDIUM,
+    RiskLevel.HIGH,
+    RiskLevel.CRITICAL,
+  ] as const;
 
   const tool_kinds: KnowledgeRiskSignals['tool_kinds'] = [];
   const nTools = Math.floor(rnd() * 3);
@@ -253,7 +270,7 @@ function randomKnowledgeSignals(rnd: () => number): KnowledgeRiskSignals {
 
 describe('PROPERTY: scoreTurnRisk (10k iter) — final NUNCA abaixo do heurístico + critical preserved', () => {
   it('LLM aleatório (incluindo abaixo + inválido) nunca rebaixa o resultado final', async () => {
-    const rnd = pseudoRandomGenerator(0xC0FFEE);
+    const rnd = pseudoRandomGenerator(0xc0ffee);
     const ITER = 10_000;
     let downgradeAttempts = 0;
     let llmCalls = 0;
@@ -314,7 +331,7 @@ describe('PROPERTY: scoreTurnRisk (10k iter) — final NUNCA abaixo do heurísti
 
 describe('PROPERTY: scoreKnowledgeRisk (10k iter) — final NUNCA abaixo do heurístico + critical preserved', () => {
   it('LLM aleatório nunca rebaixa knowledge; CRITICAL triggers nunca perdem', async () => {
-    const rnd = pseudoRandomGenerator(0xCAFE_F00D);
+    const rnd = pseudoRandomGenerator(0xcafe_f00d);
     const ITER = 10_000;
     let downgradeAttempts = 0;
     let invalidInjections = 0;
@@ -334,9 +351,7 @@ describe('PROPERTY: scoreKnowledgeRisk (10k iter) — final NUNCA abaixo do heur
       const h = scoreKnowledgeHeuristic(sig);
       expect(isAtLeast(r.level, h.level)).toBe(true);
 
-      const hasCriticalTrigger = h.triggers.some(
-        (t) => t.contributes_to === RiskLevel.CRITICAL,
-      );
+      const hasCriticalTrigger = h.triggers.some((t) => t.contributes_to === RiskLevel.CRITICAL);
       if (hasCriticalTrigger) {
         criticalHeuristicCount++;
         expect(r.level).toBe(RiskLevel.CRITICAL);
@@ -451,10 +466,7 @@ describe('scoreTurnRisk — fail-closed: ambiguous LOW + gate degraded → MEDIU
 
   it('topic=unknown + gate returns null → result is MEDIUM with gate:fallback_ambiguous', async () => {
     const gate = gateReturning(null);
-    const r = await scoreTurnRisk(
-      { topic: 'unknown' },
-      { gate, contextText: 'x' },
-    );
+    const r = await scoreTurnRisk({ topic: 'unknown' }, { gate, contextText: 'x' });
     expect(r.level).toBe(RiskLevel.MEDIUM);
     expect(r.triggers.some((t) => t.signal === 'gate:fallback_ambiguous')).toBe(true);
   });
@@ -463,10 +475,7 @@ describe('scoreTurnRisk — fail-closed: ambiguous LOW + gate degraded → MEDIU
     // financial topic → MEDIUM + ambiguous (no strong trigger). Gate null should
     // NOT escalate to HIGH — escalation only applies when level is LOW.
     const gate = gateReturning(null);
-    const r = await scoreTurnRisk(
-      { topic: 'financial' },
-      { gate, contextText: 'x' },
-    );
+    const r = await scoreTurnRisk({ topic: 'financial' }, { gate, contextText: 'x' });
     expect(r.level).toBe(RiskLevel.MEDIUM); // stays MEDIUM, not escalated to HIGH
     expect(r.triggers.some((t) => t.signal === 'gate:fallback_ambiguous')).toBe(false);
   });
@@ -490,9 +499,9 @@ describe('scoreTurnRisk — fail-closed: ambiguous LOW + gate degraded → MEDIU
     const r = await scoreKnowledgeRisk(
       {
         knowledge_type: 'regra',
-        topic: 'casual',    // no risk from topic
+        topic: 'casual', // no risk from topic
         derived_confidence: 0.8, // no risk from confidence
-        evidence_count: 1,       // ambiguous=true
+        evidence_count: 1, // ambiguous=true
       },
       { gate, contextText: 'x' },
     );

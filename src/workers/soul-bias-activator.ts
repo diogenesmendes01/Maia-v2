@@ -73,10 +73,7 @@ export async function processSoulBiasProposalApproval(args: {
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    logger.error(
-      { proposal_id: args.proposal_id, err: msg },
-      'soul_bias_activator.propose_failed',
-    );
+    logger.error({ proposal_id: args.proposal_id, err: msg }, 'soul_bias_activator.propose_failed');
     return { ok: false, reason: `propose_failed:${msg}` };
   }
 
@@ -119,8 +116,6 @@ export async function processSoulBiasProposalApproval(args: {
  * de proposal aprovada NUNCA recria uma bias que já existiu com este
  * proposal_id para evitar ressurreição de biaS rolled_back.
  */
-async function findExistingBiasForProposal(
-  proposal_id: string,
-): Promise<{ id: string } | null> {
+async function findExistingBiasForProposal(proposal_id: string): Promise<{ id: string } | null> {
   return soulBiasesRepo.findByProposalId(proposal_id);
 }

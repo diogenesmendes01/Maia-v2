@@ -14,11 +14,7 @@ export const metadata = {
 // empty session — force request-time rendering for the whole app.
 export const dynamic = 'force-dynamic';
 
-export default async function RootLayout({
-  children,
-}: {
-  children: React.ReactNode;
-}) {
+export default async function RootLayout({ children }: { children: React.ReactNode }) {
   const session = await auth();
 
   return (
@@ -28,9 +24,7 @@ export default async function RootLayout({
           {session ? (
             <Shell>{children}</Shell>
           ) : (
-            <main className="flex min-h-screen items-center justify-center p-6">
-              {children}
-            </main>
+            <main className="flex min-h-screen items-center justify-center p-6">{children}</main>
           )}
         </Providers>
       </body>

@@ -34,10 +34,7 @@ const TURNO_ID = '99999999-8888-4777-8666-555555555555';
  * writes — with v1 still exercised below so the "verifier keeps reading v1"
  * half of the owner decision has a test and not just a comment.
  */
-function signedRow(
-  over: Record<string, unknown> = {},
-  version: EnvelopeSignatureVersion = 2,
-) {
+function signedRow(over: Record<string, unknown> = {}, version: EnvelopeSignatureVersion = 2) {
   const fields = {
     trace_id: TRACE_ID,
     tenant_id: 'acme',
@@ -129,9 +126,9 @@ describe('issue #514 [P2] — envelope integrity verification', () => {
     it("another tenant's valid signature ⇒ invalid (keys are tenant-derived)", () => {
       const mine = signedRow({ tenant_id: 'tenant-a' });
       const theirs = signedRow({ tenant_id: 'tenant-b' });
-      expect(
-        verifyEnvelopeIntegrity({ ...mine, envelope_hmac: theirs.envelope_hmac }),
-      ).toBe('invalid');
+      expect(verifyEnvelopeIntegrity({ ...mine, envelope_hmac: theirs.envelope_hmac })).toBe(
+        'invalid',
+      );
     });
 
     it('a signature from a different key version ⇒ invalid', () => {
@@ -207,9 +204,7 @@ describe('issue #514 [P2] — envelope integrity verification', () => {
     it("another tenant's key ⇒ invalid", () => {
       const mine = signedBody({ trace_id: TRACE_ID }, { tenant_id: 'tenant-a' });
       const theirs = signedBody({ trace_id: TRACE_ID }, { tenant_id: 'tenant-b' });
-      expect(
-        verifyBodyIntegrity({ ...mine, packet_hmac: theirs.packet_hmac }),
-      ).toBe('invalid');
+      expect(verifyBodyIntegrity({ ...mine, packet_hmac: theirs.packet_hmac })).toBe('invalid');
     });
 
     it('an ENCRYPTED body still verifies — the writer signs what it stores', () => {
@@ -306,9 +301,7 @@ describe('issue #514 [P2] — envelope integrity verification', () => {
 
     it('an unknown signature version is refused, never silently read as v1', () => {
       const row = signedRow({}, 2);
-      expect(verifyEnvelopeIntegrity({ ...row, signature_version: 3 })).toBe(
-        'rejected_version',
-      );
+      expect(verifyEnvelopeIntegrity({ ...row, signature_version: 3 })).toBe('rejected_version');
     });
 
     it('a missing signature_version column is read as v1, matching the DB default', () => {

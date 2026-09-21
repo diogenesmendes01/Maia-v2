@@ -65,10 +65,12 @@ describe('issue #316 — idempotency_effect_outbox schema', () => {
   it('exactly-once enqueue guard: UNIQUE (tenant_id, agent_id, idempotency_key)', () => {
     // `unique(...)` declares a table CONSTRAINT (not an index), so it lives in
     // cfg.uniqueConstraints (mirrors tests/unit/import-schema.spec.ts).
-    const uniques = (cfg.uniqueConstraints as unknown as Array<{
-      name?: string;
-      columns: Array<{ name: string }>;
-    }>).map((u) => ({ name: u.name, cols: u.columns.map((c) => c.name) }));
+    const uniques = (
+      cfg.uniqueConstraints as unknown as Array<{
+        name?: string;
+        columns: Array<{ name: string }>;
+      }>
+    ).map((u) => ({ name: u.name, cols: u.columns.map((c) => c.name) }));
     expect(uniques).toContainEqual({
       name: 'idempotency_effect_outbox_tenant_agent_key',
       cols: ['tenant_id', 'agent_id', 'idempotency_key'],

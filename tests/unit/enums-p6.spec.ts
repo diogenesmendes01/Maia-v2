@@ -1,19 +1,34 @@
 import { describe, it, expect } from 'vitest';
 import {
-  SwitchBehavior, SuggestedBy, DecidedBy, AnnounceMode,
-  RoleSelectorStrength, RoleDecisionAction, FeatureFlagName,
+  SwitchBehavior,
+  SuggestedBy,
+  DecidedBy,
+  AnnounceMode,
+  RoleSelectorStrength,
+  RoleDecisionAction,
+  FeatureFlagName,
 } from '@/types/enums.js';
 import { featureFlags } from '@/config/feature-flags.js';
 
 describe('P6 enums', () => {
   it('SwitchBehavior has 4 values', () => {
-    expect(Object.values(SwitchBehavior).sort()).toEqual(['by_context', 'free_with_trigger', 'locked', 'prefer_handoff']);
+    expect(Object.values(SwitchBehavior).sort()).toEqual([
+      'by_context',
+      'free_with_trigger',
+      'locked',
+      'prefer_handoff',
+    ]);
   });
   it('SuggestedBy has 3 values', () => {
     expect(Object.values(SuggestedBy)).toHaveLength(3);
   });
   it('DecidedBy has 4 values (excludes llm_classifier)', () => {
-    expect(Object.values(DecidedBy).sort()).toEqual(['fallback_rule', 'owner_override', 'policy_default', 'policy_rule']);
+    expect(Object.values(DecidedBy).sort()).toEqual([
+      'fallback_rule',
+      'owner_override',
+      'policy_default',
+      'policy_rule',
+    ]);
     expect(Object.values(DecidedBy)).not.toContain('llm_classifier');
   });
   it('AnnounceMode has 3 values', () => {
@@ -35,8 +50,6 @@ describe('P6 enums', () => {
     // #478 registered the next phase's flag (MCP_TOOLS, default OFF) — the
     // enum is no longer empty; the removed legacy flags stay removed.
     expect(Object.keys(FeatureFlagName)).toEqual(['MCP_TOOLS']);
-    expect(
-      featureFlags.isEnabled('ANY_ABSENT_FLAG' as unknown as never),
-    ).toBe(false);
+    expect(featureFlags.isEnabled('ANY_ABSENT_FLAG' as unknown as never)).toBe(false);
   });
 });

@@ -110,11 +110,10 @@ function makeRun(): OnboardingRunRow {
 
 async function provision(): Promise<{ captured: Captured; result: Record<string, unknown> }> {
   const captured: Captured = { agents: [], profiles: [], grants: [] };
-  const out = await applyProvisionAgent(
-    makeTx(captured) as never,
-    makeRun(),
-    { agent_id: 'acme-bot', nome: 'Bot da Acme' } as never,
-  );
+  const out = await applyProvisionAgent(makeTx(captured) as never, makeRun(), {
+    agent_id: 'acme-bot',
+    nome: 'Bot da Acme',
+  } as never);
   return { captured, result: out.result as Record<string, unknown> };
 }
 

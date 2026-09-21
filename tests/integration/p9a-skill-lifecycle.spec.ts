@@ -50,9 +50,8 @@ function key(s: SkillRow) {
 }
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     skillsRepo: {
@@ -102,7 +101,9 @@ vi.mock('@/db/repositories.js', async () => {
         );
       },
       async listByCategory(category: string) {
-        return Object.values(skillsState).filter((s) => s.category === category && s.status === 'active');
+        return Object.values(skillsState).filter(
+          (s) => s.category === category && s.status === 'active',
+        );
       },
       async activate(id: string, approver: string) {
         const t = skillsState[id];
@@ -157,9 +158,8 @@ vi.mock('@/db/repositories.js', async () => {
 });
 
 vi.mock('@/cognition/runner.js', async () => {
-  const actual = await vi.importActual<typeof import('@/cognition/runner.js')>(
-    '@/cognition/runner.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/cognition/runner.js')>('@/cognition/runner.js');
   return {
     ...actual,
     runCognitiveModule: vi.fn(async (_opts: any, fn: any) => {
@@ -301,7 +301,12 @@ describe('P9a Skill Lifecycle — E2E (mocked)', () => {
   it('cenário 6: policy_blocked é respeitado pre-execução', async () => {
     vi.mocked(policyDescriptorResolver.resolveDescriptors).mockResolvedValue({
       resolved: [
-        { policy_id: 'p-block', descriptor: 'critical', effect: 'block', reason: 'compliance hold' },
+        {
+          policy_id: 'p-block',
+          descriptor: 'critical',
+          effect: 'block',
+          reason: 'compliance hold',
+        },
       ],
       unresolved: [],
     });

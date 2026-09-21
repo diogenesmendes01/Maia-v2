@@ -213,10 +213,10 @@ d('migration: eliminate the default tenant (#323) — real DB', () => {
 
     const primTenant = await pg.pool.query(`SELECT status FROM tenants WHERE id = $1`, [PRIMARY]);
     expect(primTenant.rowCount).toBe(1);
-    const primAgent = await pg.pool.query(
-      `SELECT 1 FROM agents WHERE id = $1 AND tenant_id = $2`,
-      [PRIMARY_AGENT, PRIMARY],
-    );
+    const primAgent = await pg.pool.query(`SELECT 1 FROM agents WHERE id = $1 AND tenant_id = $2`, [
+      PRIMARY_AGENT,
+      PRIMARY,
+    ]);
     expect(primAgent.rowCount).toBe(1);
   });
 });

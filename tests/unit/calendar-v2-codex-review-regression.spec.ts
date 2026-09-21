@@ -143,9 +143,7 @@ afterEach(() => {
 
 describe('register_custom_holiday — entidade_ids authorization (Codex #105 high)', () => {
   it('rejects when ANY entidade_id is outside ctx.scope.entidades', async () => {
-    const { registerCustomHolidayTool } = await import(
-      '@/tools/register-custom-holiday.js'
-    );
+    const { registerCustomHolidayTool } = await import('@/tools/register-custom-holiday.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       // Caller is scoped to E_IN, but tries to register holiday on E_OTHER.
       await expect(
@@ -166,9 +164,7 @@ describe('register_custom_holiday — entidade_ids authorization (Codex #105 hig
   });
 
   it('rejects when ctx.scope contains the entidade but profile lacks manage_calendar', async () => {
-    const { registerCustomHolidayTool } = await import(
-      '@/tools/register-custom-holiday.js'
-    );
+    const { registerCustomHolidayTool } = await import('@/tools/register-custom-holiday.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       await expect(
         registerCustomHolidayTool.handler(
@@ -187,9 +183,7 @@ describe('register_custom_holiday — entidade_ids authorization (Codex #105 hig
   });
 
   it('happy path: every entidade_id is in scope AND authorized', async () => {
-    const { registerCustomHolidayTool } = await import(
-      '@/tools/register-custom-holiday.js'
-    );
+    const { registerCustomHolidayTool } = await import('@/tools/register-custom-holiday.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       const out = await registerCustomHolidayTool.handler(
         {
@@ -208,9 +202,7 @@ describe('register_custom_holiday — entidade_ids authorization (Codex #105 hig
   });
 
   it('dedupes duplicate entidade_ids before linking and authorization', async () => {
-    const { registerCustomHolidayTool } = await import(
-      '@/tools/register-custom-holiday.js'
-    );
+    const { registerCustomHolidayTool } = await import('@/tools/register-custom-holiday.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       const out = await registerCustomHolidayTool.handler(
         {
@@ -274,9 +266,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     // Force dispatch failure mid-materialization (malformed insert).
     holidaysCreate.mockRejectedValueOnce(new Error('db_failure'));
 
-    const { approveCapabilityProposalTool } = await import(
-      '@/tools/approve-capability-proposal.js'
-    );
+    const { approveCapabilityProposalTool } =
+      await import('@/tools/approve-capability-proposal.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       await expect(
         approveCapabilityProposalTool.handler(
@@ -295,9 +286,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     proposalsGetById.mockResolvedValue(makeProposal());
     proposalsTransition.mockResolvedValue({ ok: true, updated: {} });
 
-    const { approveCapabilityProposalTool } = await import(
-      '@/tools/approve-capability-proposal.js'
-    );
+    const { approveCapabilityProposalTool } =
+      await import('@/tools/approve-capability-proposal.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       const out = await approveCapabilityProposalTool.handler(
         {
@@ -326,9 +316,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     // Link already present — reconciliation no-ops.
     holidayEntidadesListByEntidade.mockResolvedValueOnce([99]);
 
-    const { approveCapabilityProposalTool } = await import(
-      '@/tools/approve-capability-proposal.js'
-    );
+    const { approveCapabilityProposalTool } =
+      await import('@/tools/approve-capability-proposal.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       const out = await approveCapabilityProposalTool.handler(
         {
@@ -358,9 +347,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     // Link missing: entidade has no junction rows yet for this holiday id.
     holidayEntidadesListByEntidade.mockResolvedValueOnce([]);
 
-    const { approveCapabilityProposalTool } = await import(
-      '@/tools/approve-capability-proposal.js'
-    );
+    const { approveCapabilityProposalTool } =
+      await import('@/tools/approve-capability-proposal.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       const out = await approveCapabilityProposalTool.handler(
         { proposal_id: '11111111-1111-1111-1111-111111111111' } as never,
@@ -387,9 +375,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     holidaysFindByProposalId.mockResolvedValueOnce(null);
     holidayEntidadesLink.mockRejectedValueOnce(new Error('link_db_failure'));
 
-    const { approveCapabilityProposalTool } = await import(
-      '@/tools/approve-capability-proposal.js'
-    );
+    const { approveCapabilityProposalTool } =
+      await import('@/tools/approve-capability-proposal.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       await expect(
         approveCapabilityProposalTool.handler(
@@ -409,9 +396,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     proposalsGetById.mockResolvedValue(makeProposal());
     holidaysFindByProposalId.mockResolvedValue(null);
 
-    const { approveCapabilityProposalTool } = await import(
-      '@/tools/approve-capability-proposal.js'
-    );
+    const { approveCapabilityProposalTool } =
+      await import('@/tools/approve-capability-proposal.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       // Caller scope contains E_OTHER but proposal targets E_IN. Should reject.
       await expect(
@@ -429,9 +415,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     proposalsGetById.mockResolvedValue(makeProposal());
     holidaysFindByProposalId.mockResolvedValue(null);
 
-    const { approveCapabilityProposalTool } = await import(
-      '@/tools/approve-capability-proposal.js'
-    );
+    const { approveCapabilityProposalTool } =
+      await import('@/tools/approve-capability-proposal.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       // Caller has manage_capabilities + ver_saldo but NOT manage_calendar.
       await expect(
@@ -458,9 +443,8 @@ describe('approve_capability_proposal — atomic materialization (Codex #105 hig
     );
     proposalsTransition.mockResolvedValue({ ok: true, updated: {} });
 
-    const { approveCapabilityProposalTool } = await import(
-      '@/tools/approve-capability-proposal.js'
-    );
+    const { approveCapabilityProposalTool } =
+      await import('@/tools/approve-capability-proposal.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       const out = await approveCapabilityProposalTool.handler(
         { proposal_id: '11111111-1111-1111-1111-111111111111' } as never,
@@ -485,9 +469,7 @@ describe('start_recurring_payment / outreach: business-day RRULE wiring (Codex #
     // The fact that the handler succeeds proves the extended path is wired.
     // Wrapped in tenant context because the extended engine hits the
     // holidays cache (DB-backed), which requires tenant scoping.
-    const { startRecurringPaymentTool } = await import(
-      '@/tools/start-recurring-payment.js'
-    );
+    const { startRecurringPaymentTool } = await import('@/tools/start-recurring-payment.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       const out = await startRecurringPaymentTool.handler(
         {
@@ -511,9 +493,7 @@ describe('start_recurring_payment / outreach: business-day RRULE wiring (Codex #
   });
 
   it('start_recurring_payment: legacy BYMONTHDAY=15 still works (regression)', async () => {
-    const { startRecurringPaymentTool } = await import(
-      '@/tools/start-recurring-payment.js'
-    );
+    const { startRecurringPaymentTool } = await import('@/tools/start-recurring-payment.js');
     // Legacy path doesn't hit the holidays cache, no tenant ctx needed.
     const out = await startRecurringPaymentTool.handler(
       {
@@ -533,9 +513,7 @@ describe('start_recurring_payment / outreach: business-day RRULE wiring (Codex #
   });
 
   it('start_recurring_outreach: BYWORKDAY=true routes through extended engine', async () => {
-    const { startRecurringOutreachTool } = await import(
-      '@/tools/start-recurring-outreach.js'
-    );
+    const { startRecurringOutreachTool } = await import('@/tools/start-recurring-outreach.js');
     await runWithTenantContext(TENANT_CTX, async () => {
       const out = await startRecurringOutreachTool.handler(
         {

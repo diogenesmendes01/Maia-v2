@@ -159,9 +159,6 @@ export function assertEgressAuthorized(primitive: EgressPrimitive): EgressAuthor
   const auth = als.getStore();
   if (auth) return auth;
   incCounter(METRIC.OUTBOUND_DIRECT_SEND_VIOLATION, { kind: primitive });
-  logger.error(
-    { primitive, ops_alert: true },
-    'outbound.direct_send_violation',
-  );
+  logger.error({ primitive, ops_alert: true }, 'outbound.direct_send_violation');
   throw new DirectSendViolationError(primitive);
 }

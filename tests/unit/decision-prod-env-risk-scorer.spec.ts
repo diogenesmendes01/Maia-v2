@@ -144,8 +144,9 @@ describe('RiskScorerProdAdapter (Camada 3, stub #1/4)', () => {
     expect(result.level).toBe('high');
     expect(result.requires_human_review).toBe(true);
     // Must mention the cap in reasons so callers can audit the CRITICAL signal.
-    const hasIndicator =
-      result.reasons.some((r) => r.includes('critical_capped') || r.includes('critical'));
+    const hasIndicator = result.reasons.some(
+      (r) => r.includes('critical_capped') || r.includes('critical'),
+    );
     expect(hasIndicator).toBe(true);
   });
 

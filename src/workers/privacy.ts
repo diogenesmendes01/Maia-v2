@@ -261,15 +261,11 @@ export async function runPrivacyExportSweep(
         }).catch((err: unknown) => {
           // A evidência do PASSE não pode derrubar o passe: as remoções já
           // foram auditadas uma a uma, e é essa trilha que defende o pedido.
-          logger.error(
-            { err: (err as Error).name },
-            'privacy.export_sweep_run_record_failed',
-          );
+          logger.error({ err: (err as Error).name }, 'privacy.export_sweep_run_record_failed');
         });
 
         await audit({
-          acao:
-            result.status === 'completed' ? 'retention_run_completed' : 'retention_run_failed',
+          acao: result.status === 'completed' ? 'retention_run_completed' : 'retention_run_failed',
           metadata: {
             correlation_id: correlationId,
             data_class: 'privacy.export',

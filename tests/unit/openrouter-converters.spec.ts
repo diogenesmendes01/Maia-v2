@@ -18,7 +18,9 @@ vi.mock('../../src/db/repositories.js', () => ({
 }));
 
 vi.mock('../../src/lib/cost-ledger.js', () => ({ recordLLMCost: vi.fn() }));
-vi.mock('../../src/lib/logger.js', () => ({ logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() } }));
+vi.mock('../../src/lib/logger.js', () => ({
+  logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
+}));
 vi.mock('../../src/lib/metrics.js', () => ({ incCounter: vi.fn(), observeHistogram: vi.fn() }));
 
 describe('openrouter converters', () => {
@@ -47,9 +49,7 @@ describe('openrouter converters', () => {
       },
       {
         role: 'user',
-        content: [
-          { type: 'tool_result', tool_use_id: 'call_1', content: '{"saldo": 1000}' },
-        ],
+        content: [{ type: 'tool_result', tool_use_id: 'call_1', content: '{"saldo": 1000}' }],
       },
     ]);
     // [system, user, assistant w/ tool_calls, tool result]
@@ -58,7 +58,11 @@ describe('openrouter converters', () => {
     expect(asst.role).toBe('assistant');
     expect(asst.content).toBe('consultando');
     expect(asst.tool_calls?.length).toBe(1);
-    const tool_call = asst.tool_calls?.[0] as { id: string; type: string; function: { name: string; arguments: string } };
+    const tool_call = asst.tool_calls?.[0] as {
+      id: string;
+      type: string;
+      function: { name: string; arguments: string };
+    };
     expect(tool_call.id).toBe('call_1');
     expect(tool_call.function.name).toBe('query_balance');
     expect(JSON.parse(tool_call.function.arguments)).toEqual({ entidade: 'e1' });
@@ -134,13 +138,21 @@ describe('openrouter converters', () => {
   it('fromOpenAIResponse maps stop -> end_turn and length -> max_tokens', async () => {
     const { fromOpenAIResponse } = await import('../../src/lib/claude.js');
     const stopRes = {
-      id: 'r2', object: 'chat.completion', created: 0, model: 'm',
+      id: 'r2',
+      object: 'chat.completion',
+      created: 0,
+      model: 'm',
       choices: [{ index: 0, finish_reason: 'stop', message: { role: 'assistant', content: 'ok' } }],
       usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
     };
     const lenRes = {
-      id: 'r3', object: 'chat.completion', created: 0, model: 'm',
-      choices: [{ index: 0, finish_reason: 'length', message: { role: 'assistant', content: 'truncated' } }],
+      id: 'r3',
+      object: 'chat.completion',
+      created: 0,
+      model: 'm',
+      choices: [
+        { index: 0, finish_reason: 'length', message: { role: 'assistant', content: 'truncated' } },
+      ],
       usage: { prompt_tokens: 1, completion_tokens: 1024, total_tokens: 1025 },
     };
     // eslint-disable-next-line @typescript-eslint/no-explicit-any

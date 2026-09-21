@@ -144,11 +144,7 @@ export interface ResolvedPolicy {
  * - `tenant_mismatch`: input.tenant_id differs from the active tenant
  *   context. Programmer error; resolver refuses to resolve cross-tenant.
  */
-export type ResolverFailureReason =
-  | 'not_found'
-  | 'scope_mismatch'
-  | 'db_error'
-  | 'tenant_mismatch';
+export type ResolverFailureReason = 'not_found' | 'scope_mismatch' | 'db_error' | 'tenant_mismatch';
 
 export interface UnresolvedDescriptor {
   descriptor: string;

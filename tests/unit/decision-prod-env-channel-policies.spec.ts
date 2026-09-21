@@ -63,7 +63,7 @@ vi.mock('@/db/schema.js', () => ({
   channel_policies: {
     tenant_id: { name: 'tenant_id' },
     channel_id: { name: 'channel_id' },
-    agent_id:   { name: 'agent_id' },
+    agent_id: { name: 'agent_id' },
   },
 }));
 
@@ -72,7 +72,7 @@ vi.mock('@/db/schema.js', () => ({
 // capture the WHERE args from outside
 // ---------------------------------------------------------------------------
 vi.mock('drizzle-orm', () => ({
-  eq:  vi.fn((col: unknown, val: unknown) => ({ _op: 'eq',  col, val })),
+  eq: vi.fn((col: unknown, val: unknown) => ({ _op: 'eq', col, val })),
   and: vi.fn((...args: unknown[]) => ({ _op: 'and', args })),
 }));
 
@@ -95,11 +95,14 @@ function setupDbQuery(filter: (row: PolicyRow) => boolean): void {
   let tenantPred: { val: string } | null = null;
   let channelPred: { val: string } | null = null;
 
-  vi.mocked(db).select = vi.fn().mockReturnThis() as unknown as typeof db['select'];
-  vi.mocked(db).from   = vi.fn().mockReturnThis() as unknown as typeof db['from'];
-  vi.mocked(db).where  = vi.fn().mockImplementation((clause: unknown) => {
+  vi.mocked(db).select = vi.fn().mockReturnThis() as unknown as (typeof db)['select'];
+  vi.mocked(db).from = vi.fn().mockReturnThis() as unknown as (typeof db)['from'];
+  vi.mocked(db).where = vi.fn().mockImplementation((clause: unknown) => {
     // Drill into the and({ args: [eq1, eq2] }) structure built by eq/and mocks.
-    const andClause = clause as { _op: string; args: Array<{ col: { name: string }; val: string }> };
+    const andClause = clause as {
+      _op: string;
+      args: Array<{ col: { name: string }; val: string }>;
+    };
     if (andClause._op === 'and') {
       for (const arg of andClause.args) {
         if (arg.col?.name === 'tenant_id') tenantPred = arg;
@@ -107,15 +110,17 @@ function setupDbQuery(filter: (row: PolicyRow) => boolean): void {
       }
     }
     return db;
-  }) as unknown as typeof db['where'];
-  vi.mocked(db).limit  = vi.fn().mockImplementation((_n: number) => {
-    const matched = store.filter((row) => {
-      const tenantOk  = tenantPred  ? row.tenant_id  === tenantPred.val  : true;
-      const channelOk = channelPred ? row.channel_id === channelPred.val : true;
-      return tenantOk && channelOk && filter(row);
-    }).slice(0, 1);
+  }) as unknown as (typeof db)['where'];
+  vi.mocked(db).limit = vi.fn().mockImplementation((_n: number) => {
+    const matched = store
+      .filter((row) => {
+        const tenantOk = tenantPred ? row.tenant_id === tenantPred.val : true;
+        const channelOk = channelPred ? row.channel_id === channelPred.val : true;
+        return tenantOk && channelOk && filter(row);
+      })
+      .slice(0, 1);
     return Promise.resolve(matched.map((r) => ({ agent_id: r.agent_id })));
-  }) as unknown as typeof db['limit'];
+  }) as unknown as (typeof db)['limit'];
 }
 
 // ---------------------------------------------------------------------------
@@ -191,7 +196,7 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
     // Querying a different channel_id than what's in the store
     const policy = await env.channelPolicies.getForChannel(
       'tenant_C',
-      '99999999-9999-9999-9999-999999999999',  // not in store
+      '99999999-9999-9999-9999-999999999999', // not in store
     );
 
     expect(policy.default_agent_id).toBe('fallback_agent');
@@ -213,8 +218,8 @@ describe('ChannelPoliciesReaderAdapter — Camada 3 #3/4', () => {
     const env = createProductionDecisionEngineEnv();
     // T2 queries same channel_id but different tenant
     const policy = await env.channelPolicies.getForChannel(
-      'tenant_T2',           // different tenant!
-      '44444444-4444-4444-4444-444444444444',   // same channel_id as T1
+      'tenant_T2', // different tenant!
+      '44444444-4444-4444-4444-444444444444', // same channel_id as T1
     );
 
     // Tenant isolation: must NOT return T1's agent

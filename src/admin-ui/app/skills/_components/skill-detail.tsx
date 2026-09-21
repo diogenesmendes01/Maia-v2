@@ -84,9 +84,7 @@ function JsonBlock({ value }: { value: unknown }) {
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
     <div className="space-y-1.5">
-      <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">
-        {title}
-      </h3>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-zinc-500">{title}</h3>
       {children}
     </div>
   );
@@ -147,9 +145,7 @@ export function SkillDetailModal({
       ) : detailQuery.error ? (
         <ErrorState message={detailQuery.error.message} />
       ) : !skill ? (
-        <p className="text-sm text-zinc-500">
-          Skill não encontrada ou não visível.
-        </p>
+        <p className="text-sm text-zinc-500">Skill não encontrada ou não visível.</p>
       ) : (
         <div className="space-y-5">
           <div className="space-y-2">
@@ -199,9 +195,7 @@ export function SkillDetailModal({
           </Section>
 
           <Section title="Quando usar">
-            <p className="whitespace-pre-wrap text-sm text-zinc-800">
-              {skill.when_to_use}
-            </p>
+            <p className="whitespace-pre-wrap text-sm text-zinc-800">{skill.when_to_use}</p>
           </Section>
 
           <Section title="Procedimento">
@@ -209,10 +203,7 @@ export function SkillDetailModal({
           </Section>
 
           <Section title="Ferramentas permitidas">
-            <TagList
-              items={skill.allowed_tools}
-              empty="Nenhuma (sem acesso a ferramentas)."
-            />
+            <TagList items={skill.allowed_tools} empty="Nenhuma (sem acesso a ferramentas)." />
           </Section>
 
           <Section title="Descritores de política">
@@ -245,17 +236,13 @@ export function SkillDetailModal({
 
           {skill.proposed_reason && (
             <Section title="Motivo da proposta">
-              <p className="whitespace-pre-wrap text-sm text-zinc-800">
-                {skill.proposed_reason}
-              </p>
+              <p className="whitespace-pre-wrap text-sm text-zinc-800">{skill.proposed_reason}</p>
             </Section>
           )}
 
           {skill.rollback_reason && (
             <Section title="Motivo da reversão">
-              <p className="whitespace-pre-wrap text-sm text-zinc-800">
-                {skill.rollback_reason}
-              </p>
+              <p className="whitespace-pre-wrap text-sm text-zinc-800">{skill.rollback_reason}</p>
             </Section>
           )}
 
@@ -263,9 +250,7 @@ export function SkillDetailModal({
             {versionsQuery.isLoading ? (
               <p className="text-xs text-zinc-500">Carregando versões…</p>
             ) : versionsQuery.error ? (
-              <p className="text-xs text-red-600">
-                Erro: {versionsQuery.error.message}
-              </p>
+              <p className="text-xs text-red-600">Erro: {versionsQuery.error.message}</p>
             ) : versions.length === 0 ? (
               <p className="text-xs text-zinc-400">Nenhuma versão encontrada.</p>
             ) : (
@@ -291,12 +276,8 @@ export function SkillDetailModal({
                         <td className="px-3 py-2">
                           <StatusBadge status={v.status} />
                         </td>
-                        <td className="px-3 py-2 text-zinc-500">
-                          {fmtDate(v.activated_at)}
-                        </td>
-                        <td className="px-3 py-2 text-zinc-500">
-                          {fmtDate(v.created_at)}
-                        </td>
+                        <td className="px-3 py-2 text-zinc-500">{fmtDate(v.activated_at)}</td>
+                        <td className="px-3 py-2 text-zinc-500">{fmtDate(v.created_at)}</td>
                       </tr>
                     ))}
                   </tbody>

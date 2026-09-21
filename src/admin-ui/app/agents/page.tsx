@@ -8,11 +8,7 @@ import { PageHeader } from '../../components/ui/page-header.js';
 import { StatusBadge } from '../../components/ui/badge.js';
 import { Button } from '../../components/ui/button.js';
 import { Field, Select } from '../../components/ui/field.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../components/ui/states.js';
+import { LoadingState, ErrorState, EmptyState } from '../../components/ui/states.js';
 import { IconBot, IconPlus, IconChevronRight } from '../../components/ui/icons.js';
 
 /**
@@ -112,14 +108,10 @@ export default function AgentsPage() {
                 </span>
                 <StatusBadge status={agent.status} />
               </div>
-              <p className="mt-3 truncate text-sm font-semibold text-zinc-900">
-                {agent.nome}
-              </p>
+              <p className="mt-3 truncate text-sm font-semibold text-zinc-900">{agent.nome}</p>
               <p className="truncate font-mono text-xs text-zinc-500">{agent.id}</p>
               <div className="mt-4 flex items-center justify-between border-t border-zinc-100 pt-3 text-xs text-zinc-500">
-                <span>
-                  criado em {new Date(agent.created_at).toLocaleDateString('pt-BR')}
-                </span>
+                <span>criado em {new Date(agent.created_at).toLocaleDateString('pt-BR')}</span>
                 <span className="flex items-center gap-0.5 font-medium text-brand-600 opacity-0 transition-opacity group-hover:opacity-100">
                   configurar
                   <IconChevronRight size={13} />

@@ -17,7 +17,7 @@ const SUPPORTED_SOT_KINDS = [
   'skills',
 ] as const;
 
-type SotKind = typeof SUPPORTED_SOT_KINDS[number];
+type SotKind = (typeof SUPPORTED_SOT_KINDS)[number];
 
 export function isSupportedSotKind(s: string): s is SotKind {
   return (SUPPORTED_SOT_KINDS as readonly string[]).includes(s);

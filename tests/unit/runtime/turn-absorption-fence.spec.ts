@@ -208,8 +208,9 @@ describe('absorção de irmão — o fence é do ABSORVEDOR', () => {
     // Uma tentativa, não duas: insistir depois de perder a posse é exatamente
     // o comportamento de zumbi que o fence existe para impedir.
     expect(repo.markSupersededByAbsorber).toHaveBeenCalledTimes(1);
-    expect((h as unknown as { lease: { markLost: ReturnType<typeof vi.fn> } }).lease.markLost)
-      .toHaveBeenCalledWith('token_mismatch');
+    expect(
+      (h as unknown as { lease: { markLost: ReturnType<typeof vi.fn> } }).lease.markLost,
+    ).toHaveBeenCalledWith('token_mismatch');
     expect(reportFenceRejection).toHaveBeenCalledWith(
       expect.objectContaining({ operation: 'absorb_inputs' }),
     );
@@ -263,7 +264,10 @@ describe('auto-supersessão — o fence é do PRÓPRIO turno', () => {
   });
 
   it('lease PERDIDA: não conclui como `superseded` (era a única porta sem fence)', async () => {
-    await concludeTurn(handle({ lease: lease({ alive: false, reason: 'released' }) }), 'merged_into_turn');
+    await concludeTurn(
+      handle({ lease: lease({ alive: false, reason: 'released' }) }),
+      'merged_into_turn',
+    );
 
     expect(repo.markSupersededSelf).not.toHaveBeenCalled();
     expect(reportFenceRejection).toHaveBeenCalledWith(

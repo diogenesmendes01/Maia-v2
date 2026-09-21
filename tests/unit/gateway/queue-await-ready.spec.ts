@@ -167,11 +167,7 @@ describe('awaitQueueReady', () => {
       await settled();
     }
     await p;
-    expect(names).toEqual([
-      'queue:agent',
-      'queue:unrouted-replay',
-      'queue:outbound-delivery',
-    ]);
+    expect(names).toEqual(['queue:agent', 'queue:unrouted-replay', 'queue:outbound-delivery']);
   });
 
   it('REJECTS when the connection cannot be established, so the boot fails closed', async () => {

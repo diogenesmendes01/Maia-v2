@@ -24,22 +24,13 @@ export function LoadingState({ label = 'Carregando…' }: { label?: string }) {
 }
 
 /** Standard error presentation for failed queries/mutations. */
-export function ErrorState({
-  message,
-  onRetry,
-}: {
-  message: string;
-  onRetry?: () => void;
-}) {
+export function ErrorState({ message, onRetry }: { message: string; onRetry?: () => void }) {
   return (
     <div className="rounded-xl border border-red-200 bg-red-50 px-5 py-4 text-sm text-red-700">
       <p className="font-medium">Algo deu errado</p>
       <p className="mt-1 break-words text-xs leading-relaxed">{message}</p>
       {onRetry && (
-        <button
-          onClick={onRetry}
-          className="mt-2 text-xs font-medium underline hover:no-underline"
-        >
+        <button onClick={onRetry} className="mt-2 text-xs font-medium underline hover:no-underline">
           Tentar novamente
         </button>
       )}
@@ -64,9 +55,7 @@ export function EmptyState({
       {icon && <div className="mb-1 text-zinc-300">{icon}</div>}
       <p className="text-sm font-medium text-zinc-700">{title}</p>
       {description && (
-        <p className="max-w-md text-xs leading-relaxed text-zinc-500">
-          {description}
-        </p>
+        <p className="max-w-md text-xs leading-relaxed text-zinc-500">{description}</p>
       )}
       {action && <div className="mt-3">{action}</div>}
     </div>

@@ -20,13 +20,7 @@ export const Textarea = React.forwardRef<
   HTMLTextAreaElement,
   React.TextareaHTMLAttributes<HTMLTextAreaElement>
 >(function Textarea({ className, ...rest }, ref) {
-  return (
-    <textarea
-      ref={ref}
-      className={cn(CONTROL, 'leading-relaxed', className)}
-      {...rest}
-    />
-  );
+  return <textarea ref={ref} className={cn(CONTROL, 'leading-relaxed', className)} {...rest} />;
 });
 
 export const Select = React.forwardRef<
@@ -65,9 +59,7 @@ export function Field({
       {error ? (
         <span className="mt-1 block text-xs text-red-600">{error}</span>
       ) : hint ? (
-        <span className="mt-1 block text-xs leading-relaxed text-zinc-500">
-          {hint}
-        </span>
+        <span className="mt-1 block text-xs leading-relaxed text-zinc-500">{hint}</span>
       ) : null}
     </label>
   );

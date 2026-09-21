@@ -60,10 +60,7 @@ export class InvalidationBus {
         h(event).catch((err: unknown) => {
           // Failure of a single handler should not block dispatch.
           // Log via console (real impl would use the logger).
-          console.error(
-            `[InvalidationBus] handler error for ${event.type}:`,
-            err,
-          );
+          console.error(`[InvalidationBus] handler error for ${event.type}:`, err);
         }),
       ),
     );
@@ -106,10 +103,7 @@ export const EVENT_TO_SLICE: Record<InvalidationEventType, SliceName | 'all'> = 
  * Wire the default handler set: each event type invalidates its corresponding
  * slice cache for the event's tenant. Call once at runtime boot.
  */
-export function wireDefaultInvalidationHandlers(
-  bus: InvalidationBus,
-  cache: SliceCache,
-): void {
+export function wireDefaultInvalidationHandlers(bus: InvalidationBus, cache: SliceCache): void {
   for (const [eventType, slice] of Object.entries(EVENT_TO_SLICE) as Array<
     [InvalidationEventType, SliceName]
   >) {

@@ -27,10 +27,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
-import type {
-  AgentOperationalProfileVersion,
-  ProfileBody,
-} from '@/db/schema.js';
+import type { AgentOperationalProfileVersion, ProfileBody } from '@/db/schema.js';
 import type { BaseContextPacket, DecisionPacket } from '@/runtime/context-packet/types.js';
 
 // ─── Hoisted mocks ────────────────────────────────────────────────────────────
@@ -45,9 +42,8 @@ const { getActiveMock, capturedContexts } = vi.hoisted(() => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     operationalProfileVersionsRepo: {
@@ -132,9 +128,7 @@ const buildBase = (tenant_id: string, agent_id: string): BaseContextPacket => ({
 });
 
 const buildDecision = async (): Promise<DecisionPacket> => {
-  const { DEFAULT_CONTEXT_REQUIREMENTS } = await import(
-    '@/runtime/context-packet/types.js'
-  );
+  const { DEFAULT_CONTEXT_REQUIREMENTS } = await import('@/runtime/context-packet/types.js');
   return {
     trace_id: 't',
     intent: { label: 'x', confidence: 0.8 },
@@ -183,9 +177,8 @@ describe('Issue #206 — production-builder-set wires real OperationalProfilePor
       return buildMigratedRow(tenant_id, agent_id, 'active');
     });
 
-    const { getProductionBuilderSet } = await import(
-      '@/runtime/context-packet/production-builder-set.js'
-    );
+    const { getProductionBuilderSet } =
+      await import('@/runtime/context-packet/production-builder-set.js');
     const { builders } = getProductionBuilderSet();
 
     await runWithTenantContext({ tenant_id, agent_id }, async () => {
@@ -194,9 +187,7 @@ describe('Issue #206 — production-builder-set wires real OperationalProfilePor
         requirements: { depth: 'full' },
         // The IdentitySliceBuilder doesn't actually use `decision` — pass a
         // minimal stub to satisfy the type.
-        decision: undefined as unknown as Parameters<
-          typeof builders.identity.build
-        >[0]['decision'],
+        decision: undefined as unknown as Parameters<typeof builders.identity.build>[0]['decision'],
         signal: AbortSignal.timeout(600),
       });
 
@@ -206,10 +197,7 @@ describe('Issue #206 — production-builder-set wires real OperationalProfilePor
 
       // (2) The slice reflects the migrated row (not EMPTY_IDENTITY).
       expect(result.slice.role_descriptor).toBe('Assistente financeira');
-      expect(result.slice.principles).toEqual([
-        'transparência radical',
-        'preservar a evidência',
-      ]);
+      expect(result.slice.principles).toEqual(['transparência radical', 'preservar a evidência']);
       // (3) Anti-leak: principles do NOT bleed into priorities.
       expect(result.slice.priorities).toEqual([]);
     });
@@ -222,34 +210,25 @@ describe('Issue #206 — production-builder-set wires real OperationalProfilePor
     const tenant_id = 'tenant-issue206-b';
     const agent_id = 'agent-issue206-b';
 
-    getActiveMock.mockImplementation(async () =>
-      buildMigratedRow(tenant_id, agent_id, 'active'),
-    );
+    getActiveMock.mockImplementation(async () => buildMigratedRow(tenant_id, agent_id, 'active'));
 
-    const { getProductionBuilderSet } = await import(
-      '@/runtime/context-packet/production-builder-set.js'
-    );
-    const { buildContextPacket } = await import(
-      '@/runtime/context-packet/build-context-packet.js'
-    );
-    const { buildPromptFromPacket } = await import(
-      '@/runtime/prompt/build-prompt-from-packet.js'
-    );
+    const { getProductionBuilderSet } =
+      await import('@/runtime/context-packet/production-builder-set.js');
+    const { buildContextPacket } = await import('@/runtime/context-packet/build-context-packet.js');
+    const { buildPromptFromPacket } = await import('@/runtime/prompt/build-prompt-from-packet.js');
 
     const { builders } = getProductionBuilderSet();
     const base = buildBase(tenant_id, agent_id);
     const decision = await buildDecision();
 
-    const packet = await runWithTenantContext(
-      { tenant_id, agent_id },
-      () =>
-        buildContextPacket(
-          { base, decision },
-          {
-            builders,
-            historyLoader: async () => ({ turns: [], truncated: false }),
-          },
-        ),
+    const packet = await runWithTenantContext({ tenant_id, agent_id }, () =>
+      buildContextPacket(
+        { base, decision },
+        {
+          builders,
+          historyLoader: async () => ({ turns: [], truncated: false }),
+        },
+      ),
     );
 
     const { system } = buildPromptFromPacket(packet);
@@ -274,10 +253,7 @@ describe('Issue #206 — production-builder-set wires real OperationalProfilePor
 
     // (4) Packet identity slice carries the data (sanity check).
     expect(packet.identity.role_descriptor).toBe('Assistente financeira');
-    expect(packet.identity.principles).toEqual([
-      'transparência radical',
-      'preservar a evidência',
-    ]);
+    expect(packet.identity.principles).toEqual(['transparência radical', 'preservar a evidência']);
     expect(packet.identity.priorities).toEqual([]);
   });
 
@@ -297,18 +273,15 @@ describe('Issue #206 — production-builder-set wires real OperationalProfilePor
       buildMigratedRow(tenant_id, agent_id, 'frozen'),
     );
 
-    const { getProductionBuilderSet } = await import(
-      '@/runtime/context-packet/production-builder-set.js'
-    );
+    const { getProductionBuilderSet } =
+      await import('@/runtime/context-packet/production-builder-set.js');
     const { builders } = getProductionBuilderSet();
 
     await runWithTenantContext({ tenant_id, agent_id }, async () => {
       const result = await builders.identity.build({
         base: buildBase(tenant_id, agent_id),
         requirements: { depth: 'full' },
-        decision: undefined as unknown as Parameters<
-          typeof builders.identity.build
-        >[0]['decision'],
+        decision: undefined as unknown as Parameters<typeof builders.identity.build>[0]['decision'],
         signal: AbortSignal.timeout(600),
       });
 

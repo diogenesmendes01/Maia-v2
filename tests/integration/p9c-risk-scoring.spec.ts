@@ -80,10 +80,7 @@ d('P9c — risk scorer telemetry', () => {
       reason: 'jamais',
     });
     await runWithTenantContext({ tenant_id: 'primary', agent_id: 'primary' }, async () => {
-      const r = await scoreTurn(
-        { topic: 'casual', tool_kinds: [] },
-        { gate, contextText: '' },
-      );
+      const r = await scoreTurn({ topic: 'casual', tool_kinds: [] }, { gate, contextText: '' });
       expect(r.level).toBe(RiskLevel.LOW);
       expect(r.llm_consulted).toBe(false);
     });

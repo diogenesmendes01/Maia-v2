@@ -211,9 +211,7 @@ function ageSeconds(now: Date, then: Date | null): number | null {
  *    operator is not being told everything is fine, they are being told to go
  *    clean the host first (runbook §4.2).
  */
-export function restoreDrillDue(
-  input: RestoreDrillScheduleInput,
-): RestoreDrillScheduleDecision {
+export function restoreDrillDue(input: RestoreDrillScheduleInput): RestoreDrillScheduleDecision {
   const maxAge = Math.round(input.profile.objectives.restoreDrillIntervalHours * 3600);
   const age = ageSeconds(input.now, input.last_restore_drill_at);
   const failed = input.last_restore_drill_result === 'failed';
@@ -367,9 +365,7 @@ export async function runRestoreDrillTick(
         ? null
         : Math.max(
             0,
-            Math.round(
-              (now.getTime() - facts.open_restore_drill_started_at.getTime()) / 1000,
-            ),
+            Math.round((now.getTime() - facts.open_restore_drill_started_at.getTime()) / 1000),
           ),
   };
 

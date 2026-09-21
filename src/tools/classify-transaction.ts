@@ -61,12 +61,16 @@ export const classifyTransactionTool: Tool<typeof inputSchema, typeof outputSche
         if (acoes.categoria_id) {
           rules_applied.push(r.id);
           const cf = Number(r.confianca);
-          if (!bestRule || cf > bestRule.confianca) bestRule = { categoria_id: acoes.categoria_id, confianca: cf };
+          if (!bestRule || cf > bestRule.confianca)
+            bestRule = { categoria_id: acoes.categoria_id, confianca: cf };
         }
       }
     }
 
-    const cats = await categoriasRepo.list({ pessoa_id: ctx.pessoa.id, entidades: [args.entidade_id] });
+    const cats = await categoriasRepo.list({
+      pessoa_id: ctx.pessoa.id,
+      entidades: [args.entidade_id],
+    });
     const filtered = args.natureza ? cats.filter((c) => c.natureza === args.natureza) : cats;
     const scored = filtered
       .map((c) => ({

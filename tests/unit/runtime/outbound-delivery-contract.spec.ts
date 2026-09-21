@@ -91,8 +91,10 @@ describe('#632 — capability de idempotência do provedor', () => {
     for (const canal of OUTBOUND_PROVIDER_CHANNELS) {
       for (const tipo of OUTBOUND_PAYLOAD_TYPES) {
         const s = providerIdempotencySupport(canal, tipo);
-        expect([PROVIDER_IDEMPOTENCY_NATIVE, PROVIDER_IDEMPOTENCY_NONE], `${canal}/${tipo}`)
-          .toContain(s);
+        expect(
+          [PROVIDER_IDEMPOTENCY_NATIVE, PROVIDER_IDEMPOTENCY_NONE],
+          `${canal}/${tipo}`,
+        ).toContain(s);
       }
     }
   });
@@ -113,10 +115,7 @@ describe('#632 — normalização: sete categorias, nunca duas', () => {
         [{ kind: 'rejected_permanent', error_code: 'x' }, 'rejected_terminal'],
         [{ kind: 'timeout', error_code: 'x' }, 'timeout_unknown'],
         [{ kind: 'aborted', after_send: false, error_code: 'x' }, 'cancelled_before_send'],
-        [
-          { kind: 'aborted', after_send: true, error_code: 'x' },
-          'cancelled_after_send_unknown',
-        ],
+        [{ kind: 'aborted', after_send: true, error_code: 'x' }, 'cancelled_after_send_unknown'],
       ];
     for (const [obs, esperado] of casos) {
       expect(normalizeProviderOutcome(obs), obs.kind).toBe(esperado);
@@ -186,9 +185,7 @@ describe('#632 — política de reenvio', () => {
           retrySafety({ outcome, channel: 'whatsapp', payload_type: tipo }),
           `${outcome}/${tipo}`,
         ).toBe('reconcile');
-        expect(autoResendAllowed({ outcome, channel: 'whatsapp', payload_type: tipo })).toBe(
-          false,
-        );
+        expect(autoResendAllowed({ outcome, channel: 'whatsapp', payload_type: tipo })).toBe(false);
       }
     }
   });
@@ -203,8 +200,9 @@ describe('#632 — política de reenvio', () => {
   });
 
   it('terminal nunca é reenviado — nem com chave nativa', () => {
-    expect(retrySafety({ outcome: 'rejected_terminal', channel: 'whatsapp', payload_type: 'text' }))
-      .toBe('reconcile');
+    expect(
+      retrySafety({ outcome: 'rejected_terminal', channel: 'whatsapp', payload_type: 'text' }),
+    ).toBe('reconcile');
     expect(
       autoResendAllowed({
         outcome: 'rejected_terminal',

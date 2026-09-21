@@ -17,9 +17,11 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 const { auditMock } = vi.hoisted(() => ({ auditMock: vi.fn(async () => undefined) }));
 const { grantState } = vi.hoisted(() => ({
   grantState: {
-    grant: null as
-      | { granted_packs: string[]; granted_tools: string[]; denied_tools: string[] }
-      | null,
+    grant: null as {
+      granted_packs: string[];
+      granted_tools: string[];
+      denied_tools: string[];
+    } | null,
   },
 }));
 
@@ -37,18 +39,16 @@ vi.mock('@/lib/logger.js', () => ({
 // set: it returns the visible names that pass the human-permission filter. We
 // simulate a person who can do everything granted (owner) by echoing the input.
 vi.mock('@/tools/_registry.js', () => ({
-  getAgentToolSchemas: vi.fn(
-    (visible: ReadonlySet<string> | readonly string[]) => {
-      const set = visible instanceof Set ? visible : new Set(visible);
-      return [...set].map((name) => ({
-        name,
-        description: name,
-        // Deliberately the LEGACY stub: this spec pins the FILTER, not the
-        // schema payload (issue #509 pins that in tool-schema-exposure.spec.ts).
-        input_schema: { type: 'object' as const, additionalProperties: true },
-      }));
-    },
-  ),
+  getAgentToolSchemas: vi.fn((visible: ReadonlySet<string> | readonly string[]) => {
+    const set = visible instanceof Set ? visible : new Set(visible);
+    return [...set].map((name) => ({
+      name,
+      description: name,
+      // Deliberately the LEGACY stub: this spec pins the FILTER, not the
+      // schema payload (issue #509 pins that in tool-schema-exposure.spec.ts).
+      input_schema: { type: 'object' as const, additionalProperties: true },
+    }));
+  }),
   // Issue #509 — the filter now also records the exposed-contract digest in the
   // provenance audit. Stubbed deterministically so this spec stays independent
   // of the live tool set.

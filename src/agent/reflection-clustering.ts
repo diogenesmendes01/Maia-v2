@@ -13,8 +13,26 @@ export type Cluster = {
 };
 
 const STOPWORDS = new Set([
-  'de', 'da', 'do', 'das', 'dos', 'a', 'o', 'as', 'os', 'e', 'em', 'no', 'na',
-  'um', 'uma', 'pra', 'para', 'por', 'com', 'sem',
+  'de',
+  'da',
+  'do',
+  'das',
+  'dos',
+  'a',
+  'o',
+  'as',
+  'os',
+  'e',
+  'em',
+  'no',
+  'na',
+  'um',
+  'uma',
+  'pra',
+  'para',
+  'por',
+  'com',
+  'sem',
 ]);
 
 export function normalizeDescricao(input: string): string {

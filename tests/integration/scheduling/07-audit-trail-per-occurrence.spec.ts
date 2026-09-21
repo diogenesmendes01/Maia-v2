@@ -33,11 +33,14 @@ const enqueueMock = vi.fn().mockResolvedValue({ id: 'ob' });
 const insertNextMock = vi.fn().mockResolvedValue({ occurrence: null, tasks: [] });
 
 const advanceWithTxMock = vi.fn(async (fn: (tx: unknown, repos: unknown) => unknown) => {
-  return fn({}, {
-    occurrences: { setStatus: occSetStatusMock },
-    tasks: { setStatus: tasksSetStatusMock },
-    outbox: { enqueue: enqueueMock },
-  });
+  return fn(
+    {},
+    {
+      occurrences: { setStatus: occSetStatusMock },
+      tasks: { setStatus: tasksSetStatusMock },
+      outbox: { enqueue: enqueueMock },
+    },
+  );
 });
 
 vi.mock('../../../src/scheduling/repos.js', () => ({
@@ -139,9 +142,8 @@ describe('Requirement 7 — one-query per-occurrence audit trail', () => {
       { id: 't3', kind: 'execute_or_skip', status: 'pending' },
     ]);
 
-    const { runSchedulingTick, resolvePaymentOccurrence } = await import(
-      '../../../src/scheduling/engine.js'
-    );
+    const { runSchedulingTick, resolvePaymentOccurrence } =
+      await import('../../../src/scheduling/engine.js');
     await runSchedulingTick();
 
     // The engine emits aggregate `occurrence_claimed` audits when there
@@ -153,20 +155,13 @@ describe('Requirement 7 — one-query per-occurrence audit trail', () => {
     // Owner answers 'sim' → resolve.
     occByIdMock.mockResolvedValue({ ...occ, status: 'awaiting_owner' });
     pessoasFindByIdMock.mockResolvedValue(owner);
-    tasksByOccMock.mockResolvedValue([
-      { id: 't3', kind: 'execute_or_skip', status: 'pending' },
-    ]);
+    tasksByOccMock.mockResolvedValue([{ id: 't3', kind: 'execute_or_skip', status: 'pending' }]);
     // Skip dispatch (no real tool registry in this test).
-    await resolvePaymentOccurrence(
-      OCC_ID,
-      'sim',
-      null,
-      {
-        pessoa: { id: owner.id },
-        conversa: { id: 'owner-conv' },
-        mensagem_id: 'mid',
-      },
-    );
+    await resolvePaymentOccurrence(OCC_ID, 'sim', null, {
+      pessoa: { id: owner.id },
+      conversa: { id: 'owner-conv' },
+      mensagem_id: 'mid',
+    });
 
     expect(events.find((e) => e.acao === 'payment_due_confirmed')?.occurrence_id).toBe(OCC_ID);
 
@@ -198,20 +193,13 @@ describe('Requirement 7 — one-query per-occurrence audit trail', () => {
       contexto_snapshot: { valor: 4500, descricao: 'Aluguel', escalate_after_hours: 4 },
     });
     findSeriesMock.mockResolvedValue(series);
-    tasksByOccMock.mockResolvedValue([
-      { id: 't3', kind: 'execute_or_skip', status: 'pending' },
-    ]);
+    tasksByOccMock.mockResolvedValue([{ id: 't3', kind: 'execute_or_skip', status: 'pending' }]);
     const { resolvePaymentOccurrence } = await import('../../../src/scheduling/engine.js');
-    await resolvePaymentOccurrence(
-      OCC_ID,
-      'nao',
-      null,
-      {
-        pessoa: { id: 'owner-id' },
-        conversa: { id: 'owner-conv' },
-        mensagem_id: 'mid',
-      },
-    );
+    await resolvePaymentOccurrence(OCC_ID, 'nao', null, {
+      pessoa: { id: 'owner-id' },
+      conversa: { id: 'owner-conv' },
+      mensagem_id: 'mid',
+    });
     const acoes = events.filter((e) => e.occurrence_id === OCC_ID).map((e) => e.acao);
     expect(acoes).toContain('payment_due_skipped');
     expect(acoes).not.toContain('payment_due_confirmed');

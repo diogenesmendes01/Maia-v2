@@ -102,9 +102,9 @@ describe('deriveCapabilityRisk', () => {
   });
 
   it('destructive overrides everything else', () => {
-    expect(
-      deriveCapabilityRisk('knowledge', { read_only: true, destructive: true }),
-    ).toBe('critical');
+    expect(deriveCapabilityRisk('knowledge', { read_only: true, destructive: true })).toBe(
+      'critical',
+    );
   });
 
   it('coerces stringy/numeric truthy values', () => {

@@ -55,9 +55,7 @@ test.describe('Setup → Canais: linhas do agente', () => {
     // sem por onde pareá-lo. A asserção é sobre a LINHA semeada, não sobre a
     // primeira linha da tabela: o `default-channel` das migrations também está
     // ali, e ele está `verified_offline`/ativo.
-    const linha = page
-      .getByRole('row')
-      .filter({ hasText: LINHA_DECLARADA_E2E.externalId });
+    const linha = page.getByRole('row').filter({ hasText: LINHA_DECLARADA_E2E.externalId });
     await expect(linha).toBeVisible();
     await expect(linha.getByText('declarada')).toBeVisible();
     await expect(linha.getByText('não roteia')).toBeVisible();
@@ -68,10 +66,7 @@ test.describe('Setup → Canais: linhas do agente', () => {
    * autorizado, chega à tela. Sem ele, "viewer não vê" ficaria verde também
    * se a rota estivesse quebrada para todo mundo.
    */
-  test('owner ENXERGA a tela de linhas (controle do caso de recusa)', async ({
-    page,
-    context,
-  }) => {
+  test('owner ENXERGA a tela de linhas (controle do caso de recusa)', async ({ page, context }) => {
     await autenticarComo(context, 'owner');
     await page.goto(CANAIS);
     await expect(page.getByRole('heading', { name: 'Canais' })).toBeVisible();
@@ -124,23 +119,17 @@ test.describe('Setup → Canais: linhas do agente', () => {
    * tem, e o QR APARECE. Sem ele, "nunca aparece QR" passaria também com a
    * renderização quebrada para todo mundo.
    */
-  test('material de pareamento que não abre: a tela degrada FECHADO', async ({
-    page,
-    context,
-  }) => {
+  test('material de pareamento que não abre: a tela degrada FECHADO', async ({ page, context }) => {
     const bytes = await armarMaterialIlegivel(LINHA_MATERIAL_ILEGIVEL_E2E.channelId);
     expect(
       bytes,
-      'a fixture não deixou material na tabela — o caso mediria a ausência, ' +
-        'não a recusa',
+      'a fixture não deixou material na tabela — o caso mediria a ausência, ' + 'não a recusa',
     ).toBeGreaterThan(0);
 
     await autenticarComo(context, 'owner');
     await escolherAgente(page);
 
-    const linha = page
-      .getByRole('row')
-      .filter({ hasText: LINHA_MATERIAL_ILEGIVEL_E2E.externalId });
+    const linha = page.getByRole('row').filter({ hasText: LINHA_MATERIAL_ILEGIVEL_E2E.externalId });
     await expect(linha).toBeVisible();
     await linha.getByRole('button', { name: 'Acompanhar pareamento' }).click();
 

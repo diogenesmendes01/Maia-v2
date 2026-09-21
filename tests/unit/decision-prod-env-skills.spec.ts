@@ -84,14 +84,12 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
     });
 
     // Context agent is B; the DE query routes to agent A.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-1', agent_id: 'agent-B-context' },
-      () =>
-        adapter.findActive({
-          tenant_id: 'tenant-1',
-          agent_id: 'agent-A-routed',
-          applicable_to_intent: 'greet',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'agent-B-context' }, () =>
+      adapter.findActive({
+        tenant_id: 'tenant-1',
+        agent_id: 'agent-A-routed',
+        applicable_to_intent: 'greet',
+      }),
     );
 
     expect(observedAgents.length).toBeGreaterThan(0);
@@ -110,13 +108,11 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
       return null;
     });
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-1', agent_id: 'agent-B-context' },
-      () =>
-        adapter.find('skill-xyz', {
-          tenant_id: 'tenant-1',
-          agent_id: 'agent-A-routed',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'agent-B-context' }, () =>
+      adapter.find('skill-xyz', {
+        tenant_id: 'tenant-1',
+        agent_id: 'agent-A-routed',
+      }),
     );
 
     expect(observedAgent).toBe('agent-A-routed');
@@ -126,13 +122,11 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
   // CORRECTNESS 4 — every DB category is enumerated.
   // -------------------------------------------------------------------------
   it('CORRECTNESS 4 — enumerates all 8 DB skill categories (incl. classify/extract/compose/diagnose/evaluator)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'tenant-1', agent_id: 'agent-A' },
-      () =>
-        adapter.findActive({
-          tenant_id: 'tenant-1',
-          agent_id: 'agent-A',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'agent-A' }, () =>
+      adapter.findActive({
+        tenant_id: 'tenant-1',
+        agent_id: 'agent-A',
+      }),
     );
 
     const queried = mockListByCategory.mock.calls.map((c) => c[0]);
@@ -155,14 +149,15 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
     // candidate. Now it surfaces.
     mockListByCategory.mockImplementation(async (cat: string) => {
       if (cat === 'classify') {
-        return [mkRow({ id: 's_classify', skill_descriptor: 'intent.classify', category: 'classify' })];
+        return [
+          mkRow({ id: 's_classify', skill_descriptor: 'intent.classify', category: 'classify' }),
+        ];
       }
       return [];
     });
 
-    const skills = await runWithTenantContext(
-      { tenant_id: 'tenant-1', agent_id: 'agent-A' },
-      () => adapter.findActive({ tenant_id: 'tenant-1', agent_id: 'agent-A' }),
+    const skills = await runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'agent-A' }, () =>
+      adapter.findActive({ tenant_id: 'tenant-1', agent_id: 'agent-A' }),
     );
 
     expect(skills.map((s) => s.id)).toContain('s_classify');
@@ -178,9 +173,18 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
   // -------------------------------------------------------------------------
   function seededStore() {
     return [
-      { ...mkRow({ id: 's_A', skill_descriptor: 'a.skill', category: 'tool_mediated' }), agent_id: 'agent-A' },
-      { ...mkRow({ id: 's_B', skill_descriptor: 'b.skill', category: 'tool_mediated' }), agent_id: 'agent-B' },
-      { ...mkRow({ id: 's_shared', skill_descriptor: 'shared.skill', category: 'tool_mediated' }), agent_id: null },
+      {
+        ...mkRow({ id: 's_A', skill_descriptor: 'a.skill', category: 'tool_mediated' }),
+        agent_id: 'agent-A',
+      },
+      {
+        ...mkRow({ id: 's_B', skill_descriptor: 'b.skill', category: 'tool_mediated' }),
+        agent_id: 'agent-B',
+      },
+      {
+        ...mkRow({ id: 's_shared', skill_descriptor: 'shared.skill', category: 'tool_mediated' }),
+        agent_id: null,
+      },
     ];
   }
 
@@ -196,14 +200,12 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
     });
 
     // Ambient context is agent-B (the would-be leak); the query routes to A.
-    const skills = await runWithTenantContext(
-      { tenant_id: 'tenant-1', agent_id: 'agent-B' },
-      () =>
-        adapter.findActive({
-          tenant_id: 'tenant-1',
-          agent_id: 'agent-A',
-          applicable_to_intent: 'x',
-        }),
+    const skills = await runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'agent-B' }, () =>
+      adapter.findActive({
+        tenant_id: 'tenant-1',
+        agent_id: 'agent-A',
+        applicable_to_intent: 'x',
+      }),
     );
     const ids = skills.map((s) => s.id);
     expect(ids).toContain('s_A'); // routed agent's own skill
@@ -224,17 +226,14 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
 
     const scope = { tenant_id: 'tenant-1', agent_id: 'agent-A' };
     // Ambient is agent-B throughout; the routed scope (A) must govern.
-    const own = await runWithTenantContext(
-      { tenant_id: 'tenant-1', agent_id: 'agent-B' },
-      () => adapter.find('s_A', scope),
+    const own = await runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'agent-B' }, () =>
+      adapter.find('s_A', scope),
     );
-    const shared = await runWithTenantContext(
-      { tenant_id: 'tenant-1', agent_id: 'agent-B' },
-      () => adapter.find('s_shared', scope),
+    const shared = await runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'agent-B' }, () =>
+      adapter.find('s_shared', scope),
     );
-    const leaked = await runWithTenantContext(
-      { tenant_id: 'tenant-1', agent_id: 'agent-B' },
-      () => adapter.find('s_B', scope),
+    const leaked = await runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'agent-B' }, () =>
+      adapter.find('s_B', scope),
     );
     expect(own?.id).toBe('s_A');
     expect(shared?.id).toBe('s_shared');
@@ -250,13 +249,11 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
     });
 
     await Promise.all([
-      runWithTenantContext(
-        { tenant_id: 'tenant-1', agent_id: 'ambient-X' },
-        () => adapter.findActive({ tenant_id: 'tenant-1', agent_id: 'routed-A' }),
+      runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'ambient-X' }, () =>
+        adapter.findActive({ tenant_id: 'tenant-1', agent_id: 'routed-A' }),
       ),
-      runWithTenantContext(
-        { tenant_id: 'tenant-1', agent_id: 'ambient-Y' },
-        () => adapter.findActive({ tenant_id: 'tenant-1', agent_id: 'routed-B' }),
+      runWithTenantContext({ tenant_id: 'tenant-1', agent_id: 'ambient-Y' }, () =>
+        adapter.findActive({ tenant_id: 'tenant-1', agent_id: 'routed-B' }),
       ),
     ]);
 
@@ -311,14 +308,12 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
 
     // Ambient context belongs to tenant-B / agent-B (the would-be leak).
     // The DE query routes to tenant-A / agent-A.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        adapter.findActive({
-          tenant_id: 'tenant-A',
-          agent_id: 'agent-A',
-          applicable_to_intent: 'x',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      adapter.findActive({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        applicable_to_intent: 'x',
+      }),
     );
 
     expect(observed.length).toBeGreaterThan(0);
@@ -342,14 +337,12 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
     });
 
     // Ambient is tenant-A; route to tenant-B (cross-tenant symmetric leak path).
-    await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        adapter.findActive({
-          tenant_id: 'tenant-B',
-          agent_id: 'agent-B',
-          applicable_to_intent: 'x',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      adapter.findActive({
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        applicable_to_intent: 'x',
+      }),
     );
 
     expect(observed.length).toBeGreaterThan(0);
@@ -370,13 +363,11 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
       return null;
     });
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        adapter.find('s_target', {
-          tenant_id: 'tenant-A',
-          agent_id: 'agent-A',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      adapter.find('s_target', {
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+      }),
     );
 
     expect(observedTenant).toBe('tenant-A');
@@ -392,13 +383,11 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
       return null;
     });
 
-    await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        adapter.find('s_target', {
-          tenant_id: 'tenant-B',
-          agent_id: 'agent-B',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      adapter.find('s_target', {
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+      }),
     );
 
     expect(observedTenant).toBe('tenant-B');
@@ -415,13 +404,11 @@ describe('SkillsRepoAdapter — Codex PR #215 review', () => {
 
     // Ambient = tenant-B, route = tenant-A. Every listByCategory call inside
     // the adapter MUST observe tenant-A — never tenant-B.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        adapter.findActive({
-          tenant_id: 'tenant-A',
-          agent_id: 'agent-A',
-        }),
+    await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      adapter.findActive({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+      }),
     );
 
     expect(observedTenants.has('tenant-A')).toBe(true);

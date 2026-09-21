@@ -64,9 +64,7 @@ describe('unroutedReplayJobId', () => {
     const add = (unroutedQueue as unknown as { add: ReturnType<typeof vi.fn> }).add;
     const [, data, opts] = add.mock.calls[0]!;
     expect(data).toEqual({ unrouted_id: 'u-1' });
-    expect((opts as { jobId: string }).jobId).toBe(
-      unroutedReplayJobId('+5511900001111', 'WID-1'),
-    );
+    expect((opts as { jobId: string }).jobId).toBe(unroutedReplayJobId('+5511900001111', 'WID-1'));
     expect((opts as { jobId: string }).jobId).not.toContain(':');
   });
 });

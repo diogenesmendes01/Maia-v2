@@ -35,7 +35,10 @@ import {
 const ID_REGEX = /^[a-z0-9][a-z0-9_-]*$/;
 const STEPS = ['Função', 'Identificação', 'Personalidade', 'Comportamento', 'Revisão'];
 
-const ARCHETYPE_ICON: Record<Archetype['icon'], React.ComponentType<{ size?: number; className?: string }>> = {
+const ARCHETYPE_ICON: Record<
+  Archetype['icon'],
+  React.ComponentType<{ size?: number; className?: string }>
+> = {
   zap: IconZap,
   message: IconMessage,
   activity: IconActivity,
@@ -80,9 +83,7 @@ export default function NewAgentPage() {
 
   const canManage = role === 'founder' || role === 'owner';
   if (!canManage) {
-    return (
-      <ErrorState message="A criação de agentes exige papel owner ou founder." />
-    );
+    return <ErrorState message="A criação de agentes exige papel owner ou founder." />;
   }
 
   /**
@@ -141,8 +142,7 @@ export default function NewAgentPage() {
         proposed_reason: reason.trim(),
         // Issue #470 — a função escolhida vira packs de capacidade no grant
         // inicial (vendedor não vê ferramentas financeiras).
-        archetype:
-          archetypeId && isArchetypeId(archetypeId) ? archetypeId : 'custom',
+        archetype: archetypeId && isArchetypeId(archetypeId) ? archetypeId : 'custom',
       });
       router.push(`/agents/${encodeURIComponent(id)}?created=1`);
     } catch (e) {
@@ -187,9 +187,7 @@ export default function NewAgentPage() {
                     onClick={() => selectArchetype(arch)}
                     aria-pressed={selected}
                     className={`rounded-lg border p-4 text-left transition-colors hover:border-zinc-400 ${
-                      selected
-                        ? 'border-brand-500 ring-2 ring-brand-500/20'
-                        : 'border-zinc-200'
+                      selected ? 'border-brand-500 ring-2 ring-brand-500/20' : 'border-zinc-200'
                     }`}
                   >
                     <span className="flex items-center gap-2 text-sm font-medium text-zinc-900">
@@ -216,10 +214,7 @@ export default function NewAgentPage() {
           <CardBody className="space-y-4">
             {role === 'founder' && (
               <Field label="Tenant" required>
-                <Select
-                  value={effectiveTenant}
-                  onChange={(e) => setTenantId(e.target.value)}
-                >
+                <Select value={effectiveTenant} onChange={(e) => setTenantId(e.target.value)}>
                   <option value="">Selecione…</option>
                   {(tenantsQuery.data?.items ?? []).map((t) => (
                     <option key={t.id} value={t.id}>
@@ -280,9 +275,7 @@ export default function NewAgentPage() {
               <dl className="grid gap-x-6 gap-y-3 text-sm sm:grid-cols-2">
                 <div className="sm:col-span-2">
                   <dt className="text-xs font-medium text-zinc-500">Função</dt>
-                  <dd className="mt-0.5 text-zinc-900">
-                    {selectedArchetype?.label ?? '—'}
-                  </dd>
+                  <dd className="mt-0.5 text-zinc-900">{selectedArchetype?.label ?? '—'}</dd>
                 </div>
                 <div>
                   <dt className="text-xs font-medium text-zinc-500">Agente</dt>
@@ -292,9 +285,7 @@ export default function NewAgentPage() {
                 </div>
                 <div>
                   <dt className="text-xs font-medium text-zinc-500">Tenant</dt>
-                  <dd className="mt-0.5 font-mono text-xs text-zinc-900">
-                    {effectiveTenant}
-                  </dd>
+                  <dd className="mt-0.5 font-mono text-xs text-zinc-900">{effectiveTenant}</dd>
                 </div>
                 <div className="sm:col-span-2">
                   <dt className="text-xs font-medium text-zinc-500">Papel</dt>
@@ -308,9 +299,7 @@ export default function NewAgentPage() {
                 </div>
                 <div>
                   <dt className="text-xs font-medium text-zinc-500">Idioma</dt>
-                  <dd className="mt-0.5 font-mono text-xs text-zinc-900">
-                    {profile.language}
-                  </dd>
+                  <dd className="mt-0.5 font-mono text-xs text-zinc-900">{profile.language}</dd>
                 </div>
                 <div className="sm:col-span-2">
                   <dt className="text-xs font-medium text-zinc-500">Prioridades</dt>
@@ -363,9 +352,8 @@ export default function NewAgentPage() {
           )}
 
           <Alert tone="info">
-            Ao criar, o perfil v1 fica com status <strong>proposto</strong>. Aprove-o
-            na aba <strong>Versões</strong> do agente (ou na tela Identidades) para
-            colocá-lo em operação.
+            Ao criar, o perfil v1 fica com status <strong>proposto</strong>. Aprove-o na aba{' '}
+            <strong>Versões</strong> do agente (ou na tela Identidades) para colocá-lo em operação.
           </Alert>
         </div>
       )}

@@ -76,9 +76,7 @@ async function claimOutboxBatch(): Promise<OutboxRow[]> {
 }
 
 async function deleteOutboxRow(trace_id: string): Promise<void> {
-  await db.execute(
-    sql`DELETE FROM runtime_trace_body_outbox WHERE trace_id = ${trace_id}`,
-  );
+  await db.execute(sql`DELETE FROM runtime_trace_body_outbox WHERE trace_id = ${trace_id}`);
 }
 
 async function bumpOutboxFailure(trace_id: string, err: Error): Promise<void> {
@@ -103,10 +101,7 @@ export async function runTraceBodyWriter(): Promise<void> {
   try {
     outboxRows = await claimOutboxBatch();
   } catch (err) {
-    logger.error(
-      { err: (err as Error).message },
-      'trace_body_writer.outbox_claim_failed',
-    );
+    logger.error({ err: (err as Error).message }, 'trace_body_writer.outbox_claim_failed');
   }
 
   for (const row of outboxRows) {
@@ -173,11 +168,7 @@ export async function runTraceBodyWriter(): Promise<void> {
     incCounter('maia_runtime_trace_body_writer_ok_total', { source: 'in_memory' }, memoryOk);
   }
   if (outboxFailed > 0) {
-    incCounter(
-      'maia_runtime_trace_body_writer_failed_total',
-      { source: 'outbox' },
-      outboxFailed,
-    );
+    incCounter('maia_runtime_trace_body_writer_failed_total', { source: 'outbox' }, outboxFailed);
   }
   if (memoryFailed > 0) {
     incCounter(
@@ -188,8 +179,5 @@ export async function runTraceBodyWriter(): Promise<void> {
   }
 
   if (outboxOk + memoryOk + outboxFailed + memoryFailed === 0) return;
-  logger.info(
-    { outboxOk, outboxFailed, memoryOk, memoryFailed },
-    'trace_body_writer.tick',
-  );
+  logger.info({ outboxOk, outboxFailed, memoryOk, memoryFailed }, 'trace_body_writer.tick');
 }

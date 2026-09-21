@@ -203,11 +203,28 @@ export function registerMigrationGauges(deps: MigrationCollectorDeps): void {
     await refresh(deps);
     return snapshot ? pick(snapshot) : Number.NaN;
   };
-  gauge(METRIC.SCHEMA_MIGRATION_HEAD, read((s) => s.expected_head_ordinal), { kind: 'expected' });
-  gauge(METRIC.SCHEMA_MIGRATION_HEAD, read((s) => s.applied_head_ordinal), { kind: 'applied' });
-  gauge(METRIC.SCHEMA_MIGRATIONS_PENDING, read((s) => s.pending));
-  gauge(METRIC.SCHEMA_MIGRATIONS_DIRTY, read((s) => s.dirty));
-  gauge(METRIC.SCHEMA_MIGRATION_LAST_DURATION_MS, read((s) => s.last_duration_ms));
+  gauge(
+    METRIC.SCHEMA_MIGRATION_HEAD,
+    read((s) => s.expected_head_ordinal),
+    { kind: 'expected' },
+  );
+  gauge(
+    METRIC.SCHEMA_MIGRATION_HEAD,
+    read((s) => s.applied_head_ordinal),
+    { kind: 'applied' },
+  );
+  gauge(
+    METRIC.SCHEMA_MIGRATIONS_PENDING,
+    read((s) => s.pending),
+  );
+  gauge(
+    METRIC.SCHEMA_MIGRATIONS_DIRTY,
+    read((s) => s.dirty),
+  );
+  gauge(
+    METRIC.SCHEMA_MIGRATION_LAST_DURATION_MS,
+    read((s) => s.last_duration_ms),
+  );
   registered = true;
 }
 

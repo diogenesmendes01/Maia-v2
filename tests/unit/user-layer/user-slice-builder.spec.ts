@@ -234,12 +234,8 @@ describe('user-slice-builder', () => {
   });
 
   it('forwards tenant_id to resolvers (cross-tenant isolation)', async () => {
-    const memorySpy = vi
-      .spyOn(memoryResolverModule.memoryResolver, 'list')
-      .mockResolvedValue([]);
-    const hintsSpy = vi
-      .spyOn(hintsResolverModule.hintsResolver, 'list')
-      .mockResolvedValue([]);
+    const memorySpy = vi.spyOn(memoryResolverModule.memoryResolver, 'list').mockResolvedValue([]);
+    const hintsSpy = vi.spyOn(hintsResolverModule.hintsResolver, 'list').mockResolvedValue([]);
 
     await buildUserSlice({
       tenant_id: 'tenant-isolated',

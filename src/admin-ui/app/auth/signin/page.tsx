@@ -27,9 +27,7 @@ interface ProviderInfo {
 }
 
 export default function SignInPage() {
-  const [providers, setProviders] = React.useState<Record<string, ProviderInfo> | null>(
-    null,
-  );
+  const [providers, setProviders] = React.useState<Record<string, ProviderInfo> | null>(null);
   const [email, setEmail] = React.useState('');
   const [tenantId, setTenantId] = React.useState('');
   const [token, setToken] = React.useState('');
@@ -52,15 +50,11 @@ export default function SignInPage() {
         token,
       });
       if (result?.error) {
-        setError(
-          'Falha na entrada. Verifique e-mail, tenant e token dev com seu operador.',
-        );
+        setError('Falha na entrada. Verifique e-mail, tenant e token dev com seu operador.');
       } else if (result?.ok) {
         window.location.href = '/dashboard';
       } else {
-        setError(
-          'Entrada indisponível. O provider magic-link está desabilitado neste ambiente.',
-        );
+        setError('Entrada indisponível. O provider magic-link está desabilitado neste ambiente.');
       }
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
@@ -96,19 +90,15 @@ export default function SignInPage() {
         </h1>
 
         {!providers ? (
-          <p className="text-sm text-zinc-500">
-            Carregando opções de entrada…
-          </p>
+          <p className="text-sm text-zinc-500">Carregando opções de entrada…</p>
         ) : !hasAnyProvider ? (
           <Alert tone="danger" title="Nenhum provider configurado">
-            Nenhum provider de entrada está configurado neste servidor.
-            Produção exige OIDC (defina{' '}
+            Nenhum provider de entrada está configurado neste servidor. Produção exige OIDC (defina{' '}
             <code className="font-mono">OIDC_ISSUER</code>,{' '}
             <code className="font-mono">OIDC_CLIENT_ID</code>,{' '}
             <code className="font-mono">OIDC_CLIENT_SECRET</code>,{' '}
-            <code className="font-mono">OIDC_TENANT_SLUGS</code>).
-            Desenvolvimento pode habilitar magic-link via{' '}
-            <code className="font-mono">ALLOW_DEV_AUTH=true</code>.
+            <code className="font-mono">OIDC_TENANT_SLUGS</code>). Desenvolvimento pode habilitar
+            magic-link via <code className="font-mono">ALLOW_DEV_AUTH=true</code>.
           </Alert>
         ) : (
           <>
@@ -161,12 +151,7 @@ export default function SignInPage() {
                     className="font-mono"
                   />
                 </Field>
-                <Button
-                  type="submit"
-                  variant="secondary"
-                  className="w-full"
-                  loading={loading}
-                >
+                <Button type="submit" variant="secondary" className="w-full" loading={loading}>
                   Entrar (dev)
                 </Button>
               </form>

@@ -79,10 +79,7 @@ describe('calendar_* tools — smoke (always-on, holidays mocked)', () => {
 
   it('calendar_list_holidays — lista os feriados do ano em ordem cronológica', async () => {
     const res = await runWithTenantContext(TENANT_CTX, () =>
-      calendarListHolidaysTool.handler(
-        { start: '2026-01-01', end: '2026-12-31' },
-        dummyCtx,
-      ),
+      calendarListHolidaysTool.handler({ start: '2026-01-01', end: '2026-12-31' }, dummyCtx),
     );
     expect(res.holidays.map((h) => h.date)).toEqual(['2026-01-01', '2026-05-01']);
   });
@@ -90,10 +87,7 @@ describe('calendar_* tools — smoke (always-on, holidays mocked)', () => {
   it('calendar_business_days_between — 01/01..07/01 conta 4 dias úteis (1 feriado + fim de semana)', async () => {
     // Jan 2026: 1=feriado(qui), 3=sáb, 4=dom → úteis = {2,5,6,7} = 4; total = 7.
     const res = await runWithTenantContext(TENANT_CTX, () =>
-      calendarBusinessDaysBetweenTool.handler(
-        { start: '2026-01-01', end: '2026-01-07' },
-        dummyCtx,
-      ),
+      calendarBusinessDaysBetweenTool.handler({ start: '2026-01-01', end: '2026-01-07' }, dummyCtx),
     );
     expect(res.total_days).toBe(7);
     expect(res.business_days).toBe(4);
@@ -116,10 +110,7 @@ describe('calendar_* tools — contracts (bounds validation)', () => {
 
   it('calendar_business_days_between — rejeita range > 366 dias', async () => {
     await expect(
-      calendarBusinessDaysBetweenTool.handler(
-        { start: '2025-01-01', end: '2026-06-01' },
-        dummyCtx,
-      ),
+      calendarBusinessDaysBetweenTool.handler({ start: '2025-01-01', end: '2026-06-01' }, dummyCtx),
     ).rejects.toThrow(/range > 366/);
   });
 });

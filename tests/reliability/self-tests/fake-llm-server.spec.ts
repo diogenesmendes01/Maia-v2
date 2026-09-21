@@ -190,10 +190,7 @@ describe('#510 harness — FakeLlmServer: roteiro', () => {
     const { dirname, join, resolve } = await import('node:path');
     const { fileURLToPath } = await import('node:url');
     const aqui = dirname(fileURLToPath(import.meta.url));
-    const fonte = readFileSync(
-      resolve(join(aqui, '..', 'fakes', 'fake-llm-server.ts')),
-      'utf8',
-    );
+    const fonte = readFileSync(resolve(join(aqui, '..', 'fakes', 'fake-llm-server.ts')), 'utf8');
     expect(fonte).not.toMatch(/\bfetch\s*\(/);
     expect(fonte).not.toMatch(/\bhttps?\.request\s*\(/);
     expect(fonte).not.toMatch(/from 'node:https'/);

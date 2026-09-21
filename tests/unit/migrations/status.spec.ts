@@ -46,8 +46,14 @@ function row(id: string, over: Partial<LedgerEntry> = {}): LedgerEntry {
   };
 }
 
-const appliedA = row('001_a.sql', { checksum_sha256: migrationChecksum(A), checksum_source: 'computed' });
-const appliedB = row('002_b.sql', { checksum_sha256: migrationChecksum(B), checksum_source: 'computed' });
+const appliedA = row('001_a.sql', {
+  checksum_sha256: migrationChecksum(A),
+  checksum_source: 'computed',
+});
+const appliedB = row('002_b.sql', {
+  checksum_sha256: migrationChecksum(B),
+  checksum_source: 'computed',
+});
 
 const now = () => new Date('2026-08-04T12:00:00.000Z');
 
@@ -70,7 +76,10 @@ describe('computeMigrationStatus — per-migration classification', () => {
 
   it('classifies an edited applied migration as checksum_mismatch (blocking)', () => {
     const status = computeMigrationStatus(artifact(), [
-      row('001_a.sql', { checksum_sha256: migrationChecksum('DROP TABLE a;'), checksum_source: 'computed' }),
+      row('001_a.sql', {
+        checksum_sha256: migrationChecksum('DROP TABLE a;'),
+        checksum_source: 'computed',
+      }),
       appliedB,
     ]);
     expect(status.entries[0]!.state).toBe('checksum_mismatch');
@@ -94,7 +103,10 @@ describe('computeMigrationStatus — per-migration classification', () => {
   });
 
   it('classifies dirty as blocking and never as pending', () => {
-    const status = computeMigrationStatus(artifact(), [appliedA, row('002_b.sql', { status: 'dirty' })]);
+    const status = computeMigrationStatus(artifact(), [
+      appliedA,
+      row('002_b.sql', { status: 'dirty' }),
+    ]);
     expect(status.entries[1]!.state).toBe('dirty');
     expect(status.entries[1]!.blocking).toBe(true);
     expect(status.pending).not.toContain('002_b.sql');
@@ -111,7 +123,10 @@ describe('computeMigrationStatus — per-migration classification', () => {
   });
 
   it('reads `running` as ambiguous-and-blocking for a read-only caller', () => {
-    const status = computeMigrationStatus(artifact(), [appliedA, row('002_b.sql', { status: 'running' })]);
+    const status = computeMigrationStatus(artifact(), [
+      appliedA,
+      row('002_b.sql', { status: 'running' }),
+    ]);
     expect(status.entries[1]!.state).toBe('running');
     expect(status.entries[1]!.blocking).toBe(true);
   });
@@ -139,7 +154,10 @@ describe('computeMigrationStatus — per-migration classification', () => {
     // 003 applied, 002 never was — a branch merged out of order.
     const status = computeMigrationStatus(three, [
       appliedA,
-      row('003_c.sql', { checksum_sha256: migrationChecksum('SELECT 1;\n'), checksum_source: 'computed' }),
+      row('003_c.sql', {
+        checksum_sha256: migrationChecksum('SELECT 1;\n'),
+        checksum_source: 'computed',
+      }),
     ]);
     expect(status.out_of_order).toEqual(['002_b.sql']);
     expect(status.pending).toEqual(['002_b.sql']);
@@ -153,7 +171,10 @@ describe('computeMigrationStatus — per-migration classification', () => {
   });
 
   it('marks the ledger absent when it could not be read', () => {
-    const status = computeMigrationStatus(artifact(), [], { ledgerPresent: false, ledgerVersion: null });
+    const status = computeMigrationStatus(artifact(), [], {
+      ledgerPresent: false,
+      ledgerVersion: null,
+    });
     expect(status.ledger_present).toBe(false);
     expect(status.ledger_version).toBeNull();
   });
@@ -349,7 +370,10 @@ describe('evaluateSchemaReadiness — fail-closed', () => {
       min_supported_migration: '001_a.sql',
       max_supported_migration: '001_a.sql',
     };
-    const oldArtifact = buildMigrationArtifact([{ filename: '001_a.sql', contents: A }], ['001_a_down.sql']);
+    const oldArtifact = buildMigrationArtifact(
+      [{ filename: '001_a.sql', contents: A }],
+      ['001_a_down.sql'],
+    );
     const readiness = evaluateSchemaReadiness(
       computeMigrationStatus(oldArtifact, [appliedA, appliedB]),
       old,
@@ -387,7 +411,9 @@ describe('evaluateSchemaReadiness — fail-closed', () => {
 
 describe('unknownReadiness', () => {
   it('is never ready and carries the ledger_unavailable blocker', () => {
-    const readiness = unknownReadiness(defaultCompatibilityManifest(artifact()), 'db down', { now });
+    const readiness = unknownReadiness(defaultCompatibilityManifest(artifact()), 'db down', {
+      now,
+    });
     expect(readiness.ready).toBe(false);
     expect(readiness.state).toBe('unknown');
     expect(readiness.blockers[0]!.kind).toBe('ledger_unavailable');

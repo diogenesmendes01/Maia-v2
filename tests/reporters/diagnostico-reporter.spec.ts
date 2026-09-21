@@ -103,6 +103,8 @@ function fatiarBlocoDePrazos(saida: string): string | null {
   const inicio = saida.search(/^PRAZOS ESTOURADOS: \d+$/m);
   if (inicio < 0) return null;
   const resto = saida.slice(inicio);
-  const fim = resto.search(/^recuperados pela segunda tentativa|^RECUPERADOS PELA SEGUNDA TENTATIVA/m);
+  const fim = resto.search(
+    /^recuperados pela segunda tentativa|^RECUPERADOS PELA SEGUNDA TENTATIVA/m,
+  );
   return fim < 0 ? resto : resto.slice(0, fim);
 }

@@ -151,7 +151,9 @@ describe('buildPrompt — injeção de "Limitações conhecidas" (P5 Task 10)', 
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
     const { system } = await buildPrompt(ctx);
 
-    expect(system).toContain('## Limitações conhecidas (mencionar com transparência se vier à tona)');
+    expect(system).toContain(
+      '## Limitações conhecidas (mencionar com transparência se vier à tona)',
+    );
     expect(system).toContain(
       'Se o usuário perguntar sobre gerar relatório fiscal trimestral, você pode explicar honestamente que isso é uma limitação atual.',
     );
@@ -170,7 +172,9 @@ describe('buildPrompt — injeção de "Limitações conhecidas" (P5 Task 10)', 
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
     const { system } = await buildPrompt(ctx);
 
-    expect(system).toContain('## Limitações conhecidas (mencionar com transparência se vier à tona)');
+    expect(system).toContain(
+      '## Limitações conhecidas (mencionar com transparência se vier à tona)',
+    );
     expect(system).toContain(
       'Se o usuário perguntar sobre pagamento recorrente via PIX, você pode explicar honestamente que isso é uma limitação atual (proposta de melhoria já enviada).',
     );
@@ -271,9 +275,8 @@ describe('#638 — "Capacidades novas": o agente é avisado no prompt', () => {
   });
 
   it('a JANELA é do repositório, e o prompt pede a leitura com ela', async () => {
-    const { JANELA_DE_AVISO_DE_CAPACIDADE_DIAS } = await import(
-      '../../src/agent/turn-context/types.js'
-    );
+    const { JANELA_DE_AVISO_DE_CAPACIDADE_DIAS } =
+      await import('../../src/agent/turn-context/types.js');
     capabilityGapsListByLevels.mockResolvedValue([]);
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
     await buildPrompt(ctx);

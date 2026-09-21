@@ -122,10 +122,9 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
 
     // E o banco concorda com quem ganhou — a posse não é uma opinião do
     // processo, é a linha gravada.
-    const linhas = await pool.query(
-      'SELECT 1 FROM channel_line_state WHERE channel_id = $1',
-      [canal],
-    );
+    const linhas = await pool.query('SELECT 1 FROM channel_line_state WHERE channel_id = $1', [
+      canal,
+    ]);
     expect(linhas.rowCount, 'o banco guardou mais de uma posse para o mesmo canal').toBe(1);
     const vencedora = donas[0]!;
     expect(vencedora.held).toBe(true);
@@ -203,9 +202,11 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
     expect(r).toBe('fence_rejected');
 
     // E o fence de ENVIO recusa o mesmo token.
-    expect(await mod.assertChannelFence(escopo(), tokenAntigo, 'send', {
-      ownerInstanceId: REPLICA_1,
-    })).toBe(false);
+    expect(
+      await mod.assertChannelFence(escopo(), tokenAntigo, 'send', {
+        ownerInstanceId: REPLICA_1,
+      }),
+    ).toBe(false);
   });
 
   it('renovar NÃO muda o fence — senão o dono invalidaria o próprio envio em voo', async () => {
@@ -229,9 +230,9 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
     const primeira = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_1 });
     const tokenAntigo = (primeira as { fencing_token: number }).fencing_token;
 
-    expect(await mod.releaseChannelLease(escopo(), tokenAntigo, { ownerInstanceId: REPLICA_1 })).toBe(
-      true,
-    );
+    expect(
+      await mod.releaseChannelLease(escopo(), tokenAntigo, { ownerInstanceId: REPLICA_1 }),
+    ).toBe(true);
 
     // Sem esperar o prazo vencer — este é o deploy ordenado.
     const segunda = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_2 });
@@ -241,9 +242,11 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
     // `DELETE`, voltaria — e o token velho da réplica 1 valeria de novo.
     const tokenNovo = (segunda as { fencing_token: number }).fencing_token;
     expect(tokenNovo).toBeGreaterThan(tokenAntigo);
-    expect(await mod.assertChannelFence(escopo(), tokenAntigo, 'send', {
-      ownerInstanceId: REPLICA_1,
-    })).toBe(false);
+    expect(
+      await mod.assertChannelFence(escopo(), tokenAntigo, 'send', {
+        ownerInstanceId: REPLICA_1,
+      }),
+    ).toBe(false);
   });
 
   it('quem não é dono não consegue DEVOLVER a linha do outro', async () => {
@@ -256,17 +259,17 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
     ).toBe(false);
 
     // A posse da réplica 1 segue intacta e utilizável.
-    expect(await mod.assertChannelFence(escopo(), token, 'send', { ownerInstanceId: REPLICA_1 })).toBe(
-      true,
-    );
+    expect(
+      await mod.assertChannelFence(escopo(), token, 'send', { ownerInstanceId: REPLICA_1 }),
+    ).toBe(true);
   });
 
   it('quem tem a posse VENCIDA não passa no fence de envio, mesmo sendo o dono registrado', async () => {
     const primeira = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_1 });
     const token = (primeira as { fencing_token: number }).fencing_token;
-    expect(await mod.assertChannelFence(escopo(), token, 'send', { ownerInstanceId: REPLICA_1 })).toBe(
-      true,
-    );
+    expect(
+      await mod.assertChannelFence(escopo(), token, 'send', { ownerInstanceId: REPLICA_1 }),
+    ).toBe(true);
 
     // Ninguém tomou a linha: ela só VENCEU. O relógio que decide é o do banco.
     await vencerLease(canal);
@@ -295,10 +298,9 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
 
     const invasora = await mod.acquireChannelLease(escopo(), { ownerInstanceId: REPLICA_2 });
     expect(invasora.held).toBe(false);
-    expect(
-      await donoNoBanco(canal),
-      'a réplica 2 roubou o registro de posse da réplica 1',
-    ).toBe(REPLICA_1);
+    expect(await donoNoBanco(canal), 'a réplica 2 roubou o registro de posse da réplica 1').toBe(
+      REPLICA_1,
+    );
 
     // E, depois que a posse VENCE, a mesma réplica 2 pode assumir — a guarda é
     // sobre dono vivo, não um bloqueio permanente.
@@ -316,9 +318,8 @@ d('#513 — fence da posse de sessão (Postgres real)', () => {
     // arquivo (que passam o dono explicitamente) e quebraria só o shutdown
     // ordenado em produção — deixando toda linha presa até a lease vencer.
     const { runtimeInstanceId } = await import('../../src/runtime/instance-identity.js');
-    const { channelLineStateRepo } = await import(
-      '../../src/db/repositories/channel-line-state-repos.js'
-    );
+    const { channelLineStateRepo } =
+      await import('../../src/db/repositories/channel-line-state-repos.js');
 
     const posse = await mod.acquireChannelLease(escopo());
     expect(posse.held).toBe(true);

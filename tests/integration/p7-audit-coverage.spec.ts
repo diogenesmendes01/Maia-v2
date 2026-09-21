@@ -37,7 +37,10 @@ function* walkTs(dir: string): Generator<string> {
  * orquestrador realmente envolve, para a isenção não apodrecer em silêncio.
  */
 const WRAPPED_BY_ORCHESTRATOR: Array<{ dir: string; orchestrator: string }> = [
-  { dir: join('src', 'cognition', 'drift'), orchestrator: join('src', 'cognition', 'drift', 'index.ts') },
+  {
+    dir: join('src', 'cognition', 'drift'),
+    orchestrator: join('src', 'cognition', 'drift', 'index.ts'),
+  },
 ];
 
 function orchestratorFor(file: string): string | null {

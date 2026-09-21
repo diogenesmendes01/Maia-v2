@@ -50,10 +50,7 @@ import {
   type OutboundDeadLetterReason,
 } from '@/runtime/outbound/recovery-contract.js';
 import { TERMINAL_TURN_STATUSES } from '@/runtime/turns/contract.js';
-import type {
-  OutboundDeliveryOutcome,
-  OutboundPayloadType,
-} from '@/runtime/outbound/contract.js';
+import type { OutboundDeliveryOutcome, OutboundPayloadType } from '@/runtime/outbound/contract.js';
 
 /**
  * Um par (tenant, agent) com trabalho de recuperação. O dispatcher enumera
@@ -84,11 +81,7 @@ type SuccessfulTurnTransition = Extract<TurnTransitionResult, { ok: true }>;
 export type OutboundTurnFinalizationResult =
   | {
       finalized: false;
-      reason:
-        | 'not_eligible'
-        | 'no_artifacts'
-        | 'artifacts_unresolved'
-        | 'no_success';
+      reason: 'not_eligible' | 'no_artifacts' | 'artifacts_unresolved' | 'no_success';
     }
   | {
       finalized: true;
@@ -98,9 +91,7 @@ export type OutboundTurnFinalizationResult =
       transition: SuccessfulTurnTransition;
     };
 
-const FINAL_ARTIFACT_STATUS = new Set<string>(
-  OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES,
-);
+const FINAL_ARTIFACT_STATUS = new Set<string>(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES);
 
 /**
  * #506 §Auditoria mínima — a correlação devolvida pelos CAS da reconciliação.
@@ -187,9 +178,7 @@ export const outboundRecoveryRepo = {
    * Turnos cujo conjunto de artefatos parece convergido. A lista é apenas uma
    * eleição barata; `finalizeResolvedTurnTx` repete todas as guardas sob locks.
    */
-  async listFinalizableTurns(
-    limit: number,
-  ): Promise<FinalizableTurnCandidate[]> {
+  async listFinalizableTurns(limit: number): Promise<FinalizableTurnCandidate[]> {
     const result = await db.execute<FinalizableTurnCandidate>(
       finalizableTurnsStatement(getCurrentTenant(), getCurrentAgent(), limit),
     );
@@ -207,9 +196,7 @@ export const outboundRecoveryRepo = {
     const result = await db.execute<NoSuccessTurnSummary>(
       noSuccessTurnsSummaryStatement(getCurrentTenant(), getCurrentAgent()),
     );
-    return Number(
-      (result.rows as unknown as NoSuccessTurnSummary[])[0]?.pending_count ?? 0,
-    );
+    return Number((result.rows as unknown as NoSuccessTurnSummary[])[0]?.pending_count ?? 0);
   },
 
   /**
@@ -220,20 +207,17 @@ export const outboundRecoveryRepo = {
    * expirada torna o recovery a nova autoridade; rows sem claim/lease falham
    * fechado porque não oferecem selo confiável de que o produtor terminou.
    */
-  async finalizeResolvedTurnTx(
-    turn_id: string,
-  ): Promise<OutboundTurnFinalizationResult> {
+  async finalizeResolvedTurnTx(turn_id: string): Promise<OutboundTurnFinalizationResult> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
 
-    const result = await withTx(
-      async (tx): Promise<OutboundTurnFinalizationResult> => {
-        const lockedTurn = await tx.execute<{
-          id: string;
-          state_version: number | string;
-          conversa_id: string | null;
-          representative_message_id: string;
-        }>(sql`
+    const result = await withTx(async (tx): Promise<OutboundTurnFinalizationResult> => {
+      const lockedTurn = await tx.execute<{
+        id: string;
+        state_version: number | string;
+        conversa_id: string | null;
+        representative_message_id: string;
+      }>(sql`
         SELECT id, state_version, conversa_id, representative_message_id
           FROM ${agent_turns}
          WHERE tenant_id       = ${tenant_id}
@@ -245,21 +229,21 @@ export const outboundRecoveryRepo = {
            AND lease_expires_at <= now()
          FOR UPDATE SKIP LOCKED
       `);
-        const turn = Array.from(
-          lockedTurn.rows as unknown as Array<{
-            id: string;
-            state_version: number | string;
-            conversa_id: string | null;
-            representative_message_id: string;
-          }>,
-        )[0];
-        if (!turn) return { finalized: false, reason: 'not_eligible' };
-
-        const lockedArtifacts = await tx.execute<{
+      const turn = Array.from(
+        lockedTurn.rows as unknown as Array<{
           id: string;
-          status: string;
-          payload_type: string | null;
-        }>(sql`
+          state_version: number | string;
+          conversa_id: string | null;
+          representative_message_id: string;
+        }>,
+      )[0];
+      if (!turn) return { finalized: false, reason: 'not_eligible' };
+
+      const lockedArtifacts = await tx.execute<{
+        id: string;
+        status: string;
+        payload_type: string | null;
+      }>(sql`
         SELECT id, status, payload_type
           FROM ${outbound_messages}
          WHERE tenant_id = ${tenant_id}
@@ -268,72 +252,58 @@ export const outboundRecoveryRepo = {
          ORDER BY sequence_in_turn ASC
          FOR UPDATE
       `);
-        const artifacts = Array.from(
-          lockedArtifacts.rows as unknown as Array<{
-            id: string;
-            status: string;
-            payload_type: string | null;
-          }>,
-        );
-        if (artifacts.length === 0)
-          return { finalized: false, reason: 'no_artifacts' };
-        if (
-          artifacts.some(
-            (artifact) => !FINAL_ARTIFACT_STATUS.has(artifact.status),
-          )
-        ) {
-          return { finalized: false, reason: 'artifacts_unresolved' };
-        }
+      const artifacts = Array.from(
+        lockedArtifacts.rows as unknown as Array<{
+          id: string;
+          status: string;
+          payload_type: string | null;
+        }>,
+      );
+      if (artifacts.length === 0) return { finalized: false, reason: 'no_artifacts' };
+      if (artifacts.some((artifact) => !FINAL_ARTIFACT_STATUS.has(artifact.status))) {
+        return { finalized: false, reason: 'artifacts_unresolved' };
+      }
 
-        const successful = artifacts.filter(
-          (artifact) => artifact.status === 'completed',
-        );
-        if (successful.length === 0)
-          return { finalized: false, reason: 'no_success' };
+      const successful = artifacts.filter((artifact) => artifact.status === 'completed');
+      if (successful.length === 0) return { finalized: false, reason: 'no_success' };
 
-        const outcome = successful.every(
-          (artifact) => artifact.payload_type === 'status_fallback',
-        )
-          ? 'fallback_delivered'
-          : 'reply_delivered';
-        const transition = await completeRecoveredOutboundTurnInTx(tx, {
-          turn_id,
-          expected_version: Number(turn.state_version),
-          outcome,
-        });
+      const outcome = successful.every((artifact) => artifact.payload_type === 'status_fallback')
+        ? 'fallback_delivered'
+        : 'reply_delivered';
+      const transition = await completeRecoveredOutboundTurnInTx(tx, {
+        turn_id,
+        expected_version: Number(turn.state_version),
+        outcome,
+      });
 
-        const status_counts = artifacts.reduce<Record<string, number>>(
-          (counts, artifact) => {
-            counts[artifact.status] = (counts[artifact.status] ?? 0) + 1;
-            return counts;
-          },
-          {},
-        );
-        await auditTx(tx, {
-          acao: 'outbound_turn_finalized',
-          ...(turn.conversa_id ? { conversa_id: turn.conversa_id } : {}),
-          mensagem_id: turn.representative_message_id,
-          alvo_id: turn.id,
-          entidade_alvo: 'agent_turns',
-          metadata: {
-            source: 'outbound_recovery',
-            outcome,
-            artifact_count: artifacts.length,
-            successful_count: successful.length,
-            partial_delivery: successful.length < artifacts.length,
-            status_counts,
-          },
-        });
-
-        return {
-          finalized: true,
+      const status_counts = artifacts.reduce<Record<string, number>>((counts, artifact) => {
+        counts[artifact.status] = (counts[artifact.status] ?? 0) + 1;
+        return counts;
+      }, {});
+      await auditTx(tx, {
+        acao: 'outbound_turn_finalized',
+        ...(turn.conversa_id ? { conversa_id: turn.conversa_id } : {}),
+        mensagem_id: turn.representative_message_id,
+        alvo_id: turn.id,
+        entidade_alvo: 'agent_turns',
+        metadata: {
+          source: 'outbound_recovery',
           outcome,
           artifact_count: artifacts.length,
           successful_count: successful.length,
-          transition,
-        };
-      },
-    );
+          partial_delivery: successful.length < artifacts.length,
+          status_counts,
+        },
+      });
+
+      return {
+        finalized: true,
+        outcome,
+        artifact_count: artifacts.length,
+        successful_count: successful.length,
+        transition,
+      };
+    });
 
     if (result.finalized) {
       recordRecoveredOutboundTurnCommitted({ outcome: result.outcome });
@@ -368,9 +338,7 @@ export const outboundRecoveryRepo = {
    * NULL, porque `recordDeliveryOutcome` a soltou ao gravar o desfecho
    * incerto). Quem a reivindica é o worker, pelo claim atômico.
    */
-  async promoteUnknownToRetryable(input: {
-    outbound_id: string;
-  }): Promise<{ promoted: boolean }> {
+  async promoteUnknownToRetryable(input: { outbound_id: string }): Promise<{ promoted: boolean }> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     // #506 §Auditoria mínima — `outbound.reconciled`, resultado
@@ -435,9 +403,7 @@ export const outboundRecoveryRepo = {
    * `maia_outbound_pending_age_seconds`. Um `reconciling` que envelhece é o
    * alarme — se ele saísse da fila, "escalado" viraria sinônimo de "esquecido".
    */
-  async markReconciling(input: {
-    outbound_id: string;
-  }): Promise<{ marked: boolean }> {
+  async markReconciling(input: { outbound_id: string }): Promise<{ marked: boolean }> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     // #506 §Auditoria mínima — `outbound.reconciliation_started`, na MESMA
@@ -476,8 +442,7 @@ export const outboundRecoveryRepo = {
           // Por que a plataforma parou: o provedor não deduplica este
           // `payload_type`, então reenviar produziria uma SEGUNDA mensagem.
           // É o fundamento da espera humana, e ele pertence à trilha.
-          escalation_reason:
-            'provider_idempotency_unavailable_for_payload_type',
+          escalation_reason: 'provider_idempotency_unavailable_for_payload_type',
         },
       });
       return { marked: true };
@@ -702,9 +667,7 @@ export const outboundRecoveryRepo = {
                )
              )
     `);
-    return (
-      Number((result.rows as unknown as Array<{ n: string }>)[0]?.n ?? 0) > 0
-    );
+    return Number((result.rows as unknown as Array<{ n: string }>)[0]?.n ?? 0) > 0;
   },
 
   /**
@@ -824,8 +787,7 @@ export const outboundRecoveryRepo = {
            AND status    = 'delivered'
         RETURNING id
       `);
-      if (moved.rows.length === 0)
-        return { completed: false, history_message_id: null };
+      if (moved.rows.length === 0) return { completed: false, history_message_id: null };
 
       // `midia_url: null` LITERAL — a política de retenção de #635 §Retenção,
       // estrutural e não por limpeza posterior. Ver `historico.ts`.
@@ -847,11 +809,7 @@ export const outboundRecoveryRepo = {
         // O `where` é o PREDICADO do índice parcial: sem ele o PostgreSQL não
         // infere `mensagens_outbound_history_uq` como alvo do `ON CONFLICT`.
         .onConflictDoNothing({
-          target: [
-            mensagens.tenant_id,
-            mensagens.agent_id,
-            mensagens.outbound_id,
-          ],
+          target: [mensagens.tenant_id, mensagens.agent_id, mensagens.outbound_id],
           where: sql`${mensagens.outbound_id} IS NOT NULL`,
         })
         .returning({ id: mensagens.id });
@@ -1016,9 +974,7 @@ export const outboundRecoveryRepo = {
            )
          )
     `);
-    const raw = (
-      result.rows as unknown as Array<{ age_seconds: string | null }>
-    )[0];
+    const raw = (result.rows as unknown as Array<{ age_seconds: string | null }>)[0];
     return Math.max(0, Math.round(Number(raw?.age_seconds ?? 0)));
   },
 
@@ -1247,11 +1203,7 @@ export function scopesWithWorkStatement() {
 }
 
 /** Turnos escopados que têm sucesso comprovado e podem ser fechados sob lock. */
-export function finalizableTurnsStatement(
-  tenant_id: string,
-  agent_id: string,
-  limit: number,
-) {
+export function finalizableTurnsStatement(tenant_id: string, agent_id: string, limit: number) {
   return sql`
       SELECT t.id AS turn_id
         FROM ${agent_turns} t
@@ -1289,10 +1241,7 @@ export function finalizableTurnsStatement(
  * transicionar sem uma política de produto e, portanto, jamais devem ocupar a
  * janela finita reservada a trabalho que efetivamente progride.
  */
-export function noSuccessTurnsSummaryStatement(
-  tenant_id: string,
-  agent_id: string,
-) {
+export function noSuccessTurnsSummaryStatement(tenant_id: string, agent_id: string) {
   return sql`
       SELECT COUNT(*)::int AS pending_count
         FROM ${agent_turns} t
@@ -1329,11 +1278,7 @@ export function noSuccessTurnsSummaryStatement(
 }
 
 /** A varredura ESCOPADA do trabalho entregável — inclui o TAKEOVER. */
-export function deliverableStatement(
-  tenant_id: string,
-  agent_id: string,
-  limit: number,
-) {
+export function deliverableStatement(tenant_id: string, agent_id: string, limit: number) {
   return sql`
       SELECT id, status, attempt, payload_type, delivery_outcome,
              EXTRACT(EPOCH FROM (now() - created_at)) * 1000 AS age_ms
@@ -1354,11 +1299,7 @@ export function deliverableStatement(
 }
 
 /** A varredura ESCOPADA da fila de reconciliação. */
-export function reconciliationStatement(
-  tenant_id: string,
-  agent_id: string,
-  limit: number,
-) {
+export function reconciliationStatement(tenant_id: string, agent_id: string, limit: number) {
   return sql`
       SELECT id, status, attempt, payload_type, delivery_outcome,
              EXTRACT(EPOCH FROM (now() - created_at)) * 1000 AS age_ms
@@ -1379,11 +1320,7 @@ export function reconciliationStatement(
  * dos dois estar ausente. Isolado, a pergunta "o predicado de takeover é
  * indexado?" tem uma resposta só.
  */
-export function takeoverOnlyStatement(
-  tenant_id: string,
-  agent_id: string,
-  limit: number,
-) {
+export function takeoverOnlyStatement(tenant_id: string, agent_id: string, limit: number) {
   return sql`
       SELECT id, status, attempt
         FROM ${outbound_messages}

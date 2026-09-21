@@ -34,7 +34,9 @@ function detectOom(err: unknown): boolean {
   const e = err as { name?: string; code?: string; message?: string };
   if (typeof e.code === 'string' && e.code.toUpperCase() === 'OOM') return true;
   const msg = String(e.message ?? '');
-  return (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg);
+  return (
+    (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg)
+  );
 }
 
 vi.mock('@/lib/redis.js', () => ({

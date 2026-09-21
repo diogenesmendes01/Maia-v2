@@ -1,8 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  buildAudienceContext,
-  DEFAULT_CHANNEL_TYPE,
-} from '@/identity/audience-context.js';
+import { buildAudienceContext, DEFAULT_CHANNEL_TYPE } from '@/identity/audience-context.js';
 import type { Pessoa, AgentAudienceProfile } from '@/db/schema.js';
 
 const pessoa = {
@@ -67,9 +64,7 @@ describe('buildAudienceContext (#407)', () => {
   });
 
   it('fails closed (null) when profile is missing', () => {
-    expect(
-      buildAudienceContext({ pessoa, profile: null, allowed_entity_ids: [] }),
-    ).toBeNull();
+    expect(buildAudienceContext({ pessoa, profile: null, allowed_entity_ids: [] })).toBeNull();
   });
 
   it('fails closed (null) when profile is not active', () => {

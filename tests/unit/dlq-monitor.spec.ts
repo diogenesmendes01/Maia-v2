@@ -95,7 +95,9 @@ describe('dlq-monitor worker', () => {
 
     // High-severity log line emitted with the dlq.threshold_exceeded tag.
     const errorTags = loggerError.mock.calls.map((c) => c[0]);
-    expect(errorTags.some((t) => t && (t as { tag?: string }).tag === 'dlq.threshold_exceeded')).toBe(true);
+    expect(
+      errorTags.some((t) => t && (t as { tag?: string }).tag === 'dlq.threshold_exceeded'),
+    ).toBe(true);
   });
 
   it('does not re-alert when Redis flag is already set (throttled)', async () => {

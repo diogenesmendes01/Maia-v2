@@ -3,7 +3,8 @@ import { runCognitiveModule } from '@/cognition/runner.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -44,7 +45,9 @@ describe('runCognitiveModule', () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const result = await runCognitiveModule(
         { name: 'test.boom', triggered_by: 'async_event', fallback: null },
-        async () => { throw new Error('boom'); },
+        async () => {
+          throw new Error('boom');
+        },
       );
       expect(result.output).toBeNull();
       expect(result.status).toBe('error');
@@ -56,7 +59,9 @@ describe('runCognitiveModule', () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const result = await runCognitiveModule(
         { name: 'test.boom2', triggered_by: 'async_event' },
-        async () => { throw new Error('boom'); },
+        async () => {
+          throw new Error('boom');
+        },
       );
       expect(result.output).toBeNull();
       expect(result.status).toBe('error');
@@ -244,8 +249,7 @@ describe('runCognitiveModule', () => {
       labels._resetLabelGuardForTests();
 
       const budget =
-        taxonomy.LABEL_CARDINALITY_BUDGET['workload'] ??
-        taxonomy.DEFAULT_LABEL_CARDINALITY_BUDGET;
+        taxonomy.LABEL_CARDINALITY_BUDGET['workload'] ?? taxonomy.DEFAULT_LABEL_CARDINALITY_BUDGET;
       for (let i = 0; i <= budget + 1; i++) {
         await emitirCancelamento(`procedure-selector.proc-${i}`, {
           tenant_id: 'tenant-507',
@@ -348,7 +352,10 @@ describe('runCognitiveModule', () => {
         // usuário recebeu de resposta pior.
         expect(result.fallback_triggered).toBe(false);
       });
-      expect(fallbackFn, 'o fallback não pode ser sintetizado num cancelamento').not.toHaveBeenCalled();
+      expect(
+        fallbackFn,
+        'o fallback não pode ser sintetizado num cancelamento',
+      ).not.toHaveBeenCalled();
     });
 
     /**
@@ -550,8 +557,15 @@ describe('runCognitiveModule', () => {
       try {
         await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
           await runCognitiveModule(
-            { name: 'test.cleartimeout.error', triggered_by: 'async_event', timeoutMs: 5000, fallback: null },
-            async () => { throw new Error('boom'); },
+            {
+              name: 'test.cleartimeout.error',
+              triggered_by: 'async_event',
+              timeoutMs: 5000,
+              fallback: null,
+            },
+            async () => {
+              throw new Error('boom');
+            },
           );
         });
         const setHandles = setSpy.mock.results.map((r) => r.value);
@@ -570,7 +584,12 @@ describe('runCognitiveModule', () => {
       try {
         await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
           const result = await runCognitiveModule(
-            { name: 'test.cleartimeout.timeout', triggered_by: 'sync_conditional', timeoutMs: 20, fallback: 'fb' },
+            {
+              name: 'test.cleartimeout.timeout',
+              triggered_by: 'sync_conditional',
+              timeoutMs: 20,
+              fallback: 'fb',
+            },
             async () => new Promise((r) => setTimeout(() => r('slow'), 200)),
           );
           expect(result.status).toBe('timeout');

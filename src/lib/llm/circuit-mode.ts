@@ -185,7 +185,9 @@ export function resolveOverrideExpiry(msg: CircuitOverrideMessage, now: number):
   const absolute =
     typeof msg.expires_at === 'number' && Number.isFinite(msg.expires_at) ? msg.expires_at : null;
   const relative =
-    typeof msg.ttl_ms === 'number' && Number.isFinite(msg.ttl_ms) ? msg.ttl_ms : DEFAULT_OVERRIDE_MS;
+    typeof msg.ttl_ms === 'number' && Number.isFinite(msg.ttl_ms)
+      ? msg.ttl_ms
+      : DEFAULT_OVERRIDE_MS;
   const expiresAt = absolute ?? now + relative;
 
   if (expiresAt <= now) return { error: 'override já vencido na chegada' };

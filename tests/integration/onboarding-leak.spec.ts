@@ -27,7 +27,9 @@ const AG_A = 'leak-onb-a-bot';
 const AG_B = 'leak-onb-b-bot';
 
 async function ensureScope(c: pg.PoolClient, tenant: string, agent: string): Promise<void> {
-  await c.query('INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT (id) DO NOTHING', [tenant]);
+  await c.query('INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT (id) DO NOTHING', [
+    tenant,
+  ]);
   await c.query(
     'INSERT INTO agents(id, tenant_id, nome) VALUES ($1,$2,$1) ON CONFLICT (id) DO NOTHING',
     [agent, tenant],
@@ -223,7 +225,8 @@ dRepo('onboarding — isolamento pelo repo', () => {
       idempotency_key_hash: `leak-${Date.now()}`,
       payload_hash: 'leak-payload',
     });
-    if (created_run.outcome !== 'created') throw new Error(`run não criada: ${created_run.outcome}`);
+    if (created_run.outcome !== 'created')
+      throw new Error(`run não criada: ${created_run.outcome}`);
     const run = created_run.run;
     created.push(run.id);
 

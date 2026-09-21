@@ -56,9 +56,8 @@ const state: Record<string, Row> = {};
 let counter = 0;
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   // Mock that mirrors the agent-scoped real repo. Caller MUST be inside
   // runWithTenantContext — we read the current tenant/agent each time.
   const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
@@ -251,9 +250,8 @@ vi.mock('@/db/repositories.js', async () => {
 // is invoked for every mode (mission item 5).
 const runModuleCalls: Array<{ name: string }> = [];
 vi.mock('@/cognition/runner.js', async () => {
-  const actual = await vi.importActual<typeof import('@/cognition/runner.js')>(
-    '@/cognition/runner.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/cognition/runner.js')>('@/cognition/runner.js');
   return {
     ...actual,
     runCognitiveModule: vi.fn(async (opts: any, fn: any) => {
@@ -265,7 +263,7 @@ vi.mock('@/cognition/runner.js', async () => {
         const msg = (err as Error).message;
         const status = msg === 'timeout' ? 'timeout' : 'error';
         return {
-          output: typeof opts.fallback === 'function' ? opts.fallback() : opts.fallback ?? null,
+          output: typeof opts.fallback === 'function' ? opts.fallback() : (opts.fallback ?? null),
           status,
           fallback_triggered: true,
           latency_ms: 1,
@@ -338,9 +336,8 @@ describe('Finding 1 — agent isolation in skillsRepo', () => {
       await skillsRepo.activate(s.id, 'owner');
     });
     // Agent B procura — não deve achar
-    const found = await runWithTenantContext(
-      { tenant_id: 'acme', agent_id: 'agent-B' },
-      async () => skillsRepo.findActive(baseInput.skill_descriptor),
+    const found = await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-B' }, async () =>
+      skillsRepo.findActive(baseInput.skill_descriptor),
     );
     expect(found).toBeNull();
   });
@@ -351,9 +348,9 @@ describe('Finding 1 — agent isolation in skillsRepo', () => {
       await skillsRepo.activate(s.id, 'owner');
     });
     await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-B' }, async () => {
-      await expect(
-        skillsRepo.findActive(baseInput.skill_descriptor, 'agent-A'),
-      ).rejects.toThrow(/agent_scope_violation/);
+      await expect(skillsRepo.findActive(baseInput.skill_descriptor, 'agent-A')).rejects.toThrow(
+        /agent_scope_violation/,
+      );
     });
   });
 
@@ -363,18 +360,17 @@ describe('Finding 1 — agent isolation in skillsRepo', () => {
       const s = await skillsRepo.propose({ ...baseInput, agent_id: null });
       await skillsRepo.activate(s.id, 'owner');
     });
-    const found = await runWithTenantContext(
-      { tenant_id: 'acme', agent_id: 'agent-B' },
-      async () => skillsRepo.findActive(baseInput.skill_descriptor),
+    const found = await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-B' }, async () =>
+      skillsRepo.findActive(baseInput.skill_descriptor),
     );
     expect(found?.skill_descriptor).toBe(baseInput.skill_descriptor);
   });
 
   it('propose: rejeita input.agent_id de outro agente', async () => {
     await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-A' }, async () => {
-      await expect(
-        skillsRepo.propose({ ...baseInput, agent_id: 'agent-B' }),
-      ).rejects.toThrow(/agent_scope_violation/);
+      await expect(skillsRepo.propose({ ...baseInput, agent_id: 'agent-B' })).rejects.toThrow(
+        /agent_scope_violation/,
+      );
     });
   });
 
@@ -395,9 +391,8 @@ describe('Finding 1 — agent isolation in skillsRepo', () => {
       const s = await skillsRepo.propose({ ...baseInput });
       skillId = s.id;
     });
-    const found = await runWithTenantContext(
-      { tenant_id: 'acme', agent_id: 'agent-B' },
-      async () => skillsRepo.getById(skillId),
+    const found = await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-B' }, async () =>
+      skillsRepo.getById(skillId),
     );
     expect(found).toBeNull();
   });
@@ -406,9 +401,8 @@ describe('Finding 1 — agent isolation in skillsRepo', () => {
     await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-A' }, async () => {
       await skillsRepo.propose({ ...baseInput });
     });
-    const list = await runWithTenantContext(
-      { tenant_id: 'acme', agent_id: 'agent-B' },
-      async () => skillsRepo.listVersions(baseInput.skill_descriptor),
+    const list = await runWithTenantContext({ tenant_id: 'acme', agent_id: 'agent-B' }, async () =>
+      skillsRepo.listVersions(baseInput.skill_descriptor),
     );
     expect(list.length).toBe(0);
   });

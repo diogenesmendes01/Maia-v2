@@ -86,7 +86,10 @@ export const JOBS: Job[] = [
   {
     name: 'health_monitor',
     cron: '*/1 * * * *',
-    fn: lazy(() => import('./health-monitor.js'), (m) => m.runHealthMonitor),
+    fn: lazy(
+      () => import('./health-monitor.js'),
+      (m) => m.runHealthMonitor,
+    ),
     group: 'monitoring',
     effect: 'idempotent',
     guard: {
@@ -99,7 +102,10 @@ export const JOBS: Job[] = [
   {
     name: 'audit_watcher',
     cron: '*/1 * * * *',
-    fn: lazy(() => import('./audit-watcher.js'), (m) => m.runAuditWatcher),
+    fn: lazy(
+      () => import('./audit-watcher.js'),
+      (m) => m.runAuditWatcher,
+    ),
     group: 'monitoring',
     effect: 'read-only',
     guard: {
@@ -112,7 +118,10 @@ export const JOBS: Job[] = [
   {
     name: 'dlq_monitor',
     cron: '*/5 * * * *',
-    fn: lazy(() => import('./dlq-monitor.js'), (m) => m.runDlqMonitor),
+    fn: lazy(
+      () => import('./dlq-monitor.js'),
+      (m) => m.runDlqMonitor,
+    ),
     group: 'monitoring',
     effect: 'idempotent',
     guard: {
@@ -125,7 +134,10 @@ export const JOBS: Job[] = [
   {
     name: 'cost_monitor',
     cron: '30 2 * * *',
-    fn: lazy(() => import('./cost-monitor.js'), (m) => m.runCostMonitor),
+    fn: lazy(
+      () => import('./cost-monitor.js'),
+      (m) => m.runCostMonitor,
+    ),
     group: 'monitoring',
     effect: 'read-only',
     guard: {
@@ -139,7 +151,10 @@ export const JOBS: Job[] = [
   {
     name: 'trace_body_writer',
     cron: '* * * * *',
-    fn: lazy(() => import('./trace-body-writer.js'), (m) => m.runTraceBodyWriter),
+    fn: lazy(
+      () => import('./trace-body-writer.js'),
+      (m) => m.runTraceBodyWriter,
+    ),
     group: 'monitoring',
     effect: 'idempotent',
     guard: {
@@ -154,7 +169,10 @@ export const JOBS: Job[] = [
   {
     name: 'trace_body_recoverer',
     cron: '*/5 * * * *',
-    fn: lazy(() => import('./trace-body-recoverer.js'), (m) => m.runTraceBodyRecoverer),
+    fn: lazy(
+      () => import('./trace-body-recoverer.js'),
+      (m) => m.runTraceBodyRecoverer,
+    ),
     group: 'monitoring',
     effect: 'idempotent',
     guard: {
@@ -169,7 +187,10 @@ export const JOBS: Job[] = [
   {
     name: 'trace_matview_refresh',
     cron: '*/5 * * * *',
-    fn: lazy(() => import('./trace-matview-refresh.js'), (m) => m.runTraceMatviewRefresh),
+    fn: lazy(
+      () => import('./trace-matview-refresh.js'),
+      (m) => m.runTraceMatviewRefresh,
+    ),
     group: 'monitoring',
     effect: 'idempotent',
     guard: {
@@ -184,7 +205,10 @@ export const JOBS: Job[] = [
   {
     name: 'pending_expirer',
     cron: '*/1 * * * *',
-    fn: lazy(() => import('./pending-expirer.js'), (m) => m.runPendingExpirer),
+    fn: lazy(
+      () => import('./pending-expirer.js'),
+      (m) => m.runPendingExpirer,
+    ),
     group: 'turn-pipeline',
     effect: 'side-effectful',
     guard: {
@@ -199,7 +223,8 @@ export const JOBS: Job[] = [
       //     (`workflowsRepo.expireIfDue`), e a auditoria e o aviso passaram a
       //     depender dele. O aviso ainda vai pelo ledger durável, com
       //     `dedup_key` único (#506), que é uma segunda barreira.
-      claim: "CAS no UPDATE com RETURNING: `status` esperado + prazo vencido; quem não muda a linha não age",
+      claim:
+        'CAS no UPDATE com RETURNING: `status` esperado + prazo vencido; quem não muda a linha não age',
       tables: ['pending_questions', 'workflows'],
     },
     module: 'pending-expirer.ts',
@@ -208,7 +233,10 @@ export const JOBS: Job[] = [
   {
     name: 'message_recovery',
     cron: '*/2 * * * *',
-    fn: lazy(() => import('./message-recovery.js'), (m) => m.runMessageRecovery),
+    fn: lazy(
+      () => import('./message-recovery.js'),
+      (m) => m.runMessageRecovery,
+    ),
     group: 'turn-pipeline',
     effect: 'idempotent',
     guard: {
@@ -229,7 +257,10 @@ export const JOBS: Job[] = [
   {
     name: 'stream_debounce_closer',
     cron: '* * * * *',
-    fn: lazy(() => import('./stream-debounce-closer.js'), (m) => m.runStreamDebounceCloser),
+    fn: lazy(
+      () => import('./stream-debounce-closer.js'),
+      (m) => m.runStreamDebounceCloser,
+    ),
     group: 'turn-pipeline',
     effect: 'side-effectful',
     guard: {
@@ -244,7 +275,10 @@ export const JOBS: Job[] = [
   {
     name: 'pending_reminder',
     cron: '*/30 * * * *',
-    fn: lazy(() => import('./pending-reminder.js'), (m) => m.runPendingReminder),
+    fn: lazy(
+      () => import('./pending-reminder.js'),
+      (m) => m.runPendingReminder,
+    ),
     group: 'turn-pipeline',
     effect: 'side-effectful',
     guard: {
@@ -262,7 +296,10 @@ export const JOBS: Job[] = [
   {
     name: 'unrouted_recovery',
     cron: '* * * * *',
-    fn: lazy(() => import('./unrouted-recovery.js'), (m) => m.runUnroutedRecovery),
+    fn: lazy(
+      () => import('./unrouted-recovery.js'),
+      (m) => m.runUnroutedRecovery,
+    ),
     group: 'turn-pipeline',
     effect: 'idempotent',
     guard: {
@@ -278,7 +315,10 @@ export const JOBS: Job[] = [
   {
     name: 'workflow_engine_tick',
     cron: '*/30 * * * * *',
-    fn: lazy(() => import('./workflow-engine-tick.js'), (m) => m.runWorkflowEngineTick),
+    fn: lazy(
+      () => import('./workflow-engine-tick.js'),
+      (m) => m.runWorkflowEngineTick,
+    ),
     group: 'turn-pipeline',
     effect: 'side-effectful',
     guard: {
@@ -294,7 +334,8 @@ export const JOBS: Job[] = [
       //   - o ramo legado usa o `expireIfDue` da #691.
       // Os avisos ao requester vão pelo ledger com `dedup_key` derivada do id
       // do request (#506) — uma expiração, um aviso.
-      claim: "CAS no UPDATE com RETURNING: `status` esperado + prazo vencido; quem não muda a linha não notifica",
+      claim:
+        'CAS no UPDATE com RETURNING: `status` esperado + prazo vencido; quem não muda a linha não notifica',
       tables: ['approval_requests', 'workflows'],
     },
     module: 'workflow-engine-tick.ts',
@@ -303,7 +344,10 @@ export const JOBS: Job[] = [
   {
     name: 'audit_mode_expirer',
     cron: '*/15 * * * *',
-    fn: lazy(() => import('./audit-mode-expirer.js'), (m) => m.runAuditModeExpirer),
+    fn: lazy(
+      () => import('./audit-mode-expirer.js'),
+      (m) => m.runAuditModeExpirer,
+    ),
     group: 'turn-pipeline',
     effect: 'idempotent',
     guard: {
@@ -325,7 +369,10 @@ export const JOBS: Job[] = [
   {
     name: 'scheduling_tick',
     cron: '* * * * *',
-    fn: lazy(() => import('./scheduling-tick.js'), (m) => m.runScheduling),
+    fn: lazy(
+      () => import('./scheduling-tick.js'),
+      (m) => m.runScheduling,
+    ),
     group: 'scheduling',
     effect: 'side-effectful',
     guard: {
@@ -340,7 +387,10 @@ export const JOBS: Job[] = [
   {
     name: 'outbox_drain',
     cron: '* * * * *',
-    fn: lazy(() => import('./outbox-drain-worker.js'), (m) => m.runOutboxDrainWorker),
+    fn: lazy(
+      () => import('./outbox-drain-worker.js'),
+      (m) => m.runOutboxDrainWorker,
+    ),
     group: 'scheduling',
     effect: 'side-effectful',
     guard: {
@@ -355,7 +405,10 @@ export const JOBS: Job[] = [
   {
     name: 'series_next_scheduler',
     cron: '*/10 * * * *',
-    fn: lazy(() => import('./series-next-scheduler.js'), (m) => m.runSeriesNextSchedulerWorker),
+    fn: lazy(
+      () => import('./series-next-scheduler.js'),
+      (m) => m.runSeriesNextSchedulerWorker,
+    ),
     group: 'scheduling',
     effect: 'idempotent',
     guard: {
@@ -374,7 +427,10 @@ export const JOBS: Job[] = [
   {
     name: 'mcp_sync',
     cron: '* * * * *',
-    fn: lazy(() => import('./mcp-sync-worker.js'), (m) => m.runMcpSyncWorker),
+    fn: lazy(
+      () => import('./mcp-sync-worker.js'),
+      (m) => m.runMcpSyncWorker,
+    ),
     group: 'channel',
     effect: 'idempotent',
     guard: {
@@ -393,7 +449,10 @@ export const JOBS: Job[] = [
   {
     name: 'channel_pairing',
     cron: '*/5 * * * * *',
-    fn: lazy(() => import('./channel-pairing-worker.js'), (m) => m.runChannelPairingWorker),
+    fn: lazy(
+      () => import('./channel-pairing-worker.js'),
+      (m) => m.runChannelPairingWorker,
+    ),
     group: 'channel',
     effect: 'side-effectful',
     guard: {
@@ -412,7 +471,10 @@ export const JOBS: Job[] = [
   {
     name: 'synthetic_probe',
     cron: config.MAIA_PROBE_CRON,
-    fn: lazy(() => import('./synthetic-probe.js'), (m) => m.runSyntheticProbe),
+    fn: lazy(
+      () => import('./synthetic-probe.js'),
+      (m) => m.runSyntheticProbe,
+    ),
     group: 'channel',
     effect: 'side-effectful',
     guard: {
@@ -432,7 +494,10 @@ export const JOBS: Job[] = [
   {
     name: 'outbound_messages_sweeper',
     cron: '*/5 * * * *',
-    fn: lazy(() => import('./outbound-messages-sweeper.js'), (m) => m.runOutboundMessagesSweeper),
+    fn: lazy(
+      () => import('./outbound-messages-sweeper.js'),
+      (m) => m.runOutboundMessagesSweeper,
+    ),
     group: 'outbound',
     effect: 'side-effectful',
     guard: { kind: 'global-singleton', lock: 'OUTBOUND_SWEEPER_LOCK_NAMESPACE' },
@@ -447,19 +512,17 @@ export const JOBS: Job[] = [
   {
     name: 'outbound_recovery',
     cron: '* * * * *',
-    fn: lazy(() => import('./outbound-recovery.js'), (m) => m.runOutboundRecovery),
+    fn: lazy(
+      () => import('./outbound-recovery.js'),
+      (m) => m.runOutboundRecovery,
+    ),
     group: 'outbound',
     effect: 'side-effectful',
     guard: {
       kind: 'row-claim',
       claim:
         'toda mutação é `UPDATE ... WHERE status = <origem esperada>` (CAS) e o rearme usa `jobId` determinístico; a entrega é protegida pelo claim com lease de #632 — DELIBERADAMENTE sem lock global, que custaria disponibilidade justo à recuperação',
-      tables: [
-        'outbound_messages',
-        'agent_turns',
-        'agent_turn_inputs',
-        'mensagens',
-      ],
+      tables: ['outbound_messages', 'agent_turns', 'agent_turn_inputs', 'mensagens'],
     },
     module: 'outbound-recovery.ts',
     phase: 1,
@@ -472,7 +535,10 @@ export const JOBS: Job[] = [
   {
     name: 'idempotency_outbox_relayer',
     cron: '*/1 * * * *',
-    fn: lazy(() => import('./idempotency-outbox-relayer.js'), (m) => m.runIdempotencyOutboxRelayer),
+    fn: lazy(
+      () => import('./idempotency-outbox-relayer.js'),
+      (m) => m.runIdempotencyOutboxRelayer,
+    ),
     group: 'outbound',
     effect: 'side-effectful',
     guard: { kind: 'global-singleton', lock: 'OUTBOX_RELAYER_LOCK_NAMESPACE' },
@@ -488,7 +554,10 @@ export const JOBS: Job[] = [
   {
     name: 'onboarding_expirer',
     cron: '*/5 * * * *',
-    fn: lazy(() => import('./onboarding-expirer.js'), (m) => m.runOnboardingExpirer),
+    fn: lazy(
+      () => import('./onboarding-expirer.js'),
+      (m) => m.runOnboardingExpirer,
+    ),
     group: 'housekeeping',
     effect: 'idempotent',
     guard: {
@@ -501,7 +570,10 @@ export const JOBS: Job[] = [
   {
     name: 'idempotency_cleanup',
     cron: '0 4 * * *',
-    fn: lazy(() => import('./idempotency-cleanup.js'), (m) => m.runIdempotencyCleanup),
+    fn: lazy(
+      () => import('./idempotency-cleanup.js'),
+      (m) => m.runIdempotencyCleanup,
+    ),
     group: 'housekeeping',
     effect: 'idempotent',
     guard: {
@@ -514,7 +586,10 @@ export const JOBS: Job[] = [
   {
     name: 'inactivity_sweep',
     cron: '0 3 * * *',
-    fn: lazy(() => import('./inactivity-sweep.js'), (m) => m.runInactivitySweep),
+    fn: lazy(
+      () => import('./inactivity-sweep.js'),
+      (m) => m.runInactivitySweep,
+    ),
     group: 'housekeeping',
     effect: 'side-effectful',
     guard: {
@@ -531,7 +606,10 @@ export const JOBS: Job[] = [
   {
     name: 'nightly_backup',
     cron: '0 3 * * *',
-    fn: lazy(() => import('./backup.js'), (m) => m.runNightlyBackup),
+    fn: lazy(
+      () => import('./backup.js'),
+      (m) => m.runNightlyBackup,
+    ),
     group: 'ops-backup',
     effect: 'side-effectful',
     guard: { kind: 'global-singleton', lock: 'OPS_LOCK_KEYS.backup_run' },
@@ -545,7 +623,10 @@ export const JOBS: Job[] = [
   {
     name: 'backup_retention',
     cron: '0 4 * * 0',
-    fn: lazy(() => import('./backup.js'), (m) => m.runBackupRetention),
+    fn: lazy(
+      () => import('./backup.js'),
+      (m) => m.runBackupRetention,
+    ),
     group: 'ops-backup',
     effect: 'side-effectful',
     guard: { kind: 'global-singleton', lock: 'OPS_LOCK_KEYS.retention_run' },
@@ -566,7 +647,10 @@ export const JOBS: Job[] = [
   {
     name: 'privacy_export_sweep',
     cron: '50 * * * *',
-    fn: lazy(() => import('./privacy.js'), (m) => m.runPrivacyExportSweepJob),
+    fn: lazy(
+      () => import('./privacy.js'),
+      (m) => m.runPrivacyExportSweepJob,
+    ),
     group: 'ops-backup',
     effect: 'side-effectful',
     guard: { kind: 'global-singleton', lock: 'OPS_LOCK_KEYS.privacy_export_sweep' },
@@ -585,7 +669,10 @@ export const JOBS: Job[] = [
   {
     name: 'restore_drill',
     cron: '40 * * * *',
-    fn: lazy(() => import('./backup.js'), (m) => m.runScheduledRestoreDrill),
+    fn: lazy(
+      () => import('./backup.js'),
+      (m) => m.runScheduledRestoreDrill,
+    ),
     group: 'ops-backup',
     effect: 'side-effectful',
     guard: { kind: 'global-singleton', lock: 'OPS_LOCK_KEYS.restore_drill' },
@@ -600,7 +687,10 @@ export const JOBS: Job[] = [
   {
     name: 'playground_turn_drain',
     cron: '* * * * *',
-    fn: lazy(() => import('./playground-turn-worker.js'), (m) => m.runPlaygroundTurnWorker),
+    fn: lazy(
+      () => import('./playground-turn-worker.js'),
+      (m) => m.runPlaygroundTurnWorker,
+    ),
     group: 'console',
     effect: 'side-effectful',
     guard: {
@@ -617,7 +707,10 @@ export const JOBS: Job[] = [
   {
     name: 'objective_perceive',
     cron: '*/5 * * * *',
-    fn: lazy(() => import('./objective-execute-worker.js'), (m) => m.runObjectivePerceiveWorker),
+    fn: lazy(
+      () => import('./objective-execute-worker.js'),
+      (m) => m.runObjectivePerceiveWorker,
+    ),
     group: 'console',
     effect: 'idempotent',
     guard: {
@@ -630,7 +723,10 @@ export const JOBS: Job[] = [
   {
     name: 'objective_execute',
     cron: '* * * * *',
-    fn: lazy(() => import('./objective-execute-worker.js'), (m) => m.runObjectiveExecuteWorker),
+    fn: lazy(
+      () => import('./objective-execute-worker.js'),
+      (m) => m.runObjectiveExecuteWorker,
+    ),
     group: 'console',
     effect: 'side-effectful',
     guard: {
@@ -647,7 +743,10 @@ export const JOBS: Job[] = [
   {
     name: 'conversation_summarizer',
     cron: '0 2 * * *',
-    fn: lazy(() => import('./conversation-summarizer.js'), (m) => m.runConversationSummarizer),
+    fn: lazy(
+      () => import('./conversation-summarizer.js'),
+      (m) => m.runConversationSummarizer,
+    ),
     group: 'cognition',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -662,7 +761,10 @@ export const JOBS: Job[] = [
   {
     name: 'reflection_batch',
     cron: '0 2 * * *',
-    fn: lazy(() => import('./reflection-batch.js'), (m) => m.runReflectionBatch),
+    fn: lazy(
+      () => import('./reflection-batch.js'),
+      (m) => m.runReflectionBatch,
+    ),
     group: 'cognition',
     effect: 'side-effectful',
     guard: { kind: 'per-tenant-singleton', lock: 'REFLECTION_BATCH_LOCK_NAMESPACE' },
@@ -672,7 +774,10 @@ export const JOBS: Job[] = [
   {
     name: 'pattern_detector',
     cron: '0 4 * * *',
-    fn: lazy(() => import('./pattern-detector.js'), (m) => m.runPatternDetector),
+    fn: lazy(
+      () => import('./pattern-detector.js'),
+      (m) => m.runPatternDetector,
+    ),
     group: 'cognition',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -687,7 +792,10 @@ export const JOBS: Job[] = [
   {
     name: 'legacy_memory_reclassifier',
     cron: '0 3 * * *',
-    fn: lazy(() => import('./legacy-memory-reclassifier.js'), (m) => m.runLegacyMemoryReclassifier),
+    fn: lazy(
+      () => import('./legacy-memory-reclassifier.js'),
+      (m) => m.runLegacyMemoryReclassifier,
+    ),
     group: 'cognition',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -702,7 +810,10 @@ export const JOBS: Job[] = [
   {
     name: 'confidence_recompute',
     cron: '30 3 * * *',
-    fn: lazy(() => import('./confidence-recompute.js'), (m) => m.runConfidenceRecompute),
+    fn: lazy(
+      () => import('./confidence-recompute.js'),
+      (m) => m.runConfidenceRecompute,
+    ),
     group: 'cognition',
     effect: 'idempotent',
     guard: {
@@ -715,7 +826,10 @@ export const JOBS: Job[] = [
   {
     name: 'procedure_candidate_consumer',
     cron: '0 2 * * *',
-    fn: lazy(() => import('./procedure-candidate-consumer.js'), (m) => m.runProcedureCandidateConsumer),
+    fn: lazy(
+      () => import('./procedure-candidate-consumer.js'),
+      (m) => m.runProcedureCandidateConsumer,
+    ),
     group: 'cognition',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -733,7 +847,10 @@ export const JOBS: Job[] = [
   {
     name: 'knowledge_state_promoter',
     cron: '0 * * * *',
-    fn: lazy(() => import('./knowledge-state-promoter.js'), (m) => m.runKnowledgeStatePromoter),
+    fn: lazy(
+      () => import('./knowledge-state-promoter.js'),
+      (m) => m.runKnowledgeStatePromoter,
+    ),
     group: 'cognition',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -750,7 +867,10 @@ export const JOBS: Job[] = [
   {
     name: 'procedure_execution_reaper',
     cron: '0 * * * *',
-    fn: lazy(() => import('./procedure-execution-reaper.js'), (m) => m.runProcedureExecutionReaper),
+    fn: lazy(
+      () => import('./procedure-execution-reaper.js'),
+      (m) => m.runProcedureExecutionReaper,
+    ),
     group: 'procedures',
     effect: 'side-effectful',
     guard: {
@@ -765,7 +885,10 @@ export const JOBS: Job[] = [
   {
     name: 'procedure_metrics_refresh',
     cron: '*/15 * * * *',
-    fn: lazy(() => import('./procedure-metrics-refresh.js'), (m) => m.runProcedureMetricsRefresh),
+    fn: lazy(
+      () => import('./procedure-metrics-refresh.js'),
+      (m) => m.runProcedureMetricsRefresh,
+    ),
     group: 'procedures',
     effect: 'idempotent',
     guard: {
@@ -780,7 +903,10 @@ export const JOBS: Job[] = [
   {
     name: 'briefing_morning',
     cron: '0 8 * * *',
-    fn: lazy(() => import('./briefings.js'), (m) => m.runMorningBriefing),
+    fn: lazy(
+      () => import('./briefings.js'),
+      (m) => m.runMorningBriefing,
+    ),
     group: 'proactive',
     effect: 'side-effectful',
     guard: {
@@ -794,7 +920,8 @@ export const JOBS: Job[] = [
       // de dois disparos do cron — colidem e só a primeira grava. O período
       // entra na chave porque `briefing_morning` e `briefing_weekly` disparam
       // no MESMO horário toda segunda-feira.
-      claim: 'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
+      claim:
+        'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
       tables: ['outbox_messages'],
     },
     module: 'briefings.ts',
@@ -803,7 +930,10 @@ export const JOBS: Job[] = [
   {
     name: 'briefing_evening',
     cron: '0 21 * * *',
-    fn: lazy(() => import('./briefings.js'), (m) => m.runEveningBriefing),
+    fn: lazy(
+      () => import('./briefings.js'),
+      (m) => m.runEveningBriefing,
+    ),
     group: 'proactive',
     effect: 'side-effectful',
     guard: {
@@ -817,7 +947,8 @@ export const JOBS: Job[] = [
       // de dois disparos do cron — colidem e só a primeira grava. O período
       // entra na chave porque `briefing_morning` e `briefing_weekly` disparam
       // no MESMO horário toda segunda-feira.
-      claim: 'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
+      claim:
+        'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
       tables: ['outbox_messages'],
     },
     module: 'briefings.ts',
@@ -826,7 +957,10 @@ export const JOBS: Job[] = [
   {
     name: 'briefing_weekly',
     cron: '0 8 * * 1',
-    fn: lazy(() => import('./briefings.js'), (m) => m.runWeeklyBriefing),
+    fn: lazy(
+      () => import('./briefings.js'),
+      (m) => m.runWeeklyBriefing,
+    ),
     group: 'proactive',
     effect: 'side-effectful',
     guard: {
@@ -840,7 +974,8 @@ export const JOBS: Job[] = [
       // de dois disparos do cron — colidem e só a primeira grava. O período
       // entra na chave porque `briefing_morning` e `briefing_weekly` disparam
       // no MESMO horário toda segunda-feira.
-      claim: 'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
+      claim:
+        'INSERT com dedup_key única por período/dia/pessoa em outbox_messages (idx_outbox_dedup); a colisão vira sucesso idempotente',
       tables: ['outbox_messages'],
     },
     module: 'briefings.ts',
@@ -850,7 +985,10 @@ export const JOBS: Job[] = [
   {
     name: 'drift_monitor',
     cron: '0 3 * * 0',
-    fn: lazy(() => import('./drift-monitor.js'), (m) => m.runDriftMonitor),
+    fn: lazy(
+      () => import('./drift-monitor.js'),
+      (m) => m.runDriftMonitor,
+    ),
     group: 'proactive',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -868,7 +1006,10 @@ export const JOBS: Job[] = [
   {
     name: 'gap_escalation_monitor',
     cron: '*/30 * * * *',
-    fn: lazy(() => import('./gap-escalation-monitor.js'), (m) => m.runGapEscalationMonitor),
+    fn: lazy(
+      () => import('./gap-escalation-monitor.js'),
+      (m) => m.runGapEscalationMonitor,
+    ),
     group: 'governance',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -888,7 +1029,10 @@ export const JOBS: Job[] = [
   {
     name: 'tool_request_issue_relayer',
     cron: '*/5 * * * *',
-    fn: lazy(() => import('./tool-request-triage.js'), (m) => m.runToolRequestIssueRelayer),
+    fn: lazy(
+      () => import('./tool-request-triage.js'),
+      (m) => m.runToolRequestIssueRelayer,
+    ),
     group: 'governance',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -903,7 +1047,10 @@ export const JOBS: Job[] = [
   {
     name: 'tool_request_closure_monitor',
     cron: '7 * * * *',
-    fn: lazy(() => import('./tool-request-triage.js'), (m) => m.runToolRequestClosureMonitor),
+    fn: lazy(
+      () => import('./tool-request-triage.js'),
+      (m) => m.runToolRequestClosureMonitor,
+    ),
     group: 'governance',
     effect: 'side-effectful',
     guard: { kind: 'none', why: '' },
@@ -944,11 +1091,13 @@ function registerWorkerGauges(name: string): void {
   setGaugeProvider(metricsInternal.key('maia_worker_active_jobs', { worker: name }), () =>
     inflight.has(name) ? 1 : 0,
   );
-  setGaugeProvider(metricsInternal.key('maia_worker_last_success_timestamp', { worker: name }), () =>
-    Math.floor((lastSuccessAt.get(name) ?? 0) / 1000),
+  setGaugeProvider(
+    metricsInternal.key('maia_worker_last_success_timestamp', { worker: name }),
+    () => Math.floor((lastSuccessAt.get(name) ?? 0) / 1000),
   );
-  setGaugeProvider(metricsInternal.key('maia_worker_last_failure_timestamp', { worker: name }), () =>
-    Math.floor((lastFailureAt.get(name) ?? 0) / 1000),
+  setGaugeProvider(
+    metricsInternal.key('maia_worker_last_failure_timestamp', { worker: name }),
+    () => Math.floor((lastFailureAt.get(name) ?? 0) / 1000),
   );
   // Issue #513 §Observabilidade — `maia_scheduler_job_lag_seconds{job}`.
   //

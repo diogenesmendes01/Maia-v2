@@ -7,11 +7,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import { skills } from '@/db/schema.js';
-import {
-  SkillStatus,
-  SkillExecutionMode,
-  SkillCategory,
-} from '@/types/enums.js';
+import { SkillStatus, SkillExecutionMode, SkillCategory } from '@/types/enums.js';
 
 describe('P9a schema — skills table', () => {
   it('has 24 columns (15 spec + version/lifecycle metadata)', () => {
@@ -83,5 +79,4 @@ describe('P9a enums', () => {
     expect(SkillCategory.PLAN).toBe('plan');
     expect(SkillCategory.EVALUATOR).toBe('evaluator');
   });
-
 });

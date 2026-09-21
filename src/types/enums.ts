@@ -14,14 +14,14 @@ export const TenantStatus = {
   SUSPENDED: 'suspended',
   ARCHIVED: 'archived',
 } as const;
-export type TenantStatus = typeof TenantStatus[keyof typeof TenantStatus];
+export type TenantStatus = (typeof TenantStatus)[keyof typeof TenantStatus];
 
 export const AgentStatus = {
   ACTIVE: 'active',
   PAUSED: 'paused',
   ARCHIVED: 'archived',
 } as const;
-export type AgentStatus = typeof AgentStatus[keyof typeof AgentStatus];
+export type AgentStatus = (typeof AgentStatus)[keyof typeof AgentStatus];
 
 /**
  * Eventos cognitivos consumidos por workers de reflexão (item 1 do spec).
@@ -29,13 +29,13 @@ export type AgentStatus = typeof AgentStatus[keyof typeof AgentStatus];
  * já registrar eventos do Reflector existente.
  */
 export const CognitiveEventType = {
-  USER_CORRECTION: 'user_correction',         // existente (P0)
-  SUCCESS_EXPLICIT: 'success_explicit',       // P1 NEW
+  USER_CORRECTION: 'user_correction', // existente (P0)
+  SUCCESS_EXPLICIT: 'success_explicit', // P1 NEW
   CONVERSATION_CLOSED: 'conversation_closed', // P1 NEW
-  PATTERN_DETECTED: 'pattern_detected',       // P1 NEW
-  INTERNAL_GAP: 'internal_gap',               // P1 NEW
+  PATTERN_DETECTED: 'pattern_detected', // P1 NEW
+  INTERNAL_GAP: 'internal_gap', // P1 NEW
 } as const;
-export type CognitiveEventType = typeof CognitiveEventType[keyof typeof CognitiveEventType];
+export type CognitiveEventType = (typeof CognitiveEventType)[keyof typeof CognitiveEventType];
 
 /**
  * Tipos de candidatos a conhecimento que peuvent ser capturados e armazenados.
@@ -49,7 +49,7 @@ export const CandidateType = {
   TOOL_REQUEST: 'tool_request',
   DESCARTE: 'descarte',
 } as const;
-export type CandidateType = typeof CandidateType[keyof typeof CandidateType];
+export type CandidateType = (typeof CandidateType)[keyof typeof CandidateType];
 
 /**
  * P4 — Tipos de drift de identidade operacional detectados pelo sistema.
@@ -71,7 +71,7 @@ export const DriftType = {
   // P8d: 9º tipo de drift — divergência de papel (cognitive_limits/priorities).
   PAPEL_DRIFT: 'papel_drift',
 } as const;
-export type DriftType = typeof DriftType[keyof typeof DriftType];
+export type DriftType = (typeof DriftType)[keyof typeof DriftType];
 
 /**
  * P8b — Origem de uma Soul Bias (governance class).
@@ -83,7 +83,7 @@ export const SoulOrigin = {
   TENANT_CULTURE_EXPLICIT: 'tenant_culture_explicit',
   LEARNED_STRONG_EVIDENCE: 'learned_strong_evidence',
 } as const;
-export type SoulOrigin = typeof SoulOrigin[keyof typeof SoulOrigin];
+export type SoulOrigin = (typeof SoulOrigin)[keyof typeof SoulOrigin];
 
 /**
  * P8b — Escopo de aplicabilidade da Soul Bias.
@@ -95,7 +95,7 @@ export const SoulScope = {
   ROLE: 'role',
   DOMAIN: 'domain',
 } as const;
-export type SoulScope = typeof SoulScope[keyof typeof SoulScope];
+export type SoulScope = (typeof SoulScope)[keyof typeof SoulScope];
 
 /**
  * P8b — Ciclo de vida da Soul Bias (state machine).
@@ -107,7 +107,7 @@ export const SoulBiasStatus = {
   DEPRECATED: 'deprecated',
   ROLLED_BACK: 'rolled_back',
 } as const;
-export type SoulBiasStatus = typeof SoulBiasStatus[keyof typeof SoulBiasStatus];
+export type SoulBiasStatus = (typeof SoulBiasStatus)[keyof typeof SoulBiasStatus];
 
 /**
  * P4 — Severidade de drift detectado, define limiar de ação.
@@ -118,7 +118,7 @@ export const DriftSeverity = {
   ALTO: 'alto',
   CRITICO: 'critico',
 } as const;
-export type DriftSeverity = typeof DriftSeverity[keyof typeof DriftSeverity];
+export type DriftSeverity = (typeof DriftSeverity)[keyof typeof DriftSeverity];
 
 /**
  * P4 — Ciclo de vida do perfil operacional versionado.
@@ -129,7 +129,7 @@ export const ProfileStatus = {
   FROZEN: 'frozen',
   ROLLED_BACK: 'rolled_back',
 } as const;
-export type ProfileStatus = typeof ProfileStatus[keyof typeof ProfileStatus];
+export type ProfileStatus = (typeof ProfileStatus)[keyof typeof ProfileStatus];
 
 /**
  * P4 — Decisão tomada pelo classificador de drift sobre o que fazer.
@@ -140,7 +140,7 @@ export const DriftDecision = {
   FROZEN: 'frozen',
   ROLLBACK: 'rollback',
 } as const;
-export type DriftDecision = typeof DriftDecision[keyof typeof DriftDecision];
+export type DriftDecision = (typeof DriftDecision)[keyof typeof DriftDecision];
 
 /**
  * P5 — Nível de escalada para lacunas detectadas (aquisição dialógica de
@@ -154,7 +154,7 @@ export const GapLevel = {
   MENTIONABLE: 'mentionable',
   PROPOSED: 'proposed',
 } as const;
-export type GapLevel = typeof GapLevel[keyof typeof GapLevel];
+export type GapLevel = (typeof GapLevel)[keyof typeof GapLevel];
 
 /**
  * P5 — Ciclo de vida de uma proposta de capacidade (spec técnica gerada
@@ -174,7 +174,7 @@ export const ProposalStatus = {
   // the loop is reverted (and a technical_gap_id may be raised).
   REVERTED: 'reverted',
 } as const;
-export type ProposalStatus = typeof ProposalStatus[keyof typeof ProposalStatus];
+export type ProposalStatus = (typeof ProposalStatus)[keyof typeof ProposalStatus];
 
 /**
  * P5 — Resultado de teste pós-aquisição (loop fechado: a capacidade
@@ -185,7 +185,8 @@ export const CapabilityTestOutcome = {
   FAIL: 'fail',
   ERROR: 'error',
 } as const;
-export type CapabilityTestOutcome = typeof CapabilityTestOutcome[keyof typeof CapabilityTestOutcome];
+export type CapabilityTestOutcome =
+  (typeof CapabilityTestOutcome)[keyof typeof CapabilityTestOutcome];
 
 /**
  * P6 — Comportamento de switching entre roles dentro de um canal/agente.
@@ -200,7 +201,7 @@ export const SwitchBehavior = {
   FREE_WITH_TRIGGER: 'free_with_trigger',
   BY_CONTEXT: 'by_context',
 } as const;
-export type SwitchBehavior = typeof SwitchBehavior[keyof typeof SwitchBehavior];
+export type SwitchBehavior = (typeof SwitchBehavior)[keyof typeof SwitchBehavior];
 
 /**
  * P6 — Origem da sugestão de role pelo seletor. LLM apenas sugere
@@ -211,7 +212,7 @@ export const SuggestedBy = {
   DETERMINISTIC_CLASSIFIER: 'deterministic_classifier',
   NONE: 'none',
 } as const;
-export type SuggestedBy = typeof SuggestedBy[keyof typeof SuggestedBy];
+export type SuggestedBy = (typeof SuggestedBy)[keyof typeof SuggestedBy];
 
 /**
  * P6 — Origem da decisão final de role. Note que llm_classifier NÃO
@@ -224,7 +225,7 @@ export const DecidedBy = {
   OWNER_OVERRIDE: 'owner_override',
   FALLBACK_RULE: 'fallback_rule',
 } as const;
-export type DecidedBy = typeof DecidedBy[keyof typeof DecidedBy];
+export type DecidedBy = (typeof DecidedBy)[keyof typeof DecidedBy];
 
 /**
  * P6 — Política de anúncio de troca de role ao usuário. affects_user
@@ -236,7 +237,7 @@ export const AnnounceMode = {
   NEVER: 'never',
   AFFECTS_USER: 'affects_user',
 } as const;
-export type AnnounceMode = typeof AnnounceMode[keyof typeof AnnounceMode];
+export type AnnounceMode = (typeof AnnounceMode)[keyof typeof AnnounceMode];
 
 /**
  * P6 — Força do sinal do seletor de role (intensidade da evidência).
@@ -247,7 +248,7 @@ export const RoleSelectorStrength = {
   MEDIUM: 'medium',
   STRONG: 'strong',
 } as const;
-export type RoleSelectorStrength = typeof RoleSelectorStrength[keyof typeof RoleSelectorStrength];
+export type RoleSelectorStrength = (typeof RoleSelectorStrength)[keyof typeof RoleSelectorStrength];
 
 /**
  * P6 — Ação tomada pela decisão de role: manter atual, trocar,
@@ -259,7 +260,7 @@ export const RoleDecisionAction = {
   HANDOFF: 'handoff',
   FALLBACK: 'fallback',
 } as const;
-export type RoleDecisionAction = typeof RoleDecisionAction[keyof typeof RoleDecisionAction];
+export type RoleDecisionAction = (typeof RoleDecisionAction)[keyof typeof RoleDecisionAction];
 
 /**
  * P7 — Grafo cognitivo formal. Camada de execução de um módulo cognitivo
@@ -288,7 +289,7 @@ export const SkillStatus = {
   DEPRECATED: 'deprecated',
   ROLLED_BACK: 'rolled_back',
 } as const;
-export type SkillStatus = typeof SkillStatus[keyof typeof SkillStatus];
+export type SkillStatus = (typeof SkillStatus)[keyof typeof SkillStatus];
 
 /**
  * P9a — Modo de execução de uma skill. Cada modo tem um handler estável
@@ -301,7 +302,7 @@ export const SkillExecutionMode = {
   TOOL_MEDIATED: 'tool_mediated',
   EVALUATOR: 'evaluator',
 } as const;
-export type SkillExecutionMode = typeof SkillExecutionMode[keyof typeof SkillExecutionMode];
+export type SkillExecutionMode = (typeof SkillExecutionMode)[keyof typeof SkillExecutionMode];
 
 /**
  * P9a — Categoria semântica de uma skill (orienta listagem em Admin UI
@@ -317,7 +318,7 @@ export const SkillCategory = {
   PLAN: 'plan',
   EVALUATOR: 'evaluator',
 } as const;
-export type SkillCategory = typeof SkillCategory[keyof typeof SkillCategory];
+export type SkillCategory = (typeof SkillCategory)[keyof typeof SkillCategory];
 
 /**
  * P9c — Nível de risco operacional (spec §10.11). Calculado pelo
@@ -335,7 +336,7 @@ export const RiskLevel = {
   HIGH: 'high',
   CRITICAL: 'critical',
 } as const;
-export type RiskLevel = typeof RiskLevel[keyof typeof RiskLevel];
+export type RiskLevel = (typeof RiskLevel)[keyof typeof RiskLevel];
 
 /**
  * Nomes de feature flags conhecidas. Cresce conforme fases ativam.
@@ -353,4 +354,4 @@ export const FeatureFlagName = {
   // This enum (and the FeatureFlags class) survive empty as the registration
   // point for the next phase's flag; deleting them is a separate follow-up.
 } as const;
-export type FeatureFlagName = typeof FeatureFlagName[keyof typeof FeatureFlagName];
+export type FeatureFlagName = (typeof FeatureFlagName)[keyof typeof FeatureFlagName];

@@ -22,7 +22,9 @@ const mockSkill = {
 
 describe('parseEvaluatorOutput', () => {
   it('parses valid output', () => {
-    const out = parseEvaluatorOutput('{"score":0.85,"verdict":"pass","reasons":["clear","accurate"]}');
+    const out = parseEvaluatorOutput(
+      '{"score":0.85,"verdict":"pass","reasons":["clear","accurate"]}',
+    );
     expect(out.score).toBe(0.85);
     expect(out.verdict).toBe('pass');
     expect(out.reasons).toEqual(['clear', 'accurate']);
@@ -49,9 +51,9 @@ describe('parseEvaluatorOutput', () => {
   });
 
   it('throws on invalid verdict', () => {
-    expect(() =>
-      parseEvaluatorOutput('{"score":0.7,"verdict":"maybe","reasons":[]}'),
-    ).toThrow('evaluator_invalid_verdict');
+    expect(() => parseEvaluatorOutput('{"score":0.7,"verdict":"maybe","reasons":[]}')).toThrow(
+      'evaluator_invalid_verdict',
+    );
   });
 
   it('coerces non-string reasons to strings', () => {

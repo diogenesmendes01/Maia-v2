@@ -1,8 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  ActionDeciderImpl,
-  type ActionDeciderDeps,
-} from '@/runtime/decision/action-decider.ts';
+import { ActionDeciderImpl, type ActionDeciderDeps } from '@/runtime/decision/action-decider.ts';
 import type {
   ActionDeciderInput,
   RequireDualApprovalDecision,
@@ -144,9 +141,7 @@ describe('P9b — ActionDecider', () => {
       },
     });
     const decider = new ActionDeciderImpl(deps);
-    const r = await decider.decide(
-      mkInput({ intent: { label: 'unknown', confidence: 0.3 } }),
-    );
+    const r = await decider.decide(mkInput({ intent: { label: 'unknown', confidence: 0.3 } }));
     expect(r.action_mode).toBe('respond');
     expect(r.rationale).toBe('respond:skill_x');
   });
@@ -288,9 +283,7 @@ describe('P9b — ActionDecider', () => {
     expect(r.tool_permissions.allowed_tools).toContain('view_balance');
     expect(r.tool_permissions.blocked_tools).toContain('transfer_money');
     expect(r.tool_permissions.blocked_tools).toContain('delete_account');
-    expect(r.tool_permissions.requires_confirmation).not.toContain(
-      'transfer_money',
-    );
+    expect(r.tool_permissions.requires_confirmation).not.toContain('transfer_money');
   });
 
   it('Codex #103 — multiple reductions are accumulated and deduped', async () => {
@@ -417,9 +410,7 @@ describe('P9b — ActionDecider', () => {
     expect(r.action_mode).toBe('call_tool');
     // The packet reflects the SCOPED skill's tools — no leak from the repo.
     expect(r.tool_permissions.allowed_tools).toEqual(['transfer_money']);
-    expect(r.tool_permissions.allowed_tools).not.toContain(
-      'LEAKED_TOOL_FROM_OTHER_AGENT',
-    );
+    expect(r.tool_permissions.allowed_tools).not.toContain('LEAKED_TOOL_FROM_OTHER_AGENT');
     // The unscoped find() was bypassed entirely.
     expect(findSpy).not.toHaveBeenCalled();
   });

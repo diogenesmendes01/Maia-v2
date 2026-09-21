@@ -482,10 +482,7 @@ describe('auditoria — ator administrativo presente, segredo ausente', () => {
       comment: REASON,
     });
     expect(disabled).toEqual([CHANNEL_ID]);
-    expect(audits.map((a) => a.action)).toEqual([
-      'channel_disabled',
-      'channel_repair_requested',
-    ]);
+    expect(audits.map((a) => a.action)).toEqual(['channel_disabled', 'channel_repair_requested']);
     for (const a of audits) {
       expect(a.actor_id).toBe('user-1');
       expect(a.actor_role).toBe('owner');

@@ -16,10 +16,7 @@
  * behavior, every lookup is wrapped in a fixed tenant context.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  computePayloadHash,
-  PAYLOAD_HASH_VERSION_PREFIX,
-} from '@/governance/idempotency.js';
+import { computePayloadHash, PAYLOAD_HASH_VERSION_PREFIX } from '@/governance/idempotency.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 // #318 migration-window fix: computePayloadHash now tags its output with a
@@ -156,9 +153,7 @@ describe('idempotencyRepo.lookup — payload_hash revalidation (#299)', () => {
       expected_payload_hash: requestedHash,
       stored_tool_name: 'register_transaction',
     });
-    expect(incCounterSpy).toHaveBeenCalledWith(
-      'maia_idempotency_payload_hash_collision_total',
-    );
+    expect(incCounterSpy).toHaveBeenCalledWith('maia_idempotency_payload_hash_collision_total');
   });
 
   it('returns null when no row exists (real miss, no warn/metric)', async () => {
@@ -206,9 +201,7 @@ describe('idempotencyRepo.lookup — payload_hash revalidation (#299)', () => {
     );
 
     expect(result).toBeNull();
-    expect(incCounterSpy).toHaveBeenCalledWith(
-      'maia_idempotency_payload_hash_collision_total',
-    );
+    expect(incCounterSpy).toHaveBeenCalledWith('maia_idempotency_payload_hash_collision_total');
   });
 
   it('lookup signature requires payload_hash (compile-time guarantee)', async () => {
@@ -217,9 +210,7 @@ describe('idempotencyRepo.lookup — payload_hash revalidation (#299)', () => {
     // following expression will fail to compile under `tsc --noEmit`.
     // (Compile-time check; runtime executes the happy path.)
     const payload_hash = computePayloadHash(baseInput);
-    recorder.returnedRows = [
-      { key: 'K', tool_name: 't', payload_hash, resultado: { ok: true } },
-    ];
+    recorder.returnedRows = [{ key: 'K', tool_name: 't', payload_hash, resultado: { ok: true } }];
     await runWithTenantContext(TEST_CTX, async () =>
       // @ts-expect-error — payload_hash is required.
       idempotencyRepo.lookup({ key: 'K' }).catch(() => undefined),
@@ -251,14 +242,10 @@ describe('computePayloadHash — invariants (#299)', () => {
   it('tags every output with the version prefix (#318 migration-window fix)', () => {
     // The prefix is what lets the repo distinguish a current-format hash from
     // a legacy (pre-#318) stored value — see isRealPayloadHashCollision.
-    expect(computePayloadHash(base).startsWith(PAYLOAD_HASH_VERSION_PREFIX)).toBe(
-      true,
-    );
+    expect(computePayloadHash(base).startsWith(PAYLOAD_HASH_VERSION_PREFIX)).toBe(true);
     // file_sha256 path is prefixed too.
     expect(
-      computePayloadHash({ ...base, file_sha256: 'aaa' }).startsWith(
-        PAYLOAD_HASH_VERSION_PREFIX,
-      ),
+      computePayloadHash({ ...base, file_sha256: 'aaa' }).startsWith(PAYLOAD_HASH_VERSION_PREFIX),
     ).toBe(true);
   });
 

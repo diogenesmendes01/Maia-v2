@@ -71,7 +71,11 @@ function assertScoped(q: HoldQuery): void {
     );
   }
   if (!(q.at instanceof Date) || Number.isNaN(q.at.getTime())) {
-    throw new TypedError('legal_hold_unscoped', 'legal-hold evaluation requires a valid instant', {});
+    throw new TypedError(
+      'legal_hold_unscoped',
+      'legal-hold evaluation requires a valid instant',
+      {},
+    );
   }
 }
 

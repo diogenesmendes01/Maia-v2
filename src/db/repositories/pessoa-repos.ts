@@ -30,11 +30,9 @@ export const pessoasRepo = {
     const rows = await db
       .select()
       .from(pessoas)
-      .where(and(
-        eq(pessoas.id, id),
-        eq(pessoas.tenant_id, tenant_id),
-        eq(pessoas.agent_id, agent_id),
-      ))
+      .where(
+        and(eq(pessoas.id, id), eq(pessoas.tenant_id, tenant_id), eq(pessoas.agent_id, agent_id)),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
@@ -49,15 +47,19 @@ export const pessoasRepo = {
     const rows = await db
       .select()
       .from(pessoas)
-      .where(and(
-        eq(pessoas.telefone_whatsapp, telefone),
-        eq(pessoas.tenant_id, tenant_id),
-        eq(pessoas.agent_id, agent_id),
-      ))
+      .where(
+        and(
+          eq(pessoas.telefone_whatsapp, telefone),
+          eq(pessoas.tenant_id, tenant_id),
+          eq(pessoas.agent_id, agent_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
-  async create(input: Omit<Pessoa, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>): Promise<Pessoa> {
+  async create(
+    input: Omit<Pessoa, 'id' | 'tenant_id' | 'agent_id' | 'created_at' | 'updated_at'>,
+  ): Promise<Pessoa> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(pessoas).values(guarded).returning();
     return rows[0]!;
@@ -68,11 +70,9 @@ export const pessoasRepo = {
     await db
       .update(pessoas)
       .set({ status, updated_at: new Date() })
-      .where(and(
-        eq(pessoas.id, id),
-        eq(pessoas.tenant_id, tenant_id),
-        eq(pessoas.agent_id, agent_id),
-      ));
+      .where(
+        and(eq(pessoas.id, id), eq(pessoas.tenant_id, tenant_id), eq(pessoas.agent_id, agent_id)),
+      );
   },
   async updatePreferencias(id: string, preferencias: Record<string, unknown>): Promise<void> {
     const tenant_id = getCurrentTenant();
@@ -80,11 +80,9 @@ export const pessoasRepo = {
     await db
       .update(pessoas)
       .set({ preferencias, updated_at: new Date() })
-      .where(and(
-        eq(pessoas.id, id),
-        eq(pessoas.tenant_id, tenant_id),
-        eq(pessoas.agent_id, agent_id),
-      ));
+      .where(
+        and(eq(pessoas.id, id), eq(pessoas.tenant_id, tenant_id), eq(pessoas.agent_id, agent_id)),
+      );
   },
   async list(): Promise<Pessoa[]> {
     const tenant_id = getCurrentTenant();
@@ -130,9 +128,7 @@ export const pessoasRepo = {
         AND (preferencias->>'modo_auditoria_ate') IS NOT NULL
         AND (preferencias->>'modo_auditoria_ate')::timestamptz <= now()
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 
   /**
@@ -177,9 +173,7 @@ export const pessoasRepo = {
         AND tipo IN ('dono', 'co_dono')
         AND status = 'ativa'
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 };
 
@@ -286,10 +280,7 @@ export const agentToolGrantsRepo = {
       .select()
       .from(agent_tool_grants)
       .where(
-        and(
-          eq(agent_tool_grants.tenant_id, tenant_id),
-          eq(agent_tool_grants.agent_id, agent_id),
-        ),
+        and(eq(agent_tool_grants.tenant_id, tenant_id), eq(agent_tool_grants.agent_id, agent_id)),
       )
       .limit(1);
     return rows[0] ?? null;
@@ -373,10 +364,7 @@ export const agentToolGrantsRepo = {
       actor_role: string;
       action: string;
     };
-  }): Promise<
-    | { ok: true; grant: AgentToolGrantRow }
-    | { ok: false; reject: unknown }
-  > {
+  }): Promise<{ ok: true; grant: AgentToolGrantRow } | { ok: false; reject: unknown }> {
     const attempt = () =>
       withTx(async (tx) => {
         const currentRows = await tx
@@ -483,12 +471,14 @@ export const permissoesRepo = {
     return db
       .select()
       .from(permissoes)
-      .where(and(
-        eq(permissoes.tenant_id, tenant_id),
-        eq(permissoes.agent_id, agent_id),
-        eq(permissoes.pessoa_id, pessoa_id),
-        eq(permissoes.status, 'ativa'),
-      ));
+      .where(
+        and(
+          eq(permissoes.tenant_id, tenant_id),
+          eq(permissoes.agent_id, agent_id),
+          eq(permissoes.pessoa_id, pessoa_id),
+          eq(permissoes.status, 'ativa'),
+        ),
+      );
   },
   async byKey(pessoa_id: string, entidade_id: string): Promise<Permissao | null> {
     const tenant_id = getCurrentTenant();
@@ -496,16 +486,20 @@ export const permissoesRepo = {
     const rows = await db
       .select()
       .from(permissoes)
-      .where(and(
-        eq(permissoes.tenant_id, tenant_id),
-        eq(permissoes.agent_id, agent_id),
-        eq(permissoes.pessoa_id, pessoa_id),
-        eq(permissoes.entidade_id, entidade_id),
-      ))
+      .where(
+        and(
+          eq(permissoes.tenant_id, tenant_id),
+          eq(permissoes.agent_id, agent_id),
+          eq(permissoes.pessoa_id, pessoa_id),
+          eq(permissoes.entidade_id, entidade_id),
+        ),
+      )
       .limit(1);
     return rows[0] ?? null;
   },
-  async create(input: Omit<Permissao, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>): Promise<Permissao> {
+  async create(
+    input: Omit<Permissao, 'id' | 'tenant_id' | 'agent_id' | 'created_at'>,
+  ): Promise<Permissao> {
     const guarded = applyTenantGuard(input);
     const rows = await db.insert(permissoes).values(guarded).returning();
     return rows[0]!;
@@ -516,11 +510,13 @@ export const permissoesRepo = {
     await db
       .update(permissoes)
       .set({ status })
-      .where(and(
-        eq(permissoes.id, id),
-        eq(permissoes.tenant_id, tenant_id),
-        eq(permissoes.agent_id, agent_id),
-      ));
+      .where(
+        and(
+          eq(permissoes.id, id),
+          eq(permissoes.tenant_id, tenant_id),
+          eq(permissoes.agent_id, agent_id),
+        ),
+      );
   },
 
   /**
@@ -558,9 +554,7 @@ export const permissoesRepo = {
         AND p.status = 'ativa'
         AND ps.tipo NOT IN ('dono', 'co_dono')
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 };
 

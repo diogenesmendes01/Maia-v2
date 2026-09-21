@@ -161,7 +161,8 @@ describe('top-level statement tokeniser', () => {
   });
 
   it('keeps a dollar-quoted body whole, semicolons and all', () => {
-    const sql = "CREATE FUNCTION f() RETURNS trigger AS $$\nBEGIN\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n";
+    const sql =
+      'CREATE FUNCTION f() RETURNS trigger AS $$\nBEGIN\n  RETURN NEW;\nEND;\n$$ LANGUAGE plpgsql;\n';
     const statements = splitTopLevelStatements(sql);
     expect(statements).toHaveLength(1);
     expect(statements[0]).toContain('LANGUAGE plpgsql');
@@ -251,7 +252,9 @@ describe('transaction envelope analysis', () => {
   });
 
   it('rejects a statement BEFORE the BEGIN', () => {
-    const analysis = analyzeTransactionEnvelope('SET work_mem = "64MB";\nBEGIN;\nSELECT 1;\nCOMMIT;\n');
+    const analysis = analyzeTransactionEnvelope(
+      'SET work_mem = "64MB";\nBEGIN;\nSELECT 1;\nCOMMIT;\n',
+    );
     expect(analysis.envelope).toBe('unverifiable');
     expect(analysis.defect).toBe('statement_before_begin');
   });
@@ -353,7 +356,10 @@ describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', 
 
   it('refuses a dollar-quoted body under the marker — and accepts the SAME file without it', () => {
     // The finding, exactly (issue #733 "Como isso falha na prática").
-    const refused = buildMigrationArtifact([src('001_a.sql', DOLLAR_BODY_UNDER_MARKER)], ['001_a_down.sql']);
+    const refused = buildMigrationArtifact(
+      [src('001_a.sql', DOLLAR_BODY_UNDER_MARKER)],
+      ['001_a_down.sql'],
+    );
     expect(refused.problems.map((p) => p.kind)).toEqual(['no_transaction_unsplittable']);
     expect(refused.problems[0]!.id).toBe('001_a.sql');
     // The message names the cause — the marker AND the dollar quote …
@@ -421,12 +427,16 @@ describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', 
 
     // CONTROL, same `it`: without the marker the file is a normal
     // transactional migration and passes clean.
-    const accepted = buildMigrationArtifact([src('001_a.sql', withoutMarker(sql))], ['001_a_down.sql']);
+    const accepted = buildMigrationArtifact(
+      [src('001_a.sql', withoutMarker(sql))],
+      ['001_a_down.sql'],
+    );
     expect(accepted.problems).toEqual([]);
     // And an E'…' literal with escapes but NO ";" is not refused — the guard
     // reads the escape, it does not ban the prefix.
     expect(
-      analyzeNoTxSplittability("CREATE INDEX CONCURRENTLY i ON t (x) WHERE note = E'it\\'s ok';\n").hazard,
+      analyzeNoTxSplittability("CREATE INDEX CONCURRENTLY i ON t (x) WHERE note = E'it\\'s ok';\n")
+        .hazard,
     ).toBeNull();
   });
 
@@ -441,9 +451,14 @@ describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', 
       "CREATE INDEX CONCURRENTLY i ON t (x) WHERE note = 'a--b';",
       '',
     ].join('\n');
-    expect(splitNoTxStatements(onlyStatement)).toEqual(["CREATE INDEX CONCURRENTLY i ON t (x) WHERE note = 'a"]);
+    expect(splitNoTxStatements(onlyStatement)).toEqual([
+      "CREATE INDEX CONCURRENTLY i ON t (x) WHERE note = 'a",
+    ]);
 
-    const refusedOnly = buildMigrationArtifact([src('001_a.sql', onlyStatement)], ['001_a_down.sql']);
+    const refusedOnly = buildMigrationArtifact(
+      [src('001_a.sql', onlyStatement)],
+      ['001_a_down.sql'],
+    );
     expect(refusedOnly.problems.map((p) => p.kind)).toEqual(['no_transaction_unsplittable']);
     expect(refusedOnly.problems[0]!.detail).toContain('line_comment_inside_token');
     expect(refusedOnly.problems[0]!.detail).toContain('line 2');
@@ -457,7 +472,9 @@ describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', 
     ].join('\n');
     expect(splitNoTxStatements(lastStatement)).toHaveLength(2);
     expect(
-      buildMigrationArtifact([src('001_a.sql', lastStatement)], ['001_a_down.sql']).problems.map((p) => p.kind),
+      buildMigrationArtifact([src('001_a.sql', lastStatement)], ['001_a_down.sql']).problems.map(
+        (p) => p.kind,
+      ),
     ).toEqual(['no_transaction_unsplittable']);
 
     // A block comment that carries `--` loses its closing `*/` to the
@@ -473,12 +490,13 @@ describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', 
     // transactional migration. (2) A TRUE line comment — after the `;`, and
     // on its own line — is exactly what the stripper is for and is accepted.
     expect(
-      buildMigrationArtifact([src('001_a.sql', withoutMarker(onlyStatement))], ['001_a_down.sql']).problems,
+      buildMigrationArtifact([src('001_a.sql', withoutMarker(onlyStatement))], ['001_a_down.sql'])
+        .problems,
     ).toEqual([]);
     const trueLineComments = [
       '-- maia:no-transaction',
       "CREATE INDEX CONCURRENTLY i ON t (x) WHERE note = 'a'; -- b--c",
-      '-- a standalone comment with a quote (it\'s fine) and a ; too',
+      "-- a standalone comment with a quote (it's fine) and a ; too",
       '',
     ].join('\n');
     expect(analyzeNoTxSplittability(trueLineComments)).toEqual({ hazard: null, detail: null });
@@ -523,11 +541,12 @@ describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', 
     // A `;` the split cannot see, hidden in a token that is not a literal.
     expect(analyzeNoTxSplittability('CREATE INDEX CONCURRENTLY "i;x" ON t (a);\n')).toEqual({
       hazard: 'hidden_semicolon',
-      detail: 'contains a quoted identifier with a ";" inside it (line 1) — the splitter would cut the statement there',
+      detail:
+        'contains a quoted identifier with a ";" inside it (line 1) — the splitter would cut the statement there',
     });
-    expect(analyzeNoTxSplittability('CREATE INDEX CONCURRENTLY i ON t (a); /* x; y */\n').hazard).toBe(
-      'hidden_semicolon',
-    );
+    expect(
+      analyzeNoTxSplittability('CREATE INDEX CONCURRENTLY i ON t (a); /* x; y */\n').hazard,
+    ).toBe('hidden_semicolon');
     // A `--` inside a literal: the stripper would eat the closing quote and
     // the `;` after it. Detected on the token, not inferred from a count.
     expect(analyzeNoTxSplittability("SELECT 'a--b';\nSELECT 2;\n")).toEqual({
@@ -536,7 +555,9 @@ describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', 
         'contains a string literal with a "--" inside it (line 1) — the line-comment stripper would delete the rest of that line, closing quote included, before the split',
     });
     // Both defects in one token: the `;` rule is the one the docstring names.
-    expect(analyzeNoTxSplittability("SELECT 'a;--b';\n").hazard).toBe('semicolon_in_string_literal');
+    expect(analyzeNoTxSplittability("SELECT 'a;--b';\n").hazard).toBe(
+      'semicolon_in_string_literal',
+    );
   });
 
   it('does not mistake a $1 bind placeholder or an escaped quote for a hazard', () => {
@@ -544,9 +565,10 @@ describe('buildMigrationArtifact — the no-transaction splitter guard (#733)', 
     expect(analyzeNoTxSplittability("SELECT 'it''s';\n").hazard).toBeNull();
     // A dollar-quoted body WITHOUT a `;` inside would survive the split by
     // luck; the docstring forbids the shape, not the luck, so it is refused too.
-    expect(analyzeNoTxSplittability('CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n').hazard).toBe(
-      'dollar_quoted_body',
-    );
+    expect(
+      analyzeNoTxSplittability('CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql;\n')
+        .hazard,
+    ).toBe('dollar_quoted_body');
   });
 });
 

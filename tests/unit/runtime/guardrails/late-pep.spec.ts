@@ -7,10 +7,7 @@ import type {
   PolicyValidationResult,
   SkillSchemaValidator,
 } from '@/runtime/guardrails/types.js';
-import type {
-  PolicyEvaluator,
-  PolicyRulesRepo,
-} from '@/runtime/decision/types.js';
+import type { PolicyEvaluator, PolicyRulesRepo } from '@/runtime/decision/types.js';
 import type { DecisionPacket } from '@/runtime/context-packet/types.js';
 import { DEFAULT_CONTEXT_REQUIREMENTS } from '@/runtime/context-packet/types.js';
 
@@ -38,9 +35,7 @@ function mkCandidate(overrides?: Partial<AgentOutputCandidate>): AgentOutputCand
   };
 }
 
-function mkExecContext(
-  overrides?: Partial<ExecutionContextPacket>,
-): ExecutionContextPacket {
+function mkExecContext(overrides?: Partial<ExecutionContextPacket>): ExecutionContextPacket {
   return {
     trace_id: 't1',
     skill: { selected_skill: { id: 'skill_respond' } },
@@ -182,11 +177,7 @@ describe('P9b — Late PEP', () => {
       },
     });
     const pep = new LatePepImpl(deps);
-    const r: PolicyValidationResult = await pep.validate(
-      mkCandidate(),
-      exec,
-      mkDecision(),
-    );
+    const r: PolicyValidationResult = await pep.validate(mkCandidate(), exec, mkDecision());
     expect(r.final_action).toBe('escalate');
   });
 

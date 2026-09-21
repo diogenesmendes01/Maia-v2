@@ -87,10 +87,9 @@ export function statements(sql: string): string[] {
 }
 
 function isCreateTable(stmt: string, table: string): boolean {
-  return new RegExp(
-    `^CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"?${table}"?\\b`,
-    'i',
-  ).test(stmt);
+  return new RegExp(`^CREATE\\s+TABLE\\s+(?:IF\\s+NOT\\s+EXISTS\\s+)?"?${table}"?\\b`, 'i').test(
+    stmt,
+  );
 }
 
 /** Os literais de `<col> IN ('a','b',…)` dentro de um trecho de SQL. */
@@ -98,9 +97,7 @@ function inListFor(fragment: string, column: string): string[] | null {
   const re = new RegExp(`\\b${column}\\s+IN\\s*\\(([^)]*)\\)`, 'i');
   const m = re.exec(fragment);
   if (!m) return null;
-  const literals = [...m[1]!.matchAll(/'((?:[^']|'')*)'/g)].map((x) =>
-    x[1]!.replace(/''/g, "'"),
-  );
+  const literals = [...m[1]!.matchAll(/'((?:[^']|'')*)'/g)].map((x) => x[1]!.replace(/''/g, "'"));
   return literals.length > 0 ? literals : null;
 }
 

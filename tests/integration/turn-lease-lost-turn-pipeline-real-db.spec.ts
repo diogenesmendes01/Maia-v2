@@ -152,10 +152,7 @@ vi.mock('@/lib/claude.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/lib/claude.js')>();
   return {
     ...actual,
-    callLLM: async (params: {
-      workload?: string;
-      signal?: AbortSignal;
-    }): Promise<LLMResponse> => {
+    callLLM: async (params: { workload?: string; signal?: AbortSignal }): Promise<LLMResponse> => {
       const workload = params.workload ?? 'sem_workload';
       llm.workloads.push(workload);
       llm.signals.push(params.signal);
@@ -247,9 +244,7 @@ vi.mock('@/db/repositories.js', async (importOriginal) => {
     },
     procedureSelectorDecisionsRepo: {
       ...actual.procedureSelectorDecisionsRepo,
-      record: async (
-        ...args: Parameters<typeof actual.procedureSelectorDecisionsRepo.record>
-      ) => {
+      record: async (...args: Parameters<typeof actual.procedureSelectorDecisionsRepo.record>) => {
         const r = await actual.procedureSelectorDecisionsRepo.record(...args);
         await umDisparo('aposSelectorRecord');
         return r;
@@ -499,7 +494,7 @@ async function desfechoDoTurno(mensagem_id: string): Promise<DesfechoDoTurno> {
  */
 function desfechoIntactoDoSucessor(): DesfechoDoTurno {
   if (versaoAposTakeover === null) {
-    throw new Error('o takeover não aconteceu — a marca d\'água não foi capturada');
+    throw new Error("o takeover não aconteceu — a marca d'água não foi capturada");
   }
   return {
     status: 'claimed',
@@ -657,8 +652,7 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     await mkPendingQuestion(conversa_id);
     const mensagem_id = await mkInbound(conversa_id);
 
-    const perder = async (): Promise<void> =>
-      loseOwnershipForReal(await turnIdFor(mensagem_id));
+    const perder = async (): Promise<void> => loseOwnershipForReal(await turnIdFor(mensagem_id));
 
     // Os dois pontos de pausa de repositório (rodada 2). Armados fora do
     // `llm.before` porque nenhum dos dois passa por chamada de LLM.
@@ -730,10 +724,12 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     // A SEQUÊNCIA COMPLETA do que roda depois do gate, na ordem do pipeline:
     // o seletor governado de role, o reasoner do grafo pre-turn, o classificador
     // de risco do Decision Engine e o reasoner do ReAct.
-    expect(
-      llm.workloads,
-      'o pipeline pós-gate inteiro tem de ter sido alcançado',
-    ).toEqual(['role_selector', 'procedure_selector', 'risk_classifier', 'reasoner']);
+    expect(llm.workloads, 'o pipeline pós-gate inteiro tem de ter sido alcançado').toEqual([
+      'role_selector',
+      'procedure_selector',
+      'risk_classifier',
+      'reasoner',
+    ]);
     // O DESFECHO, escrito pelo DONO na fonte de verdade.
     //
     // Aqui o ReAct produz resposta e o ENVIO falha — o Baileys é dublê e o par
@@ -773,10 +769,7 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
 
     // 1. O hook de scheduling NÃO rodou. Ele é o PRIMEIRO limite depois do
     //    gate e o primeiro que mutava estado.
-    expect(
-      outreach.calls,
-      'captureInboundForOutreach rodou depois de a posse acabar',
-    ).toBe(0);
+    expect(outreach.calls, 'captureInboundForOutreach rodou depois de a posse acabar').toBe(0);
 
     // 2. O grafo pre-turn NÃO rodou: nem a chamada de LLM, nem a gravação da
     //    decisão, nem a execução de procedimento.
@@ -785,15 +778,15 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
       await selectorDecisionRows(turno_id),
       'procedure_selector_decisions foi gravado sem posse',
     ).toBe(0);
-    expect(await execucoesDaConversa(conversa_id), 'uma execução de procedimento nasceu sem posse').toBe(0);
+    expect(
+      await execucoesDaConversa(conversa_id),
+      'uma execução de procedimento nasceu sem posse',
+    ).toBe(0);
 
     // 3. NENHUM reasoner foi alcançado — Decision Engine e ReAct incluídos. O
     //    classificador do gate é dublê e não passa por `callLLM`, então
     //    qualquer workload aqui veio do pipeline DEPOIS do gate.
-    expect(
-      llm.workloads,
-      'algum reasoner posterior ao gate foi chamado sem posse',
-    ).toEqual([]);
+    expect(llm.workloads, 'algum reasoner posterior ao gate foi chamado sem posse').toEqual([]);
 
     // 4. NADA foi dito ao usuário. É REDE, não discriminador, e a diferença
     //    importa: neste harness o Baileys é dublê e o CONTROLE também não
@@ -883,10 +876,9 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     ).toEqual(desfechoIntactoDoSucessor());
 
     // 4. E parou NO GRAFO — não num guard mais adiante.
-    expect(
-      await boundariesBloqueados(),
-      'a recusa tem de vir do grafo pre-turn',
-    ).toEqual(['preturn_graph']);
+    expect(await boundariesBloqueados(), 'a recusa tem de vir do grafo pre-turn').toEqual([
+      'preturn_graph',
+    ]);
   }, 60_000);
 
   /**
@@ -933,10 +925,9 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     // 3. E o limite que recusou é o hook — não um guard mais adiante. Sem o
     //    guard NOVO (o de dentro do `if (owner)`), a mutação rodaria e quem
     //    recusaria seria `preturn_graph`: é esta linha que discrimina.
-    expect(
-      await boundariesBloqueados(),
-      'a recusa tem de vir do hook de scheduling',
-    ).toEqual(['scheduling_inbound_hook']);
+    expect(await boundariesBloqueados(), 'a recusa tem de vir do hook de scheduling').toEqual([
+      'scheduling_inbound_hook',
+    ]);
   }, 60_000);
 
   /**
@@ -976,10 +967,9 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
       await desfechoDoTurno(mensagem_id),
       'quem já não tinha a posse gravou desfecho no turno',
     ).toEqual(desfechoIntactoDoSucessor());
-    expect(
-      await boundariesBloqueados(),
-      'a recusa tem de vir do grafo pre-turn',
-    ).toEqual(['preturn_graph']);
+    expect(await boundariesBloqueados(), 'a recusa tem de vir do grafo pre-turn').toEqual([
+      'preturn_graph',
+    ]);
   }, 60_000);
 
   /**
@@ -1025,9 +1015,8 @@ d('#507 — perda de lease no turno reivindicado encerra a tentativa ANTES do ef
     ).toBeGreaterThan(0);
 
     // 4. E o limite que recusou é o do Decision Engine — nem antes, nem depois.
-    expect(
-      await boundariesBloqueados(),
-      'a recusa tem de vir do Decision Engine',
-    ).toEqual(['decision_engine']);
+    expect(await boundariesBloqueados(), 'a recusa tem de vir do Decision Engine').toEqual([
+      'decision_engine',
+    ]);
   }, 60_000);
 });

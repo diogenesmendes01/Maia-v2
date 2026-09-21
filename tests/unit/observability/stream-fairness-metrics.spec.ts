@@ -277,9 +277,7 @@ describe('#629 — séries de fairness do escalonamento por stream', () => {
     resetMetrics();
     _resetSeedForTests();
     _resetStarvationStateForTests();
-    const { registerRuntimeObservability } = await import(
-      '../../../src/observability/register.js'
-    );
+    const { registerRuntimeObservability } = await import('../../../src/observability/register.js');
     await registerRuntimeObservability();
     const body = await renderPrometheus();
     expect(body).toMatch(/^maia_stream_starvation_total 0$/m);

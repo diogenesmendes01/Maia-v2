@@ -169,8 +169,7 @@ vi.mock('drizzle-orm', () => {
     const text = strings.join('').toLowerCase();
     if (text.includes('agent_id is null')) {
       return {
-        __sqlEval: (row: Row) =>
-          row.agent_id === null || row.agent_id === undefined,
+        __sqlEval: (row: Row) => row.agent_id === null || row.agent_id === undefined,
       };
     }
     // Unrecognised — fail-closed so a future refactor doesn't silently widen.
@@ -326,8 +325,7 @@ function makeDbHandle() {
 
 vi.mock('@/db/client.js', () => {
   const db = makeDbHandle();
-  const withTx = async (fn: (tx: unknown) => Promise<unknown>) =>
-    fn(makeDbHandle());
+  const withTx = async (fn: (tx: unknown) => Promise<unknown>) => fn(makeDbHandle());
   return {
     db,
     withTx,
@@ -399,10 +397,10 @@ function pushSkills(rows: SeedRow[]) {
 
 function seedDefault() {
   pushSkills([
-    mkRow({ id: 's_A_owned',  tenant_id: 'tenant-A', agent_id: 'agent-A' }),
-    mkRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null      }),
-    mkRow({ id: 's_B_owned',  tenant_id: 'tenant-B', agent_id: 'agent-B' }),
-    mkRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null      }),
+    mkRow({ id: 's_A_owned', tenant_id: 'tenant-A', agent_id: 'agent-A' }),
+    mkRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null }),
+    mkRow({ id: 's_B_owned', tenant_id: 'tenant-B', agent_id: 'agent-B' }),
+    mkRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null }),
   ]);
 }
 
@@ -416,10 +414,10 @@ function seedDefault() {
  */
 function seedBFirst() {
   pushSkills([
-    mkRow({ id: 's_B_owned',  tenant_id: 'tenant-B', agent_id: 'agent-B' }),
-    mkRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null      }),
-    mkRow({ id: 's_A_owned',  tenant_id: 'tenant-A', agent_id: 'agent-A' }),
-    mkRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null      }),
+    mkRow({ id: 's_B_owned', tenant_id: 'tenant-B', agent_id: 'agent-B' }),
+    mkRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null }),
+    mkRow({ id: 's_A_owned', tenant_id: 'tenant-A', agent_id: 'agent-A' }),
+    mkRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null }),
   ]);
 }
 
@@ -476,19 +474,17 @@ describe('issue #226 — ActionDeciderImpl fallback skillsRepo.find cross-tenant
     // Ambient context = tenant-B (the would-be leak). The decider operates on
     // base={tenant_id:tenant-A, agent_id:agent-A}, and the fallback `find()`
     // MUST pin to that scope — not the ambient tenant-B/agent-B.
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        decider.decide(
-          // Ask for tenant-B's ID under tenant-A scope. The fallback `find()`
-          // re-resolves under {tenant-A, agent-A}; getById's WHERE drops the
-          // tenant-B row → null → ActionDecider emits ask_clarification.
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 's_B_owned',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      decider.decide(
+        // Ask for tenant-B's ID under tenant-A scope. The fallback `find()`
+        // re-resolves under {tenant-A, agent-A}; getById's WHERE drops the
+        // tenant-B row → null → ActionDecider emits ask_clarification.
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 's_B_owned',
+        }),
+      ),
     );
 
     // Production behaviour for a skill_id that does not exist in the routed
@@ -535,16 +531,14 @@ describe('issue #226 — ActionDeciderImpl fallback skillsRepo.find cross-tenant
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
     // Ambient = tenant-A; routed/decider scope = tenant-B. Ask for tenant-A's id.
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-B',
-            agent_id: 'agent-B',
-            selected_skill_id: 's_A_owned',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-B',
+          agent_id: 'agent-B',
+          selected_skill_id: 's_A_owned',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('ask_clarification');
@@ -590,16 +584,14 @@ describe('issue #226 — ActionDeciderImpl fallback skillsRepo.find cross-tenant
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 's_B_owned',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 's_B_owned',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('ask_clarification');
@@ -613,16 +605,14 @@ describe('issue #226 — ActionDeciderImpl fallback skillsRepo.find cross-tenant
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 's_A_owned',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 's_A_owned',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('call_tool');
@@ -641,17 +631,15 @@ describe('issue #226 — ActionDeciderImpl fallback skillsRepo.find cross-tenant
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        decider.decide(
-          // Ask for tenant-B's TENANT-WIDE id under tenant-A scope.
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 's_B_shared',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      decider.decide(
+        // Ask for tenant-B's TENANT-WIDE id under tenant-A scope.
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 's_B_shared',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('ask_clarification');
@@ -667,16 +655,14 @@ describe('issue #226 — ActionDeciderImpl fallback skillsRepo.find cross-tenant
 
     // A different agent inside tenant-A asks for the tenant-wide skill —
     // must resolve (tenant-wide is shared INSIDE the tenant by design).
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 's_A_shared',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 's_A_shared',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('call_tool');
@@ -766,16 +752,14 @@ describe('issue #226 — ActionDeciderImpl fallback skillsRepo.find cross-tenant
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 'compose_message',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 'compose_message',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('call_tool');
@@ -890,16 +874,14 @@ describe('issue #226 — ActionDeciderImpl fallback branch coverage (3 missing b
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 's_A_eval',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 's_A_eval',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('execute_skill');
@@ -927,28 +909,26 @@ describe('issue #226 — ActionDeciderImpl fallback branch coverage (3 missing b
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 's_A_owned',
-            midPepOutcome: {
-              pep: 'mid',
-              warnings: [],
-              tool_reductions: [
-                {
-                  policy_id: 'policy_x',
-                  rule_descriptor: 'rule.no_outbound',
-                  removed_tools: ['tool_for_s_A_owned'],
-                  reason: 'channel locked',
-                },
-              ],
-            },
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 's_A_owned',
+          midPepOutcome: {
+            pep: 'mid',
+            warnings: [],
+            tool_reductions: [
+              {
+                policy_id: 'policy_x',
+                rule_descriptor: 'rule.no_outbound',
+                removed_tools: ['tool_for_s_A_owned'],
+                reason: 'channel locked',
+              },
+            ],
+          },
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('ask_clarification');
@@ -998,16 +978,14 @@ describe('issue #226 — ActionDeciderImpl fallback branch coverage (3 missing b
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            selected_skill_id: 's_A_classify',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          selected_skill_id: 's_A_classify',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('respond');
@@ -1097,16 +1075,14 @@ describe('issue #226 — PR #236 review v3 additional gaps', () => {
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        decider.decide(
-          mkInputAmbiguous({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            candidate_skill_ids: ['s_A_one', 's_A_two'],
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      decider.decide(
+        mkInputAmbiguous({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          candidate_skill_ids: ['s_A_one', 's_A_two'],
+        }),
+      ),
     );
 
     // Deterministic outcome: the no-skill-selected branch (action-decider.ts:133)
@@ -1126,23 +1102,19 @@ describe('issue #226 — PR #236 review v3 additional gaps', () => {
     // so a refactor cannot accidentally invert the branch (e.g. emit
     // ask_clarification on empty candidates and respond:no_skill only on
     // multi-candidate, or vice versa).
-    pushSkills([
-      mkRow({ id: 's_A_one', tenant_id: 'tenant-A', agent_id: 'agent-A' }),
-    ]);
+    pushSkills([mkRow({ id: 's_A_one', tenant_id: 'tenant-A', agent_id: 'agent-A' })]);
 
     const env = createProductionDecisionEngineEnv();
     const decider = new ActionDeciderImpl({ skillsRepo: env.skillsRepo });
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        decider.decide(
-          mkInputAmbiguous({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A',
-            candidate_skill_ids: [],
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      decider.decide(
+        mkInputAmbiguous({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A',
+          candidate_skill_ids: [],
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('respond');
@@ -1187,16 +1159,14 @@ describe('issue #226 — PR #236 review v3 additional gaps', () => {
     // Ambient context = agent-A1 (the owner). The decider operates as
     // agent-A2 inside the SAME tenant-A, and the fallback `find()` MUST
     // re-pin to the routed agent — not the ambient owner.
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A1' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A2', // routed scope = sibling agent
-            selected_skill_id: 's_owner', // owned by agent-A1, NOT agent-A2
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A1' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A2', // routed scope = sibling agent
+          selected_skill_id: 's_owner', // owned by agent-A1, NOT agent-A2
+        }),
+      ),
     );
 
     // agent_id post-filter fires → null → skill_lookup_failed.
@@ -1322,16 +1292,14 @@ describe('issue #226 — PR #236 review v3 additional gaps', () => {
     // behaviour here is null (lookup failed), NOT auto-fall-through to the
     // next row. This pins both invariants: post-filter fires AND we don't
     // silently substitute another agent's row.
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A2' },
-      () =>
-        decider.decide(
-          mkInputFallback({
-            tenant_id: 'tenant-A',
-            agent_id: 'agent-A2',
-            selected_skill_id: 's_shared_id',
-          }),
-        ),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A2' }, () =>
+      decider.decide(
+        mkInputFallback({
+          tenant_id: 'tenant-A',
+          agent_id: 'agent-A2',
+          selected_skill_id: 's_shared_id',
+        }),
+      ),
     );
 
     expect(result.action_mode).toBe('ask_clarification');

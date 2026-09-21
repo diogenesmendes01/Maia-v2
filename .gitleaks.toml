@@ -107,3 +107,20 @@ description = "Synthetic request_key UUID in the maia.hermes.worker.v1 contract 
 condition = "AND"
 paths = ['''(?:^|/)(?:tests/fixtures/hermes-wire/frames\.json|tests/unit/(?:hermes-wire-contract|agent-engine-contract|maia-engine)\.spec\.ts|services/hermes_worker/tests/test_(?:protocol_fixtures|ipc|bootstrap)\.py)$''']
 regexes = ['''^8a1e2c3d-4b5a-4c7d-8e9f-0a1b2c3d4e5f$''']
+
+# High-entropy regression fixtures in the admin-ui auth-gating spec (PR #769).
+# The spec proves that a REAL-shaped operator secret (no placeholder substring)
+# is accepted by the placeholder guard, so the value must look like a secret.
+# The prettier normalization joined the NEXTAUTH_SECRET assignment onto one
+# line and generic-api-key started matching it; the OIDC_CLIENT_SECRET sibling
+# escapes today only because it spans two lines. Same shape and scope as the
+# block above (rule-level, condition = "AND"): only that spec file AND only the
+# two exact synthetic values.
+[[rules.allowlists]]
+description = "Synthetic high-entropy secrets in the admin-ui auth-gating regression tests (PR #769) - not credentials"
+condition = "AND"
+paths = ['''(?:^|/)tests/admin-ui/unit/auth-gating\.spec\.ts$''']
+regexes = [
+  '''^jH8xL4mP9qN3vK7tF2cR6yS5wB1zA0eD8gM4nQ6uV9pT3rX2hY7kJ5fZ$''',
+  '''^jH8xL4mP9qN3vK7tF2cR6yS5wB1zA0eD8gM4nQ6uV9pT3rX2hY7kJ5fZbCdGeI$''',
+]

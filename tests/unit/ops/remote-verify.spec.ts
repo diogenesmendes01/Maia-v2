@@ -51,9 +51,7 @@ function bucket(initial: Partial<FakeObject> = {}) {
       return {
         bytes: o.bytes.length,
         // Derived from the STORED BYTES — this is what makes it evidence.
-        providerSha256Base64: o.supportsProviderChecksum
-          ? hexToBase64(sha(o.bytes))
-          : null,
+        providerSha256Base64: o.supportsProviderChecksum ? hexToBase64(sha(o.bytes)) : null,
         // Independent of the bytes — this is what made the old check a lie.
         metadataSha256Hex: o.metadataSha256Hex,
       };

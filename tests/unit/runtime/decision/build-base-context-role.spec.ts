@@ -30,9 +30,7 @@ const inbound = {
 const conversa = { id: 'c1' } as unknown as Conversa;
 const pessoa = { id: 'p1' } as unknown as Pessoa;
 
-function mkInput(
-  overrides?: Partial<BuildBaseContextInput>,
-): BuildBaseContextInput {
+function mkInput(overrides?: Partial<BuildBaseContextInput>): BuildBaseContextInput {
   return {
     inbound,
     conversa,
@@ -47,9 +45,7 @@ function mkInput(
 
 describe('Issue #415/#416 — buildBaseContextPacketFromTurn threads active_role_key', () => {
   it('carries the resolved role key onto base.active_role_key', () => {
-    const base = buildBaseContextPacketFromTurn(
-      mkInput({ active_role_key: ROLE }),
-    );
+    const base = buildBaseContextPacketFromTurn(mkInput({ active_role_key: ROLE }));
     expect(base.active_role_key).toBe(ROLE);
   });
 

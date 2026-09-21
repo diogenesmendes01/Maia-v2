@@ -74,9 +74,7 @@ describe('recordLLMCost — per-pessoa breakdown', () => {
     expect(executeMock).toHaveBeenCalledTimes(1);
     const params = paramsOf(executeMock.mock.calls[0]![0]);
     expect(params).toContain('global');
-    expect(params.some((p) => /^cost\.daily\.llm\.\d{4}-\d{2}-\d{2}$/.test(String(p)))).toBe(
-      true,
-    );
+    expect(params.some((p) => /^cost\.daily\.llm\.\d{4}-\d{2}-\d{2}$/.test(String(p)))).toBe(true);
   });
 
   it('writes BOTH global + pessoa entries when pessoa_id is provided', async () => {

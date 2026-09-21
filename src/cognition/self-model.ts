@@ -43,9 +43,7 @@ export function computeConfidence(args: ConfidenceInputs): number {
   // Otherwise, exponential decay: recent failure (days=0) gives ~0,
   // old failure (days=large) gives ~1.
   const recencyFactor =
-    args.failure_count === 0
-      ? 1
-      : 1 - Math.exp(-args.days_since_last_failure / LAMBDA);
+    args.failure_count === 0 ? 1 : 1 - Math.exp(-args.days_since_last_failure / LAMBDA);
 
   // Clamp to [0, 1]
   return Math.min(1, Math.max(0, successRate * maturityFactor * recencyFactor));

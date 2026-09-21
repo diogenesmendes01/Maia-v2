@@ -107,7 +107,13 @@ export function parseBackupKeyring(
   return { activeKeyId, keys };
 }
 
-function buildHeader(keyId: string, kekNonce: Buffer, kekTag: Buffer, wrappedDek: Buffer, dataNonce: Buffer): Buffer {
+function buildHeader(
+  keyId: string,
+  kekNonce: Buffer,
+  kekTag: Buffer,
+  wrappedDek: Buffer,
+  dataNonce: Buffer,
+): Buffer {
   const keyIdBuf = Buffer.from(keyId, 'utf8');
   return Buffer.concat([
     MAGIC,

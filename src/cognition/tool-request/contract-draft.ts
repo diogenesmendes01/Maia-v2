@@ -30,11 +30,7 @@
  * fora do JSON.
  */
 import type { AgentCapabilityGapObservation } from '@/db/schema.js';
-import {
-  MARCADOR_DE_RASCUNHO,
-  type CampoDoContrato,
-  type ContratoRascunho,
-} from './types.js';
+import { MARCADOR_DE_RASCUNHO, type CampoDoContrato, type ContratoRascunho } from './types.js';
 
 /** Um objeto JSON simples — o único shape de que sabemos derivar campos. */
 function comoObjeto(v: unknown): Record<string, unknown> | null {

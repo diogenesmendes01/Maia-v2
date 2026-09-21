@@ -133,15 +133,16 @@ export function computeMigrationStatus(
     // The DB's notion of "already ran" is the ledger's own status, independent
     // of whether THIS build can still verify the file (checksum mismatch and
     // missing_file rows were applied too — that is precisely why they block).
-    if (row?.status === 'applied' && (appliedHead === null || compareMigrationIds(id, appliedHead) > 0)) {
+    if (
+      row?.status === 'applied' &&
+      (appliedHead === null || compareMigrationIds(id, appliedHead) > 0)
+    ) {
       appliedHead = id;
     }
   }
 
   const outOfOrder =
-    appliedHead === null
-      ? []
-      : pending.filter((id) => compareMigrationIds(id, appliedHead!) < 0);
+    appliedHead === null ? [] : pending.filter((id) => compareMigrationIds(id, appliedHead!) < 0);
 
   const counts: MigrationStatusCounts = {
     total: entries.length,
@@ -321,7 +322,10 @@ export function evaluateSchemaReadiness(
   if (max !== null) {
     const ahead = status.entries
       .filter((e) => compareMigrationIds(e.id, max) > 0)
-      .filter((e) => e.state === 'applied' || e.state === 'missing_file' || e.state === 'checksum_mismatch')
+      .filter(
+        (e) =>
+          e.state === 'applied' || e.state === 'missing_file' || e.state === 'checksum_mismatch',
+      )
       .map((e) => e.id);
     if (ahead.length > 0) {
       blockers.push({

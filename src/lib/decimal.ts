@@ -75,9 +75,7 @@ export function fmtBRL(d: Decimal): string {
  * Soma uma lista de valores (string Postgres, number, Decimal, ou null/undefined).
  * Retorna sempre Decimal — chame `.toString()` ou `fmtBRL` no resultado.
  */
-export function sumDecimal(
-  values: Array<string | number | null | undefined | Decimal>,
-): Decimal {
+export function sumDecimal(values: Array<string | number | null | undefined | Decimal>): Decimal {
   let acc = new Decimal(0);
   for (const v of values) {
     acc = acc.plus(toDecimal(v));

@@ -137,8 +137,9 @@ describe('scoreTurnHeuristic', () => {
       expect(t.signal.length).toBeGreaterThan(0);
       expect(typeof t.weight).toBe('number');
       expect(t.weight).toBeGreaterThan(0);
-      expect([RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL])
-        .toContain(t.contributes_to);
+      expect([RiskLevel.LOW, RiskLevel.MEDIUM, RiskLevel.HIGH, RiskLevel.CRITICAL]).toContain(
+        t.contributes_to,
+      );
     }
   });
 
@@ -164,7 +165,9 @@ describe('scoreTurnHeuristic', () => {
 
   it('topic totalmente inválido (schema drift) → coerced to unknown, result is low+ambiguous (não LOW silencioso)', () => {
     // Simula schema drift: classifier devolve string fora do union.
-    const sig = { topic: 'totally-fake' as unknown as import('@/shared/risk/types.ts').TopicSignal };
+    const sig = {
+      topic: 'totally-fake' as unknown as import('@/shared/risk/types.ts').TopicSignal,
+    };
     const r = scoreTurnHeuristic(sig);
     // O sinal inválido é coerced para 'unknown', que → LOW+ambiguous.
     // O importante é ambiguous=true: o LLM gate SERÁ consultado.
@@ -276,7 +279,9 @@ describe('scoreKnowledgeHeuristic', () => {
       const r = scoreKnowledgeHeuristic(sig);
       expect(r.level).toBe(RiskLevel.CRITICAL);
       expect(
-        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+        r.triggers.some(
+          (t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action',
+        ),
       ).toBe(true);
     });
 
@@ -340,7 +345,9 @@ describe('scoreKnowledgeHeuristic', () => {
       const r = scoreKnowledgeHeuristic(sig);
       expect(r.level).toBe(RiskLevel.HIGH);
       expect(
-        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+        r.triggers.some(
+          (t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action',
+        ),
       ).toBe(false);
     });
 
@@ -354,7 +361,9 @@ describe('scoreKnowledgeHeuristic', () => {
       // HIGH é o teto sem o composite (tool irreversible + topic).
       expect(r.level === RiskLevel.HIGH || r.level === RiskLevel.MEDIUM).toBe(true);
       expect(
-        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+        r.triggers.some(
+          (t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action',
+        ),
       ).toBe(false);
     });
 
@@ -369,7 +378,9 @@ describe('scoreKnowledgeHeuristic', () => {
       const r = scoreKnowledgeHeuristic(sig);
       expect(r.level).toBe(RiskLevel.HIGH); // critical_decision = HIGH no TOPIC_RISK
       expect(
-        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+        r.triggers.some(
+          (t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action',
+        ),
       ).toBe(false);
     });
 
@@ -384,7 +395,9 @@ describe('scoreKnowledgeHeuristic', () => {
       const r = scoreKnowledgeHeuristic(sig);
       expect(r.level).toBe(RiskLevel.HIGH);
       expect(
-        r.triggers.some((t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action'),
+        r.triggers.some(
+          (t) => t.signal === 'composite:knowledge_critical_decision+sensitive_action',
+        ),
       ).toBe(false);
     });
   });

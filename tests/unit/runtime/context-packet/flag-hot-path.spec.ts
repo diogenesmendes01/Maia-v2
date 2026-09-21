@@ -18,7 +18,10 @@ import { createDecisionPacketStub } from '@/runtime/context-packet/decision-pack
 import { IdentitySliceBuilder } from '@/runtime/context-assembly/slice-builders/identity-slice-builder.js';
 import { UserSliceBuilder } from '@/runtime/context-assembly/slice-builders/user-slice-builder.js';
 import { KnowledgeSliceBuilder } from '@/runtime/context-assembly/slice-builders/knowledge-slice-builder.js';
-import { SoulSliceBuilder, stubSoulPort } from '@/runtime/context-assembly/slice-builders/soul-slice-builder.js';
+import {
+  SoulSliceBuilder,
+  stubSoulPort,
+} from '@/runtime/context-assembly/slice-builders/soul-slice-builder.js';
 import {
   PolicySliceBuilder,
   stubPolicyDescriptorResolver,
@@ -38,29 +41,60 @@ function makeBuilders(): SliceBuilderSet {
   const cache = new InMemorySliceCache();
   return {
     identity: new IdentitySliceBuilder(
-      { async getActive() { return null; } },
+      {
+        async getActive() {
+          return null;
+        },
+      },
       cache,
     ) as unknown as SliceBuilderSet['identity'],
     user: new UserSliceBuilder(
       {
-        async getPessoa() { return null; },
-        async listMemories() { return []; },
-        async listBehavioralHints() { return []; },
+        async getPessoa() {
+          return null;
+        },
+        async listMemories() {
+          return [];
+        },
+        async listBehavioralHints() {
+          return [];
+        },
       },
       cache,
     ) as unknown as SliceBuilderSet['user'],
     knowledge: new KnowledgeSliceBuilder(
-      { async listFacts() { return []; }, async listRules() { return []; } },
+      {
+        async listFacts() {
+          return [];
+        },
+        async listRules() {
+          return [];
+        },
+      },
       cache,
     ) as unknown as SliceBuilderSet['knowledge'],
     soul: new SoulSliceBuilder(stubSoulPort, cache) as unknown as SliceBuilderSet['soul'],
-    policy: new PolicySliceBuilder(stubPolicyDescriptorResolver, cache) as unknown as SliceBuilderSet['policy'],
+    policy: new PolicySliceBuilder(
+      stubPolicyDescriptorResolver,
+      cache,
+    ) as unknown as SliceBuilderSet['policy'],
     skill: new SkillSliceBuilder(
-      { async getSkillById() { return null; }, async listSkillSummaries() { return []; } },
+      {
+        async getSkillById() {
+          return null;
+        },
+        async listSkillSummaries() {
+          return [];
+        },
+      },
       cache,
     ) as unknown as SliceBuilderSet['skill'],
     tool: new ToolPermissionSliceBuilder(
-      { async getToolDescriptor() { return null; } },
+      {
+        async getToolDescriptor() {
+          return null;
+        },
+      },
       cache,
     ) as unknown as SliceBuilderSet['tool'],
   };
@@ -76,7 +110,9 @@ describe('isContextPacketV1Enabled flag dispatch (round-2 finding #2)', () => {
   it('returns false by default (flag OFF)', async () => {
     const result = await isContextPacketV1Enabled('tenant-x', {
       getEnv: () => undefined,
-      async getTenantOverride() { return null; },
+      async getTenantOverride() {
+        return null;
+      },
     });
     expect(result).toBe(false);
   });
@@ -87,7 +123,9 @@ describe('isContextPacketV1Enabled flag dispatch (round-2 finding #2)', () => {
         if (name === 'FEATURE_CONTEXT_PACKET_V1') return 'true';
         return undefined;
       },
-      async getTenantOverride() { return null; },
+      async getTenantOverride() {
+        return null;
+      },
     });
     expect(result).toBe(true);
   });
@@ -99,7 +137,9 @@ describe('isContextPacketV1Enabled flag dispatch (round-2 finding #2)', () => {
         if (name === 'FEATURE_CONTEXT_PACKET_V1_KILL_SWITCH') return 'true';
         return undefined;
       },
-      async getTenantOverride() { return null; },
+      async getTenantOverride() {
+        return null;
+      },
     });
     expect(result).toBe(false);
   });
@@ -110,7 +150,9 @@ describe('isContextPacketV1Enabled flag dispatch (round-2 finding #2)', () => {
     // Simulate flag check returning true (as the hot path guard does).
     const flagEnabled = await isContextPacketV1Enabled('tenant-x', {
       getEnv: (name) => (name === 'FEATURE_CONTEXT_PACKET_V1' ? 'true' : undefined),
-      async getTenantOverride() { return null; },
+      async getTenantOverride() {
+        return null;
+      },
     });
     expect(flagEnabled).toBe(true);
 
@@ -133,7 +175,9 @@ describe('isContextPacketV1Enabled flag dispatch (round-2 finding #2)', () => {
     // When disabled, isContextPacketV1Enabled returns false.
     const flagEnabled = await isContextPacketV1Enabled('tenant-x', {
       getEnv: () => undefined,
-      async getTenantOverride() { return null; },
+      async getTenantOverride() {
+        return null;
+      },
     });
     expect(flagEnabled).toBe(false);
     // The hot path in agent/core.ts uses this boolean to branch: false → legacy buildPrompt.

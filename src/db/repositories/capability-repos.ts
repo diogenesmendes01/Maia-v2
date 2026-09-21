@@ -52,10 +52,7 @@ export const capabilitiesDomainRepo = {
     return rows[0] ?? null;
   },
 
-  async upsertConfidence(
-    domain: string,
-    updates: Partial<AgentCapabilityDomain>,
-  ): Promise<void> {
+  async upsertConfidence(domain: string, updates: Partial<AgentCapabilityDomain>): Promise<void> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     // Try update first
@@ -209,10 +206,7 @@ function comoUuidOuNulo(v: string | null | undefined): string | null {
  * não colhe linha nenhuma (o `id` nunca é fronteira de isolamento — #367/#368).
  */
 export const capabilityGapObservationsRepo = {
-  async record(
-    gap_id: string,
-    input: GapObservationInput,
-  ): Promise<AgentCapabilityGapObservation> {
+  async record(gap_id: string, input: GapObservationInput): Promise<AgentCapabilityGapObservation> {
     const guarded = applyTenantGuard({
       gap_id,
       intent: input.intent,
@@ -246,19 +240,13 @@ export const capabilityGapObservationsRepo = {
     try {
       return await capabilityGapObservationsRepo.record(gap_id, input);
     } catch (err) {
-      logger.warn(
-        { gap_id, err: (err as Error).message },
-        'gap_observation.record_failed',
-      );
+      logger.warn({ gap_id, err: (err as Error).message }, 'gap_observation.record_failed');
       return null;
     }
   },
 
   /** As `limit` ocorrências mais recentes DESTE gap, neste escopo. */
-  async listForGap(
-    gap_id: string,
-    limit = 20,
-  ): Promise<AgentCapabilityGapObservation[]> {
+  async listForGap(gap_id: string, limit = 20): Promise<AgentCapabilityGapObservation[]> {
     const tenant_id = getCurrentTenant();
     const agent_id = getCurrentAgent();
     return db
@@ -359,10 +347,7 @@ export const capabilityGapsRepo = {
           ),
         );
       if (input.observation) {
-        await capabilityGapObservationsRepo.recordBestEffort(
-          existing[0].id,
-          input.observation,
-        );
+        await capabilityGapObservationsRepo.recordBestEffort(existing[0].id, input.observation);
       }
       return existing[0];
     }
@@ -864,8 +849,7 @@ export const capabilityProposalsRepo = {
       if (args.decision_reason) patch.decision_reason = args.decision_reason;
     } else if (args.to === 'delivered') {
       patch.delivered_at = now;
-      if (args.delivery_artifact_ref)
-        patch.delivery_artifact_ref = args.delivery_artifact_ref;
+      if (args.delivery_artifact_ref) patch.delivery_artifact_ref = args.delivery_artifact_ref;
       if (args.last_test_outcome) {
         patch.last_test_outcome = args.last_test_outcome;
         patch.last_test_at = now;

@@ -135,7 +135,9 @@ describe('seriesRepo.insertNextOccurrenceIfActive — Requirement 5', () => {
     // `tests/integration/scheduling-dedup-idempotente-real-db.spec.ts`.
     const embrulhado = new Error('Failed query: insert into "occurrences" ...');
     (embrulhado as Error & { cause: unknown }).cause = Object.assign(
-      new Error('duplicate key value violates unique constraint "occurrences_series_id_scheduled_for_key"'),
+      new Error(
+        'duplicate key value violates unique constraint "occurrences_series_id_scheduled_for_key"',
+      ),
       { code: '23505', constraint: 'occurrences_series_id_scheduled_for_key' },
     );
     txInsertChain.returning.mockRejectedValueOnce(embrulhado);

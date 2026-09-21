@@ -34,12 +34,7 @@ import {
   RoleDecisionAction,
   RoleSelectorStrength,
 } from '@/types/enums.js';
-import type {
-  Channel,
-  Role,
-  ChannelPolicy,
-  RoleSelectorDecisionRow,
-} from '@/db/schema.js';
+import type { Channel, Role, ChannelPolicy, RoleSelectorDecisionRow } from '@/db/schema.js';
 import type { RoleCandidate } from '@/cognition/role-selector/types.js';
 
 // ---------- in-memory state ----------
@@ -319,9 +314,7 @@ describe('P6 channel/role/policy — end-to-end', () => {
         decided_by: input.decided_by,
         suggested_strength: input.suggested_strength ?? null,
         suggested_confidence:
-          input.suggested_confidence !== undefined
-            ? String(input.suggested_confidence)
-            : null,
+          input.suggested_confidence !== undefined ? String(input.suggested_confidence) : null,
         reason: input.reason ?? null,
         switch_count_in_conversation: input.switch_count_in_conversation ?? 0,
         decided_at: now,
@@ -686,5 +679,4 @@ describe('P6 channel/role/policy — end-to-end', () => {
       }),
     ).rejects.toThrow('decided_by_cannot_be_llm_classifier');
   });
-
 });

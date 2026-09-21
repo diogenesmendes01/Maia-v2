@@ -124,10 +124,15 @@ describe('planTransition — saltos não autorizados', () => {
   it('a partir de `failed_retryable` só o passo que FALHOU (e as remediações dele) é legal', () => {
     // O cenário concreto da review: negativa em `start_pairing`.
     const point = { failed_step: 'start_pairing', resume_state: 'channel_declared' };
-    expect(planTransition({ step: 'start_pairing', from: 'failed_retryable', retry_point: point }).to).toBe(
-      'pairing_pending',
-    );
-    for (const step of ['provision_tenant', 'provision_admin', 'declare_channel', 'evaluate_readiness'] as const) {
+    expect(
+      planTransition({ step: 'start_pairing', from: 'failed_retryable', retry_point: point }).to,
+    ).toBe('pairing_pending');
+    for (const step of [
+      'provision_tenant',
+      'provision_admin',
+      'declare_channel',
+      'evaluate_readiness',
+    ] as const) {
       try {
         planTransition({ step, from: 'failed_retryable', retry_point: point });
         throw new Error(`'${step}' deveria ser recusado a partir de failed_retryable`);
@@ -148,11 +153,15 @@ describe('planTransition — saltos não autorizados', () => {
     // `confirm_channel_ready` falhou (linha não provou posse): refazer o
     // pareamento da MESMA linha é a remediação legal.
     const point = { failed_step: 'confirm_channel_ready', resume_state: 'pairing_pending' };
-    expect(planTransition({ step: 'start_pairing', from: 'failed_retryable', retry_point: point }).to).toBe(
-      'pairing_pending',
-    );
     expect(
-      planTransition({ step: 'confirm_channel_ready', from: 'failed_retryable', retry_point: point }).to,
+      planTransition({ step: 'start_pairing', from: 'failed_retryable', retry_point: point }).to,
+    ).toBe('pairing_pending');
+    expect(
+      planTransition({
+        step: 'confirm_channel_ready',
+        from: 'failed_retryable',
+        retry_point: point,
+      }).to,
     ).toBe('channel_ready');
     // Declarar OUTRA linha não é remediação — é um segundo canal.
     expect(() =>
@@ -198,7 +207,10 @@ describe('estados terminais', () => {
 describe('allowedStepsFrom — o que a UI pode desenhar', () => {
   it('devolve exatamente os passos cuja definição aceita o estado', () => {
     expect(allowedStepsFrom('created')).toEqual(['provision_tenant']);
-    expect(allowedStepsFrom('channel_ready')).toEqual(['confirm_channel_ready', 'evaluate_readiness']);
+    expect(allowedStepsFrom('channel_ready')).toEqual([
+      'confirm_channel_ready',
+      'evaluate_readiness',
+    ]);
     expect(allowedStepsFrom('ready_for_activation')).toEqual(['evaluate_readiness', 'activate']);
   });
 

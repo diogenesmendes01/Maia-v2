@@ -205,14 +205,12 @@ describe('worker onboarding_expirer (issue #519)', () => {
 
       const out = await renderPrometheus();
       const failure = Number(
-        /maia_worker_last_failure_timestamp\{worker="onboarding_expirer"\} (\d+)/.exec(
-          out,
-        )?.[1] ?? '0',
+        /maia_worker_last_failure_timestamp\{worker="onboarding_expirer"\} (\d+)/.exec(out)?.[1] ??
+          '0',
       );
       const success = Number(
-        /maia_worker_last_success_timestamp\{worker="onboarding_expirer"\} (\d+)/.exec(
-          out,
-        )?.[1] ?? '0',
+        /maia_worker_last_success_timestamp\{worker="onboarding_expirer"\} (\d+)/.exec(out)?.[1] ??
+          '0',
       );
       expect(failure).toBeGreaterThan(0);
       expect(success).toBe(0);

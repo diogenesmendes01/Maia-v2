@@ -130,7 +130,10 @@ describe('#507 — o validador RECUSA definição incompleta ou incoerente', () 
   });
 
   it('SEM `effect_class` → lança, e a mensagem nomeia a ferramenta', () => {
-    const semClasse = { name: 'ferramenta_nova', side_effect: 'write' } as ClassifiableToolDefinition;
+    const semClasse = {
+      name: 'ferramenta_nova',
+      side_effect: 'write',
+    } as ClassifiableToolDefinition;
     expect(() => assertToolDefinitionsComplete([base, semClasse], nomes)).toThrow(
       ToolDefinitionError,
     );
@@ -196,12 +199,18 @@ describe('#507 — o validador RECUSA definição incompleta ou incoerente', () 
       effect_class: 'idempotent',
       compensated_by: 'compensador_existente',
     } as ClassifiableToolDefinition;
-    expect(() => assertToolDefinitionsComplete([sobrando], nomes)).toThrow(/sem ser `compensatable`/);
+    expect(() => assertToolDefinitionsComplete([sobrando], nomes)).toThrow(
+      /sem ser `compensatable`/,
+    );
   });
 
   it('acumula TODOS os problemas numa recusa só — não para no primeiro', () => {
     const a = { name: 'a', side_effect: 'write' } as ClassifiableToolDefinition;
-    const b = { name: 'b', side_effect: 'write', effect_class: 'abort_safe' } as ClassifiableToolDefinition;
+    const b = {
+      name: 'b',
+      side_effect: 'write',
+      effect_class: 'abort_safe',
+    } as ClassifiableToolDefinition;
     try {
       assertToolDefinitionsComplete([a, b], nomes);
       expect.unreachable('o validador deveria ter lançado');
@@ -258,10 +267,9 @@ describe('#507 — SONDA: o REGISTRO recusa carregar com uma ferramenta sem clas
     // O catálogo cobre também as tools gated por config (ausentes do REGISTRY
     // quando o flag está off) — o mesmo universo que o portão valida.
     for (const { tool } of buildToolCatalog()) {
-      expect(
-        TOOL_EFFECT_CLASSES,
-        `${tool.name} não declara uma classe de efeito válida`,
-      ).toContain(tool.effect_class);
+      expect(TOOL_EFFECT_CLASSES, `${tool.name} não declara uma classe de efeito válida`).toContain(
+        tool.effect_class,
+      );
     }
   });
 

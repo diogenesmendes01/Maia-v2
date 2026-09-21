@@ -75,7 +75,10 @@ function staticValueImports(file: string): string[] {
     const clause = m[2]!;
     const named = /^\s*\{([\s\S]*)\}\s*$/.exec(clause);
     if (named) {
-      const specs = named[1]!.split(',').map((s) => s.trim()).filter(Boolean);
+      const specs = named[1]!
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
       if (specs.length > 0 && specs.every((s) => /^type\s/.test(s))) continue;
     }
     out.push(m[3]!);
@@ -253,7 +256,7 @@ describe('o runtime CONTINUA alcançando src/config/env.ts (o contrapeso)', () =
       alcancam,
       'Um entrypoint que SAIU da lista perdeu a validação fail-closed do subset `runtime` no ' +
         'boot — provavelmente porque um módulo compartilhado deixou de importar ' +
-        '`@/config/env.js`. Devolva a garantia com um `import \'@/config/env.js\';` ' +
+        "`@/config/env.js`. Devolva a garantia com um `import '@/config/env.js';` " +
         'explícito no entrypoint, não reintroduzindo o singleton no módulo compartilhado. ' +
         'Um entrypoint que ENTROU precisa de uma linha nesta lista dizendo por quê.',
     ).toEqual([...COM_BOOT_FAIL_CLOSED]);

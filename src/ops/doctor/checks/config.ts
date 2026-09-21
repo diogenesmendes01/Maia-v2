@@ -38,7 +38,13 @@
  */
 import type { ConfigProblem } from '@/config/metadata.js';
 import { validateConfig } from '@/config/validate.js';
-import { notApplicable, pass, type DoctorCheck, type DoctorContext, type DoctorResult } from '../types.js';
+import {
+  notApplicable,
+  pass,
+  type DoctorCheck,
+  type DoctorContext,
+  type DoctorResult,
+} from '../types.js';
 
 /**
  * The admin-ui's OWN boot floors, mirrored here.
@@ -62,14 +68,8 @@ import { notApplicable, pass, type DoctorCheck, type DoctorContext, type DoctorR
 // paridade que lê aquele arquivo como TEXTO. Reexportamos de lá em vez de manter
 // uma segunda cópia: duas cópias do mesmo piso divergem em silêncio, e o guard de
 // paridade só protege a que ele conhece.
-export {
-  MIN_NEXTAUTH_SECRET_LEN,
-  MIN_OIDC_CLIENT_SECRET_LEN,
-} from '@/config/admin-boot-gates.js';
-import {
-  MIN_NEXTAUTH_SECRET_LEN,
-  MIN_OIDC_CLIENT_SECRET_LEN,
-} from '@/config/admin-boot-gates.js';
+export { MIN_NEXTAUTH_SECRET_LEN, MIN_OIDC_CLIENT_SECRET_LEN } from '@/config/admin-boot-gates.js';
+import { MIN_NEXTAUTH_SECRET_LEN, MIN_OIDC_CLIENT_SECRET_LEN } from '@/config/admin-boot-gates.js';
 
 /**
  * How many problems to name in the evidence before truncating. The point of
@@ -103,8 +103,7 @@ export const configContractCheck: DoctorCheck = {
   id: 'config.contract',
   category: 'config',
   criticality: 'blocker',
-  describes:
-    'o ambiente que ESTE processo realmente recebeu satisfaz o contrato do seu serviço',
+  describes: 'o ambiente que ESTE processo realmente recebeu satisfaz o contrato do seu serviço',
   deadlineMs: 2_000,
   requiresNetwork: false,
   run(ctx: DoctorContext): Promise<DoctorResult> {
@@ -182,10 +181,13 @@ export const adminBootGatesCheck: DoctorCheck = {
     // variables were present and we failed to evaluate them.
     if (nextauth === '' && issuer === '') {
       return Promise.resolve(
-        notApplicable('nenhuma variável do admin-ui presente neste ambiente — nada a afirmar sobre o console', {
-          nextauth_secret_present: false,
-          oidc_issuer_present: false,
-        }),
+        notApplicable(
+          'nenhuma variável do admin-ui presente neste ambiente — nada a afirmar sobre o console',
+          {
+            nextauth_secret_present: false,
+            oidc_issuer_present: false,
+          },
+        ),
       );
     }
 

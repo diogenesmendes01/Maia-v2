@@ -31,8 +31,8 @@ describe('T1 — turn risk: CRITICAL escalation (stub replaced)', () => {
 
     const result = await scoreTurn(
       {
-        topic: 'critical_decision',      // the financeiro_critico category
-        tool_kinds: ['irreversible'],     // sensitive_tool=true
+        topic: 'critical_decision', // the financeiro_critico category
+        tool_kinds: ['irreversible'], // sensitive_tool=true
       },
       { gate, contextText: '' },
     );
@@ -58,7 +58,7 @@ describe('T2 — turn risk: gate:fallback_ambiguous (round-2 fix reachable)', ()
     });
 
     const result = await scoreTurn(
-      { topic: 'unknown' },  // unknown → LOW + ambiguous=true
+      { topic: 'unknown' }, // unknown → LOW + ambiguous=true
       { gate, contextText: '' },
     );
 
@@ -79,20 +79,18 @@ describe('T3 — knowledge risk: source NOT stub:p10a', () => {
     // Gate returns null (no Haiku in unit tests). New signature accepts gate.
     const gate: LLMGate = vi.fn(async () => null);
 
-    const result = await KnowledgeRiskScorer.score(
-      {
-        trace_id: 'test-t3',
-        tenant_id: 'tenant-1',
-        agent_id: 'agent-1',
-        kind: 'rule',
-        scope: 'agent',
-        content_text: 'always reply in Portuguese',
-        confidence: 0.85,
-        origin: 'human_approved',
-        proposer_sensitivity_hint: 'medium',
-        gate,  // injected gate so we avoid real LLM calls
-      },
-    );
+    const result = await KnowledgeRiskScorer.score({
+      trace_id: 'test-t3',
+      tenant_id: 'tenant-1',
+      agent_id: 'agent-1',
+      kind: 'rule',
+      scope: 'agent',
+      content_text: 'always reply in Portuguese',
+      confidence: 0.85,
+      origin: 'human_approved',
+      proposer_sensitivity_hint: 'medium',
+      gate, // injected gate so we avoid real LLM calls
+    });
 
     // Stub returned 'stub:p10a'. Real scorer must return something else.
     expect(result.source).not.toBe('stub:p10a');

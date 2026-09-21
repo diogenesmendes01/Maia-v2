@@ -195,9 +195,7 @@ async function countFacts(chave: string): Promise<number> {
   return Number(r.rows[0]!.n);
 }
 
-async function reservationRows(
-  key: string,
-): Promise<Array<{ state: string }>> {
+async function reservationRows(key: string): Promise<Array<{ state: string }>> {
   const r = await pool.query<{ state: string }>(
     `SELECT state FROM idempotency_keys WHERE tenant_id=$1 AND agent_id=$2 AND key=$3`,
     [T, A, key],

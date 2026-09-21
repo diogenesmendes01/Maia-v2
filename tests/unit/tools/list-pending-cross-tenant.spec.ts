@@ -87,8 +87,8 @@ function expectBoundTenantAgent(predicate: unknown): void {
   expect(terms).toContainEqual({ kind: 'eq', column: 'agent_id', value: 'agent-B' });
 }
 
-describe('Issue #363 — list_pending does not leak another tenant\'s rows into LLM context', () => {
-  it('pending_questions: tenant-A\'s open question for the SHARED pessoa is NOT returned under tenant-B', async () => {
+describe("Issue #363 — list_pending does not leak another tenant's rows into LLM context", () => {
+  it("pending_questions: tenant-A's open question for the SHARED pessoa is NOT returned under tenant-B", async () => {
     store.reset([
       // tenant-A's open question for the shared pessoa — the leak lever.
       {
@@ -115,7 +115,7 @@ describe('Issue #363 — list_pending does not leak another tenant\'s rows into 
     for (const pred of store.selectPredicates()) expectBoundTenantAgent(pred);
   });
 
-  it('workflows: tenant-A\'s in-progress workflow for the SHARED entidade is NOT returned under tenant-B', async () => {
+  it("workflows: tenant-A's in-progress workflow for the SHARED entidade is NOT returned under tenant-B", async () => {
     store.reset([
       {
         id: 'wf-A',
@@ -140,7 +140,7 @@ describe('Issue #363 — list_pending does not leak another tenant\'s rows into 
     for (const pred of store.selectPredicates()) expectBoundTenantAgent(pred);
   });
 
-  it('transacoes: tenant-A\'s pending transação for the SHARED entidade is NOT returned under tenant-B', async () => {
+  it("transacoes: tenant-A's pending transação for the SHARED entidade is NOT returned under tenant-B", async () => {
     store.reset([
       {
         id: 'tx-A',

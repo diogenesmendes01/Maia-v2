@@ -112,15 +112,11 @@ describe('PolicyResolverCacheImpl', () => {
 
     // descriptor=a for default tenant: both scope-variants gone
     expect(cache.get(makeKey({ descriptor: 'a' }))).toBeUndefined();
-    expect(
-      cache.get(makeKey({ descriptor: 'a', scope: { channel: 'whatsapp' } })),
-    ).toBeUndefined();
+    expect(cache.get(makeKey({ descriptor: 'a', scope: { channel: 'whatsapp' } }))).toBeUndefined();
     // descriptor=b survives
     expect(cache.get(makeKey({ descriptor: 'b' }))).toBeDefined();
     // tenant-b survives (tenant isolation in cache key)
-    expect(
-      cache.get(makeKey({ descriptor: 'a', tenant_id: 'tenant-b' })),
-    ).toBeDefined();
+    expect(cache.get(makeKey({ descriptor: 'a', tenant_id: 'tenant-b' }))).toBeDefined();
   });
 
   it('invalidateAll() clears everything', () => {
@@ -204,19 +200,11 @@ describe('PolicyResolverCacheImpl', () => {
       cache.invalidate({ tenant_id: 'default', agent_id: null, descriptor: 'd' });
 
       // All same-(tenant,descriptor) entries gone regardless of agent_id
-      expect(
-        cache.get(makeKey({ descriptor: 'd', agent_id: null })),
-      ).toBeUndefined();
-      expect(
-        cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-x' })),
-      ).toBeUndefined();
-      expect(
-        cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-y' })),
-      ).toBeUndefined();
+      expect(cache.get(makeKey({ descriptor: 'd', agent_id: null }))).toBeUndefined();
+      expect(cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-x' }))).toBeUndefined();
+      expect(cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-y' }))).toBeUndefined();
       // Other descriptor survives
-      expect(
-        cache.get(makeKey({ descriptor: 'other', agent_id: 'agent-x' })),
-      ).toBeDefined();
+      expect(cache.get(makeKey({ descriptor: 'other', agent_id: 'agent-x' }))).toBeDefined();
       // Other tenant survives
       expect(
         cache.get(
@@ -257,14 +245,10 @@ describe('PolicyResolverCacheImpl', () => {
       });
 
       // agent-x entry gone
-      expect(
-        cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-x' })),
-      ).toBeUndefined();
+      expect(cache.get(makeKey({ descriptor: 'd', agent_id: 'agent-x' }))).toBeUndefined();
       // tenant-wide survives — only an agent-x specific row changed,
       // not the underlying tenant-wide fallback.
-      expect(
-        cache.get(makeKey({ descriptor: 'd', agent_id: null })),
-      ).toBeDefined();
+      expect(cache.get(makeKey({ descriptor: 'd', agent_id: null }))).toBeDefined();
     });
 
     it('invalidation does not falsely match when descriptor substring appears in scope', () => {

@@ -43,11 +43,7 @@
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { runWithTenantContext, tryGetCurrentContext } from '@/db/tenant-context.js';
-import {
-  parsePredicate,
-  rowMatches,
-  type StoreRow,
-} from './_tenant-mutation-store.js';
+import { parsePredicate, rowMatches, type StoreRow } from './_tenant-mutation-store.js';
 
 type Pair = { tenant_id: string; agent_id: string };
 
@@ -69,7 +65,11 @@ const listActiveOwnerPairsMock = vi.fn(async (): Promise<Pair[]> => enumeratedPa
 function makeMultiTableStore() {
   // Keyed by drizzle table object identity (the value passed to `.from(...)`).
   const tables = new Map<unknown, StoreRow[]>();
-  const seed = (table: unknown, rows: StoreRow[]) => tables.set(table, rows.map((r) => ({ ...r })));
+  const seed = (table: unknown, rows: StoreRow[]) =>
+    tables.set(
+      table,
+      rows.map((r) => ({ ...r })),
+    );
   const clear = () => tables.clear();
 
   const select = vi.fn(() => {
@@ -185,8 +185,14 @@ const B: Pair = { tenant_id: 'tenant-B', agent_id: 'agent-B' };
 const DEFAULT: Pair = { tenant_id: 'default', agent_id: 'default' };
 
 const BRIEFINGS = [
-  { name: 'morning', run: async () => (await import('@/workers/briefings.js')).runMorningBriefing() },
-  { name: 'evening', run: async () => (await import('@/workers/briefings.js')).runEveningBriefing() },
+  {
+    name: 'morning',
+    run: async () => (await import('@/workers/briefings.js')).runMorningBriefing(),
+  },
+  {
+    name: 'evening',
+    run: async () => (await import('@/workers/briefings.js')).runEveningBriefing(),
+  },
   { name: 'weekly', run: async () => (await import('@/workers/briefings.js')).runWeeklyBriefing() },
 ] as const;
 
@@ -342,14 +348,40 @@ describe('Issue #345 — morning briefing reads + sends for ONLY the current ten
       ent({ id: 'A-otherAgent', tenant_id: 'tenant-A', agent_id: 'agent-Z', nome: 'Zeta Z' }),
     ]);
     store.seed(contas_bancarias, [
-      conta({ id: 'A-conta', tenant_id: 'tenant-A', agent_id: 'agent-A', entidade_id: 'A-ent', saldo_atual: '1000.10' }),
+      conta({
+        id: 'A-conta',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        entidade_id: 'A-ent',
+        saldo_atual: '1000.10',
+      }),
       // Tenant B account hanging off tenant-B's entity (must never be summed for A).
-      conta({ id: 'B-conta', tenant_id: 'tenant-B', agent_id: 'agent-B', entidade_id: 'B-ent', saldo_atual: '9999.99' }),
+      conta({
+        id: 'B-conta',
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        entidade_id: 'B-ent',
+        saldo_atual: '9999.99',
+      }),
     ]);
     store.seed(pessoas, [
-      pessoa({ id: 'A-owner', tenant_id: 'tenant-A', agent_id: 'agent-A', telefone_whatsapp: '+5511111', tipo: 'dono', status: 'ativa' }),
+      pessoa({
+        id: 'A-owner',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        telefone_whatsapp: '+5511111',
+        tipo: 'dono',
+        status: 'ativa',
+      }),
       // Tenant B owner (MUST never receive tenant-A's briefing).
-      pessoa({ id: 'B-owner', tenant_id: 'tenant-B', agent_id: 'agent-B', telefone_whatsapp: '+5522222', tipo: 'dono', status: 'ativa' }),
+      pessoa({
+        id: 'B-owner',
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        telefone_whatsapp: '+5522222',
+        tipo: 'dono',
+        status: 'ativa',
+      }),
     ]);
   });
 

@@ -204,9 +204,9 @@ describe('orçamento diário por tenant+agent', () => {
 
   it('a recusa devolve a própria reserva — quota negada não consome quota', async () => {
     readDailyUsdMock.mockResolvedValue(5);
-    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
-      executeLLM(REQ),
-    ).catch(() => undefined);
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ)).catch(
+      () => undefined,
+    );
     // Sem o rollback, cada tentativa negada deixaria 0,50 preso no contador e
     // a quota encolheria a cada recusa — o pior comportamento possível durante
     // um retry storm.
@@ -229,29 +229,25 @@ describe('orçamento diário por tenant+agent', () => {
    * conter.
    */
   it('tentativa enviada que FALHA é cobrada, não devolvida', async () => {
-    anthropicCreateMock.mockRejectedValue(
-      Object.assign(new Error('nope'), { status: 401 }),
-    );
+    anthropicCreateMock.mockRejectedValue(Object.assign(new Error('nope'), { status: 401 }));
     // Reserva 0,50 (estimativa) e cobra 0,10 pela entrada transmitida.
     estimateCostMock.mockResolvedValueOnce(UNIT_COST_USD).mockResolvedValue(0.1);
 
-    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
-      executeLLM(REQ),
-    ).catch(() => undefined);
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ)).catch(
+      () => undefined,
+    );
 
     expect(spendCounter()).toBeCloseTo(0.1, 6);
   });
 
   it('retries somam: cada tentativa enviada acumula, não substitui', async () => {
     // `reasoner` com CLAUDE_MAX_RETRIES=2 → 2 tentativas no primário + fallback.
-    anthropicCreateMock.mockRejectedValue(
-      Object.assign(new Error('upstream'), { status: 503 }),
-    );
+    anthropicCreateMock.mockRejectedValue(Object.assign(new Error('upstream'), { status: 503 }));
     estimateCostMock.mockResolvedValueOnce(UNIT_COST_USD).mockResolvedValue(0.1);
 
-    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
-      executeLLM(REQ),
-    ).catch(() => undefined);
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ)).catch(
+      () => undefined,
+    );
 
     // 3 requisições enviadas (2 primário + 1 fallback) × 0,10 de entrada cada.
     expect(anthropicCreateMock).toHaveBeenCalledTimes(3);
@@ -296,9 +292,9 @@ describe('orçamento diário por tenant+agent', () => {
   it('reserva inteira só volta quando NENHUMA requisição saiu', async () => {
     // Recusa por quota: nada foi enviado, nada é cobrado.
     readDailyUsdMock.mockResolvedValue(5);
-    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
-      executeLLM(REQ),
-    ).catch(() => undefined);
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ)).catch(
+      () => undefined,
+    );
     expect(anthropicCreateMock).not.toHaveBeenCalled();
     expect(spendCounter()).toBeCloseTo(5, 6);
   });
@@ -339,9 +335,9 @@ describe('orçamento diário por tenant+agent', () => {
 
   it('estouro registra métrica com tenant/agent e status próprio', async () => {
     readDailyUsdMock.mockResolvedValue(7);
-    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
-      executeLLM(REQ),
-    ).catch(() => undefined);
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () => executeLLM(REQ)).catch(
+      () => undefined,
+    );
     expect(counterCalls('maia_llm_budget_exhausted_total')[0]).toMatchObject({
       tenant_id: 'acme',
       agent_id: 'ana',
@@ -384,16 +380,12 @@ describe('orçamento diário por tenant+agent', () => {
     anthropicCreateMock.mockResolvedValue(okReply());
 
     const results = await runWithTenantContext({ tenant_id: 'acme', agent_id: 'ana' }, () =>
-      Promise.allSettled(
-        Array.from({ length: CONCURRENCY }, () => executeLLM(REQ)),
-      ),
+      Promise.allSettled(Array.from({ length: CONCURRENCY }, () => executeLLM(REQ))),
     );
 
     const ok = results.filter((r) => r.status === 'fulfilled').length;
     const rejected = results.filter(
-      (r) =>
-        r.status === 'rejected' &&
-        (r.reason as { kind?: string }).kind === 'budget_exhausted',
+      (r) => r.status === 'rejected' && (r.reason as { kind?: string }).kind === 'budget_exhausted',
     ).length;
 
     expect(ok).toBe(FITS);
@@ -460,17 +452,14 @@ describe('invalidação distribuída do cache de settings', () => {
 
   it('publica no canal canônico', async () => {
     await publishLLMSettingsInvalidation();
-    expect(publishMock).toHaveBeenCalledWith(
-      LLM_SETTINGS_INVALIDATION_CHANNEL,
-      expect.any(String),
-    );
+    expect(publishMock).toHaveBeenCalledWith(LLM_SETTINGS_INVALIDATION_CHANNEL, expect.any(String));
   });
 
   it('falha de publish não propaga, mas conta', async () => {
     publishMock.mockRejectedValueOnce(new Error('redis down'));
     await expect(publishLLMSettingsInvalidation()).resolves.toBeUndefined();
-    expect(
-      counterCalls('maia_llm_settings_cache_total').map((l) => l.result),
-    ).toContain('invalidation_publish_failed');
+    expect(counterCalls('maia_llm_settings_cache_total').map((l) => l.result)).toContain(
+      'invalidation_publish_failed',
+    );
   });
 });

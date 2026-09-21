@@ -26,19 +26,23 @@ export function Stepper({
               )}
             >
               {done ? (
-                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="3" strokeLinecap="round" strokeLinejoin="round">
+                <svg
+                  width="12"
+                  height="12"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="3"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
                   <path d="M20 6 9 17l-5-5" />
                 </svg>
               ) : (
                 idx + 1
               )}
             </span>
-            <span
-              className={cn(
-                'text-xs font-medium',
-                active ? 'text-zinc-900' : 'text-zinc-500',
-              )}
-            >
+            <span className={cn('text-xs font-medium', active ? 'text-zinc-900' : 'text-zinc-500')}>
               {label}
             </span>
           </li>

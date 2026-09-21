@@ -28,15 +28,9 @@ const ACTION_LABEL: Record<LifecycleAction, string> = {
 // Mapeia data.code do TRPCError + a mensagem DO SERVIDOR para um texto voltado
 // ao operador. Para CONFLICT a mensagem do servidor já é específica da
 // transição; cai num texto genérico se vier vazia.
-function actionErrorMessage(
-  code: string | undefined,
-  serverMessage: string,
-): string {
+function actionErrorMessage(code: string | undefined, serverMessage: string): string {
   if (code === 'CONFLICT') {
-    return (
-      serverMessage.trim() ||
-      'Esta skill mudou de status — atualize e tente novamente.'
-    );
+    return serverMessage.trim() || 'Esta skill mudou de status — atualize e tente novamente.';
   }
   if (code === 'FORBIDDEN') {
     return `Não permitido: ${serverMessage}`;
@@ -134,8 +128,7 @@ export function SkillActions({
         <div className="space-y-2">
           <p className="text-sm text-zinc-800">
             <strong>{ACTION_LABEL[pending]}</strong> a skill{' '}
-            <code className="font-mono">{skill.skill_descriptor}</code> v
-            {skill.version}.
+            <code className="font-mono">{skill.skill_descriptor}</code> v{skill.version}.
           </p>
           <Field label="Motivo (auditado, mín. 10 caracteres)" required>
             <Textarea

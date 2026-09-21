@@ -23,9 +23,7 @@
 import safeRegex from 'safe-regex2';
 import { REGEX_CACHE_MAX } from './constants.js';
 
-type CacheEntry =
-  | { ok: true; regex: RegExp }
-  | { ok: false; reason: 'unsafe' | 'invalid' };
+type CacheEntry = { ok: true; regex: RegExp } | { ok: false; reason: 'unsafe' | 'invalid' };
 
 type CacheStats = {
   hits: number;

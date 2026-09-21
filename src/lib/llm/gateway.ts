@@ -565,8 +565,7 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
         } catch (sleepErr) {
           // Abortou durante o backoff: ainda é um desfecho da chamada e
           // precisa aparecer em `maia_llm_cancelled_total`.
-          const aborted =
-            sleepErr instanceof LLMGatewayError ? sleepErr : abortedError();
+          const aborted = sleepErr instanceof LLMGatewayError ? sleepErr : abortedError();
           await fail(primary, aborted);
           throw aborted;
         }
@@ -633,7 +632,10 @@ export async function executeLLM(req: LLMGatewayRequest): Promise<LLMResponse> {
             model: fast.model,
             workload: req.workload,
           });
-      releaseCircuit(fallbackPermit, link.deadlineFired() ? 'ignored' : circuitOutcomeFor(err.kind));
+      releaseCircuit(
+        fallbackPermit,
+        link.deadlineFired() ? 'ignored' : circuitOutcomeFor(err.kind),
+      );
       recordAttempt(
         {
           provider: fast.provider,

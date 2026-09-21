@@ -1,10 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  DriftType,
-  DriftSeverity,
-  ProfileStatus,
-  DriftDecision,
-} from '@/types/enums.js';
+import { DriftType, DriftSeverity, ProfileStatus, DriftDecision } from '@/types/enums.js';
 
 describe('P4 enums', () => {
   // P4 baseline: 7 detectores (tom, valores, confianca, vies, escopo, linguagem, procedimento).

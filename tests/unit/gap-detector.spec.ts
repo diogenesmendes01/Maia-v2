@@ -24,7 +24,8 @@ describe('detectGap', () => {
 
   it('AINDA dispara quando o signal é declaração e ? está longe', () => {
     // ? aparece muito antes do signal → não filtra
-    const long = 'tudo certo? '.padEnd(200, '.') + ' realmente não tenho como consultar isso agora.';
+    const long =
+      'tudo certo? '.padEnd(200, '.') + ' realmente não tenho como consultar isso agora.';
     expect(detectGap(long).detected).toBe(true);
   });
 });

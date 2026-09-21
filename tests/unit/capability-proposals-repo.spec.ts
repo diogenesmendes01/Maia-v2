@@ -40,50 +40,51 @@ type ProposalRow = {
 const proposalsState: Record<string, ProposalRow> = {};
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
 
   return {
     ...actual,
     capabilityProposalsRepo: {
-      create: vi.fn(async (input: {
-        gap_id?: string;
-        capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
-        title: string;
-        description: string;
-        proposed_spec: unknown;
-        motivation: string;
-        expected_impact?: string;
-        test_scenarios: unknown[];
-      }) => {
-        const id = `prop-${Math.random().toString(36).slice(2)}`;
-        const now = new Date();
-        const row: ProposalRow = {
-          id,
-          tenant_id: 'default',
-          agent_id: 'default',
-          gap_id: input.gap_id ?? null,
-          capability_type: input.capability_type,
-          title: input.title,
-          description: input.description,
-          proposed_spec: input.proposed_spec,
-          motivation: input.motivation,
-          expected_impact: input.expected_impact ?? null,
-          test_scenarios: input.test_scenarios,
-          status: 'draft',
-          submitted_at: null,
-          decided_at: null,
-          decided_by: null,
-          decision_reason: null,
-          delivered_at: null,
-          delivery_artifact_ref: null,
-          created_at: now,
-          updated_at: now,
-        };
-        proposalsState[id] = row;
-        return row;
-      }),
+      create: vi.fn(
+        async (input: {
+          gap_id?: string;
+          capability_type: 'tool' | 'knowledge' | 'procedure' | 'integration' | 'other';
+          title: string;
+          description: string;
+          proposed_spec: unknown;
+          motivation: string;
+          expected_impact?: string;
+          test_scenarios: unknown[];
+        }) => {
+          const id = `prop-${Math.random().toString(36).slice(2)}`;
+          const now = new Date();
+          const row: ProposalRow = {
+            id,
+            tenant_id: 'default',
+            agent_id: 'default',
+            gap_id: input.gap_id ?? null,
+            capability_type: input.capability_type,
+            title: input.title,
+            description: input.description,
+            proposed_spec: input.proposed_spec,
+            motivation: input.motivation,
+            expected_impact: input.expected_impact ?? null,
+            test_scenarios: input.test_scenarios,
+            status: 'draft',
+            submitted_at: null,
+            decided_at: null,
+            decided_by: null,
+            decision_reason: null,
+            delivered_at: null,
+            delivery_artifact_ref: null,
+            created_at: now,
+            updated_at: now,
+          };
+          proposalsState[id] = row;
+          return row;
+        },
+      ),
       getById: vi.fn(async (id: string) => proposalsState[id] ?? null),
       listByStatus: vi.fn(async (status: string) =>
         Object.values(proposalsState).filter((r) => r.status === status),
@@ -151,251 +152,224 @@ describe('capabilityProposalsRepo', () => {
   });
 
   it('create defaults status="draft" e seta campos básicos', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const row = await capabilityProposalsRepo.create({
-          gap_id: 'gap-1',
-          capability_type: 'tool',
-          title: 'Integração com Bling',
-          description: 'Tool para consultar pedidos no Bling',
-          proposed_spec: { tool_name: 'bling_query', params: [] },
-          motivation: 'Pedido recorrente do owner',
-          expected_impact: 'Redução de fricção em vendas',
-          test_scenarios: [{ name: 'consulta pedido por id', input: { id: '123' } }],
-        });
-        expect(row.id).toBeDefined();
-        expect(row.status).toBe('draft');
-        expect(row.tenant_id).toBe('default');
-        expect(row.agent_id).toBe('default');
-        expect(row.title).toBe('Integração com Bling');
-        expect(row.gap_id).toBe('gap-1');
-        expect(row.submitted_at).toBeNull();
-        expect(row.decided_at).toBeNull();
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const row = await capabilityProposalsRepo.create({
+        gap_id: 'gap-1',
+        capability_type: 'tool',
+        title: 'Integração com Bling',
+        description: 'Tool para consultar pedidos no Bling',
+        proposed_spec: { tool_name: 'bling_query', params: [] },
+        motivation: 'Pedido recorrente do owner',
+        expected_impact: 'Redução de fricção em vendas',
+        test_scenarios: [{ name: 'consulta pedido por id', input: { id: '123' } }],
+      });
+      expect(row.id).toBeDefined();
+      expect(row.status).toBe('draft');
+      expect(row.tenant_id).toBe('default');
+      expect(row.agent_id).toBe('default');
+      expect(row.title).toBe('Integração com Bling');
+      expect(row.gap_id).toBe('gap-1');
+      expect(row.submitted_at).toBeNull();
+      expect(row.decided_at).toBeNull();
+    });
   });
 
   it('transition(draft → submitted) seta submitted_at', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const row = await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 't',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        const result = await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
-        expect(result.ok).toBe(true);
-        if (result.ok) {
-          expect(result.updated.status).toBe('submitted');
-          expect(result.updated.submitted_at).toBeInstanceOf(Date);
-          expect(result.updated.decided_at).toBeNull();
-        }
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const row = await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      const result = await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.updated.status).toBe('submitted');
+        expect(result.updated.submitted_at).toBeInstanceOf(Date);
+        expect(result.updated.decided_at).toBeNull();
+      }
+    });
   });
 
   it('transition(submitted → approved) seta decided_at + decided_by', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const row = await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 't',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
-        const result = await capabilityProposalsRepo.transition({
-          id: row.id,
-          to: 'approved',
-          decided_by: 'owner@maia',
-        });
-        expect(result.ok).toBe(true);
-        if (result.ok) {
-          expect(result.updated.status).toBe('approved');
-          expect(result.updated.decided_at).toBeInstanceOf(Date);
-          expect(result.updated.decided_by).toBe('owner@maia');
-        }
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const row = await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
+      const result = await capabilityProposalsRepo.transition({
+        id: row.id,
+        to: 'approved',
+        decided_by: 'owner@maia',
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.updated.status).toBe('approved');
+        expect(result.updated.decided_at).toBeInstanceOf(Date);
+        expect(result.updated.decided_by).toBe('owner@maia');
+      }
+    });
   });
 
   it('transition(submitted → rejected) seta decision_reason', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const row = await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 't',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
-        const result = await capabilityProposalsRepo.transition({
-          id: row.id,
-          to: 'rejected',
-          decided_by: 'owner@maia',
-          decision_reason: 'fora de escopo',
-        });
-        expect(result.ok).toBe(true);
-        if (result.ok) {
-          expect(result.updated.status).toBe('rejected');
-          expect(result.updated.decision_reason).toBe('fora de escopo');
-        }
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const row = await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
+      const result = await capabilityProposalsRepo.transition({
+        id: row.id,
+        to: 'rejected',
+        decided_by: 'owner@maia',
+        decision_reason: 'fora de escopo',
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.updated.status).toBe('rejected');
+        expect(result.updated.decision_reason).toBe('fora de escopo');
+      }
+    });
   });
 
   it('transition(approved → delivered) seta delivery_artifact_ref', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const row = await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 't',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
-        await capabilityProposalsRepo.transition({ id: row.id, to: 'approved' });
-        const result = await capabilityProposalsRepo.transition({
-          id: row.id,
-          to: 'delivered',
-          delivery_artifact_ref: 'pr#1234',
-        });
-        expect(result.ok).toBe(true);
-        if (result.ok) {
-          expect(result.updated.status).toBe('delivered');
-          expect(result.updated.delivered_at).toBeInstanceOf(Date);
-          expect(result.updated.delivery_artifact_ref).toBe('pr#1234');
-        }
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const row = await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
+      await capabilityProposalsRepo.transition({ id: row.id, to: 'approved' });
+      const result = await capabilityProposalsRepo.transition({
+        id: row.id,
+        to: 'delivered',
+        delivery_artifact_ref: 'pr#1234',
+      });
+      expect(result.ok).toBe(true);
+      if (result.ok) {
+        expect(result.updated.status).toBe('delivered');
+        expect(result.updated.delivered_at).toBeInstanceOf(Date);
+        expect(result.updated.delivery_artifact_ref).toBe('pr#1234');
+      }
+    });
   });
 
   it('transition(submitted → delivered) retorna invalid_transition', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const row = await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 't',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
-        const result = await capabilityProposalsRepo.transition({
-          id: row.id,
-          to: 'delivered',
-        });
-        expect(result.ok).toBe(false);
-        if (!result.ok) {
-          expect(result.reason).toBe('invalid_transition');
-        }
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const row = await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
+      const result = await capabilityProposalsRepo.transition({
+        id: row.id,
+        to: 'delivered',
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe('invalid_transition');
+      }
+    });
   });
 
   it('transition(rejected → submitted) retorna invalid_transition (terminal)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const row = await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 't',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
-        await capabilityProposalsRepo.transition({ id: row.id, to: 'rejected' });
-        const result = await capabilityProposalsRepo.transition({
-          id: row.id,
-          to: 'submitted',
-        });
-        expect(result.ok).toBe(false);
-        if (!result.ok) {
-          expect(result.reason).toBe('invalid_transition');
-        }
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const row = await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      await capabilityProposalsRepo.transition({ id: row.id, to: 'submitted' });
+      await capabilityProposalsRepo.transition({ id: row.id, to: 'rejected' });
+      const result = await capabilityProposalsRepo.transition({
+        id: row.id,
+        to: 'submitted',
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe('invalid_transition');
+      }
+    });
   });
 
   it('transition com id desconhecido retorna not_found', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const result = await capabilityProposalsRepo.transition({
-          id: 'does-not-exist',
-          to: 'submitted',
-        });
-        expect(result.ok).toBe(false);
-        if (!result.ok) {
-          expect(result.reason).toBe('not_found');
-        }
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const result = await capabilityProposalsRepo.transition({
+        id: 'does-not-exist',
+        to: 'submitted',
+      });
+      expect(result.ok).toBe(false);
+      if (!result.ok) {
+        expect(result.reason).toBe('not_found');
+      }
+    });
   });
 
   it('listByStatus filtra corretamente', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { capabilityProposalsRepo } = await import('@/db/repositories.js');
-        const a = await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 'a',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        const b = await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 'b',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        await capabilityProposalsRepo.create({
-          capability_type: 'tool',
-          title: 'c',
-          description: 'd',
-          proposed_spec: {},
-          motivation: 'm',
-          test_scenarios: [],
-        });
-        await capabilityProposalsRepo.transition({ id: a.id, to: 'submitted' });
-        await capabilityProposalsRepo.transition({ id: b.id, to: 'submitted' });
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { capabilityProposalsRepo } = await import('@/db/repositories.js');
+      const a = await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 'a',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      const b = await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 'b',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      await capabilityProposalsRepo.create({
+        capability_type: 'tool',
+        title: 'c',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        test_scenarios: [],
+      });
+      await capabilityProposalsRepo.transition({ id: a.id, to: 'submitted' });
+      await capabilityProposalsRepo.transition({ id: b.id, to: 'submitted' });
 
-        const submitted = await capabilityProposalsRepo.listByStatus('submitted');
-        expect(submitted.length).toBe(2);
-        const drafts = await capabilityProposalsRepo.listByStatus('draft');
-        expect(drafts.length).toBe(1);
-      },
-    );
+      const submitted = await capabilityProposalsRepo.listByStatus('submitted');
+      expect(submitted.length).toBe(2);
+      const drafts = await capabilityProposalsRepo.listByStatus('draft');
+      expect(drafts.length).toBe(1);
+    });
   });
 });

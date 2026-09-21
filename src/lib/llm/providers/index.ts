@@ -18,7 +18,8 @@ const instances = new Map<LLMProviderName, LLMProvider>();
 export function getProvider(name?: LLMProviderName): LLMProvider {
   // O enum do env já é restrito aos dois casos; qualquer outro valor cai em
   // anthropic (operadores que querem GPT/Llama/Gemini passam por OpenRouter).
-  const resolved: LLMProviderName = name ?? (config.LLM_PROVIDER === 'openrouter' ? 'openrouter' : 'anthropic');
+  const resolved: LLMProviderName =
+    name ?? (config.LLM_PROVIDER === 'openrouter' ? 'openrouter' : 'anthropic');
   const cached = instances.get(resolved);
   if (cached) return cached;
   const created: LLMProvider =

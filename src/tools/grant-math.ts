@@ -653,7 +653,7 @@ export function computeAgentVisibleTools(
       skill_allowed_tools: [...skillAllowed],
       denied_by_skill: [...(skillScope?.denied_tools ?? [])],
       dropped_by_skill_allowlist: droppedByAllowlist,
-      active_role_key: roleRestricts ? roleScope?.role_key ?? null : null,
+      active_role_key: roleRestricts ? (roleScope?.role_key ?? null) : null,
       role_granted_packs: [...rolePacks],
       dropped_by_role: droppedByRole,
     },
@@ -699,10 +699,7 @@ export function resolveSkillToolScope(skill: {
     allowed_tools: asStrings(skill.allowed_tools),
     // `denied_tools`: prefer the runtime `blocked_tools` field; fall back to the
     // `runtime_hints.denied_tools` JSONB extension.
-    denied_tools: [
-      ...asStrings(skill.blocked_tools),
-      ...asStrings(hints['denied_tools']),
-    ],
+    denied_tools: [...asStrings(skill.blocked_tools), ...asStrings(hints['denied_tools'])],
     // `requires_confirmation_for`: prefer the runtime field; fall back to the
     // `runtime_hints.requires_confirmation_for` JSONB extension.
     requires_confirmation_for: [

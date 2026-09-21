@@ -51,7 +51,9 @@ const {
   triggerRecoveryMock: vi.fn(async () => undefined),
   stopLineSessionMock: vi.fn(() => true),
   heartbeatMock: vi.fn(async () => 'renewed' as const),
-  listLocalSessionsMock: vi.fn((): Array<{ channel_id: string; tenant_id: string; agent_id: string }> => []),
+  listLocalSessionsMock: vi.fn(
+    (): Array<{ channel_id: string; tenant_id: string; agent_id: string }> => [],
+  ),
   sealMock: vi.fn(() => ({ envelope: Buffer.from('SEALED'), key_id: 'k1' })),
   qrPngMock: vi.fn(async () => Buffer.from('PNGBYTES')),
 }));
@@ -90,10 +92,7 @@ vi.mock('../../../src/db/repositories/channel-repos.js', () => ({
 }));
 vi.mock('../../../src/config/env.js', () => ({ config: { MAIA_MULTI_LINE: false } }));
 
-import {
-  runChannelPairingWorker,
-  _internal,
-} from '../../../src/workers/channel-pairing-worker.js';
+import { runChannelPairingWorker, _internal } from '../../../src/workers/channel-pairing-worker.js';
 import { tryGetCurrentContext } from '../../../src/db/tenant-context.js';
 
 const CHANNEL_ID = 'channel-uuid-1';
@@ -836,9 +835,7 @@ describe('readiness — a linha verificada só roteia quando estiver pronta (#51
       AWAITING,
       { ...AWAITING, channel_id: 'outro-canal' },
     ]);
-    readinessMock
-      .mockRejectedValueOnce(new Error('db blip'))
-      .mockResolvedValue({ ready: true });
+    readinessMock.mockRejectedValueOnce(new Error('db blip')).mockResolvedValue({ ready: true });
     claimOnce(null);
 
     await runChannelPairingWorker();

@@ -98,7 +98,9 @@ describe('boleto proposal tools — write side-effects (issue #416)', () => {
     const { REGISTRY } = await import('../../../src/tools/_registry.js');
     expect(REGISTRY['boleto_cancel']!.required_actions).toEqual(['cancel_boleto']);
     expect(REGISTRY['boleto_cancel']!.operation_type).toBe('cancel');
-    expect(REGISTRY['company_campaign_remove']!.required_actions).toEqual(['remove_company_campaign']);
+    expect(REGISTRY['company_campaign_remove']!.required_actions).toEqual([
+      'remove_company_campaign',
+    ]);
     expect(REGISTRY['refund_create']!.required_actions).toEqual(['create_refund']);
     expect(REGISTRY['refund_create']!.operation_type).toBe('create');
     // Write tools must NOT carry the generic financial-transaction keys (so the
@@ -142,15 +144,13 @@ describe('receipt_validate — reuses parse_receipt + FAIL-CLOSED (issue #416/#4
       caption: 'comprovante',
     });
     const parseReceiptMod = await import('../../../src/tools/parse-receipt.js');
-    const spy = vi
-      .spyOn(parseReceiptMod.parseReceiptTool, 'handler')
-      .mockResolvedValue({
-        tipo: 'pix',
-        valor: 150.5,
-        data: '2026-06-01',
-        beneficiario_nome: '<ocr>ACME</ocr>',
-        confianca: 0.85,
-      } as never);
+    const spy = vi.spyOn(parseReceiptMod.parseReceiptTool, 'handler').mockResolvedValue({
+      tipo: 'pix',
+      valor: 150.5,
+      data: '2026-06-01',
+      beneficiario_nome: '<ocr>ACME</ocr>',
+      confianca: 0.85,
+    } as never);
 
     const { receiptValidateTool } = await import('../../../src/tools/receipt-validate.js');
     const out = await receiptValidateTool.handler({ attachment_ref: ATT_ID } as never, ctx);
@@ -192,7 +192,10 @@ describe('boleto read/analysis tools — callable with conservative defaults', (
   it('bank_account_validate flags missing fields and validates a complete PIX', async () => {
     const { bankAccountValidateTool } = await import('../../../src/tools/bank-account-validate.js');
     expect(bankAccountValidateTool.side_effect).toBe('read');
-    const invalid = await bankAccountValidateTool.handler({ method: 'bank_transfer' } as never, ctx);
+    const invalid = await bankAccountValidateTool.handler(
+      { method: 'bank_transfer' } as never,
+      ctx,
+    );
     expect(invalid.valid).toBe(false);
     expect(invalid.missing_fields.length).toBeGreaterThan(0);
 
@@ -223,7 +226,8 @@ describe('boleto read/analysis tools — callable with conservative defaults', (
 
   it('operational_ticket_create is an honest stub (created=false) and NOT a governed write', async () => {
     const { REGISTRY } = await import('../../../src/tools/_registry.js');
-    const { operationalTicketCreateTool } = await import('../../../src/tools/operational-ticket-create.js');
+    const { operationalTicketCreateTool } =
+      await import('../../../src/tools/operational-ticket-create.js');
     // It is an internal escalation sink, not one of the three customer writes.
     expect(REGISTRY['operational_ticket_create']!.side_effect).not.toBe('write');
     // Honest stub (#432): no ticketing backend → it must NOT fabricate a ticket.

@@ -5,7 +5,9 @@ import { runCognitiveModule } from './runner.js';
 
 const ClassificationSchema = z.object({
   memory_type: z.enum(['operational', 'preference', 'personal', 'sensitive']),
-  scope_type: z.enum(['conversation', 'interlocutor', 'channel', 'role', 'agent', 'tenant']).optional(),
+  scope_type: z
+    .enum(['conversation', 'interlocutor', 'channel', 'role', 'agent', 'tenant'])
+    .optional(),
   sensitivity: z.enum(['low', 'medium', 'high']).optional(),
   ttl_days: z.number().nullable().optional(),
 });
@@ -22,10 +24,34 @@ type ClassifierOutput = {
 type MemoryType = ClassifierOutput['memory_type'];
 
 const DEFAULTS_BY_TYPE: Record<MemoryType, Omit<ClassifierOutput, 'memory_type'>> = {
-  operational: { scope_type: 'agent', sensitivity: 'low', proactive_use: true, mention_allowed: true, ttl_days: null },
-  preference: { scope_type: 'interlocutor', sensitivity: 'low', proactive_use: true, mention_allowed: true, ttl_days: null },
-  personal: { scope_type: 'role', sensitivity: 'medium', proactive_use: false, mention_allowed: false, ttl_days: 30 },
-  sensitive: { scope_type: 'conversation', sensitivity: 'high', proactive_use: false, mention_allowed: false, ttl_days: 7 },
+  operational: {
+    scope_type: 'agent',
+    sensitivity: 'low',
+    proactive_use: true,
+    mention_allowed: true,
+    ttl_days: null,
+  },
+  preference: {
+    scope_type: 'interlocutor',
+    sensitivity: 'low',
+    proactive_use: true,
+    mention_allowed: true,
+    ttl_days: null,
+  },
+  personal: {
+    scope_type: 'role',
+    sensitivity: 'medium',
+    proactive_use: false,
+    mention_allowed: false,
+    ttl_days: 30,
+  },
+  sensitive: {
+    scope_type: 'conversation',
+    sensitivity: 'high',
+    proactive_use: false,
+    mention_allowed: false,
+    ttl_days: 7,
+  },
 };
 
 export async function classifyMemory(content: string): Promise<ClassifierOutput | null> {

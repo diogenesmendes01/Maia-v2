@@ -91,7 +91,12 @@ async function mkInboundComTurno(args: {
     await c.query(
       `INSERT INTO mensagens (id, tenant_id, agent_id, direcao, tipo, conteudo, metadata, processada_em)
        VALUES ($1, $2, $3, 'in', 'texto', 'oi', jsonb_build_object('whatsapp_id', $4::text), NULL)`,
-      [mensagem_id, args.msg_tenant, args.msg_agent, `WAID-504DLQ-${randomInt(0, 1e9).toString(36)}`],
+      [
+        mensagem_id,
+        args.msg_tenant,
+        args.msg_agent,
+        `WAID-504DLQ-${randomInt(0, 1e9).toString(36)}`,
+      ],
     );
     await c.query(
       `INSERT INTO agent_turns

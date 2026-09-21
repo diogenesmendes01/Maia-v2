@@ -8,11 +8,7 @@ import {
 import { applyTenantGuard } from '../tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
 import type { ProfileStatus, DriftType, DriftSeverity, DriftDecision } from '@/types/enums.js';
-import type {
-  AgentOperationalProfileVersion,
-  ProfileBody,
-  AgentDriftAlert,
-} from '../schema.js';
+import type { AgentOperationalProfileVersion, ProfileBody, AgentDriftAlert } from '../schema.js';
 import {
   validateProfileBodyP8d,
   readExpectedPredecessor,
@@ -122,10 +118,7 @@ export const operationalProfileVersionsRepo = {
         proposed_by: input.proposed_by,
         proposed_reason: input.proposed_reason ?? null,
       });
-      const [row] = await tx
-        .insert(agent_operational_profile_versions)
-        .values(guarded)
-        .returning();
+      const [row] = await tx.insert(agent_operational_profile_versions).values(guarded).returning();
       return row!;
     });
   },
@@ -419,8 +412,7 @@ export const operationalProfileVersionsRepo = {
     // proposed→rejected transition changes nothing the prompt reads.
     if (
       result.ok &&
-      (result.updated.status === 'active' ||
-        (fromStatus as ProfileStatus | null) === 'active')
+      (result.updated.status === 'active' || (fromStatus as ProfileStatus | null) === 'active')
     ) {
       await publishIdentityInvalidation(tenant_id, agent_id);
     }
@@ -876,11 +868,7 @@ export const operationalProfileVersionsRepo = {
       }
     | {
         ok: false;
-        reason:
-          | 'not_found'
-          | 'invalid_source_status'
-          | 'transition_failed'
-          | 'agent_missing';
+        reason: 'not_found' | 'invalid_source_status' | 'transition_failed' | 'agent_missing';
       }
     | {
         ok: false;
@@ -1170,9 +1158,7 @@ export const operationalProfileVersionsRepo = {
 
     return {
       activated: { id: proposed.id, version: proposed.version },
-      frozen_previous: incumbent
-        ? { id: incumbent.id, version: incumbent.version }
-        : null,
+      frozen_previous: incumbent ? { id: incumbent.id, version: incumbent.version } : null,
       expected_predecessor: expectedPredecessor,
     };
   },

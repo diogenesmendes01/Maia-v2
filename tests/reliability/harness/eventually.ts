@@ -119,7 +119,15 @@ export async function eventually<T>(
 
     if (Date.now() - inicio >= timeoutMs) {
       throw new EventuallyTimeoutError(
-        await montarDiagnostico(opts, timeoutMs, inicio, tentativas, ultimoValor, ultimoErro, false),
+        await montarDiagnostico(
+          opts,
+          timeoutMs,
+          inicio,
+          tentativas,
+          ultimoValor,
+          ultimoErro,
+          false,
+        ),
       );
     }
 

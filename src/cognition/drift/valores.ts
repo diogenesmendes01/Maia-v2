@@ -57,9 +57,7 @@ export const valoresDetector: DriftDetector = {
     // no principles, drift is skipped silently — we will NOT treat
     // operational priority labels as core value contracts.
     const { core_immutable } = resolveLegacyPayload(input.profile_active);
-    const principlesRaw = Array.isArray(core_immutable.principles)
-      ? core_immutable.principles
-      : [];
+    const principlesRaw = Array.isArray(core_immutable.principles) ? core_immutable.principles : [];
     const principles = principlesRaw.filter(
       (p): p is string => typeof p === 'string' && p.trim().length > 0,
     );
@@ -87,7 +85,10 @@ export const valoresDetector: DriftDetector = {
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 
-    const sample = agentMessages.slice(-20).map((m) => `- ${m.text}`).join('\n');
+    const sample = agentMessages
+      .slice(-20)
+      .map((m) => `- ${m.text}`)
+      .join('\n');
     const principlesTxt = principles.map((p, i) => `${i + 1}. ${p}`).join('\n');
 
     const system = [
@@ -124,7 +125,9 @@ export const valoresDetector: DriftDetector = {
         detected_by: 'drift_detector_valores',
         payload: {
           severity_hint: parsed.severity_hint ?? 'medio',
-          violated_principles: Array.isArray(parsed.violated_principles) ? parsed.violated_principles : [],
+          violated_principles: Array.isArray(parsed.violated_principles)
+            ? parsed.violated_principles
+            : [],
           examples: Array.isArray(parsed.examples) ? parsed.examples : [],
           reasoning: parsed.reasoning ?? '',
         },

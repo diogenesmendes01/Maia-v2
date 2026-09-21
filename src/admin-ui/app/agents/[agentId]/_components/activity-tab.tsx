@@ -28,11 +28,7 @@ import { trpc } from '../../../../trpc/client.js';
 import { cn } from '../../../../components/ui/cn.js';
 import { Card, CardHeader, CardBody } from '../../../../components/ui/card.js';
 import { Badge, StatusBadge } from '../../../../components/ui/badge.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../../../components/ui/states.js';
+import { LoadingState, ErrorState, EmptyState } from '../../../../components/ui/states.js';
 import {
   IconSearch,
   IconAlertTriangle,
@@ -102,10 +98,7 @@ function TracesCard({ tenantId, agentId }: ScopeProps) {
         {query.isLoading ? (
           <LoadingState label="Carregando traces…" />
         ) : query.error ? (
-          <ErrorState
-            message={query.error.message}
-            onRetry={() => void query.refetch()}
-          />
+          <ErrorState message={query.error.message} onRetry={() => void query.refetch()} />
         ) : rows.length === 0 ? (
           <EmptyState
             icon={<IconSearch size={32} />}
@@ -121,9 +114,7 @@ function TracesCard({ tenantId, agentId }: ScopeProps) {
                   className="flex items-center justify-between gap-3 py-2.5 hover:bg-zinc-50/70"
                 >
                   <div className="min-w-0">
-                    <p className="truncate font-mono text-xs text-zinc-800">
-                      {t.id}
-                    </p>
+                    <p className="truncate font-mono text-xs text-zinc-800">{t.id}</p>
                     <p className="mt-0.5 text-xs text-zinc-500">
                       {fmtDate(t.started_at)}
                       {t.duration_ms !== null ? ` · ${t.duration_ms} ms` : ''}
@@ -173,10 +164,7 @@ function DriftCard({ tenantId }: ScopeProps) {
         {query.isLoading ? (
           <LoadingState label="Carregando alertas…" />
         ) : query.error ? (
-          <ErrorState
-            message={query.error.message}
-            onRetry={() => void query.refetch()}
-          />
+          <ErrorState message={query.error.message} onRetry={() => void query.refetch()} />
         ) : rows.length === 0 ? (
           <EmptyState
             icon={<IconAlertTriangle size={32} />}
@@ -186,14 +174,9 @@ function DriftCard({ tenantId }: ScopeProps) {
         ) : (
           <ul className="divide-y divide-zinc-100">
             {rows.map((a) => (
-              <li
-                key={a.id}
-                className="flex items-center justify-between gap-3 py-2.5"
-              >
+              <li key={a.id} className="flex items-center justify-between gap-3 py-2.5">
                 <div className="min-w-0">
-                  <p className="truncate text-sm font-medium text-zinc-800">
-                    {a.drift_type}
-                  </p>
+                  <p className="truncate text-sm font-medium text-zinc-800">{a.drift_type}</p>
                   <p className="mt-0.5 text-xs text-zinc-500">
                     {fmtDate(a.detected_at)}
                     {a.decision ? ` · decisão: ${a.decision}` : ''}
@@ -236,10 +219,7 @@ function SkillsCard({ tenantId, agentId }: ScopeProps) {
         {query.isLoading ? (
           <LoadingState label="Carregando skills…" />
         ) : query.error ? (
-          <ErrorState
-            message={query.error.message}
-            onRetry={() => void query.refetch()}
-          />
+          <ErrorState message={query.error.message} onRetry={() => void query.refetch()} />
         ) : rows.length === 0 ? (
           <EmptyState
             icon={<IconZap size={32} />}
@@ -249,14 +229,9 @@ function SkillsCard({ tenantId, agentId }: ScopeProps) {
         ) : (
           <ul className="divide-y divide-zinc-100">
             {rows.map((s) => (
-              <li
-                key={s.id}
-                className="flex items-center justify-between gap-3 py-2.5"
-              >
+              <li key={s.id} className="flex items-center justify-between gap-3 py-2.5">
                 <div className="min-w-0">
-                  <p className="truncate font-mono text-xs text-zinc-800">
-                    {s.skill_descriptor}
-                  </p>
+                  <p className="truncate font-mono text-xs text-zinc-800">{s.skill_descriptor}</p>
                   <p className="mt-0.5 text-xs text-zinc-500">
                     v{s.version} · {s.category} · {s.execution_mode}
                   </p>
@@ -293,9 +268,7 @@ function ChannelsCard({ tenantId, agentId }: ScopeProps) {
   // getByChannel roda no contexto deste agente, então uma política não nula é,
   // por construção, deste agente.
   const policyQueries = trpc.useQueries((t) =>
-    visible.map((c) =>
-      t.channelPolicies.getByChannel({ tenantId, agentId, channelId: c.id }),
-    ),
+    visible.map((c) => t.channelPolicies.getByChannel({ tenantId, agentId, channelId: c.id })),
   );
 
   return (
@@ -358,8 +331,7 @@ function ChannelsCard({ tenantId, agentId }: ScopeProps) {
         )}
         {channels.length > MAX_ROWS && (
           <p className="mt-3 text-xs text-zinc-500">
-            Exibindo {MAX_ROWS} de {channels.length} canais — veja todos em
-            Setup → Canais.
+            Exibindo {MAX_ROWS} de {channels.length} canais — veja todos em Setup → Canais.
           </p>
         )}
       </CardBody>

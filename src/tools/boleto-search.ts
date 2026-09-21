@@ -18,9 +18,7 @@ const inputSchema = z
   })
   .refine(
     (v) =>
-      Boolean(
-        v.cnpj ?? v.company_id ?? v.boleto_number ?? v.boleto_id ?? v.amount !== undefined,
-      ),
+      Boolean(v.cnpj ?? v.company_id ?? v.boleto_number ?? v.boleto_id ?? v.amount !== undefined),
     { message: 'at least one search criterion is required' },
   )
   // Issue #509 §6 — "ao menos um destes" não tem keyword em JSON Schema. A

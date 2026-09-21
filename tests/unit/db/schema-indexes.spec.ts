@@ -49,14 +49,10 @@ interface DrizzleIndex {
  * the public type is wider — mirroring the pattern in
  * tests/unit/import-schema.spec.ts.
  */
-function indexSignatures(
-  cfg: ReturnType<typeof getTableConfig>,
-): Array<[string, string[]]> {
+function indexSignatures(cfg: ReturnType<typeof getTableConfig>): Array<[string, string[]]> {
   return (cfg.indexes as unknown as DrizzleIndex[]).map((idx) => {
     const name = idx.config.name ?? '<unnamed>';
-    const cols = idx.config.columns.map(
-      (c) => (c as { name?: string }).name ?? '<expr>',
-    );
+    const cols = idx.config.columns.map((c) => (c as { name?: string }).name ?? '<expr>');
     return [name, cols];
   });
 }
@@ -65,9 +61,7 @@ function findIndex(
   table: ReturnType<typeof getTableConfig>,
   name: string,
 ): DrizzleIndex | undefined {
-  return (table.indexes as unknown as DrizzleIndex[]).find(
-    (idx) => idx.config.name === name,
-  );
+  return (table.indexes as unknown as DrizzleIndex[]).find((idx) => idx.config.name === name);
 }
 
 const KSM_TABLES = [
@@ -95,10 +89,7 @@ describe('issue #281 (PR #310 redesign) — KSM lifecycle partial indexes', () =
       // raw-SQL expression. Drizzle stores the SQL object (no `.name`) in
       // `config.columns`, which indexSignatures maps to the `<expr>`
       // sentinel — pinning that the column list is a single expression.
-      expect(indexSignatures(cfg)).toContainEqual([
-        `${prefix}_lifecycle_active`,
-        ['<expr>'],
-      ]);
+      expect(indexSignatures(cfg)).toContainEqual([`${prefix}_lifecycle_active`, ['<expr>']]);
     });
 
     it(`${cfg.name} lifecycle indexes are PARTIAL (carry a WHERE predicate)`, () => {

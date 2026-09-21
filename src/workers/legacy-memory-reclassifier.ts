@@ -27,7 +27,11 @@ async function listTenantsWithPendingReview(): Promise<TenantAgentRow[]> {
   return Array.from(result.rows as unknown as TenantAgentRow[]);
 }
 
-async function reclassifyForTenant(): Promise<{ reclassified: number; failed: number; pending: number }> {
+async function reclassifyForTenant(): Promise<{
+  reclassified: number;
+  failed: number;
+  pending: number;
+}> {
   const pending = await memoryEntryRepo.listNeedsReview(100);
   if (pending.length === 0) {
     return { reclassified: 0, failed: 0, pending: 0 };
@@ -114,16 +118,11 @@ export async function runLegacyMemoryReclassifier(): Promise<void> {
   let totalPending = 0;
 
   for (const { tenant_id, agent_id } of tenants) {
-    const stats = await runWithTenantContext({ tenant_id, agent_id }, () =>
-      reclassifyForTenant(),
-    );
+    const stats = await runWithTenantContext({ tenant_id, agent_id }, () => reclassifyForTenant());
     totalReclassified += stats.reclassified;
     totalFailed += stats.failed;
     totalPending += stats.pending;
-    logger.info(
-      { tenant_id, agent_id, ...stats },
-      'legacy_memory_reclassifier.tenant_done',
-    );
+    logger.info({ tenant_id, agent_id, ...stats }, 'legacy_memory_reclassifier.tenant_done');
   }
 
   logger.info(

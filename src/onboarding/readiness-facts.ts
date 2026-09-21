@@ -199,93 +199,99 @@ export async function loadReadinessFactsWith(
 ): Promise<ReadinessFacts> {
   const { tenant_id, agent_id } = scope;
 
-  const [tenantRows, agentRows, profileRows, grantRows, roleRows, channelRows, policyRows, driftRows, schema] =
-    await Promise.all([
-      executor.select().from(tenants).where(eq(tenants.id, tenant_id)).limit(1),
-      // O par COMPLETO entra no WHERE (invariante 1 do AGENTS.md). Um agente de
-      // outro tenant não é "encontrado com dono errado": ele simplesmente NÃO
-      // EXISTE para esta consulta — indistinguível de ausência, que é a única
-      // resposta que não vaza existência entre tenants. O diagnóstico global
-      // vive em `diagnoseAgentOwnershipGlobally`, autorizado e auditado.
-      executor
-        .select()
-        .from(agents)
-        .where(and(eq(agents.id, agent_id), eq(agents.tenant_id, tenant_id)))
-        .limit(1),
-      executor
-        .select()
-        .from(agent_operational_profile_versions)
-        .where(
-          and(
-            eq(agent_operational_profile_versions.tenant_id, tenant_id),
-            eq(agent_operational_profile_versions.agent_id, agent_id),
-            eq(agent_operational_profile_versions.status, 'active'),
-          ),
-        )
-        .limit(1),
-      executor
-        .select()
-        .from(agent_tool_grants)
-        .where(
-          and(eq(agent_tool_grants.tenant_id, tenant_id), eq(agent_tool_grants.agent_id, agent_id)),
-        )
-        .limit(1),
-      executor
-        .select()
-        .from(roles)
-        .where(and(eq(roles.tenant_id, tenant_id), eq(roles.agent_id, agent_id))),
-      executor
-        .select({
-          id: channels.id,
-          tenant_id: channels.tenant_id,
-          agent_id: channels.agent_id,
-          channel_type: channels.channel_type,
-          active: channels.active,
-          is_synthetic: channels.is_synthetic,
-          line_state: channel_line_state.state,
-        })
-        .from(channels)
-        // O par (tenant, agente) entra no ON, não só no WHERE. `channel_id` é
-        // PK de `channel_line_state`, então hoje o join já é 1:1 e não poderia
-        // cruzar escopo; mas `channel_line_state` REPLICA (tenant_id, agent_id)
-        // sem FK composta (`migrations/103_channel_line_state.sql:28`), e uma
-        // linha replicada divergente é precisamente o que o avaliador puro
-        // trata como fato de outro dono. Casar o escopo no ON faz a divergência
-        // virar `line_state = NULL` (posse NÃO provada, fail-closed) em vez de
-        // um estado herdado de outro escopo. Invariante 1 do AGENTS.md.
-        .leftJoin(
-          channel_line_state,
-          and(
-            eq(channel_line_state.channel_id, channels.id),
-            eq(channel_line_state.tenant_id, tenant_id),
-            eq(channel_line_state.agent_id, agent_id),
-          ),
-        )
-        .where(and(eq(channels.tenant_id, tenant_id), eq(channels.agent_id, agent_id))),
-      executor
-        .select()
-        .from(channel_policies)
-        .where(
-          and(
-            eq(channel_policies.tenant_id, tenant_id),
-            eq(channel_policies.agent_id, agent_id),
-          ),
+  const [
+    tenantRows,
+    agentRows,
+    profileRows,
+    grantRows,
+    roleRows,
+    channelRows,
+    policyRows,
+    driftRows,
+    schema,
+  ] = await Promise.all([
+    executor.select().from(tenants).where(eq(tenants.id, tenant_id)).limit(1),
+    // O par COMPLETO entra no WHERE (invariante 1 do AGENTS.md). Um agente de
+    // outro tenant não é "encontrado com dono errado": ele simplesmente NÃO
+    // EXISTE para esta consulta — indistinguível de ausência, que é a única
+    // resposta que não vaza existência entre tenants. O diagnóstico global
+    // vive em `diagnoseAgentOwnershipGlobally`, autorizado e auditado.
+    executor
+      .select()
+      .from(agents)
+      .where(and(eq(agents.id, agent_id), eq(agents.tenant_id, tenant_id)))
+      .limit(1),
+    executor
+      .select()
+      .from(agent_operational_profile_versions)
+      .where(
+        and(
+          eq(agent_operational_profile_versions.tenant_id, tenant_id),
+          eq(agent_operational_profile_versions.agent_id, agent_id),
+          eq(agent_operational_profile_versions.status, 'active'),
         ),
-      // Pendência de governança bloqueante = alerta de drift CRÍTICO ainda não
-      // resolvido para este (tenant, agente).
-      executor
-        .select({ id: agent_drift_alerts.id })
-        .from(agent_drift_alerts)
-        .where(
-          and(
-            eq(agent_drift_alerts.tenant_id, tenant_id),
-            eq(agent_drift_alerts.agent_id, agent_id),
-            eq(agent_drift_alerts.severity, 'critical'),
-            isNull(agent_drift_alerts.resolved_at),
-          ),
+      )
+      .limit(1),
+    executor
+      .select()
+      .from(agent_tool_grants)
+      .where(
+        and(eq(agent_tool_grants.tenant_id, tenant_id), eq(agent_tool_grants.agent_id, agent_id)),
+      )
+      .limit(1),
+    executor
+      .select()
+      .from(roles)
+      .where(and(eq(roles.tenant_id, tenant_id), eq(roles.agent_id, agent_id))),
+    executor
+      .select({
+        id: channels.id,
+        tenant_id: channels.tenant_id,
+        agent_id: channels.agent_id,
+        channel_type: channels.channel_type,
+        active: channels.active,
+        is_synthetic: channels.is_synthetic,
+        line_state: channel_line_state.state,
+      })
+      .from(channels)
+      // O par (tenant, agente) entra no ON, não só no WHERE. `channel_id` é
+      // PK de `channel_line_state`, então hoje o join já é 1:1 e não poderia
+      // cruzar escopo; mas `channel_line_state` REPLICA (tenant_id, agent_id)
+      // sem FK composta (`migrations/103_channel_line_state.sql:28`), e uma
+      // linha replicada divergente é precisamente o que o avaliador puro
+      // trata como fato de outro dono. Casar o escopo no ON faz a divergência
+      // virar `line_state = NULL` (posse NÃO provada, fail-closed) em vez de
+      // um estado herdado de outro escopo. Invariante 1 do AGENTS.md.
+      .leftJoin(
+        channel_line_state,
+        and(
+          eq(channel_line_state.channel_id, channels.id),
+          eq(channel_line_state.tenant_id, tenant_id),
+          eq(channel_line_state.agent_id, agent_id),
         ),
-      loadSchemaState(),
-    ]);
+      )
+      .where(and(eq(channels.tenant_id, tenant_id), eq(channels.agent_id, agent_id))),
+    executor
+      .select()
+      .from(channel_policies)
+      .where(
+        and(eq(channel_policies.tenant_id, tenant_id), eq(channel_policies.agent_id, agent_id)),
+      ),
+    // Pendência de governança bloqueante = alerta de drift CRÍTICO ainda não
+    // resolvido para este (tenant, agente).
+    executor
+      .select({ id: agent_drift_alerts.id })
+      .from(agent_drift_alerts)
+      .where(
+        and(
+          eq(agent_drift_alerts.tenant_id, tenant_id),
+          eq(agent_drift_alerts.agent_id, agent_id),
+          eq(agent_drift_alerts.severity, 'critical'),
+          isNull(agent_drift_alerts.resolved_at),
+        ),
+      ),
+    loadSchemaState(),
+  ]);
 
   const tenant = tenantRows[0];
   const agent = agentRows[0];

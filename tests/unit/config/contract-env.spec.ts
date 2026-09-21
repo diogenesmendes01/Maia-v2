@@ -16,11 +16,7 @@
  *     pagava.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import {
-  CONTRACT_ENTRIES,
-  entriesForService,
-  objectSchemaForService,
-} from '@/config/contract.js';
+import { CONTRACT_ENTRIES, entriesForService, objectSchemaForService } from '@/config/contract.js';
 import { contractEnv, _resetContractEnvCacheForTests } from '@/config/contract-env.js';
 
 /** Um ambiente `runtime` completo o bastante para o schema inteiro parsear. */
@@ -68,7 +64,9 @@ describe('contractEnv — mesmo valor que o schema do serviço entregaria', () =
     // A referência é a derivação REAL de `src/config/env.ts`:
     // `objectSchemaForService('runtime').safeParse(process.env)`.
     const parsed = objectSchemaForService('runtime').safeParse(process.env);
-    expect(parsed.success, 'o ambiente desta spec deixou de satisfazer o schema runtime').toBe(true);
+    expect(parsed.success, 'o ambiente desta spec deixou de satisfazer o schema runtime').toBe(
+      true,
+    );
     const reference = parsed.success ? (parsed.data as Record<string, unknown>) : {};
 
     const divergentes: string[] = [];
@@ -138,8 +136,6 @@ describe('contractEnv — ler uma variável não é o boot de nenhum serviço', 
   });
 
   it('expõe exatamente as chaves do contrato', () => {
-    expect(Object.keys(contractEnv).sort()).toEqual(
-      CONTRACT_ENTRIES.map((s) => s.name).sort(),
-    );
+    expect(Object.keys(contractEnv).sort()).toEqual(CONTRACT_ENTRIES.map((s) => s.name).sort());
   });
 });

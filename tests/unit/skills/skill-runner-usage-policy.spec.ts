@@ -20,9 +20,8 @@ const { skillRowState } = vi.hoisted(() => ({
 const { auditMock } = vi.hoisted(() => ({ auditMock: vi.fn(async () => undefined) }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     skillsRepo: {
@@ -42,9 +41,8 @@ vi.mock('@/db/repositories.js', async () => {
 vi.mock('@/governance/audit.js', () => ({ audit: auditMock }));
 
 vi.mock('@/cognition/runner.js', async () => {
-  const actual = await vi.importActual<typeof import('@/cognition/runner.js')>(
-    '@/cognition/runner.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/cognition/runner.js')>('@/cognition/runner.js');
   return {
     ...actual,
     runCognitiveModule: vi.fn(async (_opts: unknown, fn: () => Promise<unknown>) => {
@@ -170,9 +168,7 @@ describe('SkillRunner gate 4.6 — usage-policy execution re-check (#409)', () =
     const r = await run(customerAudience);
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('audience_blocked');
-    const blocked = auditMock.mock.calls.find(
-      (c) => c[0].acao === 'skill_blocked_by_audience',
-    );
+    const blocked = auditMock.mock.calls.find((c) => c[0].acao === 'skill_blocked_by_audience');
     expect(blocked).toBeTruthy();
     expect(blocked?.[0].metadata.enforcement_point).toBe('skill_runner_gate_4_6');
   });
@@ -190,9 +186,9 @@ describe('SkillRunner gate 4.6 — usage-policy execution re-check (#409)', () =
     const r = await run(customerAudience);
     expect(r.ok).toBe(false);
     expect(r.reason).toBe('data_scope_blocked');
-    expect(
-      auditMock.mock.calls.some((c) => c[0].acao === 'skill_blocked_by_data_scope'),
-    ).toBe(true);
+    expect(auditMock.mock.calls.some((c) => c[0].acao === 'skill_blocked_by_data_scope')).toBe(
+      true,
+    );
   });
 
   it('BLOCKS on channel when the turn channel is not allowed', async () => {
@@ -232,8 +228,6 @@ describe('SkillRunner gate 4.6 — usage-policy execution re-check (#409)', () =
     const r = await run(); // no audience
     expect(r.ok).toBe(true);
     // No usage-policy audit emitted at the runner.
-    expect(
-      auditMock.mock.calls.some((c) => String(c[0].acao).startsWith('skill_')),
-    ).toBe(false);
+    expect(auditMock.mock.calls.some((c) => String(c[0].acao).startsWith('skill_'))).toBe(false);
   });
 });

@@ -153,11 +153,11 @@ describe('assertIsDirectChildOfAuthRoot — rm da raiz impossível por construç
   });
 
   it('rejeita profundidade > 2 e profundidade 2 fora de lines/pairing', () => {
-    expect(() => assertIsDirectChildOfAuthRoot(join(ROOT, 'lines', 'ch-1', 'creds.json'))).toThrowError(
-      expect.objectContaining({ code: 'auth_root_removal_forbidden' }),
-    );
-    expect(() => assertIsDirectChildOfAuthRoot(join(ROOT, 'control', 'setup-token.txt'))).toThrowError(
-      expect.objectContaining({ code: 'auth_root_removal_forbidden' }),
-    );
+    expect(() =>
+      assertIsDirectChildOfAuthRoot(join(ROOT, 'lines', 'ch-1', 'creds.json')),
+    ).toThrowError(expect.objectContaining({ code: 'auth_root_removal_forbidden' }));
+    expect(() =>
+      assertIsDirectChildOfAuthRoot(join(ROOT, 'control', 'setup-token.txt')),
+    ).toThrowError(expect.objectContaining({ code: 'auth_root_removal_forbidden' }));
   });
 });

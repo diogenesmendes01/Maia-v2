@@ -110,10 +110,7 @@ async function wipe(): Promise<void> {
       TENANT_A,
       TENANT_B,
     ]);
-    await c.query(`DELETE FROM idempotency_keys WHERE tenant_id IN ($1, $2)`, [
-      TENANT_A,
-      TENANT_B,
-    ]);
+    await c.query(`DELETE FROM idempotency_keys WHERE tenant_id IN ($1, $2)`, [TENANT_A, TENANT_B]);
   } finally {
     c.release();
   }
@@ -170,7 +167,11 @@ d('issue #316 — markCompletedWithEffect atomic enqueue under real Postgres', (
         [key],
       );
       expect(resv.rows[0]!.state).toBe('completed');
-      const outbox = await c.query<{ status: string; effect_type: string; idempotency_key: string }>(
+      const outbox = await c.query<{
+        status: string;
+        effect_type: string;
+        idempotency_key: string;
+      }>(
         `SELECT status, effect_type, idempotency_key FROM idempotency_effect_outbox
           WHERE tenant_id = $1 AND idempotency_key = $2`,
         [TENANT_A, key],
@@ -349,13 +350,11 @@ d('issue #316 — relayer claim is race-safe under real Postgres', () => {
     // release immediately — so the union covers all 4 and no row is double-held
     // WITHIN a single in-flight statement. We assert the union of ids is the
     // full set and there are no duplicates within a single claim's result.
-    const [c1, c2] = await runWithTenantContext(
-      { tenant_id: TENANT_A, agent_id: AGENT },
-      () =>
-        Promise.all([
-          idempotencyOutboxRepo.claimPendingEffects(4),
-          idempotencyOutboxRepo.claimPendingEffects(4),
-        ]),
+    const [c1, c2] = await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT }, () =>
+      Promise.all([
+        idempotencyOutboxRepo.claimPendingEffects(4),
+        idempotencyOutboxRepo.claimPendingEffects(4),
+      ]),
     );
     for (const claim of [c1, c2]) {
       const ids = claim.map((r) => r.id);

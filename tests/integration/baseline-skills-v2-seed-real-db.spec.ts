@@ -61,11 +61,7 @@ const V2_DESCRIPTORS = [
 ] as const;
 
 // 3 wholly new skills added at v1 tool_mediated
-const NEW_DESCRIPTORS = [
-  'escalate_on_risk',
-  'summarization',
-  'manage_conversation_state',
-] as const;
+const NEW_DESCRIPTORS = ['escalate_on_risk', 'summarization', 'manage_conversation_state'] as const;
 
 const ALL_NEW_DESCRIPTORS = [...V2_DESCRIPTORS, ...NEW_DESCRIPTORS] as const;
 
@@ -202,9 +198,7 @@ d('baseline skills v2 seed (migration 080) — real DB', () => {
     );
 
     // Exactly 8 rows — no duplicates, no missing rows.
-    expect(rows.map((r) => r.skill_descriptor).sort()).toEqual(
-      [...ALL_NEW_DESCRIPTORS].sort(),
-    );
+    expect(rows.map((r) => r.skill_descriptor).sort()).toEqual([...ALL_NEW_DESCRIPTORS].sort());
 
     for (const r of rows) {
       expect(r.agent_id, `${r.skill_descriptor} must be tenant-wide`).toBeNull();
@@ -212,9 +206,7 @@ d('baseline skills v2 seed (migration 080) — real DB', () => {
       expect(r.category, `${r.skill_descriptor} category mismatch`).toBe(
         EXPECTED_CATEGORIES[r.skill_descriptor],
       );
-      expect(r.execution_mode, `${r.skill_descriptor} must be tool_mediated`).toBe(
-        'tool_mediated',
-      );
+      expect(r.execution_mode, `${r.skill_descriptor} must be tool_mediated`).toBe('tool_mediated');
       expect(r.proposed_by).toBe('system');
       expect(r.approved_by).toBe('system');
 
@@ -309,10 +301,7 @@ d('baseline skills v2 seed (migration 080) — real DB', () => {
 
     expect(rows).toHaveLength(ALL_NEW_DESCRIPTORS.length);
     for (const r of rows) {
-      expect(
-        r.usage_policy,
-        `${r.skill_descriptor} must have usage_policy set`,
-      ).not.toBeNull();
+      expect(r.usage_policy, `${r.skill_descriptor} must have usage_policy set`).not.toBeNull();
     }
   });
 

@@ -89,9 +89,7 @@ describe('tools-catalog router — gateway-free import (PR #207 round 2)', () =>
     // registry (whether top-level OR via a request-time dynamic import), the
     // presence `setInterval` + queue `new IORedis(...)` would run and fail the
     // assertions below.
-    const { toolsCatalogRouter } = await import(
-      '../../src/admin-ui/trpc/routers/tools-catalog.js'
-    );
+    const { toolsCatalogRouter } = await import('../../src/admin-ui/trpc/routers/tools-catalog.js');
 
     // The router module loaded (its tRPC router is exported)…
     expect(toolsCatalogRouter).toBeDefined();
@@ -127,9 +125,7 @@ describe('tools-catalog router — gateway-free import (PR #207 round 2)', () =>
     // Drive listCatalog with a minimal protected-procedure context and assert
     // the per-tool `enabled` reflects config flags — proving the runtime gating
     // works off the static artifact + config (no registry import).
-    const { toolsCatalogRouter } = await import(
-      '../../src/admin-ui/trpc/routers/tools-catalog.js'
-    );
+    const { toolsCatalogRouter } = await import('../../src/admin-ui/trpc/routers/tools-catalog.js');
     const { config } = await import('../../src/config/env.js');
 
     const ctx = {

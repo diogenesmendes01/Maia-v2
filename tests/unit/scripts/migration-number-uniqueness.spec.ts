@@ -145,19 +145,13 @@ const GRANDFATHERED_DUPLICATE_TOKENS: Record<string, string[]> = {
   '015': ['015_p0_agents_tenant_status_idx.sql', '015_p2_behavioral_hint.sql'],
   '018': ['018_p2_agent_facts_tenant_unique.sql', '018_p3a_procedure_definitions.sql'],
   '020': ['020_p3a_procedure_hardening.sql', '020_p3b_procedure_executions.sql'],
-  '023': [
-    '023_p3b_unique_in_progress_per_conversa.sql',
-    '023_p3c_procedure_tests.sql',
-  ],
+  '023': ['023_p3b_unique_in_progress_per_conversa.sql', '023_p3c_procedure_tests.sql'],
   '025': [
     '025_p3c_procedure_metrics_tenant_defense.sql',
     '025_p4_agent_operational_profile_versions.sql',
   ],
   '026': ['026_p3c_fix_event_type_check.sql', '026_p4_agent_drift_alerts.sql'],
-  '027': [
-    '027_p4_operational_profile_immutable_content.sql',
-    '027_p5_gap_escalation_rules.sql',
-  ],
+  '027': ['027_p4_operational_profile_immutable_content.sql', '027_p5_gap_escalation_rules.sql'],
   '031': ['031_p5_capability_proposals_test_loop.sql', '031_p6_channels.sql'],
   '062': ['062_drop_dashboard_sessions.sql', '062_global_settings.sql'],
   // Issue #308: PRs #273 (idempotency PK), #276 (cleanup backup), #227
