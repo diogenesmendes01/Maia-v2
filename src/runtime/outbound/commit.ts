@@ -216,16 +216,28 @@ async function commitOutboundIntentInner(
     counter(METRIC.OUTBOUND_COMMIT_REJECTED, {
       reason: err instanceof OutboundCommitError ? err.rejection : 'db_error',
     });
-    logger.error(
-      {
-        turn_id: handle.turn_id,
-        sequence_in_turn: input.sequence_in_turn,
-        payload_type: artifact.payload_type,
-        err: (err as Error).message,
-        ops_alert: true,
-      },
-      'outbound.commit_failed_send_blocked',
-    );
+    // U-P04.7a — tomada humana não é incidente.
+    //
+    // O fence de controle (§8.2.4) recusa o commit quando um atendente assumiu
+    // a conversa. Isso é o sistema funcionando, não falhando: se entrasse pelo
+    // mesmo `logger.error` + `ops_alert` das outras recusas, cada atendimento
+    // humano acordaria o plantão — e um alerta que dispara no caminho normal
+    // deixa de ser lido, inclusive quando disparar por algo real.
+    //
+    // O `throw` abaixo continua igual. O que muda é só o VOLUME do registro,
+    // nunca o bloqueio do envio.
+    const tomadaHumana = err instanceof OutboundCommitError && err.rejection === 'human_control';
+    const registro = {
+      turn_id: handle.turn_id,
+      sequence_in_turn: input.sequence_in_turn,
+      payload_type: artifact.payload_type,
+      err: (err as Error).message,
+    };
+    if (tomadaHumana) {
+      logger.warn(registro, 'outbound.commit_blocked_human_control');
+    } else {
+      logger.error({ ...registro, ops_alert: true }, 'outbound.commit_failed_send_blocked');
+    }
     // RELANÇA. Este é o ponto da issue: falha do ledger IMPEDE o envio, com
     // erro observável. Trocar este `throw` por um `return` fail-open é a
     // reintrodução exata do defeito — e é o que a sonda 2 verifica.

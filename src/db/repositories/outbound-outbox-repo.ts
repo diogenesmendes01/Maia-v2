@@ -54,6 +54,7 @@ import { auditTx } from '@/governance/audit.js';
 import { assertTurnTransition } from '@/runtime/turns/contract.js';
 import type { TurnStatus } from '@/runtime/turns/contract.js';
 import { turnWriteConditions } from './turn-fence-sql.js';
+import { humanControlProbe, streamNotHumanControlled } from './conversation-control-sql.js';
 import type { OutboundArtifact } from '@/runtime/outbound/contract.js';
 import { legacyChannelFor } from '@/runtime/outbound/contract.js';
 
@@ -88,6 +89,17 @@ export const OUTBOUND_COMMIT_REJECTIONS = [
   'stale_claim',
   /** O turno andou de estado (ou de versão) desde a leitura do chamador. */
   'state_mismatch',
+  /**
+   * U-P04.7a (§8.2.4, linha de `commit.ts` / `commitTurnOutboundTx`) — um
+   * humano assumiu a conversa entre a admissão do turno e este commit.
+   *
+   * É um código PRÓPRIO, e não `state_mismatch`, porque as duas recusas pedem
+   * reações opostas. `state_mismatch` diz "releia e talvez insista"; esta diz
+   * "pare, e não volte por conta própria". Um retry automático em cima de uma
+   * tomada humana é a automação disputando o canal com o atendente, que é
+   * exatamente o que o §8.2.4 existe para impedir.
+   */
+  'human_control',
 ] as const;
 
 export type OutboundCommitRejection = (typeof OUTBOUND_COMMIT_REJECTIONS)[number];
@@ -203,6 +215,27 @@ export const outboundOutboxRepo = {
                   ? { kind: 'self', claim_token: input.expected_claim_token }
                   : { kind: 'none' },
             }),
+            // ── U-P04.7a — O FENCE DE CONTROLE HUMANO (§8.2.4) ─────────────
+            //
+            // Dentro da MESMA declaração que move o turno, e não numa leitura
+            // antes dela. A diferença não é estilística: ler o controle e
+            // depois commitar abre a janela em que o humano assume ENTRE as
+            // duas, e o commit passa assim mesmo — a resposta do bot fica
+            // durável e o atendente descobre pelo canal.
+            //
+            // Como predicado do `WHERE`, a checagem e a escrita decidem na
+            // mesma linha do mesmo `UPDATE`, sob o mesmo lock de linha. Ou o
+            // turno anda com a conversa em modo `bot`, ou não anda.
+            //
+            // O predicado é `streamNotHumanControlled`, o MESMO que o claim
+            // usa. Redigitá-lo aqui teria o efeito de sempre: um dos dois
+            // lados envelheceria, e o que envelhecesse seria o que deixa
+            // passar.
+            streamNotHumanControlled({
+              tenant: sql`${tenant_id}`,
+              agent: sql`${agent_id}`,
+              alvo: sql`${agent_turns}`,
+            }),
           ),
         )
         .returning();
@@ -231,8 +264,31 @@ export const outboundOutboxRepo = {
         const fenceBroken =
           input.expected_claim_token !== undefined &&
           (current.claim_token !== input.expected_claim_token || current.lease_live !== true);
+
+        // ── Ordem da classificação ────────────────────────────────────────
+        //
+        // A posse vem PRIMEIRO, pela mesma razão que já valia antes desta
+        // fatia: um worker zumbi precisa ouvir "você perdeu a posse", não
+        // "um humano assumiu" — a segunda mensagem sugere que existe algo a
+        // reconciliar quando o certo é parar.
+        //
+        // A tomada humana vem em seguida e ANTES de `state_mismatch`, porque
+        // uma pausa quase sempre move o estado do turno junto. Classificar
+        // pelo estado nesse caso trocaria "pare" por "releia e insista", que
+        // é a reação errada.
+        if (fenceBroken) throw new OutboundCommitError('stale_claim', artifact.turn_id);
+
+        const sonda = await tx.execute(
+          humanControlProbe({
+            tenant: sql`${tenant_id}`,
+            agent: sql`${agent_id}`,
+            turn_id: artifact.turn_id,
+          }),
+        );
+        const sobControleHumano = Array.from(sonda.rows as unknown as unknown[]).length > 0;
+
         throw new OutboundCommitError(
-          fenceBroken ? 'stale_claim' : 'state_mismatch',
+          sobControleHumano ? 'human_control' : 'state_mismatch',
           artifact.turn_id,
         );
       }
