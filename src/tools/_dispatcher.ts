@@ -384,11 +384,64 @@ async function dispatchToolInner(input: {
   });
   const args = parsed.data;
 
+  /**
+   * P05 / C-P05-7 (spec §7.10.1) — o gate de entidade passa a respeitar o
+   * alvo de autorização declarado pela ferramenta.
+   *
+   * Antes: TODA chamada precisava de uma entidade, e quando os argumentos não
+   * traziam uma, o fallback era `ctx.scope.entidades[0]`. Uma ferramenta de
+   * memória pessoal — que não fala de entidade nenhuma — passava no gate
+   * vinculada à PRIMEIRA entidade do escopo, arbitrária, e as checagens
+   * seguintes rodavam contra ela. Sem entidade no escopo, a mesma ferramenta
+   * era recusada com `no_entity_in_scope`, que descreve um problema que ela
+   * não tem.
+   *
+   * Agora só `entity` exige entidade. O default continua `entity`, então
+   * nenhuma ferramenta já existente muda de comportamento — o que muda é que
+   * uma ferramenta PODE declarar que não é sobre entidade, e aí ela deixa de
+   * herdar uma.
+   */
+  const authorizationTarget = tool.authorization_target ?? 'entity';
   const entity_id =
     pickToolField<'string'>(args, 'entidade_id', 'string') ?? input.ctx.scope.entidades[0];
-  if (!entity_id) return { error: 'no_entity_in_scope' };
+  if (authorizationTarget === 'entity' && !entity_id) {
+    return { error: 'no_entity_in_scope' };
+  }
 
-  const resolved = input.ctx.scope.byEntity.get(entity_id);
+  // Fora de `entity`, a permissão resolvida por entidade não se aplica: passar
+  // a da `entidades[0]` seria autorizar a chamada contra um recurso que ela
+  // não pediu. `undefined` faz as checagens adiante decidirem pelo titular e
+  // pelo perfil, que é o que `current_subject`/`current_turn` significam.
+  const resolved =
+    authorizationTarget === 'entity' && entity_id
+      ? input.ctx.scope.byEntity.get(entity_id)
+      : undefined;
+
+  /**
+   * O que entra no MATERIAL DE IDENTIDADE (chave de idempotência, hash de
+   * payload, hash de intenção) quando não há entidade.
+   *
+   * Não pode ser `entidades[0]`: a chave passaria a dizer que a chamada foi
+   * sobre uma entidade que ninguém pediu, e duas chamadas de memória pessoal
+   * de pessoas diferentes no mesmo escopo colidiriam ou não conforme a ordem
+   * da lista — que é acidente, não semântica.
+   *
+   * Também não pode ser string vazia, que colidiria entre os dois alvos não
+   * entidade. O sentinela é prefixado e NÃO é um UUID, então não colide com
+   * id de entidade real, e diz o que é quando alguém o encontra num dump.
+   */
+  const entityForIdentity =
+    authorizationTarget === 'entity' && entity_id ? entity_id : `authz:${authorizationTarget}`;
+
+  /**
+   * E o que entra onde a coluna aceita ausência.
+   *
+   * `null` é a resposta honesta: não existe entidade nesta autorização.
+   * Repetir o sentinela aqui poria um valor que não é id de entidade numa
+   * coluna de id de entidade.
+   */
+  const entidadeParaAprovacao: string | null =
+    authorizationTarget === 'entity' && entity_id ? entity_id : null;
   const valor = pickToolField<'number'>(args, 'valor', 'number');
   const natureza = pickToolField<'string'>(args, 'natureza', 'string');
   const categoria_id = pickToolField<'string'>(args, 'categoria_id', 'string');
@@ -479,7 +532,7 @@ async function dispatchToolInner(input: {
     pickToolField<'string'>(args, 'attachment_id', 'string');
   const idempotency_key = computeIdempotencyKey({
     pessoa_id: input.ctx.pessoa.id,
-    entity_id,
+    entity_id: entityForIdentity,
     tool_name: tool.name,
     operation_type: tool.operation_type,
     payload: args,
@@ -495,7 +548,7 @@ async function dispatchToolInner(input: {
   // in `waitForCompletion` for the loser-of-the-race branch below).
   const payload_hash = computePayloadHash({
     pessoa_id: input.ctx.pessoa.id,
-    entity_id,
+    entity_id: entityForIdentity,
     tool_name: tool.name,
     operation_type: tool.operation_type,
     payload: args,
@@ -578,7 +631,7 @@ async function dispatchToolInner(input: {
       tenant_id: getCurrentTenant(),
       agent_id: getCurrentAgent(),
       requester_pessoa_id: input.ctx.pessoa.id,
-      entidade_id: entity_id,
+      entidade_id: entidadeParaAprovacao,
       tool: tool.name,
       operation_type: tool.operation_type,
       args,
@@ -625,7 +678,7 @@ async function dispatchToolInner(input: {
         tenant_id: getCurrentTenant(),
         agent_id: getCurrentAgent(),
         requester: input.ctx.pessoa,
-        entidade_id: entity_id,
+        entidade_id: entidadeParaAprovacao,
         conversa_id: input.ctx.conversa.id,
         mensagem_id: input.ctx.mensagem_id,
         request_id: input.ctx.request_id,
@@ -688,7 +741,7 @@ async function dispatchToolInner(input: {
         tool_name: tool.name,
         operation_type: tool.operation_type,
         pessoa_id: input.ctx.pessoa.id,
-        entity_id,
+        entity_id: entityForIdentity,
         // #299: store/compare the REAL payload fingerprint (was incorrectly
         // `idempotency_key` before, which made the collision check a tautology
         // — the key always matches itself). `tryReserve` echoes this hash into
