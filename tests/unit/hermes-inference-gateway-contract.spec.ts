@@ -116,6 +116,7 @@ describe('P06 — rota e campos admitidos (§9.1)', () => {
   it('2. a lista de campos admitidos é EXATAMENTE a do §9.1', () => {
     expect([...INFERENCE_ADMITTED_FIELDS].sort()).toEqual(
       [
+        'max_completion_tokens',
         'max_tokens',
         'messages',
         'model',
@@ -217,9 +218,38 @@ describe('P06 — o piloto é TEXTUAL (§9.1)', () => {
   });
 
   it('12. role fora do vocabulário do chat completions é recusada', () => {
-    expect(parseInferenceRequest(req({ messages: [{ role: 'developer', content: 'x' }] })).kind).toBe(
+    expect(parseInferenceRequest(req({ messages: [{ role: 'function', content: 'x' }] })).kind).toBe(
       'invalid',
     );
+  });
+
+  it('12c. `reasoning_content` (pad do cliente pinado para deepseek/mimo) é texto no assistant', () => {
+    const replay = (extra: Record<string, unknown>, role = 'assistant') =>
+      parseInferenceRequest(
+        req({
+          messages: [
+            { role: 'user', content: 'oi' },
+            { role, content: 'ok', ...extra },
+          ],
+        }),
+      ).kind;
+    expect(replay({ reasoning_content: ' ' })).toBe('ok');
+    expect(replay({ reasoning_content: 42 })).toBe('invalid');
+    expect(replay({ reasoning_content: ' ' }, 'user')).toBe('invalid');
+  });
+
+  it('12b. `developer` (prompt de sistema do gpt-5 no cliente pinado) é texto e passa', () => {
+    const developer = (content: unknown) =>
+      parseInferenceRequest(
+        req({
+          messages: [
+            { role: 'developer', content },
+            { role: 'user', content: 'oi' },
+          ],
+        }),
+      ).kind;
+    expect(developer('x')).toBe('ok');
+    expect(developer([{ type: 'text', text: 'x' }])).toBe('invalid');
   });
 
   it('13. par tool_call/tool_result textual é aceito', () => {
@@ -365,6 +395,17 @@ describe('P06 — limites são recusa determinística, nunca truncamento', () =>
     expect(
       parseInferenceRequest(req({ max_tokens: INFERENCE_LIMITS.max_output_tokens + 1 })).kind,
     ).toBe('invalid');
+  });
+
+  it('18b. `max_completion_tokens` tem o mesmo teto; os dois nomes juntos são recusa', () => {
+    const teto = INFERENCE_LIMITS.max_output_tokens;
+    expect(parseInferenceRequest(req({ max_completion_tokens: teto })).kind).toBe('ok');
+    expect(parseInferenceRequest(req({ max_completion_tokens: teto + 1 })).kind).toBe('invalid');
+    expect(parseInferenceRequest(req({ max_tokens: 10, max_completion_tokens: 10 }))).toMatchObject({
+      kind: 'invalid',
+      code: 'invalid_request',
+      field: 'max_completion_tokens',
+    });
   });
 
   it('19. o pedido no limite exato passa (a fronteira é verificada nos DOIS lados)', () => {

@@ -1439,6 +1439,25 @@ export const ENV_CONTRACT = {
   },
 
   // ---- feature flags ----------------------------------------------------
+  MAIA_HERMES_INFERENCE_ALLOWED_SOURCES: {
+    name: 'MAIA_HERMES_INFERENCE_ALLOWED_SOURCES',
+    description:
+      'Origens, além da loopback, que podem chamar o gateway de inferência Hermes: IPv4/CIDR ou IPv6 exato, separados por vírgula (ex.: a rede do container worker). Ausente = só loopback. Nunca a rede do proxy da borda.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: z
+      .string()
+      .regex(
+        /^\s*(?:(?:\d{1,3}\.){3}\d{1,3}(?:\/\d{1,2})?|[0-9a-fA-F:]+)(?:\s*,\s*(?:(?:\d{1,3}\.){3}\d{1,3}(?:\/\d{1,2})?|[0-9a-fA-F:]+))*\s*$/,
+        'lista de IPv4/CIDR ou IPv6 separada por vírgula',
+      )
+      .optional(),
+    example: '172.18.0.0/16',
+    fixture: '10.0.0.0/8',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   FEATURE_MCP_TOOLS: {
     name: 'FEATURE_MCP_TOOLS',
     description:

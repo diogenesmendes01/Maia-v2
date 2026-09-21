@@ -39,6 +39,15 @@
  * pelo cliente fixado**" — este módulo implementa `max_tokens` porque é o nome
  * que a spec grafa, e um segundo nome só entra com a captura na mão. Inventar
  * aqui o alias de outro SDK seria fechar D09 por suposição.
+ *
+ * Captura no SHA `5d59366`: `AIAgent._max_tokens_param` troca `max_tokens` por
+ * `max_completion_tokens` nas famílias gpt-4o/4.1/5/o1/o3/o4
+ * (`utils.model_forces_max_completion_tokens`), e `_swap_developer_role` manda
+ * o prompt de sistema como `developer` para gpt-5/codex. Os dois entram; os
+ * dois nomes de limite juntos são recusa. Para modelo com "deepseek" ou "mimo"
+ * no nome, `apply_reasoning_content_policy` põe `reasoning_content` em toda
+ * mensagem `assistant` reenviada (o pad `" "`, já que o gateway nunca devolve
+ * raciocínio); entra como texto e segue ao provider como veio.
  */
 import { z } from 'zod';
 import type { EngineRunPhaseV1 } from '@/runtime/engines/contracts.js';
@@ -65,6 +74,7 @@ export const INFERENCE_ADMITTED_FIELDS = [
   'temperature',
   'top_p',
   'max_tokens',
+  'max_completion_tokens',
   'stream',
   'stream_options',
 ] as const;
@@ -144,12 +154,20 @@ const INFERENCE_ERROR_MESSAGE: Record<InferenceErrorCode, string> = {
   tool_surface_mismatch: 'requested tool surface does not match the approved one',
   run_not_active: 'execution is not accepting inference',
   payload_too_large: 'request exceeds the configured size limits',
-  budget_exhausted: 'budget is exhausted for this scope',
-  inference_limit_exceeded: 'inference call limit reached for this execution',
+  budget_exhausted: 'budget quota is exhausted for this scope',
+  inference_limit_exceeded: 'inference quota is exhausted for this execution',
   admission_unavailable: 'admission control is unavailable',
   provider_unavailable: 'upstream provider is unavailable',
 };
 
+/**
+ * `quota_error` e a palavra "quota" nas duas recusas 429 NÃO são estética. O
+ * cliente pinado (SHA 5d59366) tem retry próprio, que não lê `x-should-retry`:
+ * `agent/error_classifier.py` classifica um 429 cujo corpo cita `rate_limit`
+ * como limite de taxa RETENTÁVEL, e um 429 que fala em cota, sem sinal de
+ * janela, como `billing`, terminal. Medido com o classificador real; o spike
+ * `hermes-inference-refusals-spike` confere cada código do vocabulário.
+ */
 const INFERENCE_ERROR_TYPE: Record<InferenceErrorCode, string> = {
   invalid_request: 'invalid_request_error',
   unsupported_parameter: 'invalid_request_error',
@@ -159,8 +177,8 @@ const INFERENCE_ERROR_TYPE: Record<InferenceErrorCode, string> = {
   tool_surface_mismatch: 'permission_error',
   run_not_active: 'conflict_error',
   payload_too_large: 'invalid_request_error',
-  budget_exhausted: 'rate_limit_error',
-  inference_limit_exceeded: 'rate_limit_error',
+  budget_exhausted: 'quota_error',
+  inference_limit_exceeded: 'quota_error',
   admission_unavailable: 'service_unavailable_error',
   provider_unavailable: 'service_unavailable_error',
 };
@@ -213,12 +231,14 @@ const toolCallSchema = z
  */
 const messageSchema = z.discriminatedUnion('role', [
   z.object({ role: z.literal('system'), content: z.string() }).strict(),
+  z.object({ role: z.literal('developer'), content: z.string() }).strict(),
   z.object({ role: z.literal('user'), content: z.string() }).strict(),
   z
     .object({
       role: z.literal('assistant'),
       content: z.string().nullable(),
       tool_calls: z.array(toolCallSchema).max(INFERENCE_LIMITS.max_tools).optional(),
+      reasoning_content: z.string().optional(),
     })
     .strict(),
   z
@@ -262,6 +282,12 @@ const inferenceRequestSchema = z
     temperature: z.number().finite().min(0).max(2).optional(),
     top_p: z.number().finite().min(0).max(1).optional(),
     max_tokens: z.number().int().min(1).max(INFERENCE_LIMITS.max_output_tokens).optional(),
+    max_completion_tokens: z
+      .number()
+      .int()
+      .min(1)
+      .max(INFERENCE_LIMITS.max_output_tokens)
+      .optional(),
     stream: z.boolean().optional(),
     stream_options: z.object({ include_usage: z.boolean() }).strict().optional(),
   })
@@ -323,6 +349,16 @@ export function parseInferenceRequest(raw: unknown): ParsedInferenceRequest {
         reason: 'unknown_parameter',
       };
     }
+  }
+
+  // Dois nomes para o mesmo teto: qual valeria é ambíguo, e ambíguo recusa.
+  if ('max_tokens' in body && 'max_completion_tokens' in body) {
+    return {
+      kind: 'invalid',
+      code: 'invalid_request',
+      field: 'max_completion_tokens',
+      reason: 'schema',
+    };
   }
 
   // 2. Limites: recusa determinística, nunca truncamento.
@@ -627,11 +663,14 @@ const responseChoiceSchema = z
   })
   .strict();
 
+/** Teto `int4` do ledger: contagem maior que isso é uso que não se registra. */
+const tokenCount = () => z.number().int().min(0).max(2_147_483_647);
+
 const usageObservedSchema = z
   .object({
-    prompt_tokens: z.number().int().min(0),
-    completion_tokens: z.number().int().min(0),
-    total_tokens: z.number().int().min(0),
+    prompt_tokens: tokenCount(),
+    completion_tokens: tokenCount(),
+    total_tokens: tokenCount(),
   })
   .strict();
 
