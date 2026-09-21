@@ -265,7 +265,12 @@ export type ReActExitReason =
   | 'outbound_failure'
   | 'empty_final_text'
   | 'iteration_cap'
-  | 'claim_divergence_blocked';
+  | 'claim_divergence_blocked'
+  /**
+   * T22 — as capacidades do run foram revogadas ANTES do envio. A resposta
+   * existia e foi retida de propósito; não é ausência de resposta.
+   */
+  | 'egress_revoked';
 
 /**
  * Runs the ReAct iteration loop. Keeps the LLM call → tool execution cycle

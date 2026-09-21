@@ -63,6 +63,18 @@ export type OutputCoordinatorDepsV1 = {
     summaries: AssembledTurnResultV1['toolSummaries'],
     reason: ReActExitReason,
   ) => Promise<void>;
+  /**
+   * T22 — as capacidades deste run ainda valem?
+   *
+   * Lida imediatamente antes do envio. Ausente, não há fence: é o regime do
+   * motor LOCAL, que não tem run durável nem grant para revogar. Um caller com
+   * run — o adapter Hermes — liga isto à releitura de
+   * `capabilities_revoked_at`.
+   *
+   * `false` BLOQUEIA a entrega. Não é "tente de novo": o run foi parado de
+   * propósito por um operador ou pelo recovery.
+   */
+  isEgressAuthorized?: () => Promise<boolean>;
   /** Lacuna interna: fire-and-forget, NUNCA bloqueia a resposta (§5.9.2.9). */
   onDelivered?: (rawText: string) => void;
 };
@@ -174,6 +186,51 @@ export async function coordinateOutput(
       },
       'engine.coordinator.tool_receipt_gap',
     );
+  }
+
+  /**
+   * T22 (§6.9.1) — O FENCE DE EGRESSO, DEPOIS DA REVOGAÇÃO DE GRANT.
+   *
+   * `markToolHandlerStarted` já relê `capabilities_revoked_at` antes de
+   * liberar um handler, então o lado das FERRAMENTAS está coberto. O que
+   * faltava era a saída final: um run cujas capacidades foram revogadas —
+   * por operador ou por recovery — ainda conseguia entregar a resposta que
+   * tinha produzido antes da revogação.
+   *
+   * A janela é real e não é estreita: o texto é produzido no fim da
+   * deliberação e o envio acontece depois, e é exatamente nesse intervalo que
+   * um operador aperta o botão. Revogar as capacidades e ver a resposta sair
+   * assim mesmo é a forma de falha que o T22 nomeia — "e saída final".
+   *
+   * A releitura acontece AQUI, imediatamente antes do despacho, e não no
+   * começo da coordenação: qualquer trabalho entre a leitura e o envio
+   * reabriria a janela que ela existe para fechar.
+   */
+  if (candidato !== null && candidato.text.length > 0 && deps.isEgressAuthorized !== undefined) {
+    const autorizado = await deps.isEgressAuthorized();
+    if (!autorizado) {
+      logger.warn(
+        { conversa_id: conversa.id, mensagem_id: inbound.id },
+        'engine.coordinator.egress_blocked_capabilities_revoked',
+      );
+      if (assembled.toolSummaries.length > 0) {
+        await deps.flushUnconfirmedToolSummaries(
+          conversa.id,
+          inbound.id,
+          assembled.toolSummaries,
+          'egress_revoked',
+        );
+      }
+      return {
+        outboundText: '',
+        delivery: {
+          dispatched: false,
+          exitReason: 'egress_revoked',
+          persistUnknown: false,
+          sideEffectsCommitted: assembled.sideEffectsCommitted,
+        },
+      };
+    }
   }
 
   if (candidato !== null && candidato.text.length > 0) {

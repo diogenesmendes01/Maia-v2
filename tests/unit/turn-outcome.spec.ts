@@ -173,3 +173,30 @@ describe('divergência de alegação — ausência de receipt não é prova de a
     }
   });
 });
+
+describe('T22 — resposta RETIDA não é resposta inexistente', () => {
+  it('egresso revogado vira dead_letter, não conclusão sem resposta', () => {
+    // `complete/no_reply_produced` diria que o modelo não produziu texto. Ele
+    // produziu — a Maia é que reteve, porque alguém revogou as capacidades.
+    expect(
+      decideTurnAction({
+        dispatched: false,
+        exitReason: 'egress_revoked',
+        persistUnknown: false,
+        sideEffectsCommitted: false,
+      }),
+    ).toEqual({ kind: 'dead_letter', code: 'egress_revoked', outcome: 'unsafe_to_retry' });
+  });
+
+  it('e nunca vira retry: revogar foi decisão de alguém', () => {
+    for (const efeito of [true, false]) {
+      const acao = decideTurnAction({
+        dispatched: false,
+        exitReason: 'egress_revoked',
+        persistUnknown: false,
+        sideEffectsCommitted: efeito,
+      });
+      expect(acao.kind).toBe('dead_letter');
+    }
+  });
+});

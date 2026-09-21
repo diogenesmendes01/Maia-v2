@@ -214,3 +214,70 @@ describe('MaiaOutputCoordinator', () => {
     });
   });
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// T22 — o fence de egresso depois da revogação de grant
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Resultado montado com um texto pronto para entregar. */
+function comResposta(texto: string) {
+  return assembleTurnResult({
+    proposal: {
+      version: 1,
+      run_id: '11111111-1111-4111-8111-111111111111',
+      request_key: '22222222-2222-4222-8222-222222222222',
+      stop: { kind: 'reply', raw_text: texto } as EngineStopV1,
+      iterations: 1,
+      observed_tool_call_ids: [],
+      usage: {
+        input_tokens: null,
+        output_tokens: null,
+        cost_microusd: null,
+        source: 'unavailable' as const,
+      },
+    },
+    receipts: [],
+    outboundPrefix: null,
+  });
+}
+
+describe('T22 — egresso bloqueado depois da revogação de grant', () => {
+  it('capacidades revogadas: NÃO despacha, mesmo com resposta pronta', async () => {
+    // A janela é real: o texto é produzido no fim da deliberação e o envio
+    // acontece depois. É nesse intervalo que um operador aperta o botão.
+    const dispatch = vi.fn(async () => ({ status: 'delivered' as const }));
+    const r = await coordinateOutput(HOST, comResposta('Pronto.'), {
+      dispatch,
+      flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+      isEgressAuthorized: vi.fn(async () => false),
+    });
+
+    expect(dispatch).not.toHaveBeenCalled();
+    expect(r.delivery.dispatched).toBe(false);
+    expect(r.delivery.exitReason).toBe('egress_revoked');
+    expect(r.outboundText).toBe('');
+  });
+
+  it('capacidades válidas: despacha normalmente', async () => {
+    const dispatch = vi.fn(async () => ({ status: 'delivered' as const }));
+    const r = await coordinateOutput(HOST, comResposta('Pronto.'), {
+      dispatch,
+      flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+      isEgressAuthorized: vi.fn(async () => true),
+    });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(r.delivery.dispatched).toBe(true);
+  });
+
+  it('sem o fence ligado, o motor LOCAL entrega como sempre', async () => {
+    // O motor local não tem run durável nem grant para revogar. A ausência da
+    // dependência é o regime dele, não um fence desligado por engano.
+    const dispatch = vi.fn(async () => ({ status: 'delivered' as const }));
+    const r = await coordinateOutput(HOST, comResposta('Pronto.'), {
+      dispatch,
+      flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+    });
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(r.delivery.dispatched).toBe(true);
+  });
+});

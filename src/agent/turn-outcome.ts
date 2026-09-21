@@ -74,6 +74,20 @@ export function decideTurnAction(delivery: ReActDelivery): TurnAction {
     return { kind: 'dead_letter', code: delivery.exitReason, outcome: 'unsafe_to_retry' };
   }
 
+  // 2c. T22 — as capacidades do run foram revogadas antes do envio.
+  //
+  //     Não é `complete/no_reply_produced`, e a diferença não é cosmética:
+  //     ali o modelo não produziu texto; aqui ele produziu e a Maia RETEVE.
+  //     Concluir como "sem resposta" apagaria do registro durável o fato de
+  //     que existe uma resposta pronta que ninguém entregou.
+  //
+  //     E não é `retry`: alguém — operador ou recovery — parou este run de
+  //     propósito. Reexecutar seria desfazer a decisão por conta própria, que
+  //     é o oposto do que uma revogação significa.
+  if (delivery.exitReason === 'egress_revoked') {
+    return { kind: 'dead_letter', code: delivery.exitReason, outcome: 'unsafe_to_retry' };
+  }
+
   // 3. O turno correu até o fim sem produzir resposta.
   return { kind: 'complete', outcome: 'no_reply_produced' };
 }
