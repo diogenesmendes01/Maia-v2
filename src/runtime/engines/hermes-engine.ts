@@ -117,6 +117,20 @@ export interface HermesEngineDepsV1 {
   journal: HermesJournalPortV1;
   adapterRevision?: string;
   now?: () => number;
+  /**
+   * C24 — a trilha durável do cancelamento.
+   *
+   * Injetada e opcional pelas mesmas razões dos demais deps deste módulo:
+   * `@/governance/audit.js` resolve tenant e agent pelo ALS, e o engine é
+   * exercitado em testes sem contexto. Ausente, o cancelamento continua
+   * acontecendo — o que se perde é o registro, e o caller assume essa escolha
+   * ao não passar a dependência.
+   */
+  audit?: (input: {
+    acao: 'engine_cancel_requested' | 'engine_cancel_reconciled';
+    alvo_id: string;
+    metadata: Record<string, unknown>;
+  }) => Promise<void>;
 }
 
 // ─── plano do `start` (puro) ────────────────────────────────────────────────
@@ -428,8 +442,10 @@ export function createHermesEngine(deps: HermesEngineDepsV1): HermesEngineV1 {
             return { kind: 'refused', code: 'effect_unknown' };
           }
           const r = parsed.data;
-          if (r.kind === 'result') return { kind: 'result', result: r.result, is_error: r.is_error };
-          if (r.kind === 'in_progress') return { kind: 'in_progress', retry_after_ms: r.retry_after_ms };
+          if (r.kind === 'result')
+            return { kind: 'result', result: r.result, is_error: r.is_error };
+          if (r.kind === 'in_progress')
+            return { kind: 'in_progress', retry_after_ms: r.retry_after_ms };
           return { kind: 'refused', code: r.code };
         },
         async onResult(frame: ResultFrame, rctx: ResultContextV1): Promise<ResultPersistenceV1> {
@@ -441,7 +457,8 @@ export function createHermesEngine(deps: HermesEngineDepsV1): HermesEngineV1 {
           // O MESMO digest que o journal grava em `terminal_hash`.
           return { kind: 'persisted', terminal_digest: canonicalDigest(proposal) };
         },
-        onRevoke: (reason_code: string) => deps.journal.revokeCapabilities({ binding, reason_code }),
+        onRevoke: (reason_code: string) =>
+          deps.journal.revokeCapabilities({ binding, reason_code }),
         revalidate: () => context.revalidate(),
         leaseHorizonMs: () => context.leaseHorizonMs(),
       },
@@ -469,7 +486,8 @@ export function createHermesEngine(deps: HermesEngineDepsV1): HermesEngineV1 {
   function lookup(locator: EngineRunLocatorV1): RunRecord | null {
     const record = runs.get(locator.run_id);
     if (!record || !record.session || record.request_key !== locator.request_key) return null;
-    if (locator.remote_run_id !== null && locator.remote_run_id !== record.remote_run_id) return null;
+    if (locator.remote_run_id !== null && locator.remote_run_id !== record.remote_run_id)
+      return null;
     return record;
   }
 
@@ -549,10 +567,37 @@ export function createHermesEngine(deps: HermesEngineDepsV1): HermesEngineV1 {
       });
       const res = await Promise.race([record.session.requestCancel('operator'), aborted]);
       // `requested` confirma o PEDIDO, não ausência de efeito (INV-06).
-      return res === 'requested' ? { kind: 'requested' } : { kind: 'unknown' };
+      const desfecho: { kind: 'requested' | 'unknown' } =
+        res === 'requested' ? { kind: 'requested' } : { kind: 'unknown' };
+
+      /**
+       * C24 — a linha durável do PEDIDO.
+       *
+       * Ela registra que alguém mandou parar, e só isso. Afirmar mais seria
+       * mentir: `requested` não prova que o worker parou, nem que nenhum
+       * efeito aconteceu depois (INV-06). Quem fecha o par é
+       * `engine_cancel_reconciled`, quando o run chega a desfecho conhecido.
+       *
+       * O `await` é deliberado e o erro NÃO é engolido: um cancelamento que
+       * não deixou registro é indistinguível de um cancelamento que nunca foi
+       * pedido, e essa é a confusão que este par existe para impedir.
+       */
+      if (deps.audit !== undefined) {
+        await deps.audit({
+          acao: 'engine_cancel_requested',
+          alvo_id: locator.run_id,
+          metadata: {
+            remote_run_id: locator.remote_run_id,
+            request_key: locator.request_key,
+            outcome: desfecho.kind,
+            actor: 'operator',
+          },
+        });
+      }
+
+      return desfecho;
     },
 
     shutdown: () => sup.shutdown(),
   };
 }
-
