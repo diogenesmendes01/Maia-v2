@@ -408,14 +408,28 @@ async function dispatchToolInner(input: {
     return { error: 'no_entity_in_scope' };
   }
 
-  // Fora de `entity`, a permissão resolvida por entidade não se aplica: passar
-  // a da `entidades[0]` seria autorizar a chamada contra um recurso que ela
-  // não pediu. `undefined` faz as checagens adiante decidirem pelo titular e
-  // pelo perfil, que é o que `current_subject`/`current_turn` significam.
-  const resolved =
-    authorizationTarget === 'entity' && entity_id
-      ? input.ctx.scope.byEntity.get(entity_id)
-      : undefined;
+  /**
+   * A permissão resolvida continua vindo da entidade SEMPRE QUE HOUVER UMA.
+   *
+   * A tentação era zerá-la fora de `entity`, com o argumento de que a
+   * permissão de `entidades[0]` não descreve uma chamada que não é sobre
+   * entidade. O argumento está certo e a mudança está errada: as checagens
+   * adiante (`constitutionalCheck`, `canAct`, autorização financeira) LEEM
+   * essa permissão, e sem ela recusam. Zerar aqui não tornava a autorização
+   * mais correta — tornava a ferramenta inutilizável, e foi o que o CI pegou
+   * (`turn-effect-unknown-real-db`: `remember_safe_fact` passou a devolver
+   * `forbidden`).
+   *
+   * Então esta fatia muda só o que pode mudar com segurança: a EXIGÊNCIA de
+   * haver entidade. Onde havia uma, tudo se comporta exatamente como antes.
+   *
+   * O que FICA por resolver, e é honesto nomear: num escopo com várias
+   * entidades, uma ferramenta `current_subject` continua avaliada contra a
+   * permissão da primeira. Corrigir isso exige uma permissão de TITULAR no
+   * `ToolContext` — mudança no modelo de permissões, não no dispatcher, e
+   * fatia própria.
+   */
+  const resolved = entity_id !== undefined ? input.ctx.scope.byEntity.get(entity_id) : undefined;
 
   /**
    * O que entra no MATERIAL DE IDENTIDADE (chave de idempotência, hash de
@@ -430,8 +444,12 @@ async function dispatchToolInner(input: {
    * entidade. O sentinela é prefixado e NÃO é um UUID, então não colide com
    * id de entidade real, e diz o que é quando alguém o encontra num dump.
    */
-  const entityForIdentity =
-    authorizationTarget === 'entity' && entity_id ? entity_id : `authz:${authorizationTarget}`;
+  // O sentinela entra SÓ quando não há entidade nenhuma — o caso que antes era
+  // recusado com `no_entity_in_scope` e portanto não tem comportamento
+  // anterior a preservar. Havendo entidade, a chave continua sendo a mesma de
+  // sempre: trocá-la faria replays legítimos deixarem de casar com os
+  // registros de idempotência já gravados.
+  const entityForIdentity = entity_id ?? `authz:${authorizationTarget}`;
 
   /**
    * E o que entra onde a coluna aceita ausência.
@@ -440,8 +458,7 @@ async function dispatchToolInner(input: {
    * Repetir o sentinela aqui poria um valor que não é id de entidade numa
    * coluna de id de entidade.
    */
-  const entidadeParaAprovacao: string | null =
-    authorizationTarget === 'entity' && entity_id ? entity_id : null;
+  const entidadeParaAprovacao: string | null = entity_id ?? null;
   const valor = pickToolField<'number'>(args, 'valor', 'number');
   const natureza = pickToolField<'string'>(args, 'natureza', 'string');
   const categoria_id = pickToolField<'string'>(args, 'categoria_id', 'string');

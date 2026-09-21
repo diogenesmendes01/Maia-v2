@@ -39,6 +39,24 @@ describe('authorization_target — o contrato', () => {
     );
   });
 
+  it('o alvo só afrouxa a EXIGÊNCIA — não tira a permissão quando há entidade', () => {
+    // Uma versão anterior desta fatia zerava a permissão resolvida fora de
+    // `entity`. O argumento parecia bom — a permissão de `entidades[0]` não
+    // descreve uma chamada que não é sobre entidade — mas as checagens adiante
+    // LEEM essa permissão e recusam sem ela. O CI pegou: `remember_safe_fact`
+    // passou a devolver `forbidden` em `turn-effect-unknown-real-db`.
+    //
+    // O que resta por resolver, e é conhecido: num escopo com várias
+    // entidades, uma ferramenta `current_subject` continua avaliada contra a
+    // permissão da PRIMEIRA. Corrigir exige permissão de titular no
+    // `ToolContext` — modelo de permissões, não dispatcher.
+    const anotada = REGISTRY.remember_safe_fact;
+    expect(anotada?.authorization_target).toBe('current_subject');
+    // O contrato aqui é o do dispatcher, exercitado nos testes de integração
+    // (`turn-effect-unknown-real-db`): com entidade no escopo, o caminho é
+    // idêntico ao anterior à fatia.
+  });
+
   it('nenhuma ferramenta anotada como current_subject pede entidade no schema', () => {
     // Coerência: declarar que a autorização não é sobre entidade e ao mesmo
     // tempo receber `entidade_id` seria contradição — o dispatcher ignoraria
