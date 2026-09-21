@@ -33,7 +33,7 @@
  * "o motor novo quis chamar algo que o antigo não chamou" é exatamente o tipo
  * de divergência que a avaliação existe para encontrar.
  */
-import { createHash } from "node:crypto";
+import { createHash } from 'node:crypto';
 import type {
   AgentEnginePortV1,
   EngineRequestV1,
@@ -41,7 +41,7 @@ import type {
   EngineToolCallV1,
   EngineToolReplyV1,
   Json,
-} from "./contracts.js";
+} from './contracts.js';
 
 /** Uma chamada de ferramenta GRAVADA no turno original. */
 export type RecordedToolCallV1 = {
@@ -75,19 +75,19 @@ export type ShadowSnapshotV1 = {
 };
 
 export type ShadowDivergenceV1 =
-  | { kind: "stop_kind"; production: string; shadow: string }
-  | { kind: "reply_text"; note: "texto diferente com o mesmo desfecho" }
-  | { kind: "tool_not_recorded"; call_id: string; tool: string }
-  | { kind: "tool_unused"; tool: string; args_digest: string };
+  | { kind: 'stop_kind'; production: string; shadow: string }
+  | { kind: 'reply_text'; note: 'texto diferente com o mesmo desfecho' }
+  | { kind: 'tool_not_recorded'; call_id: string; tool: string }
+  | { kind: 'tool_unused'; tool: string; args_digest: string };
 
 export type ShadowReportV1 = {
   snapshot_id: string;
   turn_id: string;
   /** Versão do formato. Relatório versionado é requisito do §10. */
   report_format: 1;
-  engine_pin: AgentEnginePortV1["pin"];
-  production_stop_kind: EngineStopV1["kind"];
-  shadow_stop_kind: EngineStopV1["kind"] | "not_produced";
+  engine_pin: AgentEnginePortV1['pin'];
+  production_stop_kind: EngineStopV1['kind'];
+  shadow_stop_kind: EngineStopV1['kind'] | 'not_produced';
   divergences: ShadowDivergenceV1[];
   /** Chamadas que o motor em shadow pediu e a gravação não tinha. */
   unrecorded_calls: number;
@@ -95,12 +95,12 @@ export type ShadowReportV1 = {
 };
 
 export type ShadowEvaluationResultV1 =
-  | { kind: "evaluated"; report: ShadowReportV1 }
+  | { kind: 'evaluated'; report: ShadowReportV1 }
   | {
-      kind: "non_comparable";
-      reason: "engine_not_accepted" | "engine_did_not_terminate";
+      kind: 'non_comparable';
+      reason: 'engine_not_accepted' | 'engine_did_not_terminate';
     }
-  | { kind: "refused"; reason: "turn_not_closed" | "not_authorized" };
+  | { kind: 'refused'; reason: 'turn_not_closed' | 'not_authorized' };
 
 /** Armazenamento de avaliação — SEPARADO do de produção (§10). */
 export type ShadowReportStoreV1 = {
@@ -109,7 +109,7 @@ export type ShadowReportStoreV1 = {
 
 function digestArgs(args: Json): string {
   const ordenar = (v: unknown): unknown => {
-    if (v === null || typeof v !== "object") return v;
+    if (v === null || typeof v !== 'object') return v;
     if (Array.isArray(v)) return v.map(ordenar);
     return Object.fromEntries(
       Object.entries(v as Record<string, unknown>)
@@ -117,9 +117,9 @@ function digestArgs(args: Json): string {
         .map(([k, val]) => [k, ordenar(val)]),
     );
   };
-  return createHash("sha256")
-    .update(JSON.stringify(ordenar(args)), "utf8")
-    .digest("hex");
+  return createHash('sha256')
+    .update(JSON.stringify(ordenar(args)), 'utf8')
+    .digest('hex');
 }
 
 /**
@@ -161,14 +161,14 @@ export function createReplayToolIO(
 
       if (!fila || numConsumidos >= fila.length) {
         naoGravadas.push({
-          kind: "tool_not_recorded",
+          kind: 'tool_not_recorded',
           call_id: call.call_id,
           tool: call.name,
         });
         return {
-          kind: "refused",
+          kind: 'refused',
           call_id: call.call_id,
-          code: "tool_not_allowed",
+          code: 'tool_not_allowed',
         };
       }
 
@@ -176,7 +176,7 @@ export function createReplayToolIO(
       consumidos.set(chave, numConsumidos + 1);
 
       return {
-        kind: "result",
+        kind: 'result',
         call_id: call.call_id,
         result: gravada.result,
         is_error: gravada.is_error,
@@ -217,13 +217,11 @@ export async function runShadowEvaluation(input: {
    * exclui: haveria dois motores raciocinando sobre o mesmo turno, e o
    * resultado da avaliação dependeria de qual terminasse primeiro.
    */
-  if (!snapshot.turn_closed)
-    return { kind: "refused", reason: "turn_not_closed" };
+  if (!snapshot.turn_closed) return { kind: 'refused', reason: 'turn_not_closed' };
 
   // Snapshot sem autorização registrada é dado de conversa de alguém sendo
   // reprocessado sem consentimento.
-  if (snapshot.authorized_by.length === 0)
-    return { kind: "refused", reason: "not_authorized" };
+  if (snapshot.authorized_by.length === 0) return { kind: 'refused', reason: 'not_authorized' };
 
   const divergences: ShadowDivergenceV1[] = [];
   const replay = createReplayToolIO(snapshot, divergences);
@@ -231,7 +229,7 @@ export async function runShadowEvaluation(input: {
   const controller = new AbortController();
   if (input.signal?.aborted === true) controller.abort();
   const abortListener = () => controller.abort();
-  input.signal?.addEventListener("abort", abortListener, { once: true });
+  input.signal?.addEventListener('abort', abortListener, { once: true });
 
   try {
     let shadowStop: EngineStopV1 | null = null;
@@ -245,15 +243,15 @@ export async function runShadowEvaluation(input: {
      * Retornar explicitamente que o resultado não é comparável, não reportar
      * como avaliado com divergences vazio, que seria confuso.
      */
-    if (start.kind !== "accepted") {
-      return { kind: "non_comparable", reason: "engine_not_accepted" };
+    if (start.kind !== 'accepted') {
+      return { kind: 'non_comparable', reason: 'engine_not_accepted' };
     }
 
     const obs = await engine.observe(
       {
         run_id: snapshot.request.run_id,
         request_key: snapshot.request.request_key,
-        remote_instance_id: "shadow",
+        remote_instance_id: 'shadow',
         remote_run_id: start.remote_run_id,
       },
       controller.signal,
@@ -263,8 +261,8 @@ export async function runShadowEvaluation(input: {
      * Se observe não retornou terminal, o motor não terminou, logo não há
      * um desfecho para comparar com a produção.
      */
-    if (obs.kind !== "terminal") {
-      return { kind: "non_comparable", reason: "engine_did_not_terminate" };
+    if (obs.kind !== 'terminal') {
+      return { kind: 'non_comparable', reason: 'engine_did_not_terminate' };
     }
 
     shadowStop = obs.proposal.stop;
@@ -279,18 +277,18 @@ export async function runShadowEvaluation(input: {
      */
     if (shadowStop.kind !== snapshot.production_stop.kind) {
       divergences.push({
-        kind: "stop_kind",
+        kind: 'stop_kind',
         production: snapshot.production_stop.kind,
         shadow: shadowStop.kind,
       });
     } else if (
-      shadowStop.kind === "reply" &&
-      snapshot.production_stop.kind === "reply" &&
+      shadowStop.kind === 'reply' &&
+      snapshot.production_stop.kind === 'reply' &&
       shadowStop.raw_text !== snapshot.production_stop.raw_text
     ) {
       divergences.push({
-        kind: "reply_text",
-        note: "texto diferente com o mesmo desfecho",
+        kind: 'reply_text',
+        note: 'texto diferente com o mesmo desfecho',
       });
     }
 
@@ -304,7 +302,7 @@ export async function runShadowEvaluation(input: {
      */
     for (const naoUsada of replay.naoUsadas()) {
       divergences.push({
-        kind: "tool_unused",
+        kind: 'tool_unused',
         tool: naoUsada.name,
         args_digest: naoUsada.args_digest,
       });
@@ -318,16 +316,14 @@ export async function runShadowEvaluation(input: {
       production_stop_kind: snapshot.production_stop.kind,
       shadow_stop_kind: shadowStop.kind,
       divergences,
-      unrecorded_calls: divergences.filter(
-        (d) => d.kind === "tool_not_recorded",
-      ).length,
+      unrecorded_calls: divergences.filter((d) => d.kind === 'tool_not_recorded').length,
       evaluated_at: (input.now ?? (() => new Date()))().toISOString(),
     };
 
     await input.store.save(report);
-    return { kind: "evaluated", report };
+    return { kind: 'evaluated', report };
   } finally {
     // Remover o listener para evitar vazamento, mesmo se houver exceção.
-    input.signal?.removeEventListener("abort", abortListener);
+    input.signal?.removeEventListener('abort', abortListener);
   }
 }
