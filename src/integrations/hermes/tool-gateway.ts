@@ -324,7 +324,33 @@ export function createEngineToolGateway(
       return { kind: 'in_progress', call_id: call.call_id, retry_after_ms: retryAfterMs };
     }
 
-    // ── (2) RELEITURA DO BANCO (§6.9.1 item 2) ──────────────────────────
+    // ── (2) CLASSIFICAÇÃO ESTÁTICA — ANTES DA ADMISSÃO ──────────────────
+    //
+    // `effect_class: null` NUNCA autoriza handler (§4.1). Uma tool que o
+    // registry não classifica é uma tool cujo efeito ninguém sabe descrever, e
+    // liberar isso é liberar o desconhecido.
+    //
+    // Isto roda ANTES de `admit` de propósito (achado de revisão sobre a
+    // PR #773): `classify` é ESTÁTICO — vem do registry da casa, não do banco
+    // — então ele pode ser checado junto da decisão estática do broker, no
+    // mesmo fôlego que `decide`. A alternativa (checar depois de `admit`)
+    // deixava a chamada ADMITIDA no journal sem nunca ser finalizada: nenhuma
+    // transição de encerramento válida existe para uma chamada admitida que
+    // não pode prosseguir por falta de classe, e o revisor foi explícito que
+    // liquidar indiscriminadamente ali seria errado — uma recusa de CAS pode
+    // significar perda de posse, e não dá para tratar todo caso do mesmo jeito.
+    // Recusando ANTES do `admit`, a chamada nunca entra no journal e não há
+    // o que reconciliar.
+    const classificacao = deps.classify(call.name);
+    if (classificacao === null || classificacao.effect_class === null) {
+      logger.error(
+        { run_id: identity.run_id, call_id: call.call_id, tool: call.name, ops_alert: true },
+        'engine.tool_gateway.unclassified_tool_refused',
+      );
+      return { kind: 'refused', call_id: call.call_id, code: 'tool_not_allowed' };
+    }
+
+    // ── (3) RELEITURA DO BANCO (§6.9.1 item 2) ──────────────────────────
     const admissao = await deps.admit({
       ...base,
       request_id: identity.request_id,
@@ -363,20 +389,7 @@ export function createEngineToolGateway(
       };
     }
 
-    // ── (3) CLASSIFICAÇÃO CONGELADA ANTES DO HANDLER ────────────────────
-    //
-    // `effect_class: null` NUNCA autoriza handler (§4.1). Uma tool que o
-    // registry não classifica é uma tool cujo efeito ninguém sabe descrever, e
-    // liberar isso é liberar o desconhecido.
-    const classificacao = deps.classify(call.name);
-    if (classificacao === null || classificacao.effect_class === null) {
-      logger.error(
-        { run_id: identity.run_id, call_id: call.call_id, tool: call.name, ops_alert: true },
-        'engine.tool_gateway.unclassified_tool_refused',
-      );
-      return { kind: 'refused', call_id: call.call_id, code: 'tool_not_allowed' };
-    }
-
+    // ── (4) CLASSIFICAÇÃO CONGELADA ANTES DO HANDLER ────────────────────
     const congelou = await deps.markDispatching({
       ...base,
       call_id: admissao.call_id,
@@ -391,7 +404,7 @@ export function createEngineToolGateway(
       return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
     }
 
-    // ── (3a) IDENTIDADE DE IDEMPOTÊNCIA CONGELADA (§5.6.3) ──────────────
+    // ── (4a) IDENTIDADE DE IDEMPOTÊNCIA CONGELADA (§5.6.3) ──────────────
     // Antes de marcar que o handler começou, é preciso congelar a identidade
     // de idempotência. Isso garante que a chamada é determinística.
     const congelada = await deps.freezeToolIdentity({
@@ -410,10 +423,30 @@ export function createEngineToolGateway(
       return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
     }
 
-    // ── (3b) MARCADOR DO HANDLER (§5.6.4) ───────────────────────────────
-    // Depois de congelar a identidade, marca que o handler vai começar.
-    // Isso separa "não começou" de "pode ter começado". A row_version
-    // é incrementada neste passo; precisamos dessa versão nova para o settle.
+    // ── (4b) CONTEXTO DO HANDLER — ANTES DO MARCADOR ────────────────────
+    //
+    // `buildToolContext` é resolvido AQUI, antes de `markToolHandlerStarted`
+    // (achado de revisão sobre a PR #773). Antes, ele rodava DEPOIS do
+    // marcador ter sucesso, fora de qualquer `try`: se rejeitasse, a exceção
+    // propagava com o marcador já chamado uma vez, `dispatch` zero e `settle`
+    // zero — a chamada ficava carimbada `handler_started` no journal sem
+    // nunca ser liquidada, um estado que só reconciliação manual resolve
+    // (nada garante, olhando só o journal, se o handler chegou a rodar).
+    //
+    // Resolvendo o contexto ANTES do marcador, uma falha aqui acontece com a
+    // chamada ainda em `dispatching` — estado que não mente sobre o handler
+    // ter começado, porque ele DE FATO não começou. Isso é consistente com
+    // as demais falhas pré-handler acima (`admit`, `markDispatching`,
+    // `freezeToolIdentity`): nenhuma delas é envolvida em `try/catch` aqui,
+    // porque nenhuma tem como ter produzido efeito ainda.
+    const ctx = await deps.buildToolContext(call);
+
+    // ── (4c) MARCADOR DO HANDLER (§5.6.4) ───────────────────────────────
+    // Depois de congelar a identidade E resolver o contexto, marca que o
+    // handler vai começar. Isso separa "não começou" de "pode ter começado".
+    // A row_version é incrementada neste passo; precisamos dessa versão nova
+    // para o settle. A partir daqui, nada mais pode falhar entre o marcador
+    // e a tentativa de despachar — é isso que o passo acima garante.
     const marcou = await deps.markToolHandlerStarted({
       ...base,
       call_id: admissao.call_id,
@@ -430,8 +463,7 @@ export function createEngineToolGateway(
       return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
     }
 
-    // ── (4) O HANDLER ───────────────────────────────────────────────────
-    const ctx = await deps.buildToolContext(call);
+    // ── (5) O HANDLER ────────────────────────────────────────────────────
     let resultado: DispatchResult;
     try {
       resultado = await deps.dispatch({ tool: call.name, args: call.args, ctx });
@@ -452,17 +484,59 @@ export function createEngineToolGateway(
         },
         'engine.tool_gateway.handler_threw_effect_unknown',
       );
-      await deps.settle({
-        ...base,
-        call_id: admissao.call_id,
-        expected_row_version: marcou.row_version,
-        dispatch_token: congelou.dispatch_token,
-        outcome: { kind: 'effect_unknown', result: null },
-      });
+
+      /**
+       * A liquidação abaixo é a tentativa de gravar `effect_unknown` — mas ela
+       * PRÓPRIA pode falhar (achado de revisão sobre a PR #773): seja
+       * rejeitando (o erro do repositório escapando, como a sonda do revisor
+       * reproduziu), seja resolvendo `{ ok: false }` (conflito de versão ou
+       * estado). A sonda NÃO demonstra duplicação efetiva de efeito — só que a
+       * liquidação em si não gravou.
+       *
+       * Nenhum dos dois pode escapar desta função sem resposta: o caller
+       * precisa de um `EngineToolReplyV1` do contrato sempre, nunca de uma
+       * promise rejeitada por um detalhe de persistência. O desfecho devolvido
+       * ao motor já é o mais conservador que existe — `effect_unknown` nunca
+       * autoriza retry — e não muda com o resultado desta liquidação; o que
+       * muda é o log: é dele que um operador vai precisar para saber que o
+       * journal pode NÃO refletir isto, e que a chamada segue elegível à
+       * reconciliação segura.
+       */
+      try {
+        const liquidouAposExcecao = await deps.settle({
+          ...base,
+          call_id: admissao.call_id,
+          expected_row_version: marcou.row_version,
+          dispatch_token: congelou.dispatch_token,
+          outcome: { kind: 'effect_unknown', result: null },
+        });
+        if (!liquidouAposExcecao.ok) {
+          logger.error(
+            {
+              run_id: identity.run_id,
+              call_id: call.call_id,
+              reason: liquidouAposExcecao.reason,
+              ops_alert: true,
+            },
+            'engine.tool_gateway.settle_not_persisted_after_handler_threw',
+          );
+        }
+      } catch (settleErr) {
+        logger.error(
+          {
+            run_id: identity.run_id,
+            call_id: call.call_id,
+            err: (settleErr as Error).message,
+            ops_alert: true,
+          },
+          'engine.tool_gateway.settle_rejected_after_handler_threw',
+        );
+      }
+
       return { kind: 'refused', call_id: call.call_id, code: 'effect_unknown' };
     }
 
-    // ── (5) LIQUIDAÇÃO ──────────────────────────────────────────────────
+    // ── (6) LIQUIDAÇÃO ───────────────────────────────────────────────────
     const erro = ehErroDeHandler(resultado);
     const outcome: ToolSettlement = erro
       ? { kind: 'denied', result: resultado as Json }

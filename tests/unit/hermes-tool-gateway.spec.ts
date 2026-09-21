@@ -16,6 +16,7 @@ import { createEngineToolGateway } from '@/integrations/hermes/tool-gateway.js';
 import type { ToolGatewayDepsV1 } from '@/integrations/hermes/tool-gateway.js';
 import type { EngineToolCallV1 } from '@/runtime/engines/contracts.js';
 import type { ToolClassification } from '@/db/repositories/engine-repos.js';
+import { logger } from '@/lib/logger.js';
 
 vi.mock('@/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
@@ -391,5 +392,80 @@ describe('T19 — recusa de binding cruzado exige recusa E auditoria', () => {
       }),
     });
     await expect(createEngineToolGateway(IDENT, d)(CHAMADA)).rejects.toThrow('audit indisponível');
+  });
+});
+
+describe('PR #773 / Achado 1 — contexto do handler resolve ANTES do marcador', () => {
+  it('buildToolContext que rejeita NÃO deixa a chamada carimbada handler_started sem liquidar', async () => {
+    // Antes, `buildToolContext` rodava DEPOIS de `markToolHandlerStarted` ter
+    // sucesso, fora de qualquer `try`: uma rejeição ali deixava o marcador
+    // chamado uma vez, `dispatch` zero e `settle` zero — a chamada ficava
+    // carimbada `handler_started` no journal sem nunca ser liquidada, estado
+    // que só reconciliação manual resolve.
+    const d = deps({
+      buildToolContext: vi.fn(async () => {
+        throw new Error('binding sem conta resolvida');
+      }),
+    });
+
+    await expect(createEngineToolGateway(IDENT, d)(CHAMADA)).rejects.toThrow(
+      'binding sem conta resolvida',
+    );
+
+    // O marcador nunca é alcançado: a falha acontece ANTES dele, com a
+    // chamada ainda em `dispatching` — um estado que não mente sobre o
+    // handler ter começado, porque ele de fato não começou.
+    expect(d.markToolHandlerStarted).not.toHaveBeenCalled();
+    expect(d.dispatch).not.toHaveBeenCalled();
+    expect(d.settle).not.toHaveBeenCalled();
+  });
+});
+
+describe('PR #773 / Achado 2 — classificação ausente recusa ANTES da admissão', () => {
+  it('tool sem effect_class nunca chega a ser admitida no journal', async () => {
+    // `classify` é ESTÁTICO (vem do registry, não do banco), então pode ser
+    // checado junto da decisão estática do broker. Antes, o gateway admitia a
+    // chamada e SÓ DEPOIS recusava por falta de classe — deixando-a admitida
+    // no journal sem nenhuma transição de encerramento válida.
+    const d = deps({ classify: vi.fn(() => null) });
+    const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
+
+    expect(r).toEqual({ kind: 'refused', call_id: 'c1', code: 'tool_not_allowed' });
+    expect(d.admit).not.toHaveBeenCalled();
+    expect(d.markDispatching).not.toHaveBeenCalled();
+    expect(d.dispatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('PR #773 / Achado 3 — rejeição de persistência não escapa do contrato', () => {
+  it('handler lança E o settle de effect_unknown também rejeita: o contrato ainda responde', async () => {
+    // A sonda do revisor reproduz a rejeição do repositório escapando da
+    // função. Ela NÃO demonstra duplicação efetiva de efeito — só que a
+    // liquidação em si não gravou. O caller precisa receber um
+    // `EngineToolReplyV1` do contrato de qualquer forma, nunca uma promise
+    // rejeitada por um detalhe de persistência.
+    const settle = vi.fn(async () => {
+      throw new Error('pool de conexões indisponível');
+    });
+    const d = deps({
+      dispatch: vi.fn(async () => {
+        throw new Error('timeout no banco externo');
+      }),
+      settle,
+    });
+
+    const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
+
+    expect(r).toEqual({ kind: 'refused', call_id: 'c1', code: 'effect_unknown' });
+    expect(settle).toHaveBeenCalledWith(
+      expect.objectContaining({ outcome: { kind: 'effect_unknown', result: null } }),
+    );
+    // O log é a informação que um operador vai precisar: a liquidação não
+    // gravou, então a chamada segue elegível à reconciliação segura em vez de
+    // ser tratada como resolvida.
+    expect(logger.error).toHaveBeenCalledWith(
+      expect.objectContaining({ call_id: 'c1', ops_alert: true }),
+      'engine.tool_gateway.settle_rejected_after_handler_threw',
+    );
   });
 });
