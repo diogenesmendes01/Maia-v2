@@ -143,6 +143,23 @@ export type ToolGatewayDepsV1 = {
     alvo_id: string;
     metadata: Record<string, unknown>;
   }) => Promise<void>;
+  /**
+   * Abre (ou reencontra) o pedido de aprovação humana de uma chamada adiada.
+   *
+   * T30 — "o gate Maia permanece". O caller liga isto a
+   * `ensureApprovalRequest` (`@/governance/approval-requests.js`), a MESMA
+   * máquina do dispatcher: mesmo `intent_hash`, mesma deduplicação por
+   * impressão digital. A dedupe é o que faz o repolling do motor reencontrar o
+   * pedido em vez de encher a fila do humano com a mesma decisão.
+   *
+   * Não decide a classe de aprovação: quem sabe se é `requester_plus_one_owner`
+   * ou `two_distinct_owners` é `dualClassFor`, com a pessoa na mão — e a pessoa
+   * é contexto do turno, que este módulo não carrega.
+   */
+  ensureApproval?: (input: {
+    call: EngineToolCallV1;
+    run_id: string;
+  }) => Promise<{ ref: string; created: boolean }>;
 };
 
 const RETRY_PADRAO_MS = 30_000;
@@ -253,10 +270,57 @@ export function createEngineToolGateway(
        * motor que espere aprovação fica repolando em `retryAfterMs`. Fechar
        * isso exige abrir o protocolo congelado, que é a PR de Fase 0.
        */
+      /**
+       * T30 — O GATE DA MAIA PERMANECE.
+       *
+       * Devolver `in_progress` sem mais nada era pedir ao motor que esperasse
+       * por algo que NÃO EXISTIA: nenhum pedido de aprovação era aberto, então
+       * nenhum humano tinha o que aprovar, e a espera era infinita por
+       * construção. O gate não estava sendo contornado — ele simplesmente não
+       * chegava a existir neste caminho.
+       *
+       * `ensureApproval` é a MESMA máquina que o dispatcher usa
+       * (`ensureApprovalRequest`), com o mesmo `intent_hash` e a mesma
+       * deduplicação por impressão digital. Isso importa: um caminho paralelo
+       * de aprovação seria uma segunda autoridade, e duas autoridades sobre o
+       * mesmo efeito é como uma delas acaba sendo contornada.
+       *
+       * A dedupe por `intent_hash` é o que torna o repolling seguro: a segunda
+       * chamada do motor reencontra o MESMO pedido em vez de abrir outro, e o
+       * humano não vê a mesma decisão N vezes na fila.
+       */
+      const aprovacao =
+        deps.ensureApproval !== undefined
+          ? await deps.ensureApproval({ call, run_id: identity.run_id })
+          : null;
+
       logger.info(
-        { run_id: identity.run_id, call_id: call.call_id, tool: call.name },
+        {
+          run_id: identity.run_id,
+          call_id: call.call_id,
+          tool: call.name,
+          approval_ref: aprovacao?.ref ?? null,
+          approval_created: aprovacao?.created ?? null,
+        },
         'engine.tool_gateway.deferred_pending_approval',
       );
+
+      /**
+       * Sem `ensureApproval` o gateway NÃO finge que há aprovação a caminho.
+       *
+       * `in_progress` diria ao motor "espere, isto vai resolver". Se ninguém
+       * abriu pedido, não vai — e o motor repolaria até o deadline do run.
+       * `tool_not_allowed` é a verdade disponível no wire: esta chamada não
+       * pode prosseguir por este caminho.
+       */
+      if (aprovacao === null) {
+        logger.error(
+          { run_id: identity.run_id, call_id: call.call_id, tool: call.name, ops_alert: true },
+          'engine.tool_gateway.defer_without_approval_channel',
+        );
+        return { kind: 'refused', call_id: call.call_id, code: 'tool_not_allowed' };
+      }
+
       return { kind: 'in_progress', call_id: call.call_id, retry_after_ms: retryAfterMs };
     }
 

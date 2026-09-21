@@ -259,7 +259,37 @@ describe('EngineToolGateway — efeito incerto nunca vira retry seguro', () => {
     );
   });
 
-  it('defer vira in_progress: o wire não sabe dizer "esperando aprovação"', async () => {
+  it('defer ABRE o pedido de aprovação e só então manda esperar (T30)', async () => {
+    // Antes, `defer` devolvia `in_progress` sem mais nada: o motor esperava
+    // por algo que NÃO EXISTIA, porque nenhum pedido era aberto e nenhum
+    // humano tinha o que aprovar. O gate não estava sendo contornado — ele
+    // não chegava a existir neste caminho.
+    const ensureApproval = vi.fn(async () => ({ ref: 'AP-7', created: true }));
+    const d = deps({
+      decide: vi.fn(() => ({
+        kind: 'defer' as const,
+        reason: 'approval_required' as const,
+        tool: TOOL as never,
+      })),
+      ensureApproval,
+    });
+    const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
+
+    expect(ensureApproval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        run_id: 'run-1',
+        call: expect.objectContaining({ call_id: 'c1' }),
+      }),
+    );
+    expect(r).toMatchObject({ kind: 'in_progress' });
+    // E o handler continua sem rodar: aprovação pendente não é autorização.
+    expect(d.admit).not.toHaveBeenCalled();
+    expect(d.dispatch).not.toHaveBeenCalled();
+  });
+
+  it('sem canal de aprovação, defer RECUSA em vez de mandar esperar para sempre', async () => {
+    // `in_progress` diria "espere, isto vai resolver". Sem pedido aberto, não
+    // vai — e o motor repolaria até o deadline do run.
     const d = deps({
       decide: vi.fn(() => ({
         kind: 'defer' as const,
@@ -268,8 +298,8 @@ describe('EngineToolGateway — efeito incerto nunca vira retry seguro', () => {
       })),
     });
     const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
-    expect(r).toMatchObject({ kind: 'in_progress' });
-    expect(d.admit).not.toHaveBeenCalled();
+    expect(r).toMatchObject({ kind: 'refused', code: 'tool_not_allowed' });
+    expect(d.dispatch).not.toHaveBeenCalled();
   });
 
   it('falha ao congelar identidade recusa a chamada', async () => {
