@@ -86,7 +86,28 @@ const RE_TELEFONE = /\b(?:\+?55\s?)?\(?\d{2}\)?[\s-]?9?\d{4}[\s-]?\d{4}\b/g;
 const RE_SEGREDO =
   /\b(senha|password|passwd|secret|token|api[_-]?key|chave[_-]?(?:api|privada)|authorization|bearer|private[_-]?key)\b\s*[:=]/gi;
 
-function varrerTexto(texto: string, path: string, out: PayloadFindingV1[]): void {
+/**
+ * UUID em qualquer das formas que a casa usa (com ou sem hífen).
+ *
+ * Ele é mascarado ANTES de qualquer heurística numérica, e a razão é concreta:
+ * um UUID é uma corrida de dígitos hexadecimais separados por hífen, e as
+ * heurísticas de telefone e de cartão são heurísticas sobre corridas de
+ * dígitos separados por hífen. `11111111-2222-3333-4444-555555555555` casava
+ * como telefone brasileiro — foi o que reprovou o CI da primeira versão desta
+ * varredura, marcando `subject_id` de um fato comum como dado pessoal.
+ *
+ * Mascarar é melhor que excluir o campo: o mesmo texto pode ter um id E um
+ * telefone, e pular o campo inteiro perderia o segundo.
+ */
+const RE_UUID = /\b[0-9a-f]{8}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{4}-?[0-9a-f]{12}\b/gi;
+
+/** Substitui UUIDs por um marcador do mesmo tamanho, sem dígitos. */
+function mascararIdentificadores(texto: string): string {
+  return texto.replace(RE_UUID, (m) => '#'.repeat(m.length));
+}
+
+function varrerTexto(textoBruto: string, path: string, out: PayloadFindingV1[]): void {
+  const texto = mascararIdentificadores(textoBruto);
   // CPF e CNPJ passam pelo validador de dígito: candidato que não valida não
   // vira achado, e é isso que mantém o sinal legível.
   for (const m of texto.matchAll(RE_CPF)) {
@@ -95,16 +116,29 @@ function varrerTexto(texto: string, path: string, out: PayloadFindingV1[]): void
   for (const m of texto.matchAll(RE_CNPJ)) {
     if (isValidCNPJ(m[0])) out.push({ signal: 'cnpj', path });
   }
+  // O TELEFONE vem antes do cartão, e o que ele casa sai do texto.
+  //
+  // `+5511987654321` são treze dígitos contíguos, que é também a faixa de um
+  // PAN. Sem mascarar, o mesmo telefone saía com DOIS achados — `phone_br` e
+  // `card_like` — e o segundo é informação errada no motivo que vai para a
+  // auditoria. O risco final mal mudaria; o que mudaria é o operador lendo
+  // "cartão" onde havia um telefone.
+  let restante = texto;
+  if (RE_TELEFONE.test(texto)) {
+    out.push({ signal: 'phone_br', path });
+    RE_TELEFONE.lastIndex = 0;
+    restante = texto.replace(RE_TELEFONE, (m) => '#'.repeat(m.length));
+  }
+  RE_TELEFONE.lastIndex = 0;
+
   // Cartão não tem validador na casa; o comprimento é o sinal, e ele erra para
   // o lado de marcar demais — que aqui é o lado certo.
-  if (RE_CARTAO.test(texto)) out.push({ signal: 'card_like', path });
+  if (RE_CARTAO.test(restante)) out.push({ signal: 'card_like', path });
   RE_CARTAO.lastIndex = 0;
   if (RE_SEGREDO.test(texto)) out.push({ signal: 'secret_like', path });
   RE_SEGREDO.lastIndex = 0;
   if (RE_EMAIL.test(texto)) out.push({ signal: 'email', path });
   RE_EMAIL.lastIndex = 0;
-  if (RE_TELEFONE.test(texto)) out.push({ signal: 'phone_br', path });
-  RE_TELEFONE.lastIndex = 0;
 }
 
 /**

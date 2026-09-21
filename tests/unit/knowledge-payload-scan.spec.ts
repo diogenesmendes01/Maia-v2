@@ -53,6 +53,29 @@ describe('scanPayload — cobertura integral', () => {
     expect(scan.findings.some((f) => f.signal === 'cpf')).toBe(false);
   });
 
+  it('UUID não é telefone nem cartão — regressão do falso positivo', () => {
+    // A primeira versão desta varredura reprovou o CI marcando `phone_br` num
+    // `subject_id`. Um UUID é uma corrida de dígitos separados por hífen, e as
+    // heurísticas de telefone e cartão são heurísticas sobre exatamente isso.
+    // O efeito não era cosmético: o fato passava a exigir revisão humana por
+    // causa do próprio identificador dele.
+    const pid = '11111111-2222-3333-4444-555555555555';
+    const scan = scanPayload({ content: 'hi', subject_id: pid });
+    expect(scan.findings).toEqual([]);
+    expect(riskFloorFromScan(scan)).toBeNull();
+
+    // Sem hífen também: a casa usa as duas formas.
+    expect(scanPayload({ id: pid.replace(/-/g, '') }).findings).toEqual([]);
+  });
+
+  it('telefone com +55 não vira TAMBÉM cartão', () => {
+    // Treze dígitos contíguos são a faixa de um PAN. Sem mascarar o telefone
+    // antes, o mesmo valor saía com dois achados, e o operador leria "cartão"
+    // onde havia um telefone.
+    const scan = scanPayload({ t: '+5511987654321' });
+    expect(scan.findings.map((f) => f.signal)).toEqual(['phone_br']);
+  });
+
   it('o caminho do achado não carrega o valor encontrado', () => {
     const scan = scanPayload({ cliente: { documento: CPF_VALIDO } });
     const achado = scan.findings.find((f) => f.signal === 'cpf');
