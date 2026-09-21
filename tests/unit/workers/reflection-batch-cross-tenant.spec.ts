@@ -66,12 +66,19 @@ import { runWithTenantContext, tryGetCurrentContext } from '@/db/tenant-context.
 // In-memory audit_log + db.execute fake
 // ---------------------------------------------------------------------------
 type AuditRow = {
+  /**
+   * G1 item 1 — `id`, `conversa_id` e `created_at` entram porque a consulta
+   * real passou a selecioná-los: sem id estável não há linhagem auditável, e
+   * sem titular derivável o sinal vai para quarentena em vez de virar cluster.
+   */
+  id: string;
   tenant_id: string;
   agent_id: string;
   acao: string;
   alvo_id: string | null;
   metadata: Record<string, unknown>;
   pessoa_id: string | null;
+  conversa_id: string | null;
   created_at: Date;
 };
 
@@ -104,7 +111,12 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
   }
 
   // (B) Per-tenant inner read — filters by acao + tenant_id + agent_id.
-  if (/SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id\s+FROM/i.test(sqlText)) {
+  // G1 item 1 — a projeção real passou a incluir `id`, `conversa_id` e
+  // `created_at`. O casamento é pela ÂNCORA da consulta (a coluna `acao` e a
+  // tabela), não pela lista inteira de colunas: prender a lista faria este
+  // fake deixar de casar a cada coluna nova, e o sintoma seria um teste
+  // "sem sinais" em vez de um erro que aponta para cá.
+  if (/SELECT[\s\S]*acao[\s\S]*FROM/i.test(sqlText) && /audit_log/i.test(sqlText)) {
     // Param order from the production SQL: $1=tenant_id, $2=agent_id.
     // (The `since` is a raw sql template, not a bound param.)
     const tenant_id = params[0] as string;
@@ -115,10 +127,13 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     );
     return {
       rows: filtered.map((r) => ({
+        id: r.id,
         acao: r.acao,
         alvo_id: r.alvo_id,
         metadata: r.metadata,
         pessoa_id: r.pessoa_id,
+        conversa_id: r.conversa_id,
+        created_at: r.created_at,
       })),
     };
   }
@@ -366,12 +381,17 @@ function seedCorrection(
     .padStart(12, '0')}`,
 ): void {
   auditStore.push({
+    id: `ev-${auditStore.length}`,
     tenant_id: ctx.tenant_id,
     agent_id: ctx.agent_id,
     acao: 'transaction_corrected',
     alvo_id,
-    metadata: { descricao },
+    // G1 item 1 — o titular precisa ser DEMONSTRÁVEL. O evento declara a
+    // referência; sem ela o sinal iria para quarentena em vez de virar
+    // cluster, que é o comportamento correto e não o que este arquivo mede.
+    metadata: { descricao, data_subject_ref: `titular-${ctx.tenant_id}` },
     pessoa_id: null,
+    conversa_id: null,
     created_at: new Date(),
   });
 }
@@ -533,8 +553,8 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     // Defensive: the SELECT acao,alvo_id,... per-tenant read was NEVER fired
     // because we never entered a tenant context. (The dispatcher SELECT
     // DISTINCT DID fire — that's expected.)
-    const perTenantReads = renderedSqls.filter((s) =>
-      /SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id/i.test(s),
+    const perTenantReads = renderedSqls.filter(
+      (s) => /audit_log/i.test(s) && !/\bDISTINCT\b/i.test(s),
     );
     expect(perTenantReads).toHaveLength(0);
   });
@@ -554,9 +574,7 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     // Every per-tenant inner SELECT must include tenant_id AND agent_id in
     // its WHERE clause — that's the defense-in-depth predicate that protects
     // against future dispatcher bugs.
-    const innerReads = renderedSqls.filter((s) =>
-      /SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id/i.test(s),
-    );
+    const innerReads = renderedSqls.filter((s) => /audit_log/i.test(s) && !/\bDISTINCT\b/i.test(s));
     expect(innerReads.length).toBeGreaterThan(0);
     for (const s of innerReads) {
       expect(s).toMatch(/tenant_id\s*=/);
@@ -817,9 +835,7 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #2: concurrent worker guard (adviso
 
     // The per-tenant inner SELECT (acao, alvo_id, ...) must NOT have fired
     // for tenant-A because we skipped before opening the tenant context.
-    const innerReads = renderedSqls.filter((s) =>
-      /SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id/i.test(s),
-    );
+    const innerReads = renderedSqls.filter((s) => /audit_log/i.test(s) && !/\bDISTINCT\b/i.test(s));
     expect(innerReads).toHaveLength(0);
 
     // The pre-seeded lock is still held (we never unlocked it — the worker

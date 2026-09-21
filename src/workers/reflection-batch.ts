@@ -1,3 +1,4 @@
+import { z } from 'zod';
 import type { PoolClient } from 'pg';
 import { db, pool } from '@/db/client.js';
 import { audit_log } from '@/db/schema.js';
@@ -11,19 +12,55 @@ import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/te
 import { runCognitiveModule } from '@/cognition/runner.js';
 import {
   clusterCorrections,
+  clusterDedupeKey,
   type CorrectionSignal,
   type Cluster,
 } from '@/agent/reflection-clustering.js';
 
 const MAX_LLM_CALLS = 200;
+
 const VALID_TIPOS = ['classificacao', 'identificacao_entidade'] as const;
 type ValidTipo = (typeof VALID_TIPOS)[number];
 
+/**
+ * O que o modelo PODE devolver, e nada além.
+ *
+ * Repare no que não existe aqui: `origin`, `confianca`, `lifecycle_status`,
+ * `approved_by`, `visible_to_llm`. Não é omissão — é o contrato. Com
+ * `.strict()`, um modelo que tentasse declarar qualquer um deles faz a
+ * proposta inteira ser rejeitada, em vez de ter o campo silenciosamente
+ * ignorado e alguém passar a lê-lo seis meses depois.
+ */
+const propostaSchema = z
+  .object({
+    applicable: z.boolean(),
+    tipo: z.enum(VALID_TIPOS).optional(),
+    contexto: z.string().min(1).max(2_000).optional(),
+    acao: z.string().min(1).max(2_000).optional(),
+    contexto_jsonb: z.record(z.unknown()).optional(),
+    acoes_jsonb: z.record(z.unknown()).optional(),
+    justificativa: z.string().max(2_000).optional(),
+  })
+  .strict();
+
+/**
+ * G1 (spec §7.6.1 item 1) — a linha de auditoria com o que ela precisa ter.
+ *
+ * `id` e `created_at` entram porque sem id estável não há linhagem auditável e
+ * sem timestamp não há como ordenar evidência. `conversa_id` entra porque a
+ * finalidade e o recurso costumam estar amarrados à conversa.
+ *
+ * `pessoa_id` continua sendo o ATOR da correção. Ele NÃO é promovido a titular
+ * em lugar nenhum deste arquivo — ver `resolveDataSubject`.
+ */
 type AuditRow = {
+  id: string;
   acao: string;
   alvo_id: string | null;
   metadata: unknown;
   pessoa_id: string | null;
+  conversa_id: string | null;
+  created_at: Date | string;
 };
 
 type Proposal = {
@@ -297,6 +334,43 @@ type ReflectionStats = {
   llm_calls: number;
 };
 
+/**
+ * G1 (spec §7.6.1 item 1) — DE QUEM É O DADO CORRIGIDO.
+ *
+ * A linha da spec é literal: "`pessoa_id` é o ator da correção, **não
+ * presumir que seja titular de todos os dados do payload**. Resolver
+ * titular/recurso pelo evento e ownership canônico; se não for demonstrável,
+ * quarentena."
+ *
+ * Então esta função NÃO cai em `row.pessoa_id`. Ela procura, na ordem, as
+ * referências que o EVENTO declara sobre o titular. Não achando nenhuma,
+ * devolve `null` — e `null` manda o sinal para quarentena em vez de para um
+ * cluster.
+ *
+ * O `pessoa_id` do ator não é um default ruim: ele é uma resposta ERRADA
+ * quando um operador corrige o dado de um cliente, que é o caso comum num
+ * atendimento. Usá-lo faria o cluster falar do operador.
+ *
+ * A ordem das chaves é a da especificidade: uma referência explícita de
+ * titular vence uma derivada de recurso.
+ */
+function resolveDataSubject(
+  meta: Record<string, unknown>,
+  row: { conversa_id: string | null },
+): string | null {
+  for (const chave of ['data_subject_ref', 'subject_id', 'titular_id', 'pessoa_alvo_id']) {
+    const v = meta[chave];
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  // A conversa identifica o titular do atendimento quando o evento não o
+  // declara. É derivação, não presunção: a conversa TEM titular, enquanto o
+  // ator só tem papel.
+  if (row.conversa_id !== null && row.conversa_id.length > 0) {
+    return `conversa:${row.conversa_id}`;
+  }
+  return null;
+}
+
 async function runReflectionBatchInner(since: ReturnType<typeof sql>): Promise<ReflectionStats> {
   // Defense-in-depth: filter audit_log explicitly by the current tenant/agent
   // pulled from the ALS context. The dispatcher in `runReflectionBatch`
@@ -308,7 +382,7 @@ async function runReflectionBatchInner(since: ReturnType<typeof sql>): Promise<R
   const agent_id = getCurrentAgent();
 
   const rows = await db.execute<AuditRow>(
-    sql`SELECT acao, alvo_id, metadata, pessoa_id FROM ${audit_log}
+    sql`SELECT id, acao, alvo_id, metadata, pessoa_id, conversa_id, created_at FROM ${audit_log}
         WHERE acao = 'transaction_corrected'
           AND created_at >= ${since}
           AND tenant_id = ${tenant_id}
@@ -324,6 +398,14 @@ async function runReflectionBatchInner(since: ReturnType<typeof sql>): Promise<R
       alvo_id: r.alvo_id,
       descricao,
       contexto: meta,
+      source_event_id: r.id,
+      occurred_at: r.created_at instanceof Date ? r.created_at.toISOString() : String(r.created_at),
+      actor_pessoa_id: r.pessoa_id,
+      data_subject_ref: resolveDataSubject(meta, r),
+      conversa_id: r.conversa_id,
+      purpose: typeof meta.purpose === 'string' ? meta.purpose : null,
+      authorized_resource:
+        typeof meta.authorized_resource === 'string' ? meta.authorized_resource : null,
     });
   }
 
@@ -332,15 +414,63 @@ async function runReflectionBatchInner(since: ReturnType<typeof sql>): Promise<R
     return { created: 0, skipped: 0, signals: 0, clusters: 0, llm_calls: 0 };
   }
 
-  const clusters = clusterCorrections(signals);
+  const { clusters, quarantined } = clusterCorrections(signals);
+
+  /**
+   * G1 item 1 — a quarentena é REPORTADA, não descartada em silêncio.
+   *
+   * Um sinal sem titular demonstrável não vira cluster, e isso é o
+   * comportamento certo. Mas se ele sumisse sem registro, um evento de
+   * auditoria mal formado — ou uma mudança de esquema que parasse de gravar a
+   * referência — apareceria como "o lote não achou nada para aprender", que é
+   * indistinguível de "não houve correções".
+   */
+  if (quarantined.length > 0) {
+    const porMotivo: Record<string, number> = {};
+    for (const q of quarantined) porMotivo[q.reason] = (porMotivo[q.reason] ?? 0) + 1;
+    logger.warn(
+      { tenant_id, agent_id, quarantined: quarantined.length, by_reason: porMotivo },
+      'reflection_batch.signals_quarantined',
+    );
+  }
   let llmCalls = 0;
   let created = 0;
   let skipped = 0;
+  /**
+   * Chaves já propostas NESTA rodada.
+   *
+   * O dedupe durável entre rodadas é do `LearningService` — ele reencontra a
+   * proposta pendente pelo KSM. Este conjunto cobre o caso mais estreito e
+   * mais provável: dois clusters da MESMA rodada que derivam a mesma chave.
+   */
+  const propostasDaRodada = new Set<string>();
 
   for (const cluster of clusters) {
     if (llmCalls >= MAX_LLM_CALLS) break;
 
-    // Dedupe: skip if a rule with the same contexto already exists.
+    /**
+     * G1 item 3 — DEDUPE PELA CHAVE PERSISTIDA, não por regra visível.
+     *
+     * `rulesRepo.findByContext` procura só entre regras VISÍVEIS. Uma proposta
+     * pendente de revisão não é visível — então, enquanto o humano não
+     * decidisse, TODA rodada do lote reabria proposta para o mesmo cluster e a
+     * fila enchia com duplicatas da mesma decisão.
+     *
+     * A chave inclui titular, tipo e as FONTES, e a inclusão das fontes é
+     * deliberada: dois clusters com a mesma descrição e evidência diferente
+     * são propostas diferentes, e colapsá-los esconderia evidência nova.
+     *
+     * A checagem de regra visível FICA, como segundo filtro: se a regra já
+     * existe e está ativa, não há o que propor, independentemente de a chave
+     * ser nova.
+     */
+    const dedupeKey = clusterDedupeKey(cluster, 'learned_rule');
+    if (propostasDaRodada.has(dedupeKey)) {
+      skipped++;
+      continue;
+    }
+    propostasDaRodada.add(dedupeKey);
+
     const existing = await rulesRepo.findByContext('classificacao', cluster.descricao_normalized);
     if (existing) {
       skipped++;
@@ -402,7 +532,7 @@ async function runReflectionBatchInner(since: ReturnType<typeof sql>): Promise<R
         // preserva essa semântica para o consumidor não procurar na tabela
         // errada.
         source_example_ids: cluster.signals
-          .map((sig) => sig.alvo_id)
+          .map((sig: CorrectionSignal) => sig.alvo_id)
           .filter((id): id is string => typeof id === 'string' && id.length > 0),
         // O MESMO exemplo que o caminho anterior gravava em
         // `learned_rules.exemplo_origem_id`.
@@ -492,13 +622,42 @@ async function proposeRule(cluster: Cluster): Promise<Proposal | null> {
     logger.warn({ status: proposalResult.status }, 'reflection_batch.llm_failed_skipping');
     return null;
   }
+  const text = res.content?.trim() ?? '';
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+
+  let bruto: unknown;
   try {
-    const text = res.content?.trim() ?? '';
-    const m = text.match(/\{[\s\S]*\}/);
-    if (!m) return null;
-    return JSON.parse(m[0]) as Proposal;
+    bruto = JSON.parse(m[0]);
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'reflection_batch.parse_failed');
     return null;
   }
+
+  /**
+   * G1 item 4 — SCHEMA FECHADO, no lugar do cast.
+   *
+   * Era `JSON.parse(m[0]) as Proposal`. Um cast não valida nada: o objeto
+   * chegava com a forma que o modelo quisesse, e os campos extras passavam
+   * adiante. Numa proposta de aprendizado isso não é descuido de tipagem — é a
+   * superfície por onde o modelo declararia o que não é dele.
+   *
+   * `.strict()` é o ponto: campo desconhecido REPROVA em vez de ser ignorado.
+   * Ignorar deixaria um `origin`, um `confianca` ou um `lifecycle_status`
+   * vindo do modelo passar despercebido até alguém decidir lê-lo. O §7.6.1
+   * item 4 é explícito: "o modelo não escolhe lifecycle, confiança ou origem".
+   *
+   * Os limites existem para que payload inválido não vire loop nem custo: um
+   * modelo que devolvesse um contexto de megabytes seria rejeitado aqui, não
+   * lá adiante.
+   */
+  const parsed = propostaSchema.safeParse(bruto);
+  if (!parsed.success) {
+    logger.warn(
+      { issues: parsed.error.issues.slice(0, 5).map((i) => `${i.path.join('.')}:${i.code}`) },
+      'reflection_batch.proposal_schema_rejected',
+    );
+    return null;
+  }
+  return parsed.data;
 }
