@@ -462,7 +462,12 @@ export async function runVerifiedBackup(
   // `errorCode === null` is load-bearing: a manifest for an artifact that was
   // never promoted would describe bytes no consumer can find — or, worse, a
   // path another run later occupies.
-  if (errorCode === null && evidence.locally_verified && digest !== null && plaintextDigest !== null) {
+  if (
+    errorCode === null &&
+    evidence.locally_verified &&
+    digest !== null &&
+    plaintextDigest !== null
+  ) {
     try {
       const prov = await ports.provenance();
       // Probed BEFORE the dump and guaranteed non-null past that gate.

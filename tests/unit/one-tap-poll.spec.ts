@@ -48,7 +48,8 @@ const MAIA_JID = '5500000000000@s.whatsapp.net';
 describe('dispatchPollVote', () => {
   it('decrypts vote with persisted pollCreatorJid, hash-matches a label, dispatches', async () => {
     findByWhatsappId.mockResolvedValueOnce({
-      id: 'out-1', conversa_id: 'c1',
+      id: 'out-1',
+      conversa_id: 'c1',
       metadata: {
         pending_question_id: 'pq-1',
         poll_options: [
@@ -80,17 +81,20 @@ describe('dispatchPollVote', () => {
         voterJid: 'jid',
       }),
     );
-    expect(resolveAndDispatch).toHaveBeenCalledWith(expect.objectContaining({
-      expected_pending_id: 'pq-1',
-      option_chosen: 'restaurante',
-      confidence: 1,
-      source: 'poll_vote',
-    }));
+    expect(resolveAndDispatch).toHaveBeenCalledWith(
+      expect.objectContaining({
+        expected_pending_id: 'pq-1',
+        option_chosen: 'restaurante',
+        confidence: 1,
+        source: 'poll_vote',
+      }),
+    );
   });
 
   it('parent without pending_question_id → audit no_pending_anchor', async () => {
     findByWhatsappId.mockResolvedValueOnce({
-      id: 'out-1', conversa_id: 'c1',
+      id: 'out-1',
+      conversa_id: 'c1',
       metadata: { whatsapp_id: 'WAID-POLL' },
     });
     const { dispatchPollVote } = await import('../../src/agent/one-tap.js');
@@ -101,10 +105,15 @@ describe('dispatchPollVote', () => {
 
   it('metadata missing poll_creator_jid → audit missing_poll_metadata, no decrypt attempt', async () => {
     findByWhatsappId.mockResolvedValueOnce({
-      id: 'out-1', conversa_id: 'c1',
+      id: 'out-1',
+      conversa_id: 'c1',
       metadata: {
         pending_question_id: 'pq-1',
-        poll_options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }, { key: 'c', label: 'C' }],
+        poll_options: [
+          { key: 'a', label: 'A' },
+          { key: 'b', label: 'B' },
+          { key: 'c', label: 'C' },
+        ],
         poll_message_secret: Buffer.from('secret').toString('base64'),
         // poll_creator_jid intentionally absent
       },
@@ -113,22 +122,33 @@ describe('dispatchPollVote', () => {
     await dispatchPollVote(pollUpdateMsg);
     expect(decryptPollVote).not.toHaveBeenCalled();
     expect(resolveAndDispatch).not.toHaveBeenCalled();
-    expect(audit.mock.calls.some(
-      (c) => c[0].acao === 'one_tap_dispatch_error' && c[0].metadata?.reason === 'missing_poll_metadata',
-    )).toBe(true);
+    expect(
+      audit.mock.calls.some(
+        (c) =>
+          c[0].acao === 'one_tap_dispatch_error' &&
+          c[0].metadata?.reason === 'missing_poll_metadata',
+      ),
+    ).toBe(true);
   });
 
   it('decryption throws → audit one_tap_dispatch_error', async () => {
     findByWhatsappId.mockResolvedValueOnce({
-      id: 'out-1', conversa_id: 'c1',
+      id: 'out-1',
+      conversa_id: 'c1',
       metadata: {
         pending_question_id: 'pq-1',
-        poll_options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }, { key: 'c', label: 'C' }],
+        poll_options: [
+          { key: 'a', label: 'A' },
+          { key: 'b', label: 'B' },
+          { key: 'c', label: 'C' },
+        ],
         poll_message_secret: Buffer.from('secret').toString('base64'),
         poll_creator_jid: MAIA_JID,
       },
     });
-    decryptPollVote.mockImplementationOnce(() => { throw new Error('decrypt failed'); });
+    decryptPollVote.mockImplementationOnce(() => {
+      throw new Error('decrypt failed');
+    });
     const { dispatchPollVote } = await import('../../src/agent/one-tap.js');
     await dispatchPollVote(pollUpdateMsg);
     expect(resolveAndDispatch).not.toHaveBeenCalled();
@@ -137,10 +157,15 @@ describe('dispatchPollVote', () => {
 
   it('hash matches no label → audit one_tap_dispatch_error', async () => {
     findByWhatsappId.mockResolvedValueOnce({
-      id: 'out-1', conversa_id: 'c1',
+      id: 'out-1',
+      conversa_id: 'c1',
       metadata: {
         pending_question_id: 'pq-1',
-        poll_options: [{ key: 'a', label: 'A' }, { key: 'b', label: 'B' }, { key: 'c', label: 'C' }],
+        poll_options: [
+          { key: 'a', label: 'A' },
+          { key: 'b', label: 'B' },
+          { key: 'c', label: 'C' },
+        ],
         poll_message_secret: Buffer.from('secret').toString('base64'),
         poll_creator_jid: MAIA_JID,
       },

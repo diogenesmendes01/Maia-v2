@@ -29,8 +29,7 @@ describe('correlation token', () => {
   });
 
   it('extractCorrelationToken finds a token even with surrounding text', () => {
-    const sample =
-      'Oi! Segue o relatório que você pediu. Qualquer dúvida me chama. _ref: B3D1_';
+    const sample = 'Oi! Segue o relatório que você pediu. Qualquer dúvida me chama. _ref: B3D1_';
     expect(extractCorrelationToken(sample)).toBe('B3D1');
   });
 });

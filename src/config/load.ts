@@ -24,9 +24,7 @@ import { scrubSecrets } from '@/config/redact.js';
 import { validateConfig } from '@/config/validate.js';
 
 /** Typed configuration for one service, inferred from the contract. */
-export type ServiceConfig<S extends MaiaService> = z.infer<
-  z.ZodObject<ServiceShape<S>>
->;
+export type ServiceConfig<S extends MaiaService> = z.infer<z.ZodObject<ServiceShape<S>>>;
 
 export interface LoadOptions {
   /** Environment snapshot. Defaults to `process.env` at CALL time. */
@@ -58,7 +56,10 @@ export class ConfigValidationError extends Error {
 
   constructor(service: MaiaService, profile: MaiaProfile, problems: readonly ConfigProblem[]) {
     const body = problems
-      .map((p) => `  - ${p.variable ?? '<config>'} [${p.rule}]: ${p.message}\n      → ${p.remediation}`)
+      .map(
+        (p) =>
+          `  - ${p.variable ?? '<config>'} [${p.rule}]: ${p.message}\n      → ${p.remediation}`,
+      )
       .join('\n');
     super(`Invalid configuration for service "${service}" (profile ${profile}):\n${body}`);
     this.name = 'ConfigValidationError';

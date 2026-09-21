@@ -16,7 +16,8 @@ const execState: Record<string, any> = {};
 const events: any[] = [];
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureExecutionsRepo: {
@@ -86,7 +87,13 @@ function makeDefinition(overrides: Partial<ProcedureDefinition> = {}): Procedure
     when_not_apply: {} as any,
     steps: [
       { id: 'step-1', intencao: 'Saudar', como: 'oi', sucesso_criteria_ref: 'crit-1' },
-      { id: 'step-2', intencao: 'Encerrar', como: 'tchau', depends_on: ['step-1'], sucesso_criteria_ref: 'crit-2' },
+      {
+        id: 'step-2',
+        intencao: 'Encerrar',
+        como: 'tchau',
+        depends_on: ['step-1'],
+        sucesso_criteria_ref: 'crit-2',
+      },
     ] as any,
     success_criteria: [
       { id: 'crit-1', type: 'machine_check', expression: 'ola' },
@@ -168,7 +175,13 @@ describe('runProcedureTest', () => {
     const definition = makeDefinition({
       steps: [
         { id: 'step-1', intencao: 'Saudar', como: 'oi', sucesso_criteria_ref: 'crit-1' },
-        { id: 'step-h', intencao: 'Confirmar humano', como: '...', depends_on: ['step-1'], sucesso_criteria_ref: 'crit-h' },
+        {
+          id: 'step-h',
+          intencao: 'Confirmar humano',
+          como: '...',
+          depends_on: ['step-1'],
+          sucesso_criteria_ref: 'crit-h',
+        },
       ] as any,
       success_criteria: [
         { id: 'crit-1', type: 'machine_check', expression: 'ola' },
@@ -186,9 +199,7 @@ describe('runProcedureTest', () => {
             { role: 'agent', response_text: 'ola!' }, // completes step-1, lands on step-h
             { role: 'agent', response_text: 'aguardando aprovacao...' }, // step-h re-evaluates after confirmation injects
           ],
-          human_confirmations: [
-            { at_step: 'step-h', decision: 'approved', operator_id: 'op-1' },
-          ],
+          human_confirmations: [{ at_step: 'step-h', decision: 'approved', operator_id: 'op-1' }],
         },
         expected_outcome: 'success',
         expected_step_path: ['step-1', 'step-h'],

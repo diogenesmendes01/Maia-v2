@@ -18,7 +18,8 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 let pool: pg.Pool;
@@ -35,7 +36,10 @@ d('procedureExecutionsRepo.createOrFindActive (real DB)', () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL });
     const c = await pool.connect();
     try {
-      await c.query(`INSERT INTO tenants(id, nome) VALUES ($1, 'P84 Tenant') ON CONFLICT (id) DO NOTHING`, [T]);
+      await c.query(
+        `INSERT INTO tenants(id, nome) VALUES ($1, 'P84 Tenant') ON CONFLICT (id) DO NOTHING`,
+        [T],
+      );
       await c.query(
         `INSERT INTO agents(id, tenant_id, nome) VALUES ($1, $2, 'P84 Agent') ON CONFLICT (id) DO NOTHING`,
         [A, T],

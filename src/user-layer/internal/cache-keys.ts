@@ -68,8 +68,12 @@ export function buildUserSliceCacheKey(args: {
   scope_hint?: string[];
 }): string {
   assertValidScope(args.tenant_id, args.agent_id);
-  const scopeHash = args.scope_hint ? crypto.createHash('sha256').update(JSON.stringify(args.scope_hint)).digest('hex').slice(0, 8) : 'default';
-  const intentHash = args.intent_label ? crypto.createHash('sha256').update(args.intent_label).digest('hex').slice(0, 8) : 'none';
+  const scopeHash = args.scope_hint
+    ? crypto.createHash('sha256').update(JSON.stringify(args.scope_hint)).digest('hex').slice(0, 8)
+    : 'default';
+  const intentHash = args.intent_label
+    ? crypto.createHash('sha256').update(args.intent_label).digest('hex').slice(0, 8)
+    : 'none';
   return buildCacheKey(
     'user_slice:v2:',
     args.tenant_id,
@@ -110,8 +114,12 @@ export function buildKnowledgeSliceCacheKey(args: {
   intent_label?: string;
 }): string {
   assertValidScope(args.tenant_id, args.agent_id);
-  const scopeHash = args.scope_hint ? crypto.createHash('sha256').update(JSON.stringify(args.scope_hint)).digest('hex').slice(0, 8) : 'default';
-  const intentHash = args.intent_label ? crypto.createHash('sha256').update(args.intent_label).digest('hex').slice(0, 8) : 'none';
+  const scopeHash = args.scope_hint
+    ? crypto.createHash('sha256').update(JSON.stringify(args.scope_hint)).digest('hex').slice(0, 8)
+    : 'default';
+  const intentHash = args.intent_label
+    ? crypto.createHash('sha256').update(args.intent_label).digest('hex').slice(0, 8)
+    : 'none';
   const domain = args.domain ?? 'global';
   return buildCacheKey(
     'knowledge_slice:v2:',

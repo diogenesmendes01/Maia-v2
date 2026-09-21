@@ -59,9 +59,7 @@ async function seriesBloqueadas(): Promise<string[]> {
 
 /** O mesmo extrator que a barreira da #599 usa, palavra por palavra. */
 async function boundariesBloqueados(): Promise<string[]> {
-  return (await seriesBloqueadas())
-    .map((l) => /boundary="([^"]+)"/.exec(l)?.[1] ?? '?')
-    .sort();
+  return (await seriesBloqueadas()).map((l) => /boundary="([^"]+)"/.exec(l)?.[1] ?? '?').sort();
 }
 
 const ESCOPO = { tenant_id: 'tenant-601', agent_id: 'agent-601' };

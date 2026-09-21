@@ -58,8 +58,7 @@ export const TOOL_REQUEST_CONTRACT_STATUS = 'draft_proposal_not_in_force' as con
 export const TOOL_REQUEST_SPEC_VERSION = 1 as const;
 
 /** O guardrail, escrito na própria linha, para quem lê o JSON cru. */
-export const TOOL_REQUEST_GUARDRAIL =
-  'o agente especifica; humano implementa e instala' as const;
+export const TOOL_REQUEST_GUARDRAIL = 'o agente especifica; humano implementa e instala' as const;
 
 /**
  * Cabeçalho obrigatório de `zod_source`. Sobrevive ao copiar-e-colar: quem tirar
@@ -185,7 +184,6 @@ export function eRascunhoDeProposta(spec: unknown): boolean {
   if (typeof spec !== 'object' || spec === null) return false;
   const s = spec as Record<string, unknown>;
   return (
-    s.spec_kind === TOOL_REQUEST_SPEC_KIND &&
-    s.contract_status === TOOL_REQUEST_CONTRACT_STATUS
+    s.spec_kind === TOOL_REQUEST_SPEC_KIND && s.contract_status === TOOL_REQUEST_CONTRACT_STATUS
   );
 }

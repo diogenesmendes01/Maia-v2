@@ -159,7 +159,9 @@ async function removePrimaryAuthState(): Promise<void> {
   }
 }
 
-async function doPrimaryRecovery(req: Extract<RecoveryRequest, { target: 'primary' }>): Promise<void> {
+async function doPrimaryRecovery(
+  req: Extract<RecoveryRequest, { target: 'primary' }>,
+): Promise<void> {
   setupState.setRecovering();
   await audit({ acao: 'pairing_recovery_started', metadata: { target: 'primary' } });
   try {
@@ -191,9 +193,8 @@ async function doLineRecovery(req: Extract<RecoveryRequest, { target: 'line' }>)
   // sem o wrap, audit() cai no bucket `system` — metadata não corrige
   // colunas nem labels de métricas.
   const auditScoped = (input: Parameters<typeof audit>[0]): Promise<void> =>
-    runWithTenantContext(
-      { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
-      () => audit(input),
+    runWithTenantContext({ tenant_id: channel.tenant_id, agent_id: channel.agent_id }, () =>
+      audit(input),
     );
 
   await auditScoped({
@@ -219,10 +220,7 @@ async function doLineRecovery(req: Extract<RecoveryRequest, { target: 'line' }>)
       () => channelsRepo.deactivate(channel.id),
     );
     if (rowCount === 0) {
-      logger.warn(
-        { channel_id: channel.id },
-        'setup.line_recovery_channel_row_missing',
-      );
+      logger.warn({ channel_id: channel.id }, 'setup.line_recovery_channel_row_missing');
     }
     // 2. Remove APENAS o auth desta linha (guard de raiz aplicado acima).
     logger.info({ channel_id: channel.id, dir }, 'setup.line_recovery_rm_auth_dir');
@@ -242,10 +240,7 @@ async function doLineRecovery(req: Extract<RecoveryRequest, { target: 'line' }>)
       },
     });
   } catch (err) {
-    logger.error(
-      { channel_id: channel.id, err },
-      'setup.line_recovery_failed',
-    );
+    logger.error({ channel_id: channel.id, err }, 'setup.line_recovery_failed');
     throw err;
   }
 }
@@ -257,8 +252,7 @@ async function doLineRecovery(req: Extract<RecoveryRequest, { target: 'line' }>)
  * (`'primary'` | `'line:<id>'`) pergunta pelo alvo específico.
  */
 export const _internal = {
-  isRecovering: (key?: string) =>
-    key ? _state.recoveries.has(key) : _state.recoveries.size > 0,
+  isRecovering: (key?: string) => (key ? _state.recoveries.has(key) : _state.recoveries.size > 0),
   reset: () => {
     _state.recoveries.clear();
   },

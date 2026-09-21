@@ -12,11 +12,7 @@
  *      platform floor.
  */
 import { describe, it, expect } from 'vitest';
-import {
-  ARCHETYPE_IDS,
-  ARCHETYPE_PACK_MAP,
-  isArchetypeId,
-} from '@/tools/archetype-packs.js';
+import { ARCHETYPE_IDS, ARCHETYPE_PACK_MAP, isArchetypeId } from '@/tools/archetype-packs.js';
 import { TOOL_PACKS, resolvePackTools } from '@/tools/grant-math.js';
 import { BASE_AGENT_PACKS } from '@/tools/base-agent-packs.js';
 import { ARCHETYPES } from '@/admin-ui/app/agents/_components/archetypes.js';

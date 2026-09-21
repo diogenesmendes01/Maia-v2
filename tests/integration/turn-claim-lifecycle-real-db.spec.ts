@@ -142,9 +142,7 @@ d('#504 — claim ligado à fachada de ciclo de vida (DB real)', () => {
     await pool.query(`DELETE FROM agents WHERE id = ANY($1::text[])`, [
       [A, 'claimlc504-outro-agent'],
     ]);
-    await pool.query(`DELETE FROM tenants WHERE id = ANY($1::text[])`, [
-      [T, 'claimlc504-outro'],
-    ]);
+    await pool.query(`DELETE FROM tenants WHERE id = ANY($1::text[])`, [[T, 'claimlc504-outro']]);
     await pool.end();
   });
 
@@ -166,9 +164,10 @@ d('#504 — claim ligado à fachada de ciclo de vida (DB real)', () => {
     // Não é erro: é a resposta correta de quem chegou depois.
     expect(!blocked.started && blocked.reason).toBe('not_claimed');
 
-    const row = await pool.query(`SELECT status, attempt_count, claim_token FROM agent_turns WHERE id=$1`, [
-      turn_id,
-    ]);
+    const row = await pool.query(
+      `SELECT status, attempt_count, claim_token FROM agent_turns WHERE id=$1`,
+      [turn_id],
+    );
     expect(row.rows[0].status).toBe('running');
     // UMA tentativa, não duas: o claim conta, o `markRunning` não recontabiliza.
     expect(Number(row.rows[0].attempt_count)).toBe(1);
@@ -197,10 +196,9 @@ d('#504 — claim ligado à fachada de ciclo de vida (DB real)', () => {
     // O zumbi acorda e tenta concluir com o handle antigo. É a linha que a
     // issue existe para tornar impossível.
     await inT(() => concludeTurn(zombieHandle, 'reply_delivered'));
-    const afterZombie = await pool.query(
-      `SELECT status, outcome FROM agent_turns WHERE id=$1`,
-      [turn_id],
-    );
+    const afterZombie = await pool.query(`SELECT status, outcome FROM agent_turns WHERE id=$1`, [
+      turn_id,
+    ]);
     expect(afterZombie.rows[0].status, 'o zumbi NÃO pode concluir o turno').not.toBe('completed');
     // E a lease dele foi cancelada localmente, para o heartbeat parar de tentar.
     expect(zombieHandle.lease?.alive ?? true).toBe(false);
@@ -241,9 +239,8 @@ d('#504 — claim ligado à fachada de ciclo de vida (DB real)', () => {
    * distingue "recusou" de "gravou".
    */
   it('lease MARCADA COMO PERDIDA sem takeover: conclude/fail não alteram a linha', async () => {
-    const { beginTurnExecution, concludeTurn, failTurnRetryable } = await import(
-      '@/runtime/turns/lifecycle.js'
-    );
+    const { beginTurnExecution, concludeTurn, failTurnRetryable } =
+      await import('@/runtime/turns/lifecycle.js');
     const { turn_id, mensagem_id } = await mkTurn();
 
     const h = handleFor(turn_id);
@@ -286,9 +283,8 @@ d('#504 — claim ligado à fachada de ciclo de vida (DB real)', () => {
    * conta.
    */
   it('lease LIBERADA sem takeover: conclude/fail não alteram a linha', async () => {
-    const { beginTurnExecution, concludeTurn, failTurnRetryable } = await import(
-      '@/runtime/turns/lifecycle.js'
-    );
+    const { beginTurnExecution, concludeTurn, failTurnRetryable } =
+      await import('@/runtime/turns/lifecycle.js');
     const { turn_id, mensagem_id } = await mkTurn();
 
     const h = handleFor(turn_id);

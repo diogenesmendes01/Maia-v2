@@ -257,10 +257,12 @@ describe('register_transaction tool', () => {
       return { id: 'tx-doomed' };
     });
     // Stage the balance credit into the tx.
-    contasAddToBalanceTx.mockImplementationOnce(async (_tx: unknown, _id: string, delta: number) => {
-      staged.saldoDelta += delta;
-      return { id: C1, saldo_atual: '1500.00' };
-    });
+    contasAddToBalanceTx.mockImplementationOnce(
+      async (_tx: unknown, _id: string, delta: number) => {
+        staged.saldoDelta += delta;
+        return { id: C1, saldo_atual: '1500.00' };
+      },
+    );
     // The audit insert fails inside the tx (DB slow/OOM, etc.). Fail-loud.
     auditTx.mockRejectedValueOnce(new Error('audit insert failed'));
 

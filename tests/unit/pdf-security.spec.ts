@@ -25,9 +25,7 @@ describe('renderPdfToBuffer — local access policy', () => {
     // this would proceed (and fail only because /etc/passwd is not a valid image).
     // With the correct allowlist the policy itself throws before any file read.
     const maliciousDoc = {
-      content: [
-        { image: '/etc/passwd' },
-      ],
+      content: [{ image: '/etc/passwd' }],
       defaultStyle: { font: 'Helvetica' },
     };
 

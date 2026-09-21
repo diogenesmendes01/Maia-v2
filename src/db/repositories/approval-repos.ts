@@ -219,10 +219,7 @@ export const approvalRequestsRepo = {
    * que o handler NÃO chegou a rodar (ex.: corrida de idempotência) — nunca
    * após execução iniciada.
    */
-  async releaseClaim(input: {
-    id: string;
-    claim_token: string;
-  }): Promise<ApprovalRequest | null> {
+  async releaseClaim(input: { id: string; claim_token: string }): Promise<ApprovalRequest | null> {
     const { tenant_id, agent_id } = scope();
     const rows = await db
       .update(approval_requests)

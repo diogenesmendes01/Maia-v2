@@ -53,7 +53,9 @@ function detectOom(err: unknown): boolean {
   const e = err as { name?: string; code?: string; message?: string };
   if (typeof e.code === 'string' && e.code.toUpperCase() === 'OOM') return true;
   const msg = String(e.message ?? '');
-  return (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg);
+  return (
+    (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg)
+  );
 }
 
 vi.mock('@/lib/redis.js', () => ({
@@ -115,9 +117,9 @@ describe('debouncer — OOM handling (#309)', () => {
   it('scheduleDebouncedAgent converts a writeState OOM into a typed fail-closed error', async () => {
     // First message path: getJob→null, queue.add→ok, then writeState SET OOMs.
     redisStub.setSetThrowsOom(true);
-    await expect(asTenantA(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' }))).rejects.toMatchObject(
-      { code: 'DEBOUNCER_REDIS_UNAVAILABLE', oom: true },
-    );
+    await expect(
+      asTenantA(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' })),
+    ).rejects.toMatchObject({ code: 'DEBOUNCER_REDIS_UNAVAILABLE', oom: true });
   });
 
   it('the thrown error is a DebouncerRedisUnavailableError instance (no raw ReplyError)', async () => {
@@ -132,7 +134,9 @@ describe('debouncer — OOM handling (#309)', () => {
 
   it('scheduleDebouncedAgent OOM increments redis_oom_degraded_total{operation="debouncer.write_state"}', async () => {
     redisStub.setSetThrowsOom(true);
-    await asTenantA(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' })).catch(() => {});
+    await asTenantA(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' })).catch(
+      () => {},
+    );
     const out = await renderPrometheus();
     expect(out).toContain('redis_oom_degraded_total{operation="debouncer.write_state"} 1');
   });
@@ -143,9 +147,9 @@ describe('debouncer — OOM handling (#309)', () => {
     queueAdd.mockImplementationOnce(async () => {
       throw redisStub.makeOom();
     });
-    await expect(asTenantA(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' }))).rejects.toMatchObject(
-      { code: 'DEBOUNCER_REDIS_UNAVAILABLE', oom: true },
-    );
+    await expect(
+      asTenantA(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' })),
+    ).rejects.toMatchObject({ code: 'DEBOUNCER_REDIS_UNAVAILABLE', oom: true });
     const out = await renderPrometheus();
     expect(out).toContain('redis_oom_degraded_total{operation="debouncer.write_state"} 1');
   });
@@ -165,7 +169,9 @@ describe('debouncer — OOM handling (#309)', () => {
     redisStub.set.mockImplementationOnce(async () => {
       throw boom;
     });
-    await expect(asTenantA(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' }))).rejects.toBe(boom);
+    await expect(
+      asTenantA(() => scheduleDebouncedAgent({ phone: PHONE, mensagem_id: 'm1' })),
+    ).rejects.toBe(boom);
     const out = await renderPrometheus();
     expect(out).not.toContain('redis_oom_degraded_total');
   });

@@ -69,9 +69,8 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
     conversasFindActive.mockResolvedValueOnce({ id: 'conv-existing', channel_id: 'ch-existing' });
     mensagensCreate.mockResolvedValueOnce({ id: 'msg-uuid-1' });
 
-    const { sendProactiveMessageTool } = await import(
-      '../../../src/tools/send-proactive-message.js'
-    );
+    const { sendProactiveMessageTool } =
+      await import('../../../src/tools/send-proactive-message.js');
     const result = await sendProactiveMessageTool.handler(
       {
         pessoa_id_destino: TARGET_ID,
@@ -110,9 +109,8 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
   });
 
   it('extractEffect projects the result into a whatsapp_text PlannedEffect', async () => {
-    const { sendProactiveMessageTool } = await import(
-      '../../../src/tools/send-proactive-message.js'
-    );
+    const { sendProactiveMessageTool } =
+      await import('../../../src/tools/send-proactive-message.js');
     const effect = sendProactiveMessageTool.extractEffect!({
       mensagem_id: 'msg-uuid-1',
       whatsapp_id: null,
@@ -136,9 +134,8 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
     conversasCreate.mockResolvedValueOnce({ id: 'conv-new', channel_id: 'ch-1' });
     mensagensCreate.mockResolvedValueOnce({ id: 'msg-uuid-2' });
 
-    const { sendProactiveMessageTool } = await import(
-      '../../../src/tools/send-proactive-message.js'
-    );
+    const { sendProactiveMessageTool } =
+      await import('../../../src/tools/send-proactive-message.js');
     await sendProactiveMessageTool.handler(
       {
         pessoa_id_destino: TARGET_ID,
@@ -171,9 +168,8 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
     conversasCreate.mockResolvedValueOnce({ id: 'conv-new-legacy', channel_id: null });
     mensagensCreate.mockResolvedValueOnce({ id: 'msg-uuid-3' });
 
-    const { sendProactiveMessageTool } = await import(
-      '../../../src/tools/send-proactive-message.js'
-    );
+    const { sendProactiveMessageTool } =
+      await import('../../../src/tools/send-proactive-message.js');
     await sendProactiveMessageTool.handler(
       {
         pessoa_id_destino: TARGET_ID,
@@ -194,9 +190,8 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
   });
 
   it('schema invalid: rejects empty texto', async () => {
-    const { sendProactiveMessageTool } = await import(
-      '../../../src/tools/send-proactive-message.js'
-    );
+    const { sendProactiveMessageTool } =
+      await import('../../../src/tools/send-proactive-message.js');
     const parsed = sendProactiveMessageTool.input_schema.safeParse({
       pessoa_id_destino: TARGET_ID,
       texto: '',
@@ -208,9 +203,8 @@ describe('send_proactive_message tool (#316 transactional outbox)', () => {
 
   it('throws pessoa_destino_not_found when target does not exist (no send, no persist)', async () => {
     pessoasFindById.mockResolvedValueOnce(null);
-    const { sendProactiveMessageTool } = await import(
-      '../../../src/tools/send-proactive-message.js'
-    );
+    const { sendProactiveMessageTool } =
+      await import('../../../src/tools/send-proactive-message.js');
     await expect(
       sendProactiveMessageTool.handler(
         {

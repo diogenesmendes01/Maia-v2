@@ -184,9 +184,7 @@ export async function computeRuntimeVisibleTools(
   // visible set (the registry projection).
   const tools = getAgentToolSchemas(composed.visible, input.byEntity);
   const finalNames = new Set(tools.map((t) => t.name));
-  const requires_confirmation = composed.requires_confirmation.filter((n) =>
-    finalNames.has(n),
-  );
+  const requires_confirmation = composed.requires_confirmation.filter((n) => finalNames.has(n));
 
   // Issue #509 — CANONICAL schema identity + budget for THIS visible set.
   //
@@ -228,10 +226,7 @@ export async function computeRuntimeVisibleTools(
       },
     });
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'tools.runtime_filter.visibility_audit_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'tools.runtime_filter.visibility_audit_failed');
   }
 
   return { tools, requires_confirmation, grant };

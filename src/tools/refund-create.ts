@@ -45,14 +45,11 @@ const inputSchema = z
   })
   // A refund must carry evidence: at least one of a related payment/boleto or a
   // validated receipt reference. Prevents opening a refund with no traceability.
-  .refine(
-    (v) => Boolean(v.related_payment_id ?? v.related_boleto_id ?? v.receipt_reference),
-    {
-      message:
-        'refund_create requires evidence: related_payment_id, related_boleto_id, or receipt_reference',
-      path: ['receipt_reference'],
-    },
-  )
+  .refine((v) => Boolean(v.related_payment_id ?? v.related_boleto_id ?? v.receipt_reference), {
+    message:
+      'refund_create requires evidence: related_payment_id, related_boleto_id, or receipt_reference',
+    path: ['receipt_reference'],
+  })
   // Issue #509 §6 — regra cross-field sem keyword JSON Schema; Zod é a autoridade.
   .describe(
     'Abertura de reembolso. Além dos campos obrigatórios, informe AO MENOS UMA ' +
@@ -62,13 +59,7 @@ const inputSchema = z
 
 const outputSchema = z.object({
   executed: z.boolean(),
-  status: z.enum([
-    'stub_not_executed',
-    'created',
-    'requires_confirmation',
-    'blocked',
-    'failed',
-  ]),
+  status: z.enum(['stub_not_executed', 'created', 'requires_confirmation', 'blocked', 'failed']),
   // Set ONLY by a real integration; the stub fabricates neither.
   refund_protocol: z.string().optional(),
   created_at: z.string().optional(),
@@ -96,8 +87,7 @@ export const refundCreateTool: Tool<typeof inputSchema, typeof outputSchema> = {
     return {
       executed: false,
       status: 'stub_not_executed' as const,
-      message:
-        'Criação de reembolso ainda não implementada (stub): nenhum reembolso foi criado.',
+      message: 'Criação de reembolso ainda não implementada (stub): nenhum reembolso foi criado.',
     };
   },
 };

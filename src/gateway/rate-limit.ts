@@ -161,10 +161,7 @@ export async function checkRateLimit(pessoa: Pessoa): Promise<RateLimitDecision>
   const isOwner = pessoa.tipo === 'dono' || pessoa.tipo === 'co_dono';
   if (!isRedisConnected()) {
     if (isOwner) return { kind: 'allow' };
-    logger.warn(
-      { pessoa_id: pessoa.id, tenant_id, agent_id },
-      'rate_limit.redis_down_fail_closed',
-    );
+    logger.warn({ pessoa_id: pessoa.id, tenant_id, agent_id }, 'rate_limit.redis_down_fail_closed');
     return { kind: 'silence' };
   }
 

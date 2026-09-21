@@ -30,7 +30,8 @@ const outputSchema = z.object({
 
 export const compareEntitiesTool: Tool<typeof inputSchema, typeof outputSchema> = {
   name: 'compare_entities',
-  description: 'Comparativo financeiro entre entidades em um período (receitas, despesas, lucro, caixa final).',
+  description:
+    'Comparativo financeiro entre entidades em um período (receitas, despesas, lucro, caixa final).',
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['read_reports'],
@@ -54,12 +55,8 @@ export const compareEntitiesTool: Tool<typeof inputSchema, typeof outputSchema> 
         { pessoa_id: ctx.pessoa.id, entidades: [e.id] },
         { date_from: args.date_from, date_to: args.date_to, limit: 1000 },
       );
-      const receita = sumDecimal(
-        txns.filter((t) => t.natureza === 'receita').map((t) => t.valor),
-      );
-      const despesa = sumDecimal(
-        txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor),
-      );
+      const receita = sumDecimal(txns.filter((t) => t.natureza === 'receita').map((t) => t.valor));
+      const despesa = sumDecimal(txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor));
       const lucro = receita.minus(despesa);
       const contas = await contasRepo.byEntity(e.id);
       const caixa_final = sumDecimal(contas.map((c) => c.saldo_atual));

@@ -87,10 +87,16 @@ vi.mock('../../src/workers/drift-monitor.js', sentinela('drift-monitor.js'));
 vi.mock('../../src/workers/gap-escalation-monitor.js', sentinela('gap-escalation-monitor.js'));
 vi.mock('../../src/workers/health-monitor.js', sentinela('health-monitor.js'));
 vi.mock('../../src/workers/idempotency-cleanup.js', sentinela('idempotency-cleanup.js'));
-vi.mock('../../src/workers/idempotency-outbox-relayer.js', sentinela('idempotency-outbox-relayer.js'));
+vi.mock(
+  '../../src/workers/idempotency-outbox-relayer.js',
+  sentinela('idempotency-outbox-relayer.js'),
+);
 vi.mock('../../src/workers/inactivity-sweep.js', sentinela('inactivity-sweep.js'));
 vi.mock('../../src/workers/knowledge-state-promoter.js', sentinela('knowledge-state-promoter.js'));
-vi.mock('../../src/workers/legacy-memory-reclassifier.js', sentinela('legacy-memory-reclassifier.js'));
+vi.mock(
+  '../../src/workers/legacy-memory-reclassifier.js',
+  sentinela('legacy-memory-reclassifier.js'),
+);
 vi.mock('../../src/workers/mcp-sync-worker.js', sentinela('mcp-sync-worker.js'));
 vi.mock('../../src/workers/message-recovery.js', sentinela('message-recovery.js'));
 vi.mock('../../src/workers/objective-execute-worker.js', sentinela('objective-execute-worker.js'));
@@ -100,7 +106,10 @@ vi.mock(
   '../../src/workers/onboarding-expirer.js',
   sentinelaComHandler('onboarding-expirer.js', 'runOnboardingExpirer'),
 );
-vi.mock('../../src/workers/outbound-messages-sweeper.js', sentinela('outbound-messages-sweeper.js'));
+vi.mock(
+  '../../src/workers/outbound-messages-sweeper.js',
+  sentinela('outbound-messages-sweeper.js'),
+);
 vi.mock('../../src/workers/outbound-recovery.js', sentinela('outbound-recovery.js'));
 vi.mock('../../src/workers/outbox-drain-worker.js', sentinela('outbox-drain-worker.js'));
 vi.mock('../../src/workers/pattern-detector.js', sentinela('pattern-detector.js'));
@@ -108,9 +117,18 @@ vi.mock('../../src/workers/pending-expirer.js', sentinela('pending-expirer.js'))
 vi.mock('../../src/workers/pending-reminder.js', sentinela('pending-reminder.js'));
 vi.mock('../../src/workers/playground-turn-worker.js', sentinela('playground-turn-worker.js'));
 vi.mock('../../src/workers/privacy.js', sentinela('privacy.js'));
-vi.mock('../../src/workers/procedure-candidate-consumer.js', sentinela('procedure-candidate-consumer.js'));
-vi.mock('../../src/workers/procedure-execution-reaper.js', sentinela('procedure-execution-reaper.js'));
-vi.mock('../../src/workers/procedure-metrics-refresh.js', sentinela('procedure-metrics-refresh.js'));
+vi.mock(
+  '../../src/workers/procedure-candidate-consumer.js',
+  sentinela('procedure-candidate-consumer.js'),
+);
+vi.mock(
+  '../../src/workers/procedure-execution-reaper.js',
+  sentinela('procedure-execution-reaper.js'),
+);
+vi.mock(
+  '../../src/workers/procedure-metrics-refresh.js',
+  sentinela('procedure-metrics-refresh.js'),
+);
 vi.mock('../../src/workers/reflection-batch.js', sentinela('reflection-batch.js'));
 vi.mock('../../src/workers/scheduling-tick.js', sentinela('scheduling-tick.js'));
 vi.mock('../../src/workers/series-next-scheduler.js', sentinela('series-next-scheduler.js'));

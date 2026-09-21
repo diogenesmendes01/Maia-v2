@@ -102,10 +102,7 @@ export class InMemorySliceCache implements SliceCache {
     return count;
   }
 
-  async invalidateSliceForTenant(
-    tenant_id: string,
-    slice: string,
-  ): Promise<number> {
+  async invalidateSliceForTenant(tenant_id: string, slice: string): Promise<number> {
     // Issue #235: key format is `maia:context:v2:{tenant}:{agent}:{slice}:*`.
     // Wildcard the agent_id position so an event scoped to a tenant
     // invalidates all agents' slices under that tenant. A future
@@ -160,10 +157,7 @@ export class RedisSliceCache implements SliceCache {
     return await this.redis.del(...keys);
   }
 
-  async invalidateSliceForTenant(
-    tenant_id: string,
-    slice: string,
-  ): Promise<number> {
+  async invalidateSliceForTenant(tenant_id: string, slice: string): Promise<number> {
     // Issue #235: key format is `maia:context:v2:{tenant}:{agent}:{slice}:*`.
     // Wildcard the agent_id position; see InMemorySliceCache comment.
     return this.invalidate(invalidationPatternForTenant(tenant_id, slice));

@@ -74,10 +74,7 @@ export async function runUnroutedRecovery(): Promise<void> {
       }
     } catch (err) {
       // Keyring ausente com pendings é o MESMO problema do canário.
-      logger.error(
-        { err: (err as Error).message },
-        'unrouted_recovery.keyring_unavailable',
-      );
+      logger.error({ err: (err as Error).message }, 'unrouted_recovery.keyring_unavailable');
     }
   }
 }

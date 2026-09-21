@@ -80,15 +80,7 @@ const UpsertInputSchema = z.object({
 
 // Mirrors channelsRepo.create's channel_type union (schema has no CHECK; the
 // repo signature is the contract).
-const ChannelTypeSchema = z.enum([
-  'whatsapp',
-  'telegram',
-  'email',
-  'sms',
-  'web',
-  'api',
-  'other',
-]);
+const ChannelTypeSchema = z.enum(['whatsapp', 'telegram', 'email', 'sms', 'web', 'api', 'other']);
 
 const CreateChannelInputSchema = z.object({
   tenantId: z.string().optional(),
@@ -121,16 +113,14 @@ const CreateRoleInputSchema = z.object({
 });
 
 export const channelPoliciesRouter = router({
-  listChannels: protectedProcedure
-    .input(ListChannelsInputSchema)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      const items = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: input.agentId },
-        async () => ctx.repos.channelsRepo.listActive(),
-      );
-      return { items };
-    }),
+  listChannels: protectedProcedure.input(ListChannelsInputSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const items = await runWithTenantContext(
+      { tenant_id: tenantId, agent_id: input.agentId },
+      async () => ctx.repos.channelsRepo.listActive(),
+    );
+    return { items };
+  }),
 
   listRoles: protectedProcedure.input(ListRolesInputSchema).query(async ({ input, ctx }) => {
     const tenantId = resolveTenantId(ctx, input.tenantId);
@@ -150,51 +140,46 @@ export const channelPoliciesRouter = router({
     .input(ListChannelsInputSchema)
     .query(async ({ input, ctx }) => {
       const tenantId = resolveTenantId(ctx, input.tenantId);
-      return runWithTenantContext(
-        { tenant_id: tenantId, agent_id: input.agentId },
-        async () => {
-          const [channels, roles] = await Promise.all([
-            ctx.repos.channelsRepo.listActive(),
-            ctx.repos.rolesRepo.listActive(),
-          ]);
-          const roleKeyById = new Map(roles.map((r) => [r.id, r.role_key]));
-          const withPolicy = await Promise.all(
-            channels.map(async (c) => {
-              const policy = await ctx.repos.channelPoliciesRepo.getByChannelId(c.id);
-              // roleKeyById only holds ACTIVE roles, so a policy whose
-              // default role was deactivated resolves to null — the channel
-              // has a policy but is NOT ready to operate. Consumers (go-live
-              // checklist, policy badge) must gate on policy_ready, not
-              // has_policy (PR #491 review, medium).
-              const defaultRoleKey = policy
-                ? (roleKeyById.get(policy.default_role_id) ?? null)
-                : null;
-              return {
-                id: c.id,
-                channel_type: c.channel_type,
-                external_id: c.external_id,
-                display_name: c.display_name,
-                has_policy: policy !== null,
-                default_role_key: defaultRoleKey,
-                policy_ready: policy !== null && defaultRoleKey !== null,
-              };
-            }),
-          );
-          return { channels: withPolicy, roles_count: roles.length };
-        },
-      );
+      return runWithTenantContext({ tenant_id: tenantId, agent_id: input.agentId }, async () => {
+        const [channels, roles] = await Promise.all([
+          ctx.repos.channelsRepo.listActive(),
+          ctx.repos.rolesRepo.listActive(),
+        ]);
+        const roleKeyById = new Map(roles.map((r) => [r.id, r.role_key]));
+        const withPolicy = await Promise.all(
+          channels.map(async (c) => {
+            const policy = await ctx.repos.channelPoliciesRepo.getByChannelId(c.id);
+            // roleKeyById only holds ACTIVE roles, so a policy whose
+            // default role was deactivated resolves to null — the channel
+            // has a policy but is NOT ready to operate. Consumers (go-live
+            // checklist, policy badge) must gate on policy_ready, not
+            // has_policy (PR #491 review, medium).
+            const defaultRoleKey = policy
+              ? (roleKeyById.get(policy.default_role_id) ?? null)
+              : null;
+            return {
+              id: c.id,
+              channel_type: c.channel_type,
+              external_id: c.external_id,
+              display_name: c.display_name,
+              has_policy: policy !== null,
+              default_role_key: defaultRoleKey,
+              policy_ready: policy !== null && defaultRoleKey !== null,
+            };
+          }),
+        );
+        return { channels: withPolicy, roles_count: roles.length };
+      });
     }),
 
-  getByChannel: protectedProcedure
-    .input(GetByChannelInputSchema)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      const policy = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: input.agentId },
-        async () => ctx.repos.channelPoliciesRepo.getByChannelId(input.channelId),
-      );
-      return policy;
-    }),
+  getByChannel: protectedProcedure.input(GetByChannelInputSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const policy = await runWithTenantContext(
+      { tenant_id: tenantId, agent_id: input.agentId },
+      async () => ctx.repos.channelPoliciesRepo.getByChannelId(input.channelId),
+    );
+    return policy;
+  }),
 
   upsert: protectedProcedure.input(UpsertInputSchema).mutation(async ({ input, ctx }) => {
     ctx.assertRole('owner', 'founder');
@@ -234,9 +219,7 @@ export const channelPoliciesRouter = router({
           return ctx.repos.channelPoliciesRepo.update(existing.id, {
             default_role_id: input.default_role_id,
             switch_behavior: input.switch_behavior,
-            ...(input.announce_mode !== undefined
-              ? { announce_mode: input.announce_mode }
-              : {}),
+            ...(input.announce_mode !== undefined ? { announce_mode: input.announce_mode } : {}),
             ...(input.by_context_guards !== undefined
               ? { by_context_guards: input.by_context_guards as object }
               : {}),
@@ -350,45 +333,43 @@ export const channelPoliciesRouter = router({
    * automatically. Both UNIQUEs (role_key per agent; single default per
    * agent — partial index) stay authoritative and surface as CONFLICT.
    */
-  createRole: protectedProcedure
-    .input(CreateRoleInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      ctx.assertRole('owner', 'founder');
-      const tenantId = resolveTenantId(ctx, input.tenantId);
+  createRole: protectedProcedure.input(CreateRoleInputSchema).mutation(async ({ input, ctx }) => {
+    ctx.assertRole('owner', 'founder');
+    const tenantId = resolveTenantId(ctx, input.tenantId);
 
-      const agent = await ctx.repos.agentsRepo.findById(input.agentId);
-      if (!agent || agent.tenant_id !== tenantId) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
-      }
+    const agent = await ctx.repos.agentsRepo.findById(input.agentId);
+    if (!agent || agent.tenant_id !== tenantId) {
+      throw new TRPCError({ code: 'NOT_FOUND', message: 'Agent not found' });
+    }
 
-      // PR #491 review (high) — create + audit in ONE tx; `is_default`
-      // omitted is resolved INSIDE the tx (first active role becomes the
-      // default; the partial unique index breaks concurrent-create ties).
-      const result = await ctx.repos.rolesRepo.createWithAudit({
-        tenant_id: tenantId,
-        agent_id: input.agentId,
-        role: {
-          role_key: input.role_key,
-          display_name: input.display_name,
-          description: input.description,
-          prompt_addendum: input.prompt_addendum,
-          is_default: input.is_default,
-        },
-        audit: {
-          actor_id: ctx.userId,
-          actor_role: ctx.userRole,
-          reason: input.comment,
-        },
+    // PR #491 review (high) — create + audit in ONE tx; `is_default`
+    // omitted is resolved INSIDE the tx (first active role becomes the
+    // default; the partial unique index breaks concurrent-create ties).
+    const result = await ctx.repos.rolesRepo.createWithAudit({
+      tenant_id: tenantId,
+      agent_id: input.agentId,
+      role: {
+        role_key: input.role_key,
+        display_name: input.display_name,
+        description: input.description,
+        prompt_addendum: input.prompt_addendum,
+        is_default: input.is_default,
+      },
+      audit: {
+        actor_id: ctx.userId,
+        actor_role: ctx.userRole,
+        reason: input.comment,
+      },
+    });
+    if (!result.ok) {
+      throw new TRPCError({
+        code: 'CONFLICT',
+        message:
+          `Role '${input.role_key}' already exists for this agent, ` +
+          `or another role is already the default`,
       });
-      if (!result.ok) {
-        throw new TRPCError({
-          code: 'CONFLICT',
-          message:
-            `Role '${input.role_key}' already exists for this agent, ` +
-            `or another role is already the default`,
-        });
-      }
+    }
 
-      return { role: result.role };
-    }),
+    return { role: result.role };
+  }),
 });

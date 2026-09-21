@@ -112,11 +112,7 @@ export function isSafeArtifactRef(ref: unknown): ref is string {
  * `root`. Throws rather than returning a boolean, so a caller cannot delete by
  * forgetting to check.
  */
-export function resolveArtifactPath(
-  root: string,
-  ref: string,
-  path: PathImpl = nodePath,
-): string {
+export function resolveArtifactPath(root: string, ref: string, path: PathImpl = nodePath): string {
   const safeRef = assertSafeArtifactRef(ref);
   if (typeof root !== 'string' || root.trim() === '') {
     throw new UnsafeArtifactRefError('empty backup root', safeRef);

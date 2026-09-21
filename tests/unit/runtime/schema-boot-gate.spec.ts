@@ -97,7 +97,11 @@ beforeAll(async () => {
   migrationsDir = await mkdtemp(join(tmpdir(), 'maia-schema-boot-'));
   for (const [name, sql] of Object.entries(FILES)) {
     await writeFile(join(migrationsDir, name), sql, 'utf8');
-    await writeFile(join(migrationsDir, name.replace('.sql', '_down.sql')), 'DROP TABLE a;\n', 'utf8');
+    await writeFile(
+      join(migrationsDir, name.replace('.sql', '_down.sql')),
+      'DROP TABLE a;\n',
+      'utf8',
+    );
   }
 });
 
@@ -134,7 +138,7 @@ function ledgerPool(
     async connect() {
       if (options.connectError) throw options.connectError;
       const client: ReadOnlyPoolClient = {
-        query: <R,>(text: string): Promise<{ rows: R[] }> => {
+        query: <R>(text: string): Promise<{ rows: R[] }> => {
           // #658 — a sonda de `pg_index`. Reconhecida explicitamente: sem isto
           // o `else` devolveria as linhas do LEDGER para a consulta de
           // catálogo, e todo veredito nasceria com um índice inválido fantasma.
@@ -147,18 +151,18 @@ function ledgerPool(
                 is_live: i.live,
               }))
             : text.includes('information_schema.columns')
-            ? V2_COLUMNS.map((column_name) => ({ column_name }))
-            : rows.map((r) => ({
-                applied_at: '2026-01-01T00:00:00.000Z',
-                started_at: null,
-                execution_ms: 1,
-                app_version: null,
-                runner_version: null,
-                error_class: null,
-                repaired_at: null,
-                repair_reason: null,
-                ...r,
-              }));
+              ? V2_COLUMNS.map((column_name) => ({ column_name }))
+              : rows.map((r) => ({
+                  applied_at: '2026-01-01T00:00:00.000Z',
+                  started_at: null,
+                  execution_ms: 1,
+                  app_version: null,
+                  runner_version: null,
+                  error_class: null,
+                  repaired_at: null,
+                  repair_reason: null,
+                  ...r,
+                }));
           return Promise.resolve({ rows: out as unknown as R[] });
         },
         release: () => undefined,
@@ -206,12 +210,10 @@ async function boot(
   const exited = new Promise<number>((resolve) => {
     settle = resolve;
   });
-  const exitSpy = vi
-    .spyOn(process, 'exit')
-    .mockImplementation(((code?: number) => {
-      settle(code ?? 0);
-      return undefined as never;
-    }) as never);
+  const exitSpy = vi.spyOn(process, 'exit').mockImplementation(((code?: number) => {
+    settle(code ?? 0);
+    return undefined as never;
+  }) as never);
 
   await import('@/index.js');
 
@@ -248,9 +250,8 @@ describe('a tabela de exit codes', () => {
   });
 
   it('cobre TODO blocker kind — um kind sem código viraria `undefined` no exit', async () => {
-    const { SCHEMA_BOOT_EXIT_CODES, SCHEMA_BOOT_BLOCKER_PRECEDENCE } = await import(
-      '@/runtime/lifecycle/schema-boot-gate.js'
-    );
+    const { SCHEMA_BOOT_EXIT_CODES, SCHEMA_BOOT_BLOCKER_PRECEDENCE } =
+      await import('@/runtime/lifecycle/schema-boot-gate.js');
     // A precedência e a tabela têm de descrever o MESMO conjunto: um kind só na
     // tabela nunca seria escolhido; um kind só na precedência sairia undefined.
     expect([...SCHEMA_BOOT_BLOCKER_PRECEDENCE].sort()).toEqual(
@@ -298,7 +299,11 @@ describe('src/index.ts — o passo `schema` decide pelo veredito canônico', () 
       ],
     });
     expect(out.exitCode).toBe(98);
-    expect(out.refusal).toMatchObject({ exit_code: 98, blocker: 'invalid_index', verdict: 'blocked' });
+    expect(out.refusal).toMatchObject({
+      exit_code: 98,
+      blocker: 'invalid_index',
+      verdict: 'blocked',
+    });
     expect(String(out.refusal?.remediation)).toMatch(/DROP INDEX CONCURRENTLY/);
     expect(out.fatalMessage).toContain('SCHEMA BOOT REFUSED');
     expect(out.fatalMessage).toContain('agent_turns_stream_active_uq');

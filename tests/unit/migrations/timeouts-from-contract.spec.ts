@@ -20,7 +20,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { MigrationRunResult, RunOptions } from '@/migrations/index.js';
 
-const runMigrationsMock = vi.fn<(deps: unknown, options?: RunOptions) => Promise<MigrationRunResult>>();
+const runMigrationsMock =
+  vi.fn<(deps: unknown, options?: RunOptions) => Promise<MigrationRunResult>>();
 
 vi.mock('@/migrations/index.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/migrations/index.js')>();
@@ -75,7 +76,9 @@ afterEach(() => {
 });
 
 /** Roda `migrate up` com o ambiente dado e devolve as opções que a CLI passou. */
-async function optionsPassedByCli(over: Record<string, string> = {}): Promise<RunOptions | undefined> {
+async function optionsPassedByCli(
+  over: Record<string, string> = {},
+): Promise<RunOptions | undefined> {
   process.env = { ...BASE_ENV, ...over, MIGRATE_NO_MAIN: '1' } as NodeJS.ProcessEnv;
   const log = vi.spyOn(console, 'log').mockImplementation(() => undefined);
   try {
@@ -125,9 +128,16 @@ describe('scripts/migrate.ts — os tetos vêm do contrato', () => {
   });
 
   it('recusa o boot do migrator com teto negativo, em vez de aceitar e ignorar', async () => {
-    process.env = { ...BASE_ENV, MIGRATION_LOCK_WAIT_MS: '-1', MIGRATE_NO_MAIN: '1' } as NodeJS.ProcessEnv;
+    process.env = {
+      ...BASE_ENV,
+      MIGRATION_LOCK_WAIT_MS: '-1',
+      MIGRATE_NO_MAIN: '1',
+    } as NodeJS.ProcessEnv;
     const { main } = await import('../../../scripts/migrate.js');
     await expect(main(['up'])).rejects.toThrow(/MIGRATION_LOCK_WAIT_MS/);
-    expect(runMigrationsMock, 'nada pode ser aplicado com configuração inválida').not.toHaveBeenCalled();
+    expect(
+      runMigrationsMock,
+      'nada pode ser aplicado com configuração inválida',
+    ).not.toHaveBeenCalled();
   });
 });

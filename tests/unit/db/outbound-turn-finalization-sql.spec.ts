@@ -18,9 +18,7 @@ const compile = (statement: ReturnType<typeof scopesWithWorkStatement>) => {
 
 describe('P1 — SQL de convergência outbound → turno', () => {
   it('exige escopo, outbound_pending, claim e lease vencida', () => {
-    const { sql, params } = compile(
-      finalizableTurnsStatement('tenant-a', 'agent-a', 25),
-    );
+    const { sql, params } = compile(finalizableTurnsStatement('tenant-a', 'agent-a', 25));
     expect(sql).toContain("t.status = 'outbound_pending'");
     expect(sql).toContain('t.claim_token IS NOT NULL');
     expect(sql).toContain('t.lease_expires_at IS NOT NULL');
@@ -31,27 +29,18 @@ describe('P1 — SQL de convergência outbound → turno', () => {
   });
 
   it('exige sucesso comprovado e bloqueia qualquer artefato não final', () => {
-    const { sql, params } = compile(
-      finalizableTurnsStatement('tenant-a', 'agent-a', 25),
-    );
+    const { sql, params } = compile(finalizableTurnsStatement('tenant-a', 'agent-a', 25));
     expect(sql.match(/EXISTS/g)?.length).toBeGreaterThanOrEqual(2);
     expect(sql).toContain("o.status = 'completed'");
     expect(sql).toContain('o.status NOT IN (');
-    for (const status of [
-      'completed',
-      'failed_terminal',
-      'cancelled',
-      'dead_letter',
-    ]) {
+    for (const status of ['completed', 'failed_terminal', 'cancelled', 'dead_letter']) {
       expect(params).toContain(status);
     }
     expect(params).not.toContain('delivered');
   });
 
   it('diagnostica zero-sucesso em consulta agregada fora do LIMIT de finalização', () => {
-    const { sql, params } = compile(
-      noSuccessTurnsSummaryStatement('tenant-a', 'agent-a'),
-    );
+    const { sql, params } = compile(noSuccessTurnsSummaryStatement('tenant-a', 'agent-a'));
     expect(sql).toContain('COUNT(*)::int AS pending_count');
     expect(sql).toContain("t.status = 'outbound_pending'");
     expect(sql).toContain('o.status NOT IN (');

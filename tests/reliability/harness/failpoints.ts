@@ -248,9 +248,7 @@ export class HandshakeTimeoutError extends Error {
         `Gates armados no momento do estouro: ${
           diagnostico.armados.length === 0
             ? '(nenhum)'
-            : diagnostico.armados
-                .map((g) => `${g.failpoint}:${g.action}x${g.remaining}`)
-                .join(', ')
+            : diagnostico.armados.map((g) => `${g.failpoint}:${g.action}x${g.remaining}`).join(', ')
         }.`,
         `Failpoints alcançados nesta rodada: ${
           diagnostico.alcancados.length === 0
@@ -316,7 +314,10 @@ export class FailpointGateRegistry {
    * Consome o gate para este `reached` e devolve a ação a executar.
    * `undefined` = nenhum gate armado, o processo segue.
    */
-  reached(failpointBruto: string, context: Readonly<Record<string, string | number>> = {}): {
+  reached(
+    failpointBruto: string,
+    context: Readonly<Record<string, string | number>> = {},
+  ): {
     action: FailpointAction | undefined;
     evento: ReachedEvent;
   } {

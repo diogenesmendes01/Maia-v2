@@ -28,16 +28,18 @@ import { TypedError } from '../../../src/lib/utils.js';
  */
 
 type Ports = Awaited<
-  ReturnType<typeof import('../../../src/ops/backup/drill-adapters.js')['createRestoreDrillPorts']>
+  ReturnType<
+    (typeof import('../../../src/ops/backup/drill-adapters.js'))['createRestoreDrillPorts']
+  >
 >;
 
 let ports: Ports;
 let productionDatabase: string;
 let productionUrl: string;
-let assertDrillTarget: typeof import('../../../src/ops/backup/drill.js')['assertDrillTarget'];
-let assertAdminTarget: typeof import('../../../src/ops/backup/drill.js')['assertAdminTarget'];
-let drillDatabaseName: typeof import('../../../src/ops/backup/drill.js')['drillDatabaseName'];
-let drillFailureCode: typeof import('../../../src/ops/backup/drill.js')['drillFailureCode'];
+let assertDrillTarget: (typeof import('../../../src/ops/backup/drill.js'))['assertDrillTarget'];
+let assertAdminTarget: (typeof import('../../../src/ops/backup/drill.js'))['assertAdminTarget'];
+let drillDatabaseName: (typeof import('../../../src/ops/backup/drill.js'))['drillDatabaseName'];
+let drillFailureCode: (typeof import('../../../src/ops/backup/drill.js'))['drillFailureCode'];
 
 beforeAll(async () => {
   const adapters = await import('../../../src/ops/backup/drill-adapters.js');

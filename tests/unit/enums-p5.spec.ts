@@ -1,9 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  GapLevel,
-  ProposalStatus,
-  CapabilityTestOutcome,
-} from '@/types/enums.js';
+import { GapLevel, ProposalStatus, CapabilityTestOutcome } from '@/types/enums.js';
 
 describe('P5 enums', () => {
   it('GapLevel has 4 values', () => {

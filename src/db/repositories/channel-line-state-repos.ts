@@ -217,7 +217,6 @@ function normalizeOverview(raw: {
   };
 }
 
-
 /**
  * Veredito do enfileiramento sobre um `current` JÁ LIDO — função PURA.
  *
@@ -370,10 +369,7 @@ async function lockLineState(tx: Tx, channel_id: string): Promise<ChannelLineSta
  * MESMO `decideCommand`, que então enxerga o pairing vivo do vencedor e
  * devolve `pairing_in_progress`.
  */
-async function requestCommandInTx(
-  tx: Tx,
-  args: RequestCommandArgs,
-): Promise<RequestCommandResult> {
+async function requestCommandInTx(tx: Tx, args: RequestCommandArgs): Promise<RequestCommandResult> {
   // O canal precisa existir NESTE escopo — a checagem vive dentro da tx
   // para não abrir janela TOCTOU com um DELETE concorrente.
   const chan = await tx
@@ -432,11 +428,7 @@ async function requestCommandInTx(
 }
 
 /** Trilha administrativa, na transacao do chamador. */
-async function appendLineAudit(
-  tx: Tx,
-  scope: LineScope,
-  entry: LineCommandAudit,
-): Promise<void> {
+async function appendLineAudit(tx: Tx, scope: LineScope, entry: LineCommandAudit): Promise<void> {
   await tx.insert(admin_audit_log).values({
     tenant_id: scope.tenant_id,
     actor_id: entry.actor_id,
@@ -502,9 +494,7 @@ export const channelLineStateRepo = {
       .select(overviewColumns())
       .from(channels)
       .leftJoin(channel_line_state, eq(channel_line_state.channel_id, channels.id))
-      .where(
-        and(eq(channels.tenant_id, scope.tenant_id), eq(channels.agent_id, scope.agent_id)),
-      )
+      .where(and(eq(channels.tenant_id, scope.tenant_id), eq(channels.agent_id, scope.agent_id)))
       .orderBy(channels.channel_type, channels.external_id);
     return rows.map(normalizeOverview);
   },
@@ -696,7 +686,6 @@ export const channelLineStateRepo = {
     });
   },
 
-
   /**
    * Marca a linha como desabilitada pelo operador, sem transação composta.
    * O caminho do console é `disableLineWithAudit`; este fica para chamadores
@@ -849,7 +838,6 @@ export const channelLineStateRepo = {
     return rows.length;
   },
 
-
   /**
    * Abre mão da posse da sessão (shutdown ordenado da #512, stop explícito).
    * Liberar aqui, em vez de esperar a lease vencer, deixa outra réplica
@@ -922,9 +910,7 @@ export const channelLineStateRepo = {
         ...(args.release_owner
           ? { owner_instance: null, owner_lease_expires_at: null }
           : {
-              owner_lease_expires_at: new Date(
-                now.getTime() + (args.lease_ms ?? OWNER_LEASE_MS),
-              ),
+              owner_lease_expires_at: new Date(now.getTime() + (args.lease_ms ?? OWNER_LEASE_MS)),
             }),
         ...(args.state
           ? {
@@ -1013,9 +999,7 @@ export const channelLineStateRepo = {
       .update(channel_line_state)
       .set({
         state: args.state,
-        ...(args.release_owner
-          ? { owner_instance: null, owner_lease_expires_at: null }
-          : {}),
+        ...(args.release_owner ? { owner_instance: null, owner_lease_expires_at: null } : {}),
         ...(args.reason_code !== undefined ? { reason_code: args.reason_code } : {}),
         ...(args.verified_at ? { verified_at: args.verified_at } : {}),
         ...(args.connected_at ? { connected_at: args.connected_at } : {}),

@@ -403,7 +403,9 @@ describe('postura `off`', () => {
     expect(_internal.circuits.size).toBe(0);
     expect(circuitState(KEY)).toBe('closed');
     expect(
-      setGaugeProviderMock.mock.calls.filter((c) => String(c[0]).startsWith('maia_llm_circuit_state')),
+      setGaugeProviderMock.mock.calls.filter((c) =>
+        String(c[0]).startsWith('maia_llm_circuit_state'),
+      ),
     ).toHaveLength(0);
   });
 
@@ -479,7 +481,9 @@ describe('kill switch — override de postura', () => {
   it('RECUSA override sem ator ou sem motivo', () => {
     expect(applyCircuitOverride({ mode: 'off', reason: REASON }, T0).applied).toBe(false);
     expect(applyCircuitOverride({ mode: 'off', actor: ACTOR }, T0).applied).toBe(false);
-    expect(applyCircuitOverride({ mode: 'off', actor: '  ', reason: '  ' }, T0).applied).toBe(false);
+    expect(applyCircuitOverride({ mode: 'off', actor: '  ', reason: '  ' }, T0).applied).toBe(
+      false,
+    );
     expect(effectiveMode(T0)).toBe(modeInternal.baselineMode());
     expect(overrideCalls().every((c) => c.reason === 'rejected')).toBe(true);
   });
@@ -528,7 +532,12 @@ describe('kill switch — override de postura', () => {
     expect(line, 'o uso do kill switch tem que aparecer no log').toBeTruthy();
     // Ator e motivo são texto livre do operador: vivem no log (sem
     // cardinalidade), NUNCA em label.
-    expect(line![0]).toMatchObject({ action: 'applied', mode: 'off', actor: ACTOR, reason: REASON });
+    expect(line![0]).toMatchObject({
+      action: 'applied',
+      mode: 'off',
+      actor: ACTOR,
+      reason: REASON,
+    });
     // Mudar a postura é evento de FROTA, não de tenant: o contador não carrega
     // atribuição (seria a do ALS que por acaso estava ativo, que não diz nada),
     // e ator/motivo são texto livre — log, nunca label.

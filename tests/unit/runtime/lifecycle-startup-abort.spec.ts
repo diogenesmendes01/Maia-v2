@@ -20,10 +20,7 @@ vi.mock('../../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
 
-import {
-  lifecycle,
-  StartupAbortedError,
-} from '../../../src/runtime/lifecycle/controller.js';
+import { lifecycle, StartupAbortedError } from '../../../src/runtime/lifecycle/controller.js';
 
 const deferred = () => {
   let resolve!: () => void;
@@ -81,11 +78,13 @@ describe('runStartupStep — cancellation', () => {
   it('names the aborted step so the log says WHERE the boot stopped', async () => {
     lifecycle.registerShutdownStep({ name: 'noop', run: async () => undefined });
     await lifecycle.shutdown({ signal: 'SIGTERM' });
-    await lifecycle.runStartupStep('whatsapp_session', async () => undefined).catch((err) => {
-      expect(err).toBeInstanceOf(StartupAbortedError);
-      expect((err as StartupAbortedError).step).toBe('whatsapp_session');
-      expect((err as StartupAbortedError & { code: string }).code).toBe('STARTUP_ABORTED');
-    });
+    await lifecycle
+      .runStartupStep('whatsapp_session', async () => undefined)
+      .catch((err) => {
+        expect(err).toBeInstanceOf(StartupAbortedError);
+        expect((err as StartupAbortedError).step).toBe('whatsapp_session');
+        expect((err as StartupAbortedError & { code: string }).code).toBe('STARTUP_ABORTED');
+      });
     expect.assertions(3);
   });
 
@@ -99,9 +98,11 @@ describe('runStartupStep — cancellation', () => {
   });
 
   it('clears the in-flight marker even when the phase throws', async () => {
-    await lifecycle.runStartupStep('db', async () => {
-      throw new Error('boom');
-    }).catch(() => undefined);
+    await lifecycle
+      .runStartupStep('db', async () => {
+        throw new Error('boom');
+      })
+      .catch(() => undefined);
     expect(lifecycle.startupStepInFlight).toBeNull();
   });
 });

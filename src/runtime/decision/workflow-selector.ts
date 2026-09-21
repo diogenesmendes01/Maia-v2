@@ -6,15 +6,8 @@
  *
  * Budget target: <20ms.
  */
-import type {
-  ProceduresRepo,
-  WorkflowSelector,
-  WorkflowSelectorResult,
-} from './types.js';
-import type {
-  BaseContextPacket,
-  DecisionPacket,
-} from '../context-packet/types.js';
+import type { ProceduresRepo, WorkflowSelector, WorkflowSelectorResult } from './types.js';
+import type { BaseContextPacket, DecisionPacket } from '../context-packet/types.js';
 
 export interface WorkflowSelectorDeps {
   proceduresRepo: ProceduresRepo;
@@ -49,9 +42,7 @@ export class WorkflowSelectorImpl implements WorkflowSelector {
       return { mode: 'none' };
     }
 
-    const exec = await this.deps.proceduresRepo.findExecution(
-      base.active_procedure_execution_id,
-    );
+    const exec = await this.deps.proceduresRepo.findExecution(base.active_procedure_execution_id);
     if (!exec) {
       return { mode: 'none' };
     }

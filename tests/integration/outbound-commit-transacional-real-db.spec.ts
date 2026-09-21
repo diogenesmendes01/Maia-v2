@@ -176,10 +176,9 @@ async function linhasOutboundDoTurno(): Promise<
 }
 
 async function statusDoTurno(): Promise<{ status: string; state_version: number } | null> {
-  const { rows } = await pool.query(
-    `SELECT status, state_version FROM agent_turns WHERE id = $1`,
-    [turnId],
-  );
+  const { rows } = await pool.query(`SELECT status, state_version FROM agent_turns WHERE id = $1`, [
+    turnId,
+  ]);
   return rows[0] ? { status: rows[0].status, state_version: Number(rows[0].state_version) } : null;
 }
 
@@ -445,10 +444,9 @@ d('#631 — commit transacional da resposta (Postgres real)', () => {
 
     expect(canal.sendText).not.toHaveBeenCalled();
     // A linha do artefato NÃO sobreviveu ao rollback.
-    const { rows } = await pool.query(
-      `SELECT id FROM outbound_messages WHERE in_reply_to = $1`,
-      [mensagemApagada],
-    );
+    const { rows } = await pool.query(`SELECT id FROM outbound_messages WHERE in_reply_to = $1`, [
+      mensagemApagada,
+    ]);
     expect(rows).toHaveLength(0);
     // E o turno voltou: as duas escritas eram a MESMA transação.
     expect((await statusDoTurno())!.status).toBe('running');

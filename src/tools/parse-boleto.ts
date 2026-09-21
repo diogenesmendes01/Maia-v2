@@ -73,10 +73,7 @@ export const parseBoletoTool: Tool<typeof inputSchema, typeof outputSchema> = {
       linha_digitavel: linhaValid ? linha : undefined,
       codigo_barras: validateOrDrop(parsed?.codigo_barras, OCR_REGEXES.codigo_barras),
       valor: parsed?.valor ?? result.valor,
-      vencimento: validateOrDrop(
-        parsed?.vencimento_data ?? result.vencimento,
-        OCR_REGEXES.data,
-      ),
+      vencimento: validateOrDrop(parsed?.vencimento_data ?? result.vencimento, OCR_REGEXES.data),
       beneficiario_nome: result.beneficiario_nome
         ? wrapWithTag(result.beneficiario_nome, 'ocr')
         : undefined,

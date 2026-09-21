@@ -144,7 +144,10 @@ describe('DLQ writer — registered from the real BullMQ failed handler', () => 
     dlqAddMock.mockReturnValue(dlqWrite.promise.then(() => ({ id: 'dlq-1' })));
 
     // A job that exhausted its retries.
-    failedHandlers[0]!({ id: 'j1', data: { mensagem_id: 'm1' }, attemptsMade: 3, opts: {} }, new Error('boom'));
+    failedHandlers[0]!(
+      { id: 'j1', data: { mensagem_id: 'm1' }, attemptsMade: 3, opts: {} },
+      new Error('boom'),
+    );
 
     expect(lifecycle.countBackgroundTasks()).toBe(1);
     expect(lifecycle.pendingBackgroundTaskNames()).toContain('dlq_write');
@@ -156,7 +159,10 @@ describe('DLQ writer — registered from the real BullMQ failed handler', () => 
 
   it('does NOT register anything for a job that still has retries left', () => {
     startAgentWorker(vi.fn(async () => undefined));
-    failedHandlers[0]!({ id: 'j1', data: {}, attemptsMade: 1, opts: { attempts: 3 } }, new Error('x'));
+    failedHandlers[0]!(
+      { id: 'j1', data: {}, attemptsMade: 1, opts: { attempts: 3 } },
+      new Error('x'),
+    );
     expect(lifecycle.countBackgroundTasks()).toBe(0);
     expect(dlqAddMock).not.toHaveBeenCalled();
   });

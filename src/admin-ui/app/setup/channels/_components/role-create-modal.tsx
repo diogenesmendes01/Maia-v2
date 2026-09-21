@@ -73,9 +73,8 @@ export default function RoleCreateModal({
       title="Novo papel"
       description={
         <>
-          Cria um modo operacional para o agente{' '}
-          <code className="font-mono">{agentId}</code>. A política de canal
-          exige um papel padrão.
+          Cria um modo operacional para o agente <code className="font-mono">{agentId}</code>. A
+          política de canal exige um papel padrão.
         </>
       }
       footer={
@@ -135,8 +134,7 @@ export default function RoleCreateModal({
 
       {!hasRoles && (
         <p className="mt-3 text-xs text-zinc-500">
-          Este é o primeiro papel do agente — ele se torna automaticamente o
-          papel padrão.
+          Este é o primeiro papel do agente — ele se torna automaticamente o papel padrão.
         </p>
       )}
 

@@ -79,9 +79,8 @@ vi.mock('@/db/client.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureExecutionsRepo: {
@@ -89,9 +88,7 @@ vi.mock('@/db/repositories.js', async () => {
         // Issue #323: a query real agora filtra por tenant_id E agent_id.
         // O mock espelha isso para garantir que cada iteração só veja as
         // execuções stale do (tenant, agent) corrente.
-        const { getCurrentTenant, getCurrentAgent } = await import(
-          '@/db/tenant-context.js'
-        );
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
         contextsSeen.push({ tenant_id, agent_id });
@@ -138,9 +135,7 @@ vi.mock('@/db/repositories.js', async () => {
       // can assert the audit event lands under the REAL agent (#323), not
       // 'default'.
       recordTx: vi.fn(async (_tx: unknown, input: any) => {
-        const { getCurrentTenant, getCurrentAgent } = await import(
-          '@/db/tenant-context.js'
-        );
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         eventsLog.push({
           ...input,
           ctx_tenant_id: getCurrentTenant(),
@@ -344,9 +339,8 @@ describe('runProcedureExecutionReaper', () => {
     // Ambos contextos REAIS abertos (um por agent). Ordem é irrelevante AQUI
     // (a ordenação oldest-first é coberta pelo teste de fairness dedicado);
     // este cenário só garante que CADA agent ganhou seu próprio contexto REAL.
-    const sortByAgent = (
-      arr: Array<{ tenant_id: string; agent_id: string }>,
-    ) => [...arr].sort((a, b) => a.agent_id.localeCompare(b.agent_id));
+    const sortByAgent = (arr: Array<{ tenant_id: string; agent_id: string }>) =>
+      [...arr].sort((a, b) => a.agent_id.localeCompare(b.agent_id));
     expect(sortByAgent(contextsSeen)).toEqual([
       { tenant_id: 'tenant-a', agent_id: 'agent-1' },
       { tenant_id: 'tenant-a', agent_id: 'agent-2' },
@@ -437,8 +431,6 @@ describe('runProcedureExecutionReaper', () => {
     expect(executionsState['exec-t-9d'].status).toBe('abandoned');
     // Todas as 4 ceifadas ao fim dos 2 ticks — eventual progress, sem starvation.
     expect(eventsLog).toHaveLength(4);
-    expect(
-      Object.values(executionsState).every((ex: any) => ex.status === 'abandoned'),
-    ).toBe(true);
+    expect(Object.values(executionsState).every((ex: any) => ex.status === 'abandoned')).toBe(true);
   });
 });

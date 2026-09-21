@@ -148,9 +148,7 @@ d('migration 085 — calendar backfill (real DB)', () => {
       expect(rows[0]!.denied_tools).toContain('some_sensitive_tool');
     } finally {
       // Cleanup — cascade deletes the grant via ON DELETE CASCADE.
-      await client
-        .query(`DELETE FROM agents WHERE id = $1`, [agentId])
-        .catch(() => undefined);
+      await client.query(`DELETE FROM agents WHERE id = $1`, [agentId]).catch(() => undefined);
       client.release();
     }
   });
@@ -175,9 +173,7 @@ d('migration 085 — calendar backfill (real DB)', () => {
       expect(rows[0]!.granted_packs).toContain('domain.calendar');
     } finally {
       // Cleanup — cascade deletes the grant.
-      await client
-        .query(`DELETE FROM agents WHERE id = $1`, [agentId])
-        .catch(() => undefined);
+      await client.query(`DELETE FROM agents WHERE id = $1`, [agentId]).catch(() => undefined);
       client.release();
     }
   });

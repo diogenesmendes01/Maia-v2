@@ -13,9 +13,8 @@ vi.mock('@/config/feature-flags.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     skillsRepo: {
@@ -33,9 +32,8 @@ vi.mock('@/db/repositories.js', async () => {
 });
 
 vi.mock('@/cognition/runner.js', async () => {
-  const actual = await vi.importActual<typeof import('@/cognition/runner.js')>(
-    '@/cognition/runner.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/cognition/runner.js')>('@/cognition/runner.js');
   return {
     ...actual,
     // Pass-through wrapper: runs fn directly, captures status.
@@ -192,7 +190,11 @@ describe('SkillRunner — 7-gate flow', () => {
     const result = await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
       async () =>
-        runSkill({ skill_descriptor: 'detect_legal_risk', input: {}, triggered_by: 'user_message' }),
+        runSkill({
+          skill_descriptor: 'detect_legal_risk',
+          input: {},
+          triggered_by: 'user_message',
+        }),
     );
     expect(result.ok).toBe(true);
   });
@@ -251,8 +253,7 @@ describe('SkillRunner — 7-gate flow', () => {
     });
     const result = await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
-      async () =>
-        runSkill({ skill_descriptor: 'x', input: {}, triggered_by: 'user_message' }),
+      async () => runSkill({ skill_descriptor: 'x', input: {}, triggered_by: 'user_message' }),
     );
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('policy_blocked');
@@ -286,8 +287,7 @@ describe('SkillRunner — 7-gate flow', () => {
     vi.mocked(promptOnlyMode).mockResolvedValue({ wrong_field: 'data' });
     const result = await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
-      async () =>
-        runSkill({ skill_descriptor: 'x', input: {}, triggered_by: 'user_message' }),
+      async () => runSkill({ skill_descriptor: 'x', input: {}, triggered_by: 'user_message' }),
     );
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('invalid_output');
@@ -299,8 +299,7 @@ describe('SkillRunner — 7-gate flow', () => {
     vi.mocked(promptOnlyMode).mockRejectedValue(new Error('llm_failure'));
     const result = await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
-      async () =>
-        runSkill({ skill_descriptor: 'x', input: {}, triggered_by: 'user_message' }),
+      async () => runSkill({ skill_descriptor: 'x', input: {}, triggered_by: 'user_message' }),
     );
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('executor_error');
@@ -314,8 +313,7 @@ describe('SkillRunner — 7-gate flow', () => {
     vi.mocked(promptOnlyMode).mockRejectedValue(new Error('timeout'));
     const result = await runWithTenantContext(
       { tenant_id: 'default', agent_id: 'default' },
-      async () =>
-        runSkill({ skill_descriptor: 'x', input: {}, triggered_by: 'user_message' }),
+      async () => runSkill({ skill_descriptor: 'x', input: {}, triggered_by: 'user_message' }),
     );
     expect(result.ok).toBe(false);
     expect(result.reason).toBe('timeout');

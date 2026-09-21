@@ -13,7 +13,10 @@ export type Transcription = {
  * `readValidatedMedia` (src/lib/media-guard.ts). This module no longer reads
  * the filesystem — callers resolve an attachment_id and pass the buffer.
  */
-export async function transcribeWhisper(input: { buf: Buffer; mime: string }): Promise<Transcription> {
+export async function transcribeWhisper(input: {
+  buf: Buffer;
+  mime: string;
+}): Promise<Transcription> {
   if (!config.OPENAI_API_KEY) {
     throw new Error('OPENAI_API_KEY missing for Whisper');
   }

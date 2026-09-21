@@ -25,18 +25,11 @@
  *                + active_voice_modifiers (when present)
  */
 import { createHash } from 'node:crypto';
-import type {
-  BaseContextPacket,
-  IdentitySlice,
-} from '../../context-packet/types.js';
+import type { BaseContextPacket, IdentitySlice } from '../../context-packet/types.js';
 import type { LearnedVoiceModifier } from '@/identity/learned-voice-modifier.js';
 import { sliceCacheKey, type SliceCache } from '../../context-packet/cache/slice-cache.js';
 import { getTTLForSlice } from '../../context-packet/cache/ttl-policy.js';
-import type {
-  SliceBuilder,
-  SliceBuilderInput,
-  SliceBuilderResult,
-} from './_types.js';
+import type { SliceBuilder, SliceBuilderInput, SliceBuilderResult } from './_types.js';
 import { operationalProfileVersionsRepo } from '@/db/repositories.js';
 
 export interface IdentityRequirements {
@@ -51,10 +44,7 @@ export interface IdentityRequirements {
  * `realIdentityPort` (#206); this port shape remains for DI and tests.
  */
 export interface OperationalProfilePort {
-  getActive(
-    tenant_id: string,
-    agent_id: string,
-  ): Promise<OperationalProfileRecord | null>;
+  getActive(tenant_id: string, agent_id: string): Promise<OperationalProfileRecord | null>;
 }
 
 export interface OperationalProfileRecord {
@@ -93,9 +83,7 @@ const EMPTY_IDENTITY: IdentitySlice = {
   version_id: '',
 };
 
-export class IdentitySliceBuilder
-  implements SliceBuilder<IdentityRequirements, IdentitySlice>
-{
+export class IdentitySliceBuilder implements SliceBuilder<IdentityRequirements, IdentitySlice> {
   readonly name = 'identity' as const;
 
   constructor(
@@ -191,17 +179,10 @@ export class IdentitySliceBuilder
     // `getActiveIdAndStatus()` probe — same cache-key strategy, smaller
     // payload. The contract (cache invalidates on state change) does NOT
     // depend on the probe shape.
-    const record = await this.repo.getActive(
-      input.base.tenant_id,
-      input.base.agent_id,
-    );
+    const record = await this.repo.getActive(input.base.tenant_id, input.base.agent_id);
     throwIfAborted(input.signal);
 
-    const key = this.versionedCacheKey(
-      input.base,
-      input.requirements,
-      record?.id ?? null,
-    );
+    const key = this.versionedCacheKey(input.base, input.requirements, record?.id ?? null);
 
     // Cache lookup (now keyed by the active profile id, so a state change
     // since the previous turn naturally falls through to a fresh build).
@@ -246,9 +227,7 @@ export class IdentitySliceBuilder
       cognitive_limits: body.identity.cognitive_limits,
       priorities: input.requirements.depth === 'full' ? explicitPriorities : [],
       learned_voice_modifiers:
-        input.requirements.depth === 'full'
-          ? (body.identity.learned_voice_modifiers ?? [])
-          : [],
+        input.requirements.depth === 'full' ? (body.identity.learned_voice_modifiers ?? []) : [],
       schema_version: body.schema_version ?? 'v3.1.1-2026-05-15',
       version_id: record.id,
     };
@@ -293,10 +272,7 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 function hashShort(obj: Record<string, unknown>): string {
-  return createHash('sha256')
-    .update(JSON.stringify(obj))
-    .digest('hex')
-    .substring(0, 12);
+  return createHash('sha256').update(JSON.stringify(obj)).digest('hex').substring(0, 12);
 }
 
 // ─── P8d §5 — function-style API ──────────────────────────────────────────────
@@ -344,15 +320,12 @@ export async function buildIdentitySlice(args: {
     // canonical priorities. principles surface through slice.principles
     // (populated below for depth='full'); never through slice.priorities.
     priorities: Array.isArray(identity.priorities)
-      ? (identity.priorities as unknown[]).filter(
-          (p): p is string => typeof p === 'string',
-        )
+      ? (identity.priorities as unknown[]).filter((p): p is string => typeof p === 'string')
       : [],
     voice: extractVoice(identity.voice),
     cognitive_limits: extractCognitiveLimits(identity.cognitive_limits),
     learned_voice_modifiers: [],
-    schema_version:
-      typeof body.schema_version === 'string' ? body.schema_version : 'unknown',
+    schema_version: typeof body.schema_version === 'string' ? body.schema_version : 'unknown',
     version_id: profile.id,
     version_number: profile.version,
   };
@@ -400,16 +373,11 @@ function extractCognitiveLimits(clRaw: unknown): IdentitySlice['cognitive_limits
   if (typeof clRaw === 'object' && clRaw !== null) {
     const cl = clRaw as Record<string, unknown>;
     return {
-      max_inference_depth:
-        typeof cl.max_inference_depth === 'number' ? cl.max_inference_depth : 3,
+      max_inference_depth: typeof cl.max_inference_depth === 'number' ? cl.max_inference_depth : 3,
       max_speculation_in_response:
-        typeof cl.max_speculation_in_response === 'number'
-          ? cl.max_speculation_in_response
-          : 0.2,
+        typeof cl.max_speculation_in_response === 'number' ? cl.max_speculation_in_response : 0.2,
       confidence_floor_for_action:
-        typeof cl.confidence_floor_for_action === 'number'
-          ? cl.confidence_floor_for_action
-          : 0.7,
+        typeof cl.confidence_floor_for_action === 'number' ? cl.confidence_floor_for_action : 0.7,
     };
   }
   return {

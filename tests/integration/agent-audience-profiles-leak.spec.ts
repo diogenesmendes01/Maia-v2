@@ -230,9 +230,8 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
 
       const { agentAudienceProfilesRepo } = await loadRepos();
 
-      const fromR1 = await runWithTenantContext(
-        { tenant_id: 'primary', agent_id: 'agentR1' },
-        () => agentAudienceProfilesRepo.findByPessoa(p1),
+      const fromR1 = await runWithTenantContext({ tenant_id: 'primary', agent_id: 'agentR1' }, () =>
+        agentAudienceProfilesRepo.findByPessoa(p1),
       );
       expect(fromR1?.audience_type).toBe('owner');
 
@@ -263,8 +262,16 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
     try {
       await ensureTenantAgent(c, 'primary', 'agentL1');
       await ensureTenantAgent(c, 'primary', 'agentL2');
-      const p1 = await mkPessoaRow(c, { tenant: 'primary', agent: 'agentL1', phone: '+5511900888101' });
-      const p2 = await mkPessoaRow(c, { tenant: 'primary', agent: 'agentL2', phone: '+5511900888102' });
+      const p1 = await mkPessoaRow(c, {
+        tenant: 'primary',
+        agent: 'agentL1',
+        phone: '+5511900888101',
+      });
+      const p2 = await mkPessoaRow(c, {
+        tenant: 'primary',
+        agent: 'agentL2',
+        phone: '+5511900888102',
+      });
       created.pessoas.push(p1, p2);
       const a1 = await mkProfileRow(c, {
         tenant: 'primary',
@@ -281,9 +288,8 @@ dRepo('agentAudienceProfilesRepo — ALS-scoped reads (#407)', () => {
       created.profiles.push(a1, a2);
 
       const { agentAudienceProfilesRepo } = await loadRepos();
-      const fromL1 = await runWithTenantContext(
-        { tenant_id: 'primary', agent_id: 'agentL1' },
-        () => agentAudienceProfilesRepo.list(),
+      const fromL1 = await runWithTenantContext({ tenant_id: 'primary', agent_id: 'agentL1' }, () =>
+        agentAudienceProfilesRepo.list(),
       );
       // Every returned row is the current agent's; the other agent's is invisible.
       expect(fromL1.every((p) => p.agent_id === 'agentL1' && p.tenant_id === 'primary')).toBe(true);

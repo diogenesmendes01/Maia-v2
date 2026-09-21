@@ -53,7 +53,11 @@ export const startWorkflowTool: Tool<typeof inputSchema, typeof outputSchema> = 
     const wf = await workflowsRepo.create({
       tipo: args.tipo,
       status: 'pendente',
-      contexto: { ...(args.contexto ?? {}), resumo: args.resumo, requester_pessoa_id: ctx.pessoa.id },
+      contexto: {
+        ...(args.contexto ?? {}),
+        resumo: args.resumo,
+        requester_pessoa_id: ctx.pessoa.id,
+      },
       entidade_id: args.entidade_id,
       pessoa_envolvida: ctx.pessoa.id,
       proxima_acao_em: new Date(),

@@ -39,8 +39,18 @@ function deps(db: FakeDb) {
 }
 
 const applied = [
-  { id: '001_a.sql', status: 'applied' as const, checksum_sha256: migrationChecksum(A), checksum_source: 'computed' as const },
-  { id: '002_b.sql', status: 'applied' as const, checksum_sha256: migrationChecksum(B), checksum_source: 'computed' as const },
+  {
+    id: '001_a.sql',
+    status: 'applied' as const,
+    checksum_sha256: migrationChecksum(A),
+    checksum_source: 'computed' as const,
+  },
+  {
+    id: '002_b.sql',
+    status: 'applied' as const,
+    checksum_sha256: migrationChecksum(B),
+    checksum_source: 'computed' as const,
+  },
 ];
 
 describe('getSchemaReadiness — read-only guarantees', () => {

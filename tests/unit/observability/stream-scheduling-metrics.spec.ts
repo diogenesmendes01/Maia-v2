@@ -93,9 +93,7 @@ describe('#626 — séries do escalonamento por stream', () => {
   it('é fiado a partir de registerRuntimeObservability, o ponto de registro do boot', async () => {
     resetMetrics();
     _resetSeedForTests();
-    const { registerRuntimeObservability } = await import(
-      '../../../src/observability/register.js'
-    );
+    const { registerRuntimeObservability } = await import('../../../src/observability/register.js');
     await registerRuntimeObservability();
     const body = await renderPrometheus();
     expect(body).toContain('maia_stream_fifo_violation_total{stage="claim"} 0');

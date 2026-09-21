@@ -103,8 +103,8 @@ export function DiffOperationalProfile({
     <div className="space-y-3">
       {isSeed && (
         <Alert tone="info" title="Primeira versão (seed)">
-          Não há versão predecessora para comparar — esta aprovação coloca o
-          perfil inicial em operação. Confira o conteúdo abaixo.
+          Não há versão predecessora para comparar — esta aprovação coloca o perfil inicial em
+          operação. Confira o conteúdo abaixo.
         </Alert>
       )}
 
@@ -125,8 +125,8 @@ export function DiffOperationalProfile({
 
       {changes.length === 0 && (
         <Alert tone="warning" title="Sem mudanças detectáveis">
-          A versão proposta é idêntica ao predecessor declarado em todos os
-          campos do schema canônico. Confirme se a aprovação ainda faz sentido.
+          A versão proposta é idêntica ao predecessor declarado em todos os campos do schema
+          canônico. Confirme se a aprovação ainda faz sentido.
         </Alert>
       )}
 
@@ -152,13 +152,7 @@ export function DiffOperationalProfile({
   );
 }
 
-function RiskGroup({
-  level,
-  entries,
-}: {
-  level: ProfileRiskLevel;
-  entries: ProfileChangeEntry[];
-}) {
+function RiskGroup({ level, entries }: { level: ProfileRiskLevel; entries: ProfileChangeEntry[] }) {
   const border =
     level === 'high'
       ? 'border-red-200'
@@ -173,9 +167,7 @@ function RiskGroup({
         : 'bg-zinc-50 text-zinc-600 border-zinc-100';
   return (
     <div className={cn('overflow-hidden rounded-lg border', border)}>
-      <p className={cn('border-b px-3 py-2 text-xs font-medium', header)}>
-        {RISK_LABEL[level]}
-      </p>
+      <p className={cn('border-b px-3 py-2 text-xs font-medium', header)}>{RISK_LABEL[level]}</p>
       <table className="w-full text-sm">
         <tbody>
           {entries.map((e) => (
@@ -226,8 +218,7 @@ function ChangeValue({ entry }: { entry: ProfileChangeEntry }) {
   }
 
   // Escalares: de → para. Objetos/arrays livres (rhythm, modifiers): JSON.
-  const scalar = (v: unknown) =>
-    v === null || ['string', 'number', 'boolean'].includes(typeof v);
+  const scalar = (v: unknown) => v === null || ['string', 'number', 'boolean'].includes(typeof v);
   if ((before === undefined || scalar(before)) && scalar(after)) {
     return (
       <span>

@@ -50,7 +50,9 @@ export const nodeVersionCheck: DoctorCheck = {
         status: 'fail',
         summary: `versão do Node irreconhecível: "${current}"`,
         evidence: { node: current, minimum: MINIMUM_NODE_VERSION },
-        remediation: [`Instale Node ${MINIMUM_NODE_VERSION} ou superior (\`nvm install\` lê o .nvmrc).`],
+        remediation: [
+          `Instale Node ${MINIMUM_NODE_VERSION} ou superior (\`nvm install\` lê o .nvmrc).`,
+        ],
       });
     }
     if (compareSemver(parsed, floor) < 0) {
@@ -63,7 +65,9 @@ export const nodeVersionCheck: DoctorCheck = {
         ],
       });
     }
-    return Promise.resolve(pass(`Node ${current}`, { node: current, minimum: MINIMUM_NODE_VERSION }));
+    return Promise.resolve(
+      pass(`Node ${current}`, { node: current, minimum: MINIMUM_NODE_VERSION }),
+    );
   },
 };
 

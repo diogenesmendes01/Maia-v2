@@ -23,7 +23,12 @@ import { ReplyError } from 'redis-errors';
 
 const warnMock = vi.fn();
 vi.mock('@/lib/logger.js', () => ({
-  logger: { warn: (...a: unknown[]) => warnMock(...a), info: vi.fn(), error: vi.fn(), debug: vi.fn() },
+  logger: {
+    warn: (...a: unknown[]) => warnMock(...a),
+    info: vi.fn(),
+    error: vi.fn(),
+    debug: vi.fn(),
+  },
 }));
 
 // `src/lib/redis.ts` instantiates an ioredis client at import time. We stub
@@ -80,28 +85,25 @@ describe('isRedisOomError (#309)', () => {
     // branch must catch it (otherwise `pushMessage` rethrows instead of failing
     // open, the exact PR #339 regression).
     const wrapped =
-      "ERR Error running script (call to f_0123456789abcdef): @user_script:1: " +
-      OOM_MESSAGE;
+      'ERR Error running script (call to f_0123456789abcdef): @user_script:1: ' + OOM_MESSAGE;
     // Sanity: it really does NOT start with the OOM token.
     expect(/^\s*OOM\b/i.test(wrapped)).toBe(false);
     expect(isRedisOomError(new ReplyError(wrapped))).toBe(true);
     // Also via the genuine ReplyError shape with the name preserved.
-    expect(
-      isRedisOomError(Object.assign(new Error(wrapped), { name: 'ReplyError' })),
-    ).toBe(true);
+    expect(isRedisOomError(Object.assign(new Error(wrapped), { name: 'ReplyError' }))).toBe(true);
   });
 
   it('is case-insensitive on the OOM token', () => {
-    const err = Object.assign(new Error("oom command not allowed"), { name: 'ReplyError' });
+    const err = Object.assign(new Error('oom command not allowed'), { name: 'ReplyError' });
     expect(isRedisOomError(err)).toBe(true);
   });
 
   it('does NOT false-positive on lookalike words ("zoom", "room")', () => {
     expect(isRedisOomError(new Error('zoom level changed'))).toBe(false);
     expect(isRedisOomError(new Error('no room left in the inn'))).toBe(false);
-    expect(
-      isRedisOomError(Object.assign(new Error('zoomed out'), { name: 'ReplyError' })),
-    ).toBe(false);
+    expect(isRedisOomError(Object.assign(new Error('zoomed out'), { name: 'ReplyError' }))).toBe(
+      false,
+    );
   });
 
   it('does NOT match a non-OOM ReplyError (e.g. WRONGTYPE)', () => {

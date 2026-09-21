@@ -156,7 +156,11 @@ export async function emitUsage(event: LLMUsageEvent, scope: LLMScope): Promise<
       incCounter('maia_llm_tokens_total', { ...base, kind: 'input' }, event.usage.input_tokens);
       incCounter('maia_llm_tokens_total', { ...base, kind: 'output' }, event.usage.output_tokens);
       if (event.usage.cache_read) {
-        incCounter('maia_llm_tokens_total', { ...base, kind: 'cache_read' }, event.usage.cache_read);
+        incCounter(
+          'maia_llm_tokens_total',
+          { ...base, kind: 'cache_read' },
+          event.usage.cache_read,
+        );
       }
       if (event.usage.cache_write) {
         incCounter(

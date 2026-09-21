@@ -352,11 +352,7 @@ function rawFragmentSatisfied(text: string, row: StoreRow, now: Date): boolean {
   const inList = /^(\w+)\s+IN\s*\((.+)\)$/i.exec(text);
   if (inList) {
     const col = inList[1]!;
-    const allowed = new Set(
-      inList[2]!
-        .split(',')
-        .map((s) => s.trim().replace(/^'(.*)'$/, '$1')),
-    );
+    const allowed = new Set(inList[2]!.split(',').map((s) => s.trim().replace(/^'(.*)'$/, '$1')));
     return allowed.has(String(row[col]));
   }
   // `<col> is null` — drizzle renders `isNull(col)` as a column interpolation
@@ -424,9 +420,7 @@ export function parseRawUpdateTerms(node: SqlNode): Term[] {
       if (pre) {
         const next = chunks[i + 1];
         if (next === undefined || isStringChunk(next)) {
-          throw new Error(
-            `tenant-mutation-store: raw "${pre[1]}=" has no bound value chunk`,
-          );
+          throw new Error(`tenant-mutation-store: raw "${pre[1]}=" has no bound value chunk`);
         }
         terms.push({ kind: 'eq', column: pre[1]!, value: String(next as unknown) });
         i += 1; // consume the value chunk
@@ -522,13 +516,10 @@ export function makeTenantScopedUpdateStore(
         // applies the mutation, while a `.returning()` caller can read results.
         const matched = applyUpdate(patch, predicate);
         const result = {
-          returning: async (_selection?: unknown) =>
-            matched.map((r) => ({ id: r.id })),
+          returning: async (_selection?: unknown) => matched.map((r) => ({ id: r.id })),
           // Allow `await db.update(...).set(...).where(...)` (no returning).
-          then: (
-            resolve: (v: { rowCount: number }) => unknown,
-            reject?: (e: unknown) => unknown,
-          ) => Promise.resolve({ rowCount: matched.length }).then(resolve, reject),
+          then: (resolve: (v: { rowCount: number }) => unknown, reject?: (e: unknown) => unknown) =>
+            Promise.resolve({ rowCount: matched.length }).then(resolve, reject),
         };
         return result;
       },
@@ -623,10 +614,8 @@ export function makeTenantScopedUpdateStore(
       rows = survivors;
       return {
         returning: async (_selection?: unknown) => matched.map((r) => ({ id: r.id })),
-        then: (
-          resolve: (v: { rowCount: number }) => unknown,
-          reject?: (e: unknown) => unknown,
-        ) => Promise.resolve({ rowCount: matched.length }).then(resolve, reject),
+        then: (resolve: (v: { rowCount: number }) => unknown, reject?: (e: unknown) => unknown) =>
+          Promise.resolve({ rowCount: matched.length }).then(resolve, reject),
       };
     },
   }));
@@ -662,9 +651,7 @@ export function makeTenantScopedUpdateStore(
           // Conflict: gate the SET on the ownership WHERE (if any).
           capturedConflictWhere = cfg.where;
           const gateOk =
-            cfg.where === undefined
-              ? true
-              : rowMatches(existing, parsePredicate(cfg.where), now);
+            cfg.where === undefined ? true : rowMatches(existing, parsePredicate(cfg.where), now);
           if (!gateOk) return []; // foreign row — reject, leave untouched
           Object.assign(existing, cfg.set ?? {});
           return [{ ...existing }];

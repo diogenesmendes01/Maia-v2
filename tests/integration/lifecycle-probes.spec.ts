@@ -47,7 +47,8 @@ import { _resetHealthCacheForTests } from '@/lib/healthcheck.js';
 import { ensureRedisConnect } from '@/lib/redis.js';
 import { LIFECYCLE_COMPONENTS } from '@/runtime/lifecycle/roles.js';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 let pool: pg.Pool;
@@ -197,7 +198,7 @@ function ledgerPool(
     async connect() {
       if (options.connectError) throw options.connectError;
       const client: ReadOnlyPoolClient = {
-        query: <R,>(text: string): Promise<{ rows: R[] }> => {
+        query: <R>(text: string): Promise<{ rows: R[] }> => {
           // #658 — a sonda de `pg_index`. Sem este ramo o `else` devolveria as
           // linhas do LEDGER para a consulta de catálogo e todo veredito
           // nasceria com um índice inválido fantasma. Este ledger forjado nunca
@@ -206,18 +207,18 @@ function ledgerPool(
           const out = text.includes('NOT i.indisvalid')
             ? []
             : text.includes('information_schema.columns')
-            ? V2_COLUMNS.map((column_name) => ({ column_name }))
-            : rows.map((r) => ({
-                applied_at: '2026-01-01T00:00:00.000Z',
-                started_at: null,
-                execution_ms: 1,
-                app_version: null,
-                runner_version: null,
-                error_class: null,
-                repaired_at: null,
-                repair_reason: null,
-                ...r,
-              }));
+              ? V2_COLUMNS.map((column_name) => ({ column_name }))
+              : rows.map((r) => ({
+                  applied_at: '2026-01-01T00:00:00.000Z',
+                  started_at: null,
+                  execution_ms: 1,
+                  app_version: null,
+                  runner_version: null,
+                  error_class: null,
+                  repaired_at: null,
+                  repair_reason: null,
+                  ...r,
+                }));
           return Promise.resolve({ rows: out as unknown as R[] });
         },
         release: () => undefined,
@@ -238,7 +239,11 @@ d('issue #516 — /readyz gates on the canonical schema verdict (real route)', (
     migrationsDir = await mkdtemp(join(tmpdir(), 'maia-readyz-schema-'));
     for (const [name, sql] of Object.entries(FILES)) {
       await writeFile(join(migrationsDir, name), sql, 'utf8');
-      await writeFile(join(migrationsDir, name.replace('.sql', '_down.sql')), 'DROP TABLE a;\n', 'utf8');
+      await writeFile(
+        join(migrationsDir, name.replace('.sql', '_down.sql')),
+        'DROP TABLE a;\n',
+        'utf8',
+      );
     }
   });
 

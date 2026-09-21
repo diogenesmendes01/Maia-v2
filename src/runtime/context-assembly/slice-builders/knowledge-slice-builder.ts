@@ -18,11 +18,7 @@ import type {
 } from '../../context-packet/types.js';
 import { sliceCacheKey, type SliceCache } from '../../context-packet/cache/slice-cache.js';
 import { getTTLForSlice } from '../../context-packet/cache/ttl-policy.js';
-import type {
-  SliceBuilder,
-  SliceBuilderInput,
-  SliceBuilderResult,
-} from './_types.js';
+import type { SliceBuilder, SliceBuilderInput, SliceBuilderResult } from './_types.js';
 
 export interface KnowledgeRequirements {
   depth: 'none' | 'relevant' | 'deep';
@@ -96,9 +92,7 @@ function isAllowed(status: string): status is KnowledgeLifecycleStatus {
   return (ALLOWED_LIFECYCLE as Set<string>).has(status);
 }
 
-export class KnowledgeSliceBuilder
-  implements SliceBuilder<KnowledgeRequirements, KnowledgeSlice>
-{
+export class KnowledgeSliceBuilder implements SliceBuilder<KnowledgeRequirements, KnowledgeSlice> {
   readonly name = 'knowledge' as const;
 
   constructor(
@@ -178,8 +172,8 @@ export class KnowledgeSliceBuilder
       return authorizedEntityIds.includes(entityId);
     };
 
-    const safeFacts = lifecycleAllowedFacts.filter((f) =>
-      f.scope !== 'entity' || isEntityAuthorized(f.entity_id),
+    const safeFacts = lifecycleAllowedFacts.filter(
+      (f) => f.scope !== 'entity' || isEntityAuthorized(f.entity_id),
     );
     const safeRules = lifecycleAllowedRules.filter((r) => isEntityAuthorized(r.entity_id));
 
@@ -223,8 +217,5 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 function hashShort(obj: Record<string, unknown>): string {
-  return createHash('sha256')
-    .update(JSON.stringify(obj))
-    .digest('hex')
-    .substring(0, 12);
+  return createHash('sha256').update(JSON.stringify(obj)).digest('hex').substring(0, 12);
 }

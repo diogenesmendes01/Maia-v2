@@ -7,7 +7,8 @@ vi.mock('@/lib/claude.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -24,7 +25,11 @@ describe('classifyMemory', () => {
 
   it('CNPJ → operational', async () => {
     (callLLM as any).mockResolvedValueOnce({
-      content: JSON.stringify({ memory_type: 'operational', scope_type: 'agent', sensitivity: 'low' }),
+      content: JSON.stringify({
+        memory_type: 'operational',
+        scope_type: 'agent',
+        sensitivity: 'low',
+      }),
     });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const result = await classifyMemory('CNPJ da empresa X: 12.345.678/0001-99');
@@ -36,7 +41,11 @@ describe('classifyMemory', () => {
 
   it('"prefere matutino" → preference + scope=interlocutor', async () => {
     (callLLM as any).mockResolvedValueOnce({
-      content: JSON.stringify({ memory_type: 'preference', scope_type: 'interlocutor', sensitivity: 'low' }),
+      content: JSON.stringify({
+        memory_type: 'preference',
+        scope_type: 'interlocutor',
+        sensitivity: 'low',
+      }),
     });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const result = await classifyMemory('Marina prefere atendimento matutino');
@@ -47,7 +56,11 @@ describe('classifyMemory', () => {
 
   it('"comentou divórcio" → personal com mention_allowed=false', async () => {
     (callLLM as any).mockResolvedValueOnce({
-      content: JSON.stringify({ memory_type: 'personal', scope_type: 'role', sensitivity: 'medium' }),
+      content: JSON.stringify({
+        memory_type: 'personal',
+        scope_type: 'role',
+        sensitivity: 'medium',
+      }),
     });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const result = await classifyMemory('Cliente comentou que está em processo de divórcio');
@@ -59,7 +72,11 @@ describe('classifyMemory', () => {
 
   it('"filha doente" → sensitive com mention_allowed=false e ttl baixo', async () => {
     (callLLM as any).mockResolvedValueOnce({
-      content: JSON.stringify({ memory_type: 'sensitive', scope_type: 'conversation', sensitivity: 'high' }),
+      content: JSON.stringify({
+        memory_type: 'sensitive',
+        scope_type: 'conversation',
+        sensitivity: 'high',
+      }),
     });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const result = await classifyMemory('Cliente disse que filha dela está doente');

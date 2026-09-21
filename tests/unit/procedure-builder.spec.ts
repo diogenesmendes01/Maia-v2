@@ -7,10 +7,14 @@ vi.mock('@/lib/claude.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
-    cognitiveModuleLogRepo: { record: vi.fn(async () => {}), recentByModule: vi.fn(async () => []) },
+    cognitiveModuleLogRepo: {
+      record: vi.fn(async () => {}),
+      recentByModule: vi.fn(async () => []),
+    },
   };
 });
 
@@ -26,11 +30,26 @@ describe('teachProcedure', () => {
         when_apply: { tags: ['lead_b2c_adulto'] },
         when_not_apply: { tags: ['lead_em_fechamento'] },
         steps: [
-          { id: 'descobrir_motivo', intencao: 'Entender porquê', como: 'Pergunte aberto', sucesso_criteria_ref: 'tem_motivo' },
-          { id: 'estimar_nivel', intencao: 'Calibrar nível', como: 'Não pergunte direto', depends_on: ['descobrir_motivo'] },
+          {
+            id: 'descobrir_motivo',
+            intencao: 'Entender porquê',
+            como: 'Pergunte aberto',
+            sucesso_criteria_ref: 'tem_motivo',
+          },
+          {
+            id: 'estimar_nivel',
+            intencao: 'Calibrar nível',
+            como: 'Não pergunte direto',
+            depends_on: ['descobrir_motivo'],
+          },
         ],
         success_criteria: [
-          { id: 'tem_motivo', type: 'llm_judge', prompt: 'Cliente expressou motivo real?', threshold: 0.7 },
+          {
+            id: 'tem_motivo',
+            type: 'llm_judge',
+            prompt: 'Cliente expressou motivo real?',
+            threshold: 0.7,
+          },
         ],
         failure_modes: ['Confiar no nível declarado'],
         tools_referenced: ['ask_pending_question'],
@@ -40,7 +59,8 @@ describe('teachProcedure', () => {
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const draft = await teachProcedure({
         nome: 'qualificar-lead-ingles',
-        descricao_livre: 'Quando entra lead novo de inglês adulto, primeiro descobre motivo real (viagem? trabalho? hobby?), depois estima nível sem confrontar...',
+        descricao_livre:
+          'Quando entra lead novo de inglês adulto, primeiro descobre motivo real (viagem? trabalho? hobby?), depois estima nível sem confrontar...',
         scope: 'tenant',
       });
       expect(draft).not.toBeNull();

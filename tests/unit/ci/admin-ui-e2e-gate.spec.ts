@@ -207,7 +207,9 @@ function contratoDoArtefato(): {
   const cmd = /^CMD\s+\["node",\s*"([^"]+)"\]\s*$/m.exec(dockerfile);
   if (!cmd) throw new Error('Dockerfile do console sem `CMD ["node", "…"]`');
 
-  const copias = [...dockerfile.matchAll(/^COPY\s+--from=build\s+(?:--\S+\s+)*(\S+)\s+(\S+)\s*$/gm)];
+  const copias = [
+    ...dockerfile.matchAll(/^COPY\s+--from=build\s+(?:--\S+\s+)*(\S+)\s+(\S+)\s*$/gm),
+  ];
   const standalone = copias.find(([, origem]) => origem!.endsWith('.next/standalone'));
   const estatico = copias.find(([, origem]) => origem!.endsWith('.next/static'));
   if (!standalone || !estatico) {
@@ -539,9 +541,7 @@ describe('[declaração] o E2E roda o ARTEFATO STANDALONE, o mesmo do Dockerfile
   });
 
   it('o script monta `.next/static` na posição que o Dockerfile usa', () => {
-    expect(varDoScript('ESTATICO_DESTINO')).toBe(
-      `$STANDALONE/${artefato.destinoEstatico}`,
-    );
+    expect(varDoScript('ESTATICO_DESTINO')).toBe(`$STANDALONE/${artefato.destinoEstatico}`);
     expect(scriptE2eExecutavel, 'o script não copia o estático para dentro do artefato').toMatch(
       /cp -R "src\/admin-ui\/\.next\/static" "\$ESTATICO_DESTINO"/,
     );
@@ -754,11 +754,11 @@ describe('[declaração] a quarentena `@pendente-runtime` não cresce em silênc
       const declarados = [...cabecalho.matchAll(/^ \* {3}FORA DO GATE: (.+)$/gm)]
         .map((m) => m[1]!.trim())
         .sort();
-      const reais = [...fonte.matchAll(/^\s+test\(\s*'([^']+)'/gm)]
-        .map((m) => m[1]!)
-        .sort();
-      expect(reais.length, `${f}: nenhum \`test(\` encontrado — a checagem virou no-op`)
-        .toBeGreaterThan(0);
+      const reais = [...fonte.matchAll(/^\s+test\(\s*'([^']+)'/gm)].map((m) => m[1]!).sort();
+      expect(
+        reais.length,
+        `${f}: nenhum \`test(\` encontrado — a checagem virou no-op`,
+      ).toBeGreaterThan(0);
       expect(
         declarados,
         `${f}: o cabeçalho justifica [${declarados.join(' | ')}] mas o arquivo ` +

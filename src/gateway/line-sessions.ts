@@ -43,24 +43,11 @@ import {
   sendOutboundDocumentVia,
   sendOutboundVoiceVia,
 } from './baileys.js';
-import {
-  markReadVia,
-  startTypingVia,
-  sendReactionVia,
-  sendPollVia,
-} from './presence.js';
-import {
-  getLineSessionManager,
-  lineAuthDir,
-  type LineTransport,
-} from './line-session-manager.js';
+import { markReadVia, startTypingVia, sendReactionVia, sendPollVia } from './presence.js';
+import { getLineSessionManager, lineAuthDir, type LineTransport } from './line-session-manager.js';
 import { triggerRecovery } from '../setup/recovery.js';
 import { runtimeInstanceId } from '../runtime/instance-identity.js';
-import {
-  acquireChannelLease,
-  assertChannelFence,
-  releaseChannelLease,
-} from './channel-lease.js';
+import { acquireChannelLease, assertChannelFence, releaseChannelLease } from './channel-lease.js';
 
 const LINE_RECONNECT_BASE_MS = 1000;
 const LINE_RECONNECT_MAX_MS = 30_000;
@@ -115,9 +102,8 @@ function auditLineTransition(
   channel: LineChannel,
   metadata: Record<string, unknown>,
 ): Promise<void> {
-  return runWithTenantContext(
-    { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
-    () => audit({ acao: 'line_session_transition', metadata }),
+  return runWithTenantContext({ tenant_id: channel.tenant_id, agent_id: channel.agent_id }, () =>
+    audit({ acao: 'line_session_transition', metadata }),
   );
 }
 
@@ -175,18 +161,16 @@ async function handleLineLoggedOut(
   reason: number | undefined,
 ): Promise<void> {
   try {
-    await runWithTenantContext(
-      { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
-      () =>
-        audit({
-          acao: 'pairing_logged_out',
-          metadata: {
-            channel_id: channel.id,
-            line_external_id: channel.external_id,
-            is_primary: false,
-            reason,
-          },
-        }),
+    await runWithTenantContext({ tenant_id: channel.tenant_id, agent_id: channel.agent_id }, () =>
+      audit({
+        acao: 'pairing_logged_out',
+        metadata: {
+          channel_id: channel.id,
+          line_external_id: channel.external_id,
+          is_primary: false,
+          reason,
+        },
+      }),
     );
     await triggerRecovery({ target: 'line', channel });
   } catch (err) {
@@ -347,10 +331,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
         line_external_id: channel.external_id,
         is_primary: false,
       });
-      logger.info(
-        { channel_id: channel.id, line: channel.external_id },
-        'line_session.connected',
-      );
+      logger.info({ channel_id: channel.id, line: channel.external_id }, 'line_session.connected');
       void auditLineTransition(channel, {
         channel_id: channel.id,
         state: 'connected',
@@ -365,10 +346,7 @@ async function startLineSession(channel: LineChannel): Promise<void> {
       const loggedOut = reason === DisconnectReason.loggedOut;
       const nextState = loggedOut ? ('closed' as const) : ('recovering' as const);
       manager.markState(channel.id, nextState);
-      logger.warn(
-        { channel_id: channel.id, reason, state: nextState },
-        'line_session.closed',
-      );
+      logger.warn({ channel_id: channel.id, reason, state: nextState }, 'line_session.closed');
       void auditLineTransition(channel, {
         channel_id: channel.id,
         state: nextState,
@@ -600,15 +578,11 @@ export async function shutdownLineSessions(): Promise<void> {
   // caminho — o estado local carrega sempre o token da posse corrente.
   if (owned.length > 0) {
     try {
-      const { channelLineStateRepo } = await import(
-        '../db/repositories/channel-line-state-repos.js'
-      );
+      const { channelLineStateRepo } =
+        await import('../db/repositories/channel-line-state-repos.js');
       await channelLineStateRepo.releaseSessionOwnership(runtimeInstanceId(), owned);
     } catch (err) {
-      logger.warn(
-        { err: (err as Error).message },
-        'line_session.session_ownership_release_failed',
-      );
+      logger.warn({ err: (err as Error).message }, 'line_session.session_ownership_release_failed');
     }
   }
 }

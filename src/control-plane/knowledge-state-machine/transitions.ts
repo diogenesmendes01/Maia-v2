@@ -18,10 +18,7 @@ import type { KnowledgeLifecycleStatus } from './types.js';
  *  - 'revoked' is terminal absolute. No transition out is permitted.
  *  - 'verified' and 'active' enforce no-downgrade (only deprecated/revoked).
  */
-export const ALLOWED_TRANSITIONS: Record<
-  KnowledgeLifecycleStatus,
-  KnowledgeLifecycleStatus[]
-> = {
+export const ALLOWED_TRANSITIONS: Record<KnowledgeLifecycleStatus, KnowledgeLifecycleStatus[]> = {
   proposed: ['pending_review', 'ephemeral'],
   pending_review: ['active', 'verified', 'revoked'],
   ephemeral: ['observed', 'deprecated', 'revoked'],

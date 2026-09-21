@@ -63,9 +63,7 @@ export type ChannelResolutionFailureContext = {
   channel_type: string;
   external_id: string;
   /** Which fallback branch tripped — useful for audit/triage. */
-  resolver_path:
-    | 'unknown_or_inactive_channel'
-    | 'ambiguous_active_channels';
+  resolver_path: 'unknown_or_inactive_channel' | 'ambiguous_active_channels';
   /** When `unknown_or_inactive_channel`: did we find a row at all? */
   found?: boolean;
   /** When `unknown_or_inactive_channel`: was the row marked active? */
@@ -153,9 +151,7 @@ export async function resolveChannel(args: {
     // shadow: computa a divergência SEM mudar o resultado (§1.2). Divergente
     // quando o exact pela linha aponta outro canal — ou não existe canal para
     // a linha enquanto o legado resolveu.
-    const divergent = exactActive
-      ? exactActive.id !== legacy.channel_id
-      : true;
+    const divergent = exactActive ? exactActive.id !== legacy.channel_id : true;
     if (divergent) {
       logger.warn(
         {

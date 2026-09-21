@@ -47,13 +47,7 @@ const inputSchema = z.object({
 const outputSchema = z.object({
   // `executed` is the honesty flag: a stub NEVER reports a real effect.
   executed: z.boolean(),
-  status: z.enum([
-    'stub_not_executed',
-    'cancelled',
-    'blocked',
-    'requires_confirmation',
-    'failed',
-  ]),
+  status: z.enum(['stub_not_executed', 'cancelled', 'blocked', 'requires_confirmation', 'failed']),
   // Present ONLY when a real provider executed the baixa — the stub never sets
   // these (no fabricated protocol / status).
   operation_protocol: z.string().optional(),
@@ -82,8 +76,7 @@ export const boletoCancelTool: Tool<typeof inputSchema, typeof outputSchema> = {
     return {
       executed: false,
       status: 'stub_not_executed' as const,
-      message:
-        'Cancelamento de boleto ainda não implementado (stub): nenhuma ação foi executada.',
+      message: 'Cancelamento de boleto ainda não implementado (stub): nenhuma ação foi executada.',
     };
   },
 };

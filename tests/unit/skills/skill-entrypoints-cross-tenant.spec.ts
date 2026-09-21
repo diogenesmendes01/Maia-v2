@@ -39,12 +39,7 @@ import { runWithTenantContext, getCurrentAgent } from '@/db/tenant-context.js';
 // ---------------------------------------------------------------------------
 // Hoisted mocks for skillsRepo + capabilityProposalsRepo (used by proposer).
 // ---------------------------------------------------------------------------
-const {
-  mockFindActive,
-  mockGetById,
-  mockListByCategory,
-  mockCreateProposal,
-} = vi.hoisted(() => ({
+const { mockFindActive, mockGetById, mockListByCategory, mockCreateProposal } = vi.hoisted(() => ({
   mockFindActive: vi.fn(),
   mockGetById: vi.fn(),
   mockListByCategory: vi.fn(),
@@ -52,9 +47,8 @@ const {
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     skillsRepo: {
@@ -198,10 +192,34 @@ function mkRow(over: {
 }
 
 const CROSS_TENANT_STORE = [
-  mkRow({ id: 's_A_owned',  tenant_id: 'tenant-A', agent_id: 'agent-A', descriptor: 'shared.descr', category: 'tool_mediated' }),
-  mkRow({ id: 's_A_shared', tenant_id: 'tenant-A', agent_id: null,      descriptor: 'shared.descr', category: 'tool_mediated' }),
-  mkRow({ id: 's_B_owned',  tenant_id: 'tenant-B', agent_id: 'agent-B', descriptor: 'shared.descr', category: 'tool_mediated' }),
-  mkRow({ id: 's_B_shared', tenant_id: 'tenant-B', agent_id: null,      descriptor: 'shared.descr', category: 'tool_mediated' }),
+  mkRow({
+    id: 's_A_owned',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-A',
+    descriptor: 'shared.descr',
+    category: 'tool_mediated',
+  }),
+  mkRow({
+    id: 's_A_shared',
+    tenant_id: 'tenant-A',
+    agent_id: null,
+    descriptor: 'shared.descr',
+    category: 'tool_mediated',
+  }),
+  mkRow({
+    id: 's_B_owned',
+    tenant_id: 'tenant-B',
+    agent_id: 'agent-B',
+    descriptor: 'shared.descr',
+    category: 'tool_mediated',
+  }),
+  mkRow({
+    id: 's_B_shared',
+    tenant_id: 'tenant-B',
+    agent_id: null,
+    descriptor: 'shared.descr',
+    category: 'tool_mediated',
+  }),
 ];
 
 beforeEach(async () => {
@@ -230,25 +248,25 @@ describe('item 7 — runSkill cross-tenant isolation', () => {
       const { getCurrentTenant } = await import('@/db/tenant-context.js');
       observedTenant = getCurrentTenant();
       observedAgent = getCurrentAgent();
-      return CROSS_TENANT_STORE.find(
-        (r) =>
-          r.skill_descriptor === 'shared.descr' &&
-          r.tenant_id === observedTenant &&
-          (r.agent_id === observedAgent || r.agent_id === null),
-      ) ?? null;
+      return (
+        CROSS_TENANT_STORE.find(
+          (r) =>
+            r.skill_descriptor === 'shared.descr' &&
+            r.tenant_id === observedTenant &&
+            (r.agent_id === observedAgent || r.agent_id === null),
+        ) ?? null
+      );
     });
 
     const { runSkill } = await import('@/skills/skill-runner.js');
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        runSkill({
-          skill_descriptor: 'shared.descr',
-          input: {},
-          triggered_by: 'user_message',
-          conversa_id: 'c-1',
-          turno_id: 't-1',
-        }),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      runSkill({
+        skill_descriptor: 'shared.descr',
+        input: {},
+        triggered_by: 'user_message',
+        conversa_id: 'c-1',
+        turno_id: 't-1',
+      }),
     );
 
     // The runner picked up the tenant-A row (tenant scope observed correctly).
@@ -267,25 +285,25 @@ describe('item 7 — runSkill cross-tenant isolation', () => {
       const { getCurrentTenant } = await import('@/db/tenant-context.js');
       observedTenant = getCurrentTenant();
       observedAgent = getCurrentAgent();
-      return CROSS_TENANT_STORE.find(
-        (r) =>
-          r.skill_descriptor === 'shared.descr' &&
-          r.tenant_id === observedTenant &&
-          (r.agent_id === observedAgent || r.agent_id === null),
-      ) ?? null;
+      return (
+        CROSS_TENANT_STORE.find(
+          (r) =>
+            r.skill_descriptor === 'shared.descr' &&
+            r.tenant_id === observedTenant &&
+            (r.agent_id === observedAgent || r.agent_id === null),
+        ) ?? null
+      );
     });
 
     const { runSkill } = await import('@/skills/skill-runner.js');
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        runSkill({
-          skill_descriptor: 'shared.descr',
-          input: {},
-          triggered_by: 'user_message',
-          conversa_id: 'c-1',
-          turno_id: 't-1',
-        }),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      runSkill({
+        skill_descriptor: 'shared.descr',
+        input: {},
+        triggered_by: 'user_message',
+        conversa_id: 'c-1',
+        turno_id: 't-1',
+      }),
     );
 
     expect(observedTenant).toBe('tenant-B');
@@ -305,16 +323,14 @@ describe('item 7 — runSkill cross-tenant isolation', () => {
     });
 
     const { runSkill } = await import('@/skills/skill-runner.js');
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        runSkill({
-          skill_descriptor: 'shared.descr',
-          input: {},
-          triggered_by: 'user_message',
-          conversa_id: 'c-1',
-          turno_id: 't-1',
-        }),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      runSkill({
+        skill_descriptor: 'shared.descr',
+        input: {},
+        triggered_by: 'user_message',
+        conversa_id: 'c-1',
+        turno_id: 't-1',
+      }),
     );
 
     // The runner detected the cross-tenant skill and refused — proves the
@@ -354,19 +370,17 @@ describe('item 7 — buildSkillSlice cross-tenant isolation (contract test)', ()
     const { sliceCache } = await import('@/skills/cache.js');
     await sliceCache.clear();
 
-    const slice = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () =>
-        buildSkillSlice({
-          tenant_id: 'tenant-A',
-          agent_id: 'agent-A',
-          decision: {
-            routing: {
-              selected_skill_id: 's_A_owned',
-              candidate_skill_ids: ['s_A_owned'],
-            },
+    const slice = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      buildSkillSlice({
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        decision: {
+          routing: {
+            selected_skill_id: 's_A_owned',
+            candidate_skill_ids: ['s_A_owned'],
           },
-        }),
+        },
+      }),
     );
 
     expect(observed.length).toBeGreaterThan(0);
@@ -398,21 +412,19 @@ describe('item 7 — buildSkillSlice cross-tenant isolation (contract test)', ()
     const { sliceCache } = await import('@/skills/cache.js');
     await sliceCache.clear();
 
-    const slice = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () =>
-        buildSkillSlice({
-          // ctx.tenant_id = tenant-B (matches the runWithTenantContext above)
-          tenant_id: 'tenant-B',
-          agent_id: 'agent-B',
-          decision: {
-            routing: {
-              // Ask for tenant-A's ID — leak path. The slice must NOT surface it.
-              selected_skill_id: 's_A_owned',
-              candidate_skill_ids: ['s_A_owned', 's_A_shared'],
-            },
+    const slice = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      buildSkillSlice({
+        // ctx.tenant_id = tenant-B (matches the runWithTenantContext above)
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        decision: {
+          routing: {
+            // Ask for tenant-A's ID — leak path. The slice must NOT surface it.
+            selected_skill_id: 's_A_owned',
+            candidate_skill_ids: ['s_A_owned', 's_A_shared'],
           },
-        }),
+        },
+      }),
     );
 
     // Every observation under tenant-B; no tenant-A skill resolved.
@@ -448,9 +460,7 @@ describe('item 7 — skill-proposer duplicate-detection cross-tenant isolation',
     mockDb.where.mockReturnThis();
     // Use a module_name shaped so `suggested_descriptor` (lower-cased, non
     // alphanumerics → underscore) matches our seed's `skill_descriptor`.
-    mockDb.groupBy.mockResolvedValue([
-      { module_name: 'shared_descr', occurrences: 5 },
-    ]);
+    mockDb.groupBy.mockResolvedValue([{ module_name: 'shared_descr', occurrences: 5 }]);
 
     let observedTenant: string | undefined;
     let observedAgent: string | undefined;
@@ -505,9 +515,7 @@ describe('item 7 — skill-proposer duplicate-detection cross-tenant isolation',
     mockDb.select.mockReturnThis();
     mockDb.from.mockReturnThis();
     mockDb.where.mockReturnThis();
-    mockDb.groupBy.mockResolvedValue([
-      { module_name: 'shared_descr', occurrences: 5 },
-    ]);
+    mockDb.groupBy.mockResolvedValue([{ module_name: 'shared_descr', occurrences: 5 }]);
 
     let observedTenant: string | undefined;
     let observedAgent: string | undefined;
@@ -526,8 +534,18 @@ describe('item 7 — skill-proposer duplicate-detection cross-tenant isolation',
     mockCreateProposal.mockResolvedValue({ id: 'prop-1' });
 
     // Seed BOTH tenants with a 'shared_descr' duplicate so symmetric works.
-    const dupA = mkRow({ id: 's_A_dup', tenant_id: 'tenant-A', agent_id: 'agent-A', descriptor: 'shared_descr' });
-    const dupB = mkRow({ id: 's_B_dup', tenant_id: 'tenant-B', agent_id: 'agent-B', descriptor: 'shared_descr' });
+    const dupA = mkRow({
+      id: 's_A_dup',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      descriptor: 'shared_descr',
+    });
+    const dupB = mkRow({
+      id: 's_B_dup',
+      tenant_id: 'tenant-B',
+      agent_id: 'agent-B',
+      descriptor: 'shared_descr',
+    });
     CROSS_TENANT_STORE.push(dupA, dupB);
 
     try {
@@ -555,9 +573,7 @@ describe('item 7 — skill-proposer duplicate-detection cross-tenant isolation',
     mockDb.select.mockReturnThis();
     mockDb.from.mockReturnThis();
     mockDb.where.mockReturnThis();
-    mockDb.groupBy.mockResolvedValue([
-      { module_name: 'shared_descr', occurrences: 5 },
-    ]);
+    mockDb.groupBy.mockResolvedValue([{ module_name: 'shared_descr', occurrences: 5 }]);
 
     // findActive returns rows scoped by the AMBIENT context. We simulate a
     // pruned store where ONLY tenant-A has the descriptor active — tenant-B
@@ -581,7 +597,12 @@ describe('item 7 — skill-proposer duplicate-detection cross-tenant isolation',
     mockCreateProposal.mockResolvedValue({ id: 'prop-new' });
 
     // Seed ONLY tenant-A with the slugified duplicate. tenant-B has NOTHING.
-    const dupA = mkRow({ id: 's_A_dup', tenant_id: 'tenant-A', agent_id: 'agent-A', descriptor: 'shared_descr' });
+    const dupA = mkRow({
+      id: 's_A_dup',
+      tenant_id: 'tenant-A',
+      agent_id: 'agent-A',
+      descriptor: 'shared_descr',
+    });
     CROSS_TENANT_STORE.push(dupA);
 
     try {
@@ -626,9 +647,7 @@ describe('item 7 — DE selector + adapter end-to-end cross-tenant isolation', (
       );
     });
 
-    const { createProductionDecisionEngineEnv } = await import(
-      '@/runtime/decision/prod-env.js'
-    );
+    const { createProductionDecisionEngineEnv } = await import('@/runtime/decision/prod-env.js');
     const { SkillSelectorImpl } = await import('@/runtime/decision/skill-selector.js');
     const env = createProductionDecisionEngineEnv();
     const selector = new SkillSelectorImpl({ skillsRepo: env.skillsRepo });
@@ -646,9 +665,8 @@ describe('item 7 — DE selector + adapter end-to-end cross-tenant isolation', (
     // Ambient context = tenant-B (would-be leak). The adapter must re-pin
     // to the routed agent (base.agent_id = agent-A) AND the routed tenant
     // (base.tenant_id = tenant-A).
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => selector.select(base, { label: 'shared.descr', confidence: 0.9 }),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      selector.select(base, { label: 'shared.descr', confidence: 0.9 }),
     );
 
     // Every candidate id must belong to tenant-A. We assert via the seed
@@ -674,9 +692,7 @@ describe('item 7 — DE selector + adapter end-to-end cross-tenant isolation', (
       );
     });
 
-    const { createProductionDecisionEngineEnv } = await import(
-      '@/runtime/decision/prod-env.js'
-    );
+    const { createProductionDecisionEngineEnv } = await import('@/runtime/decision/prod-env.js');
     const { SkillSelectorImpl } = await import('@/runtime/decision/skill-selector.js');
     const env = createProductionDecisionEngineEnv();
     const selector = new SkillSelectorImpl({ skillsRepo: env.skillsRepo });
@@ -690,9 +706,8 @@ describe('item 7 — DE selector + adapter end-to-end cross-tenant isolation', (
       input: { content_ref: 'cref', received_at: new Date() },
     };
 
-    const result = await runWithTenantContext(
-      { tenant_id: 'tenant-A', agent_id: 'agent-A' },
-      () => selector.select(base, { label: 'shared.descr', confidence: 0.9 }),
+    const result = await runWithTenantContext({ tenant_id: 'tenant-A', agent_id: 'agent-A' }, () =>
+      selector.select(base, { label: 'shared.descr', confidence: 0.9 }),
     );
 
     for (const id of result.candidate_skill_ids) {
@@ -707,31 +722,25 @@ describe('item 7 — DE selector + adapter end-to-end cross-tenant isolation', (
       const { getCurrentTenant } = await import('@/db/tenant-context.js');
       const ctxTenant = getCurrentTenant();
       const ctxAgent = getCurrentAgent();
-      const row = CROSS_TENANT_STORE.find(
-        (r) => r.id === id && r.tenant_id === ctxTenant,
-      );
+      const row = CROSS_TENANT_STORE.find((r) => r.id === id && r.tenant_id === ctxTenant);
       if (!row) return null;
       if (row.agent_id !== null && row.agent_id !== ctxAgent) return null;
       return row;
     });
 
-    const { createProductionDecisionEngineEnv } = await import(
-      '@/runtime/decision/prod-env.js'
-    );
+    const { createProductionDecisionEngineEnv } = await import('@/runtime/decision/prod-env.js');
     const env = createProductionDecisionEngineEnv();
 
     // Ambient = tenant-B; routed scope = tenant-A. Try to read tenant-B's id
     // under tenant-A scope → must return null (leak path).
-    const leaked = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => env.skillsRepo.find('s_B_owned', { tenant_id: 'tenant-A', agent_id: 'agent-A' }),
+    const leaked = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      env.skillsRepo.find('s_B_owned', { tenant_id: 'tenant-A', agent_id: 'agent-A' }),
     );
     expect(leaked).toBeNull();
 
     // Sanity: tenant-A own id resolves under tenant-A scope.
-    const own = await runWithTenantContext(
-      { tenant_id: 'tenant-B', agent_id: 'agent-B' },
-      () => env.skillsRepo.find('s_A_owned', { tenant_id: 'tenant-A', agent_id: 'agent-A' }),
+    const own = await runWithTenantContext({ tenant_id: 'tenant-B', agent_id: 'agent-B' }, () =>
+      env.skillsRepo.find('s_A_owned', { tenant_id: 'tenant-A', agent_id: 'agent-A' }),
     );
     expect(own?.id).toBe('s_A_owned');
   });

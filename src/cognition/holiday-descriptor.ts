@@ -33,14 +33,16 @@ export interface HolidayDescriptorPayload {
 const TYPE_RE = /^(national|state|municipal|entity_custom|holding_recess)$/;
 
 export function slugifyName(name: string): string {
-  return name
-    .toLowerCase()
-    .normalize('NFD')
-    // Combining diacritical marks (U+0300..U+036F)
-    .replace(/[̀-ͯ]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 60);
+  return (
+    name
+      .toLowerCase()
+      .normalize('NFD')
+      // Combining diacritical marks (U+0300..U+036F)
+      .replace(/[̀-ͯ]/g, '')
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .slice(0, 60)
+  );
 }
 
 export function buildHolidayDescriptor(args: {

@@ -197,9 +197,7 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     const key = streamKey();
     const m = [] as string[];
     for (const seq of [1, 2, 3]) {
-      m.push(
-        await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq, repos: repos() }),
-      );
+      m.push(await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq, repos: repos() }));
     }
 
     // A ORDEM DE TENTATIVA É INVERTIDA de propósito: M3 primeiro. Se a
@@ -246,9 +244,21 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
 
   it('a recusa identifica QUEM está na frente — e é sempre o mais antigo', async () => {
     const key = streamKey();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
     await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
-    const m3 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 3, repos: repos() });
+    const m3 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 3,
+      repos: repos(),
+    });
 
     const r3 = await inA(() =>
       repos().agentTurnsRepo.claimNextEligibleTurn({
@@ -269,8 +279,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
   it('concluído o head, o sucessor passa a ser reivindicável', async () => {
     // O contrário de "somente o head avança" não pode ser "a stream trava".
     const key = streamKey();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
 
     expect(
       (
@@ -303,8 +325,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // posteriores". Sem o head-of-line, um turno em backoff longo era
     // exatamente a janela pela qual a mensagem seguinte passava na frente.
     const key = streamKey();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
     await pool.query(
       `UPDATE agent_turns SET status = 'retryable', next_attempt_at = now() + interval '1 hour'
         WHERE id = $1`,
@@ -327,8 +361,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // o bloqueador de um trabalho que já terminou. O motivo honesto é
     // `not_eligible`: este turno não pode ser reivindicado, ponto.
     const key = streamKey();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
     void m1;
     await concluir(m2);
     const r = await inA(() =>
@@ -357,12 +403,25 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     ];
     for (const [terminal, outcome] of terminais) {
       const key = streamKey();
-      const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-      const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
-      await pool.query(
-        `UPDATE agent_turns SET status = $2, outcome = $3 WHERE id = $1`,
-        [m1, terminal, outcome],
-      );
+      const m1 = await turnInStream({
+        tenant: T_A,
+        agent: A_A,
+        stream_key: key,
+        seq: 1,
+        repos: repos(),
+      });
+      const m2 = await turnInStream({
+        tenant: T_A,
+        agent: A_A,
+        stream_key: key,
+        seq: 2,
+        repos: repos(),
+      });
+      await pool.query(`UPDATE agent_turns SET status = $2, outcome = $3 WHERE id = $1`, [
+        m1,
+        terminal,
+        outcome,
+      ]);
       const r2 = await inA(() =>
         repos().agentTurnsRepo.claimNextEligibleTurn({
           turn_id: m2,
@@ -382,8 +441,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // move o anterior — quem o move é o delivery worker do outbox (#506)".
     // Colapsá-las mandaria o operador esperar por algo que não vai acontecer.
     const key = streamKey();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
     await setStatus(m1, 'outbound_pending');
 
     const r2 = await inA(() =>
@@ -420,8 +491,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
       heads.push(
         await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: base, repos: repos() }),
       );
-      await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: base + 1, repos: repos() });
-      await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: base + 2, repos: repos() });
+      await turnInStream({
+        tenant: T_A,
+        agent: A_A,
+        stream_key: key,
+        seq: base + 1,
+        repos: repos(),
+      });
+      await turnInStream({
+        tenant: T_A,
+        agent: A_A,
+        stream_key: key,
+        seq: base + 2,
+        repos: repos(),
+      });
     }
 
     const results = await Promise.all(
@@ -443,10 +526,22 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // no `NOT EXISTS`, uma colisão de hash faria o turno da tenant A bloquear a
     // conversa da B — e o bloqueio seria invisível na linha de B.
     const key = streamKey();
-    const a1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
+    const a1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
     // Em B só existe o turno de sequência 2: se o escopo vazasse, o turno de
     // sequência 1 da tenant A o barraria.
-    const b2 = await turnInStream({ tenant: T_B, agent: A_B, stream_key: key, seq: 2, repos: repos() });
+    const b2 = await turnInStream({
+      tenant: T_B,
+      agent: A_B,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
 
     const rB = await inB(() =>
       repos().agentTurnsRepo.claimNextEligibleTurn({
@@ -470,8 +565,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // Sem backfill (decisão da fatia A), turnos históricos têm `stream_key`
     // NULL. Recusá-los tornaria INCLAIMÁVEL todo o histórico — uma parada total
     // do ingresso causada pela própria proteção.
-    const t1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: null, seq: null, repos: repos() });
-    const t2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: null, seq: null, repos: repos() });
+    const t1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: null,
+      seq: null,
+      repos: repos(),
+    });
+    const t2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: null,
+      seq: null,
+      repos: repos(),
+    });
     for (const t of [t1, t2]) {
       expect(
         (
@@ -496,9 +603,27 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // conversa não anda — enquanto a métrica de recovery diz que houve trabalho.
     const key = streamKey();
     const antigo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
-    const m3 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 3, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
+    const m3 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 3,
+      repos: repos(),
+    });
     await pool.query(`UPDATE agent_turns SET created_at = $2 WHERE id = ANY($1::uuid[])`, [
       [m1, m2, m3],
       antigo,
@@ -519,8 +644,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // par a cada varredura para o inner devolver lista vazia.
     const key = streamKey();
     const antigo = new Date(Date.now() - 60 * 60 * 1000).toISOString();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
     await pool.query(`UPDATE agent_turns SET created_at = $2 WHERE id = ANY($1::uuid[])`, [
       [m1, m2],
       antigo,
@@ -535,8 +672,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
 
   it('o canário do recovery não acusa nada quando a regra está de pé', async () => {
     const key = streamKey();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
     // O canário é consultado com os ids que o filtro devolveu; aqui passamos os
     // DOIS de propósito, para provar que ele SABE apontar o fora-de-ordem — e
     // que o filtro é quem impede que ele receba um.
@@ -568,7 +717,11 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     }
     for (const turn_id of [m[2]!, m[1]!, m[0]!, m[1]!]) {
       await inA(() =>
-        repos().agentTurnsRepo.claimNextEligibleTurn({ turn_id, worker_id: 'w', lease_ms: LEASE_MS }),
+        repos().agentTurnsRepo.claimNextEligibleTurn({
+          turn_id,
+          worker_id: 'w',
+          lease_ms: LEASE_MS,
+        }),
       );
     }
 
@@ -589,8 +742,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
     // vez dele. A recuperação continua acontecendo (é o que destrava a stream),
     // e o sucessor continua parado (é o que mantém a ordem).
     const key = streamKey();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
 
     expect(
       (
@@ -644,8 +809,20 @@ d('#626 — head-of-line como condição do claim (DB real)', () => {
 
   it('beginTurnExecution (call site de produção) devolve not_head e AUDITA', async () => {
     const key = streamKey();
-    const m1 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 1, repos: repos() });
-    const m2 = await turnInStream({ tenant: T_A, agent: A_A, stream_key: key, seq: 2, repos: repos() });
+    const m1 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 1,
+      repos: repos(),
+    });
+    const m2 = await turnInStream({
+      tenant: T_A,
+      agent: A_A,
+      stream_key: key,
+      seq: 2,
+      repos: repos(),
+    });
 
     const primeiro = await inA(() => turns().beginTurnExecution(handleFor(m1)));
     const segundo = await inA(() => turns().beginTurnExecution(handleFor(m2)));

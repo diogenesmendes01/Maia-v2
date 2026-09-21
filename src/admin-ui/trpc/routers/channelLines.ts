@@ -128,54 +128,55 @@ export const channelLinesRouter = router({
    * `Cache-Control: no-store`) e nunca em URL. Se o envelope expirou ou não
    * abre, devolvemos `material: null` — jamais conteúdo parcial.
    */
-  getPairingStatus: protectedProcedure
-    .input(LineInputSchema)
-    .query(async ({ input, ctx }) => {
-      ctx.assertRole('owner', 'founder');
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      assertRateLimit(`lines:status:${ctx.userId}`, STATUS_RULE);
+  getPairingStatus: protectedProcedure.input(LineInputSchema).query(async ({ input, ctx }) => {
+    ctx.assertRole('owner', 'founder');
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    assertRateLimit(`lines:status:${ctx.userId}`, STATUS_RULE);
 
-      const scope = {
-        tenant_id: tenantId,
-        agent_id: input.agentId,
-        channel_id: input.channelId,
-      };
-      const line = await ctx.repos.channelLineStateRepo.getForScope(scope);
-      if (!line) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
+    const scope = {
+      tenant_id: tenantId,
+      agent_id: input.agentId,
+      channel_id: input.channelId,
+    };
+    const line = await ctx.repos.channelLineStateRepo.getForScope(scope);
+    if (!line) {
+      throw new TRPCError({
+        code: 'NOT_FOUND',
+        message: 'Linha não encontrada neste tenant/agente',
+      });
+    }
+    const state = await ctx.repos.channelLineStateRepo.getStateForScope(scope);
+
+    let material: { kind: 'qr'; png_data_uri: string } | { kind: 'code'; code: string } | null =
+      null;
+    const notExpired =
+      state?.pairing_material_expires_at !== null &&
+      state?.pairing_material_expires_at !== undefined &&
+      state.pairing_material_expires_at.getTime() > Date.now();
+    if (state?.pairing_material && notExpired) {
+      try {
+        material = openPairingMaterial(state.pairing_material);
+      } catch {
+        // Chave rotacionada/removida ou envelope corrompido: a UI pede para
+        // repetir o pareamento. Nada do envelope é logado.
+        material = null;
       }
-      const state = await ctx.repos.channelLineStateRepo.getStateForScope(scope);
+    }
 
-      let material: { kind: 'qr'; png_data_uri: string } | { kind: 'code'; code: string } | null =
-        null;
-      const notExpired =
-        state?.pairing_material_expires_at !== null &&
-        state?.pairing_material_expires_at !== undefined &&
-        state.pairing_material_expires_at.getTime() > Date.now();
-      if (state?.pairing_material && notExpired) {
-        try {
-          material = openPairingMaterial(state.pairing_material);
-        } catch {
-          // Chave rotacionada/removida ou envelope corrompido: a UI pede para
-          // repetir o pareamento. Nada do envelope é logado.
-          material = null;
-        }
-      }
-
-      return {
-        state: line.state,
-        method: line.pairing_method,
-        attempts: line.pairing_attempts,
-        reason_code: line.reason_code,
-        pairing_expires_at: line.pairing_expires_at,
-        material_expires_at: notExpired ? (state?.pairing_material_expires_at ?? null) : null,
-        pending_command: line.command,
-        active: line.active,
-        verified_at: line.verified_at,
-        connected_at: line.connected_at,
-        material,
-      };
-    }),
+    return {
+      state: line.state,
+      method: line.pairing_method,
+      attempts: line.pairing_attempts,
+      reason_code: line.reason_code,
+      pairing_expires_at: line.pairing_expires_at,
+      material_expires_at: notExpired ? (state?.pairing_material_expires_at ?? null) : null,
+      pending_command: line.command,
+      active: line.active,
+      verified_at: line.verified_at,
+      connected_at: line.connected_at,
+      material,
+    };
+  }),
 
   /**
    * Pede ao runtime que abra a PairingSession (QR ou código). O console não
@@ -205,7 +206,10 @@ export const channelLinesRouter = router({
       };
       const line = await ctx.repos.channelLineStateRepo.getForScope(scope);
       if (!line) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: 'Linha não encontrada neste tenant/agente',
+        });
       }
       if (line.channel_type !== 'whatsapp') {
         throw new TRPCError({
@@ -267,88 +271,93 @@ export const channelLinesRouter = router({
     }),
 
   /** Cancela o pareamento. Idempotente: repetir não é erro. */
-  abortPairing: protectedProcedure
-    .input(MutationInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      ctx.assertRole('owner', 'founder');
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      assertRateLimit(`lines:mutate:${ctx.userId}`, MUTATION_RULE);
+  abortPairing: protectedProcedure.input(MutationInputSchema).mutation(async ({ input, ctx }) => {
+    ctx.assertRole('owner', 'founder');
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    assertRateLimit(`lines:mutate:${ctx.userId}`, MUTATION_RULE);
 
-      const scope = {
-        tenant_id: tenantId,
-        agent_id: input.agentId,
-        channel_id: input.channelId,
-      };
-      const result = await ctx.repos.channelLineStateRepo.requestCommandWithAudit({
-        scope,
-        command: 'abort_pairing',
-        command_id: randomUUID(),
+    const scope = {
+      tenant_id: tenantId,
+      agent_id: input.agentId,
+      channel_id: input.channelId,
+    };
+    const result = await ctx.repos.channelLineStateRepo.requestCommandWithAudit({
+      scope,
+      command: 'abort_pairing',
+      command_id: randomUUID(),
+      actor_id: ctx.userId,
+      actor_role: ctx.userRole,
+      correlation_id: randomUUID(),
+      audit: {
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
-        correlation_id: randomUUID(),
-        audit: {
-          actor_id: ctx.userId,
-          actor_role: ctx.userRole,
-          action: 'pairing_session_aborted',
-          change_summary: { agent_id: input.agentId, reason: input.comment },
-        },
+        action: 'pairing_session_aborted',
+        change_summary: { agent_id: input.agentId, reason: input.comment },
+      },
+    });
+    if (!result.ok) {
+      throw new TRPCError({
+        code: 'NOT_FOUND',
+        message: 'Linha não encontrada neste tenant/agente',
       });
-      if (!result.ok) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
-      }
-      return { aborted: true };
-    }),
+    }
+    return { aborted: true };
+  }),
 
   /**
    * Desativa a linha: ela para de rotear imediatamente. Não apaga
    * credenciais — reativar exige re-pareamento explícito (`requestRepair` +
    * `startPairing`), que é o caminho auditado.
    */
-  disable: protectedProcedure
-    .input(MutationInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      ctx.assertRole('owner', 'founder');
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      assertRateLimit(`lines:mutate:${ctx.userId}`, MUTATION_RULE);
+  disable: protectedProcedure.input(MutationInputSchema).mutation(async ({ input, ctx }) => {
+    ctx.assertRole('owner', 'founder');
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    assertRateLimit(`lines:mutate:${ctx.userId}`, MUTATION_RULE);
 
-      const scope = {
-        tenant_id: tenantId,
-        agent_id: input.agentId,
-        channel_id: input.channelId,
-      };
-      const line = await ctx.repos.channelLineStateRepo.getForScope(scope);
-      if (!line) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
-      }
+    const scope = {
+      tenant_id: tenantId,
+      agent_id: input.agentId,
+      channel_id: input.channelId,
+    };
+    const line = await ctx.repos.channelLineStateRepo.getForScope(scope);
+    if (!line) {
+      throw new TRPCError({
+        code: 'NOT_FOUND',
+        message: 'Linha não encontrada neste tenant/agente',
+      });
+    }
 
-      // Review PR #528 (P1 + P2) — quatro escritas num único commit:
-      // desativa o ROTEAMENTO (a propriedade de segurança, imediata), marca
-      // `disabled`, enfileira a derrubada do SOCKET (que vive no runtime) e
-      // audita. Soltas, uma queda no meio deixava a linha desativada sem
-      // trilha, ou com trilha e sem o comando de parada.
-      const result = await ctx.repos.channelLineStateRepo.disableLineWithAudit({
-        scope,
-        reason_code: 'operator_disabled',
-        stop_command_id: randomUUID(),
+    // Review PR #528 (P1 + P2) — quatro escritas num único commit:
+    // desativa o ROTEAMENTO (a propriedade de segurança, imediata), marca
+    // `disabled`, enfileira a derrubada do SOCKET (que vive no runtime) e
+    // audita. Soltas, uma queda no meio deixava a linha desativada sem
+    // trilha, ou com trilha e sem o comando de parada.
+    const result = await ctx.repos.channelLineStateRepo.disableLineWithAudit({
+      scope,
+      reason_code: 'operator_disabled',
+      stop_command_id: randomUUID(),
+      actor_id: ctx.userId,
+      actor_role: ctx.userRole,
+      correlation_id: randomUUID(),
+      audit: {
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
-        correlation_id: randomUUID(),
-        audit: {
-          actor_id: ctx.userId,
-          actor_role: ctx.userRole,
-          action: 'channel_disabled',
-          change_summary: {
-            agent_id: input.agentId,
-            external_id: line.external_id,
-            reason: input.comment,
-          },
+        action: 'channel_disabled',
+        change_summary: {
+          agent_id: input.agentId,
+          external_id: line.external_id,
+          reason: input.comment,
         },
+      },
+    });
+    if (!result.ok) {
+      throw new TRPCError({
+        code: 'NOT_FOUND',
+        message: 'Linha não encontrada neste tenant/agente',
       });
-      if (!result.ok) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
-      }
-      return { disabled: true };
-    }),
+    }
+    return { disabled: true };
+  }),
 
   /**
    * Pede re-pareamento: o runtime encerra a posse da linha (desativa o canal
@@ -356,55 +365,59 @@ export const channelLinesRouter = router({
    * pronta para um novo `startPairing`. É o caminho para logout/recovery sem
    * shell.
    */
-  requestRepair: protectedProcedure
-    .input(MutationInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      ctx.assertRole('owner', 'founder');
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      assertRateLimit(`lines:mutate:${ctx.userId}`, MUTATION_RULE);
+  requestRepair: protectedProcedure.input(MutationInputSchema).mutation(async ({ input, ctx }) => {
+    ctx.assertRole('owner', 'founder');
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    assertRateLimit(`lines:mutate:${ctx.userId}`, MUTATION_RULE);
 
-      const scope = {
-        tenant_id: tenantId,
-        agent_id: input.agentId,
-        channel_id: input.channelId,
-      };
-      const line = await ctx.repos.channelLineStateRepo.getForScope(scope);
-      if (!line) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
-      }
-      if (line.channel_type !== 'whatsapp') {
-        throw new TRPCError({
-          code: 'BAD_REQUEST',
-          message: 'Re-pareamento só se aplica a linhas WhatsApp',
-        });
-      }
+    const scope = {
+      tenant_id: tenantId,
+      agent_id: input.agentId,
+      channel_id: input.channelId,
+    };
+    const line = await ctx.repos.channelLineStateRepo.getForScope(scope);
+    if (!line) {
+      throw new TRPCError({
+        code: 'NOT_FOUND',
+        message: 'Linha não encontrada neste tenant/agente',
+      });
+    }
+    if (line.channel_type !== 'whatsapp') {
+      throw new TRPCError({
+        code: 'BAD_REQUEST',
+        message: 'Re-pareamento só se aplica a linhas WhatsApp',
+      });
+    }
 
-      const correlationId = randomUUID();
-      const result = await ctx.repos.channelLineStateRepo.requestCommandWithAudit({
-        scope,
-        command: 'repair',
-        command_id: randomUUID(),
-        // Endereçado à réplica que segura o socket: o repair derruba a sessão
-        // ANTES de apagar o auth dir, e só quem tem o socket consegue.
-        address_to_session_owner: true,
+    const correlationId = randomUUID();
+    const result = await ctx.repos.channelLineStateRepo.requestCommandWithAudit({
+      scope,
+      command: 'repair',
+      command_id: randomUUID(),
+      // Endereçado à réplica que segura o socket: o repair derruba a sessão
+      // ANTES de apagar o auth dir, e só quem tem o socket consegue.
+      address_to_session_owner: true,
+      actor_id: ctx.userId,
+      actor_role: ctx.userRole,
+      correlation_id: correlationId,
+      audit: {
         actor_id: ctx.userId,
         actor_role: ctx.userRole,
-        correlation_id: correlationId,
-        audit: {
-          actor_id: ctx.userId,
-          actor_role: ctx.userRole,
-          action: 'channel_repair_requested',
-          change_summary: {
-            agent_id: input.agentId,
-            external_id: line.external_id,
-            correlation_id: correlationId,
-            reason: input.comment,
-          },
+        action: 'channel_repair_requested',
+        change_summary: {
+          agent_id: input.agentId,
+          external_id: line.external_id,
+          correlation_id: correlationId,
+          reason: input.comment,
         },
+      },
+    });
+    if (!result.ok) {
+      throw new TRPCError({
+        code: 'NOT_FOUND',
+        message: 'Linha não encontrada neste tenant/agente',
       });
-      if (!result.ok) {
-        throw new TRPCError({ code: 'NOT_FOUND', message: 'Linha não encontrada neste tenant/agente' });
-      }
-      return { queued: true, correlation_id: correlationId };
-    }),
+    }
+    return { queued: true, correlation_id: correlationId };
+  }),
 });

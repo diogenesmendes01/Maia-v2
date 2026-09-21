@@ -81,9 +81,7 @@ describe('#633 — a disposição da reconciliação', () => {
         payload_type: t,
       }),
     );
-    expect(comChave).toEqual(
-      expect.arrayContaining(['text', 'status_fallback']),
-    );
+    expect(comChave).toEqual(expect.arrayContaining(['text', 'status_fallback']));
     for (const payload_type of comChave) {
       for (const outcome of DELIVERY_UNKNOWN_OUTCOMES) {
         expect(
@@ -199,15 +197,11 @@ describe('#633 — a disposição da reconciliação', () => {
     expect([...OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES].sort()).toEqual(
       ['completed', 'failed_terminal', 'cancelled', 'dead_letter'].sort(),
     );
-    expect(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES).not.toContain(
-      'delivered' as never,
-    );
+    expect(OUTBOUND_TURN_FINAL_ARTIFACT_STATUSES).not.toContain('delivered' as never);
   });
 
   it('o orçamento de tentativas fecha no teto, não depois dele', () => {
-    expect(attemptBudgetExhausted(OUTBOUND_MAX_DELIVERY_ATTEMPTS - 1)).toBe(
-      false,
-    );
+    expect(attemptBudgetExhausted(OUTBOUND_MAX_DELIVERY_ATTEMPTS - 1)).toBe(false);
     expect(attemptBudgetExhausted(OUTBOUND_MAX_DELIVERY_ATTEMPTS)).toBe(true);
   });
 });
@@ -255,15 +249,13 @@ describe('#633 — o rearmamento manual (falha #12 da épica)', () => {
       duplicate_risk: true,
     };
     expect(manualRearmRefusal(base)).toBe('duplicate_risk_unacknowledged');
-    expect(
-      manualRearmRefusal({ ...base, acknowledge_duplicate_risk: false }),
-    ).toBe('duplicate_risk_unacknowledged');
-    expect(
-      manualRearmRefusal({ ...base, acknowledge_duplicate_risk: undefined }),
-    ).toBe('duplicate_risk_unacknowledged');
-    expect(
-      manualRearmRefusal({ ...base, acknowledge_duplicate_risk: true }),
-    ).toBeNull();
+    expect(manualRearmRefusal({ ...base, acknowledge_duplicate_risk: false })).toBe(
+      'duplicate_risk_unacknowledged',
+    );
+    expect(manualRearmRefusal({ ...base, acknowledge_duplicate_risk: undefined })).toBe(
+      'duplicate_risk_unacknowledged',
+    );
+    expect(manualRearmRefusal({ ...base, acknowledge_duplicate_risk: true })).toBeNull();
   });
 
   it('`reason` em branco é recusa — a auditoria é o ponto da operação', () => {
@@ -277,16 +269,10 @@ describe('#633 — o rearmamento manual (falha #12 da épica)', () => {
   });
 
   it('`failed_terminal` e os estados concluídos não são rearmáveis', () => {
-    for (const status of [
-      'failed_terminal',
-      'completed',
-      'delivered',
-      'sent',
-      'sending',
-    ]) {
-      expect(
-        manualRearmRefusal({ status, reason: 'x', duplicate_risk: false }),
-      ).toBe('status_not_rearmable');
+    for (const status of ['failed_terminal', 'completed', 'delivered', 'sent', 'sending']) {
+      expect(manualRearmRefusal({ status, reason: 'x', duplicate_risk: false })).toBe(
+        'status_not_rearmable',
+      );
     }
   });
 

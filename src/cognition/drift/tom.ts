@@ -27,7 +27,10 @@ export const tomDetector: DriftDetector = {
     const agentMessages = input.recent_messages.filter((m) => m.from === 'agent');
     if (agentMessages.length === 0) return null;
 
-    const sample = agentMessages.slice(-20).map((m) => `- ${m.text}`).join('\n');
+    const sample = agentMessages
+      .slice(-20)
+      .map((m) => `- ${m.text}`)
+      .join('\n');
 
     const system = [
       'Você é um auditor de identidade conversacional.',

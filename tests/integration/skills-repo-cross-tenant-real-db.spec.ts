@@ -112,12 +112,12 @@ const AGENT_B = 'agent-B-issue-218';
  * the same row across runs.
  */
 const SEED_IDS = {
-  s_A_owned:  '00000000-0000-0000-0000-000000000a01',
+  s_A_owned: '00000000-0000-0000-0000-000000000a01',
   s_A_shared: '00000000-0000-0000-0000-000000000a02',
-  s_A_extra:  '00000000-0000-0000-0000-000000000a03',
-  s_B_owned:  '00000000-0000-0000-0000-000000000b01',
+  s_A_extra: '00000000-0000-0000-0000-000000000a03',
+  s_B_owned: '00000000-0000-0000-0000-000000000b01',
   s_B_shared: '00000000-0000-0000-0000-000000000b02',
-  s_B_extra:  '00000000-0000-0000-0000-000000000b03',
+  s_B_extra: '00000000-0000-0000-0000-000000000b03',
 } as const;
 type SeedKey = keyof typeof SEED_IDS;
 
@@ -225,27 +225,135 @@ const at = (ms: number): Date => new Date(T0.getTime() + ms);
 /** Default seed (tenant-A first, then tenant-B). */
 async function seedTwoTenants(): Promise<void> {
   // tenant-A: own agent skill + tenant-wide skill (shared INSIDE tenant-A).
-  await insertSeed({ key: 's_A_owned',  tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(0) });
-  await insertSeed({ key: 's_A_shared', tenant_id: TENANT_A, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(1) });
+  await insertSeed({
+    key: 's_A_owned',
+    tenant_id: TENANT_A,
+    agent_id: AGENT_A,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(0),
+  });
+  await insertSeed({
+    key: 's_A_shared',
+    tenant_id: TENANT_A,
+    agent_id: null,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(1),
+  });
   // tenant-B: own agent skill + tenant-wide skill. The s_B_shared row is the
   // canonical leak risk — tenant-wide for tenant-B but MUST NEVER appear
   // under tenant-A's context.
-  await insertSeed({ key: 's_B_owned',  tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(2) });
-  await insertSeed({ key: 's_B_shared', tenant_id: TENANT_B, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(3) });
+  await insertSeed({
+    key: 's_B_owned',
+    tenant_id: TENANT_B,
+    agent_id: AGENT_B,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(2),
+  });
+  await insertSeed({
+    key: 's_B_shared',
+    tenant_id: TENANT_B,
+    agent_id: null,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(3),
+  });
   // Extras so listAll/listSummaries surface > 1 row per tenant and the
   // cross-tenant absence is a stronger signal.
-  await insertSeed({ key: 's_A_extra', tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'a.extra', category: 'classify', status: 'active', version: 1, created_at: at(4) });
-  await insertSeed({ key: 's_B_extra', tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'b.extra', category: 'classify', status: 'active', version: 1, created_at: at(5) });
+  await insertSeed({
+    key: 's_A_extra',
+    tenant_id: TENANT_A,
+    agent_id: AGENT_A,
+    skill_descriptor: 'a.extra',
+    category: 'classify',
+    status: 'active',
+    version: 1,
+    created_at: at(4),
+  });
+  await insertSeed({
+    key: 's_B_extra',
+    tenant_id: TENANT_B,
+    agent_id: AGENT_B,
+    skill_descriptor: 'b.extra',
+    category: 'classify',
+    status: 'active',
+    version: 1,
+    created_at: at(5),
+  });
 }
 
 /** Adversarial seed: tenant-B FIRST, then tenant-A (PR #222 review item 3). */
 async function seedTwoTenantsReverse(): Promise<void> {
-  await insertSeed({ key: 's_B_owned',  tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(0) });
-  await insertSeed({ key: 's_B_shared', tenant_id: TENANT_B, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(1) });
-  await insertSeed({ key: 's_A_owned',  tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(2) });
-  await insertSeed({ key: 's_A_shared', tenant_id: TENANT_A, agent_id: null,    skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(3) });
-  await insertSeed({ key: 's_B_extra', tenant_id: TENANT_B, agent_id: AGENT_B, skill_descriptor: 'b.extra', category: 'classify', status: 'active', version: 1, created_at: at(4) });
-  await insertSeed({ key: 's_A_extra', tenant_id: TENANT_A, agent_id: AGENT_A, skill_descriptor: 'a.extra', category: 'classify', status: 'active', version: 1, created_at: at(5) });
+  await insertSeed({
+    key: 's_B_owned',
+    tenant_id: TENANT_B,
+    agent_id: AGENT_B,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(0),
+  });
+  await insertSeed({
+    key: 's_B_shared',
+    tenant_id: TENANT_B,
+    agent_id: null,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(1),
+  });
+  await insertSeed({
+    key: 's_A_owned',
+    tenant_id: TENANT_A,
+    agent_id: AGENT_A,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(2),
+  });
+  await insertSeed({
+    key: 's_A_shared',
+    tenant_id: TENANT_A,
+    agent_id: null,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(3),
+  });
+  await insertSeed({
+    key: 's_B_extra',
+    tenant_id: TENANT_B,
+    agent_id: AGENT_B,
+    skill_descriptor: 'b.extra',
+    category: 'classify',
+    status: 'active',
+    version: 1,
+    created_at: at(4),
+  });
+  await insertSeed({
+    key: 's_A_extra',
+    tenant_id: TENANT_A,
+    agent_id: AGENT_A,
+    skill_descriptor: 'a.extra',
+    category: 'classify',
+    status: 'active',
+    version: 1,
+    created_at: at(5),
+  });
 }
 
 /**
@@ -281,14 +389,50 @@ async function seedTwoTenantsReverse(): Promise<void> {
 async function seedTenantWideOnlyBFirst(): Promise<void> {
   // B's tenant-wide row FIRST (earlier `created_at`) — encodes the
   // adversarial ordering deterministically.
-  await insertSeed({ key: 's_B_shared', tenant_id: TENANT_B, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(0) });
-  await insertSeed({ key: 's_A_shared', tenant_id: TENANT_A, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(1) });
+  await insertSeed({
+    key: 's_B_shared',
+    tenant_id: TENANT_B,
+    agent_id: null,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(0),
+  });
+  await insertSeed({
+    key: 's_A_shared',
+    tenant_id: TENANT_A,
+    agent_id: null,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(1),
+  });
 }
 
 /** Symmetric counterpart: A FIRST (earlier `created_at`). */
 async function seedTenantWideOnlyAFirst(): Promise<void> {
-  await insertSeed({ key: 's_A_shared', tenant_id: TENANT_A, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(0) });
-  await insertSeed({ key: 's_B_shared', tenant_id: TENANT_B, agent_id: null, skill_descriptor: 'shared.descr', category: 'tool_mediated', status: 'active', version: 1, created_at: at(1) });
+  await insertSeed({
+    key: 's_A_shared',
+    tenant_id: TENANT_A,
+    agent_id: null,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(0),
+  });
+  await insertSeed({
+    key: 's_B_shared',
+    tenant_id: TENANT_B,
+    agent_id: null,
+    skill_descriptor: 'shared.descr',
+    category: 'tool_mediated',
+    status: 'active',
+    version: 1,
+    created_at: at(1),
+  });
 }
 
 function idsOf<T extends { id: string }>(rows: T[]): string[] {
@@ -388,9 +532,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
 
   it('listSummariesPage: every row in tenant-A page is tenant-A (per-row tenant_id check)', async () => {
     await seedTwoTenants();
-    const page = await runAs(TENANT_A, AGENT_A, () =>
-      skillsRepoMod.skillsRepo.listSummariesPage(),
-    );
+    const page = await runAs(TENANT_A, AGENT_A, () => skillsRepoMod.skillsRepo.listSummariesPage());
     expect(page.items.every((r) => r.tenant_id === TENANT_A)).toBe(true);
     expect(idsOf(page.items).sort()).toEqual(
       [idOf('s_A_extra'), idOf('s_A_owned'), idOf('s_A_shared')].sort(),
@@ -399,9 +541,7 @@ d('skillsRepo — cross-tenant isolation on REAL Postgres (issue #218)', () => {
 
   it('listSummariesPage: symmetric — every row in tenant-B page is tenant-B', async () => {
     await seedTwoTenants();
-    const page = await runAs(TENANT_B, AGENT_B, () =>
-      skillsRepoMod.skillsRepo.listSummariesPage(),
-    );
+    const page = await runAs(TENANT_B, AGENT_B, () => skillsRepoMod.skillsRepo.listSummariesPage());
     expect(page.items.every((r) => r.tenant_id === TENANT_B)).toBe(true);
     expect(idsOf(page.items).sort()).toEqual(
       [idOf('s_B_extra'), idOf('s_B_owned'), idOf('s_B_shared')].sort(),

@@ -27,11 +27,7 @@ import type { AudienceContext } from '@/identity/audience-context.js';
 import { buildAudienceContext } from '@/identity/audience-context.js';
 import { sliceCacheKey, type SliceCache } from '../../context-packet/cache/slice-cache.js';
 import { getTTLForSlice } from '../../context-packet/cache/ttl-policy.js';
-import type {
-  SliceBuilder,
-  SliceBuilderInput,
-  SliceBuilderResult,
-} from './_types.js';
+import type { SliceBuilder, SliceBuilderInput, SliceBuilderResult } from './_types.js';
 import type { AgentAudienceProfile, Pessoa } from '@/db/schema.js';
 
 export interface AudienceRequirements {
@@ -60,9 +56,7 @@ export interface AudienceRepoPort {
 
 const EMPTY_AUDIENCE: AudienceSlice = { audience: null };
 
-export class AudienceSliceBuilder
-  implements SliceBuilder<AudienceRequirements, AudienceSlice>
-{
+export class AudienceSliceBuilder implements SliceBuilder<AudienceRequirements, AudienceSlice> {
   readonly name = 'audience' as const;
 
   constructor(
@@ -109,9 +103,7 @@ export class AudienceSliceBuilder
       // entry within the same updated_at granularity.
       audience_status: profile?.status ?? '__none__',
       audience_version:
-        profile?.updated_at != null
-          ? new Date(profile.updated_at).toISOString()
-          : '__none__',
+        profile?.updated_at != null ? new Date(profile.updated_at).toISOString() : '__none__',
     });
     return sliceCacheKey(base.tenant_id, base.agent_id, 'audience', scope);
   }

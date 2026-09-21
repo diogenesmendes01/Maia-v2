@@ -90,7 +90,8 @@ function mergeLimits(p: Permissao, profile: PermissionProfile): EffectiveLimits 
       ? Number(profile.limite_default)
       : null;
   const valor_max =
-    explicit.valor_max ?? (profileDefault !== null && Number.isNaN(profileDefault) ? 0 : profileDefault);
+    explicit.valor_max ??
+    (profileDefault !== null && Number.isNaN(profileDefault) ? 0 : profileDefault);
   return {
     valor_max,
     naturezas_permitidas: explicit.naturezas_permitidas,

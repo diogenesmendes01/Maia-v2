@@ -38,11 +38,8 @@ export default function ChannelPolicyModal({
   const mutation = trpc.channelPolicies.upsert.useMutation();
 
   const [defaultRoleId, setDefaultRoleId] = React.useState('');
-  const [switchBehavior, setSwitchBehavior] =
-    React.useState<SwitchBehavior>('locked');
-  const [announceMode, setAnnounceMode] = React.useState<AnnounceMode>(
-    'affects_user',
-  );
+  const [switchBehavior, setSwitchBehavior] = React.useState<SwitchBehavior>('locked');
+  const [announceMode, setAnnounceMode] = React.useState<AnnounceMode>('affects_user');
   const [comment, setComment] = React.useState('');
   const [error, setError] = React.useState<string | null>(null);
 
@@ -124,10 +121,7 @@ export default function ChannelPolicyModal({
       ) : (
         <div className="space-y-4">
           <Field label="Papel padrão" required>
-            <Select
-              value={defaultRoleId}
-              onChange={(e) => setDefaultRoleId(e.target.value)}
-            >
+            <Select value={defaultRoleId} onChange={(e) => setDefaultRoleId(e.target.value)}>
               <option value="">Escolha o papel…</option>
               {(rolesQuery.data?.items ?? []).map((r) => (
                 <option key={r.id} value={r.id}>
@@ -142,9 +136,7 @@ export default function ChannelPolicyModal({
               onChange={(e) => setSwitchBehavior(e.target.value as SwitchBehavior)}
             >
               <option value="locked">locked — o papel nunca troca</option>
-              <option value="prefer_handoff">
-                prefer_handoff — handoff em vez de troca
-              </option>
+              <option value="prefer_handoff">prefer_handoff — handoff em vez de troca</option>
               <option value="free_with_trigger">
                 free_with_trigger — troca sob gatilho explícito
               </option>
@@ -164,11 +156,7 @@ export default function ChannelPolicyModal({
             </Select>
           </Field>
           <Field label="Motivo (auditado, mín. 10 caracteres)" required>
-            <Textarea
-              value={comment}
-              onChange={(e) => setComment(e.target.value)}
-              rows={3}
-            />
+            <Textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={3} />
           </Field>
         </div>
       )}

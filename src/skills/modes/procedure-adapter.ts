@@ -27,9 +27,7 @@ interface ProcedureSpec {
   [key: string]: unknown;
 }
 
-export async function procedureAdapterMode(
-  ctx: ModeContext,
-): Promise<Record<string, unknown>> {
+export async function procedureAdapterMode(ctx: ModeContext): Promise<Record<string, unknown>> {
   const procedure = (ctx.skill.procedure ?? {}) as ProcedureSpec;
 
   // Resolve procedure definition id (descriptor lookup is best-effort).

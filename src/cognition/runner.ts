@@ -176,9 +176,8 @@ export async function runCognitiveModule<TOut>(
         status = timedOut || e.message === 'timeout' ? 'timeout' : 'error';
         fallback_triggered = true;
         if (opts.fallback !== undefined) {
-          output = typeof opts.fallback === 'function'
-            ? (opts.fallback as () => TOut)()
-            : opts.fallback;
+          output =
+            typeof opts.fallback === 'function' ? (opts.fallback as () => TOut)() : opts.fallback;
         } else {
           output = null;
         }
@@ -255,10 +254,7 @@ export async function runCognitiveModule<TOut>(
       // alternative (writing under a poisoned tenant id) is strictly
       // worse — auditors would see ghost rows and cross-tenant
       // cognitive_candidates correlation would break.
-      logger.warn(
-        { module: opts.name },
-        'runner.audit_skipped_missing_tenant_context',
-      );
+      logger.warn({ module: opts.name }, 'runner.audit_skipped_missing_tenant_context');
       return { output, status, fallback_triggered, latency_ms };
     }
     try {

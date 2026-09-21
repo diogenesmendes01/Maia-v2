@@ -92,10 +92,7 @@ function encodeSegment(segment: string): string {
   return encodeURIComponent(segment).replace(GLOB_METACHAR_RE, neutralizeGlobMetachar);
 }
 
-export function buildCacheKey(
-  prefix: string,
-  ...segments: Array<string | number>
-): string {
+export function buildCacheKey(prefix: string, ...segments: Array<string | number>): string {
   const encoded = segments.map((s, i) => {
     // Fail closed: a `null`/`undefined` segment is almost always a forgotten
     // optional field. Silently coercing it to '' aliases "missing" with

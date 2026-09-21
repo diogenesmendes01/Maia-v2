@@ -484,9 +484,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
         // Re-validate that the candidate is still 'aberta'. Defends against
         // dispatcher-cache returning a stale id from a prior retry within the
         // 5-min idempotency bucket.
-        const stillActive = await pendingQuestionsRepo
-          .findActiveSnapshot(c.id)
-          .catch(() => null);
+        const stillActive = await pendingQuestionsRepo.findActiveSnapshot(c.id).catch(() => null);
         if (stillActive && stillActive.id === candidate.pending_question_id) {
           latestPending = {
             id: candidate.pending_question_id,
@@ -545,9 +543,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
           // resolução só suprime a reação, nunca o turno.
           const emoji: '✅' | '❌' | null = !isError
             ? '✅'
-            : ['forbidden', 'requires_dual_approval'].includes(
-                  (out as { error: string }).error,
-                )
+            : ['forbidden', 'requires_dual_approval'].includes((out as { error: string }).error)
               ? '❌'
               : null;
           if (emoji) {
@@ -710,12 +706,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // prompt-builder still surfaces them in the "## Eventos confirmados pelo
   // backend" block. Covers iteration-cap and empty-final-text paths.
   if (!outboundDispatched && toolSummaries.length > 0) {
-    await flushUnconfirmedToolSummaries(
-      c.id,
-      inbound.id,
-      toolSummaries,
-      exitReason,
-    );
+    await flushUnconfirmedToolSummaries(c.id, inbound.id, toolSummaries, exitReason);
   }
 
   return {

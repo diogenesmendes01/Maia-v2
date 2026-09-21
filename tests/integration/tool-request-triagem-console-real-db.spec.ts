@@ -118,10 +118,7 @@ async function limpar(c: pg.PoolClient, l: Lixo) {
     g,
   );
   await c.query('DELETE FROM capability_proposals WHERE gap_id = ANY($1::uuid[])', g);
-  await c.query(
-    'DELETE FROM agent_capability_gap_observations WHERE gap_id = ANY($1::uuid[])',
-    g,
-  );
+  await c.query('DELETE FROM agent_capability_gap_observations WHERE gap_id = ANY($1::uuid[])', g);
   await c.query('DELETE FROM agent_capability_gaps WHERE id = ANY($1::uuid[])', g);
 }
 
@@ -145,8 +142,7 @@ async function pedidoReal(
      VALUES ($1, $2, $3, $4, '{}'::jsonb)`,
     [args.tenant, args.agent, gapId, args.descricao],
   );
-  const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId]))
-    .rows[0];
+  const gap = (await c.query('SELECT * FROM agent_capability_gaps WHERE id = $1', [gapId])).rows[0];
   const resultado = await runWithTenantContext(
     { tenant_id: args.tenant, agent_id: args.agent },
     () => proposer().proposeToolRequestForGap({ gap: gap as never }),
@@ -482,7 +478,10 @@ d('#638 — triagem no console: escopo, idempotência e leitura do backend', () 
       expect(await contarAuditoria(c, 'tool_request_issue_failed', linhaId)).toBe(0);
 
       // 404: terminal. Retentar não muda o desfecho, então a linha sai da fila.
-      const inexistente = transporteFalso(() => ({ status: 404, corpo: '{"message":"Not Found"}' }));
+      const inexistente = transporteFalso(() => ({
+        status: 404,
+        corpo: '{"message":"Not Found"}',
+      }));
       await worker().runToolRequestIssueRelayer({ transporte: inexistente.transporte });
       const terminal = (
         await c.query<{ status: string; issue_number: number | null }>(

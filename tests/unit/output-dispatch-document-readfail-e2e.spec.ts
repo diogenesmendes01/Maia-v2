@@ -100,12 +100,25 @@ vi.mock('@/gateway/line-output.js', () => ({
   }),
 }));
 
-import { dispatchOutput, safeDispatchOutput, OutboundDeliveryError } from '@/agent/output-dispatch.js';
+import {
+  dispatchOutput,
+  safeDispatchOutput,
+  OutboundDeliveryError,
+} from '@/agent/output-dispatch.js';
 import * as baileys from '@/gateway/baileys.js';
 
-const pessoa = { id: 'p_1', telefone_whatsapp: '+5511999999999', preferencias: null } as unknown as Pessoa;
+const pessoa = {
+  id: 'p_1',
+  telefone_whatsapp: '+5511999999999',
+  preferencias: null,
+} as unknown as Pessoa;
 const conversa = { id: 'c_1', channel_id: null } as Conversa;
-const inbound = { id: 'msg_1', conteudo: 'manda o extrato', metadata: null, tipo: 'texto' } as unknown as Mensagem;
+const inbound = {
+  id: 'msg_1',
+  conteudo: 'manda o extrato',
+  metadata: null,
+  tipo: 'texto',
+} as unknown as Mensagem;
 
 // Fresh ctx each call with a NEW random missing path so the real readFile is the
 // thing that fails (deterministically — the file cannot pre-exist).

@@ -20,9 +20,7 @@ const TenantAgentInput = z.object({
 });
 
 const ListProposalsInput = TenantAgentInput.extend({
-  status: z
-    .enum(['draft', 'submitted', 'approved', 'rejected', 'delivered'])
-    .default('submitted'),
+  status: z.enum(['draft', 'submitted', 'approved', 'rejected', 'delivered']).default('submitted'),
 });
 
 const ListGapsInput = TenantAgentInput.extend({
@@ -59,14 +57,12 @@ export const capabilitiesRouter = router({
     return { items };
   }),
 
-  listProposals: protectedProcedure
-    .input(ListProposalsInput)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      const items = await runWithTenantContext(
-        { tenant_id: tenantId, agent_id: input.agentId },
-        async () => ctx.repos.capabilityProposalsRepo.listByStatus(input.status),
-      );
-      return { items };
-    }),
+  listProposals: protectedProcedure.input(ListProposalsInput).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    const items = await runWithTenantContext(
+      { tenant_id: tenantId, agent_id: input.agentId },
+      async () => ctx.repos.capabilityProposalsRepo.listByStatus(input.status),
+    );
+    return { items };
+  }),
 });

@@ -23,7 +23,10 @@ function makeProfile() {
   });
 }
 
-function makeAgentMsg(text: string, id = 'm-' + Math.random().toString(36).slice(2)): DriftRecentMessage {
+function makeAgentMsg(
+  text: string,
+  id = 'm-' + Math.random().toString(36).slice(2),
+): DriftRecentMessage {
   return { id, from: 'agent', text, created_at: new Date() };
 }
 
@@ -31,7 +34,9 @@ describe('confiancaDetector', () => {
   it('skill vendas com confidence=0.3 + msg "tenho certeza que entendo vendas" → evidence com severity critico (gap=0.7)', async () => {
     const out = await confiancaDetector.detect({
       profile_active: makeProfile(),
-      recent_messages: [makeAgentMsg('Tenho certeza que entendo vendas e posso te orientar.', 'm1')],
+      recent_messages: [
+        makeAgentMsg('Tenho certeza que entendo vendas e posso te orientar.', 'm1'),
+      ],
       self_model_skills: [{ skill_name: 'vendas', confidence: 0.3, evidence_count: 2 }],
     });
 
@@ -83,7 +88,9 @@ describe('confiancaDetector', () => {
   it('agent msg sem regex confiante → null (mesmo com skill de baixa confiança)', async () => {
     const out = await confiancaDetector.detect({
       profile_active: makeProfile(),
-      recent_messages: [makeAgentMsg('Acho que vendas costumam funcionar assim, mas não sei dizer ao certo.')],
+      recent_messages: [
+        makeAgentMsg('Acho que vendas costumam funcionar assim, mas não sei dizer ao certo.'),
+      ],
       self_model_skills: [{ skill_name: 'vendas', confidence: 0.2, evidence_count: 1 }],
     });
 
@@ -116,9 +123,7 @@ describe('confiancaDetector', () => {
   it('msg confiante menciona skill X (baixa) e skill Y (alta) → só X entra em confident_claims', async () => {
     const out = await confiancaDetector.detect({
       profile_active: makeProfile(),
-      recent_messages: [
-        makeAgentMsg('Com certeza, tanto vendas quanto suporte estão dominados.'),
-      ],
+      recent_messages: [makeAgentMsg('Com certeza, tanto vendas quanto suporte estão dominados.')],
       self_model_skills: [
         { skill_name: 'vendas', confidence: 0.25, evidence_count: 1 },
         { skill_name: 'suporte', confidence: 0.95, evidence_count: 80 },
@@ -136,7 +141,12 @@ describe('confiancaDetector', () => {
     const out = await confiancaDetector.detect({
       profile_active: makeProfile(),
       recent_messages: [
-        { id: 'u1', from: 'user', text: 'Tenho certeza que entendo vendas.', created_at: new Date() },
+        {
+          id: 'u1',
+          from: 'user',
+          text: 'Tenho certeza que entendo vendas.',
+          created_at: new Date(),
+        },
       ],
       self_model_skills: [{ skill_name: 'vendas', confidence: 0.1, evidence_count: 1 }],
     });

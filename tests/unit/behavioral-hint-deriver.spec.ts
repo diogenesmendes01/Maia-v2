@@ -7,10 +7,14 @@ vi.mock('@/lib/claude.js', () => ({
 }));
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
-    cognitiveModuleLogRepo: { record: vi.fn(async () => {}), recentByModule: vi.fn(async () => []) },
+    cognitiveModuleLogRepo: {
+      record: vi.fn(async () => {}),
+      recentByModule: vi.fn(async () => []),
+    },
   };
 });
 

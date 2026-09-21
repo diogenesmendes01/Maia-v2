@@ -14,11 +14,7 @@ import { z } from 'zod';
 import { TRPCError } from '@trpc/server';
 import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
-import {
-  ProposalTypeSchema,
-  RiskLevelSchema,
-  ProposalUnifiedStatusSchema,
-} from '../types.js';
+import { ProposalTypeSchema, RiskLevelSchema, ProposalUnifiedStatusSchema } from '../types.js';
 
 const ListInputSchema = z.object({
   tenantId: z.string().optional(),
@@ -40,50 +36,44 @@ const BulkRejectInputSchema = z.object({
 });
 
 export const inboxRouter = router({
-  listProposals: protectedProcedure
-    .input(ListInputSchema)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      return await ctx.repos.proposalsUnifiedRepo.list({
-        tenantId,
-        types: input.types,
-        risks: input.risks,
-        sources: input.sources,
-        status: input.status,
-        ageBucket: input.ageBucket,
-        limit: input.limit,
-        cursor: input.cursor,
+  listProposals: protectedProcedure.input(ListInputSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    return await ctx.repos.proposalsUnifiedRepo.list({
+      tenantId,
+      types: input.types,
+      risks: input.risks,
+      sources: input.sources,
+      status: input.status,
+      ageBucket: input.ageBucket,
+      limit: input.limit,
+      cursor: input.cursor,
+    });
+  }),
+
+  counters: protectedProcedure.input(CountersInputSchema).query(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    return await ctx.repos.proposalsUnifiedRepo.countersByType(tenantId);
+  }),
+
+  bulkReject: protectedProcedure.input(BulkRejectInputSchema).mutation(async ({ input, ctx }) => {
+    const tenantId = resolveTenantId(ctx, input.tenantId);
+    ctx.assertRole('owner', 'compliance_officer', 'founder');
+
+    const result = await ctx.repos.proposalsUnifiedRepo.bulkReject(
+      tenantId,
+      input.ids,
+      ctx.userId,
+      ctx.userRole,
+      input.comment,
+    );
+
+    if (result.rejected_count === 0) {
+      throw new TRPCError({
+        code: 'BAD_REQUEST',
+        message: 'No proposals were eligible for bulk reject (risk=low + no architecture lock)',
       });
-    }),
+    }
 
-  counters: protectedProcedure
-    .input(CountersInputSchema)
-    .query(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      return await ctx.repos.proposalsUnifiedRepo.countersByType(tenantId);
-    }),
-
-  bulkReject: protectedProcedure
-    .input(BulkRejectInputSchema)
-    .mutation(async ({ input, ctx }) => {
-      const tenantId = resolveTenantId(ctx, input.tenantId);
-      ctx.assertRole('owner', 'compliance_officer', 'founder');
-
-      const result = await ctx.repos.proposalsUnifiedRepo.bulkReject(
-        tenantId,
-        input.ids,
-        ctx.userId,
-        ctx.userRole,
-        input.comment,
-      );
-
-      if (result.rejected_count === 0) {
-        throw new TRPCError({
-          code: 'BAD_REQUEST',
-          message: 'No proposals were eligible for bulk reject (risk=low + no architecture lock)',
-        });
-      }
-
-      return result;
-    }),
+    return result;
+  }),
 });

@@ -53,19 +53,15 @@ export function profileBodyToForm(body: unknown): ProfileFormValue {
   const strArr = (v: unknown): string[] =>
     Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : [];
   return {
-    role_descriptor:
-      typeof identity.role_descriptor === 'string' ? identity.role_descriptor : '',
+    role_descriptor: typeof identity.role_descriptor === 'string' ? identity.role_descriptor : '',
     tone: typeof voice.tone === 'string' ? voice.tone : DEFAULT_PROFILE.tone,
-    formality: ['low', 'medium', 'high'].includes(voice.formality)
-      ? voice.formality
-      : 'medium',
+    formality: ['low', 'medium', 'high'].includes(voice.formality) ? voice.formality : 'medium',
     verbosity: ['concise', 'medium', 'detailed'].includes(voice.verbosity)
       ? voice.verbosity
       : 'medium',
     priorities: strArr(identity.priorities),
     principles: strArr(identity.principles),
-    language:
-      typeof style.language === 'string' ? style.language : DEFAULT_PROFILE.language,
+    language: typeof style.language === 'string' ? style.language : DEFAULT_PROFILE.language,
     max_inference_depth:
       typeof limits.max_inference_depth === 'number' ? limits.max_inference_depth : 3,
     max_speculation_in_response:
@@ -114,8 +110,7 @@ export function validateIdentity(v: ProfileFormValue): string | null {
     return 'Descreva o papel do agente (ex.: "Atendente de leads do WhatsApp").';
   if (v.tone.trim().length === 0) return 'Defina o tom de voz.';
   const clash = findPriorityPrincipleOverlap(v);
-  if (clash)
-    return `"${clash}" aparece em prioridades E princípios — escolha um dos dois campos.`;
+  if (clash) return `"${clash}" aparece em prioridades E princípios — escolha um dos dois campos.`;
   if (v.principles.length > 0 && v.priorities.length === 0)
     return 'Declare ao menos uma prioridade ao definir princípios.';
   return null;
@@ -216,7 +211,11 @@ export function IdentitySection({
               maxLength={500}
             />
           </Field>
-          <Field label="Tom de voz" required hint="Ex.: “profissional e cordial”, “descontraído mas preciso”.">
+          <Field
+            label="Tom de voz"
+            required
+            hint="Ex.: “profissional e cordial”, “descontraído mas preciso”."
+          >
             <Input
               value={value.tone}
               onChange={(e) => set('tone', e.target.value)}
@@ -281,8 +280,8 @@ export function IdentitySection({
             </div>
           ) : (
             <p className="text-xs text-zinc-500">
-              Sem princípios declarados — a guarda de valores fica desativada
-              para este perfil. Você pode declará-los agora ou depois.
+              Sem princípios declarados — a guarda de valores fica desativada para este perfil. Você
+              pode declará-los agora ou depois.
             </p>
           )
         }
@@ -296,19 +295,19 @@ export function IdentitySection({
           />
           {overlap && (
             <Alert tone="warning" title="Conflito entre campos">
-              “{overlap}” está em prioridades e princípios ao mesmo tempo. O servidor
-              rejeita essa sobreposição — mantenha cada rótulo em apenas um campo.
+              “{overlap}” está em prioridades e princípios ao mesmo tempo. O servidor rejeita essa
+              sobreposição — mantenha cada rótulo em apenas um campo.
             </Alert>
           )}
           {value.principles.length === 0 && (
             <p className="text-xs text-zinc-500">
-              Sem princípios declarados, a guarda de valores fica desativada para este
-              perfil — você pode declará-los depois.
+              Sem princípios declarados, a guarda de valores fica desativada para este perfil — você
+              pode declará-los depois.
             </p>
           )}
           <p className="text-xs text-zinc-500">
-            Não repita prioridades aqui — são coisas diferentes (prioridades
-            são pesos operacionais brandos; princípios são contratos duros).
+            Não repita prioridades aqui — são coisas diferentes (prioridades são pesos operacionais
+            brandos; princípios são contratos duros).
           </p>
         </div>
       </AdvancedCard>
@@ -348,8 +347,8 @@ export function BehaviorSection({
         collapsedSummary={
           <p className="text-xs text-zinc-600">
             Profundidade de inferência{' '}
-            <strong className="font-semibold">{value.max_inference_depth}</strong> ·
-            teto de especulação{' '}
+            <strong className="font-semibold">{value.max_inference_depth}</strong> · teto de
+            especulação{' '}
             <strong className="font-semibold">
               {Math.round(value.max_speculation_in_response * 100)}%
             </strong>{' '}

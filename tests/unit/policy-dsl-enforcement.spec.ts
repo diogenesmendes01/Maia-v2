@@ -16,11 +16,7 @@
 import { describe, expect, it } from 'vitest';
 import * as fc from 'fast-check';
 import { enforce } from '@/governance/policy-dsl/enforcement.js';
-import type {
-  PolicyDecision,
-  PolicyEffect,
-  PolicyOutcome,
-} from '@/governance/policy-dsl/types.js';
+import type { PolicyDecision, PolicyEffect, PolicyOutcome } from '@/governance/policy-dsl/types.js';
 
 const baseDiagnostics = {
   predicate_depth_visited: 0,
@@ -86,9 +82,7 @@ describe('enforce — not_applicable outcome', () => {
 
 describe('enforce — evaluation_error MUST block (Architecture Lock)', () => {
   it('evaluation_error → kind=block, reason=evaluation_error', () => {
-    const d = decision('evaluation_error', undefined, [
-      { code: 'missing_field', message: 'x' },
-    ]);
+    const d = decision('evaluation_error', undefined, [{ code: 'missing_field', message: 'x' }]);
     const result = enforce(d);
     expect(result.kind).toBe('block');
     expect(result.reason).toBe('evaluation_error');
@@ -109,9 +103,7 @@ describe('enforce — evaluation_error MUST block (Architecture Lock)', () => {
       'missing_field',
       'regex_pattern_unsafe',
     ] as const) {
-      const result = enforce(
-        decision('evaluation_error', undefined, [{ code, message: 'x' }]),
-      );
+      const result = enforce(decision('evaluation_error', undefined, [{ code, message: 'x' }]));
       expect(result.kind).not.toBe('allow');
       expect(result.kind).not.toBe('pass');
       expect(result.kind).toBe('block');
@@ -140,11 +132,7 @@ describe('enforce — property: evaluation_error MUST always block', () => {
         ),
         (errors) => {
           const result = enforce(
-            decision(
-              'evaluation_error',
-              undefined,
-              errors as PolicyDecision['errors'],
-            ),
+            decision('evaluation_error', undefined, errors as PolicyDecision['errors']),
           );
           expect(result.kind).toBe('block');
           expect(result.kind).not.toBe('allow');

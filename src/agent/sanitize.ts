@@ -11,7 +11,16 @@
  *       and sanitized via sanitizeBlock.
  */
 
-const PROTECTED_TAGS = ['user_message', 'ocr', 'audio_transcript', 'fact', 'rule', 'gap', 'memory', 'hint'] as const;
+const PROTECTED_TAGS = [
+  'user_message',
+  'ocr',
+  'audio_transcript',
+  'fact',
+  'rule',
+  'gap',
+  'memory',
+  'hint',
+] as const;
 
 /**
  * Sanitizes text by replacing literal closing tags that would let an attacker

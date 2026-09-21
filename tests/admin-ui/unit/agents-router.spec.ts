@@ -134,12 +134,7 @@ function makeRepos(
       async listByTenant(tenant_id: string) {
         return Object.values(agentsMap).filter((a) => a.tenant_id === tenant_id);
       },
-      async create(input: {
-        id: string;
-        tenant_id: string;
-        nome: string;
-        status?: string;
-      }) {
+      async create(input: { id: string; tenant_id: string; nome: string; status?: string }) {
         const row: Agent = {
           id: input.id,
           tenant_id: input.tenant_id,
@@ -284,17 +279,12 @@ function makeRepos(
       // populated by the time the mock runs. getById lista active+proposed
       // por agente e contaria dobrado sem o escopo (tenant, agent).
       async listByStatus(status: string) {
-        const { getCurrentTenant, getCurrentAgent } = await import(
-          '@/db/tenant-context.js'
-        );
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
         return profiles
           .filter(
-            (p) =>
-              p.status === status &&
-              p.tenant_id === tenant_id &&
-              p.agent_id === agent_id,
+            (p) => p.status === status && p.tenant_id === tenant_id && p.agent_id === agent_id,
           )
           .map((p) => ({ ...p, created_at: p.created_at ?? new Date() }));
       },
@@ -313,9 +303,8 @@ function makeRepos(
         const insertedProfileIds: string[] = [];
         try {
           const version =
-            profiles.filter(
-              (p) => p.tenant_id === args.tenant_id && p.agent_id === args.agent_id,
-            ).length + 1;
+            profiles.filter((p) => p.tenant_id === args.tenant_id && p.agent_id === args.agent_id)
+              .length + 1;
           const row: Profile = {
             id: `prof-${profiles.length + 1}`,
             tenant_id: args.tenant_id,
@@ -402,8 +391,7 @@ function makeRepos(
           ) ?? null;
 
         // Predecessor enforcement (mirrors repo behavior).
-        const md = (target.profile_body as { metadata?: Record<string, unknown> } | null)
-          ?.metadata;
+        const md = (target.profile_body as { metadata?: Record<string, unknown> } | null)?.metadata;
         let expected: string | null | 'unknown';
         if (!md || !('previous_version_id' in md)) {
           expected = 'unknown';
@@ -480,9 +468,7 @@ function makeRepos(
         return {
           ok: true as const,
           activated: { id: target.id, version: target.version },
-          frozen_previous: incumbent
-            ? { id: incumbent.id, version: incumbent.version }
-            : null,
+          frozen_previous: incumbent ? { id: incumbent.id, version: incumbent.version } : null,
         };
       },
     },
@@ -490,15 +476,10 @@ function makeRepos(
       // ALS-aware like listByStatus above — the router wraps this call in
       // runWithTenantContext, so the store is populated.
       async findForCurrentAgent() {
-        const { getCurrentTenant, getCurrentAgent } = await import(
-          '@/db/tenant-context.js'
-        );
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        return (
-          grants.find((g) => g.tenant_id === tenant_id && g.agent_id === agent_id) ??
-          null
-        );
+        return grants.find((g) => g.tenant_id === tenant_id && g.agent_id === agent_id) ?? null;
       },
       // Mirrors the real atomic helper (PR #494 review): the CURRENT row is
       // read inside the "tx" and handed to the caller's pure compute; a
@@ -650,20 +631,17 @@ const validProfileWithPrinciples = {
 } as const;
 
 describe('agentsRouter.create — role gate', () => {
-  it.each(['analyst', 'viewer', 'compliance_officer'])(
-    '%s gets FORBIDDEN',
-    async (role) => {
-      const repos = makeRepos();
-      await expect(
-        caller(role, 'tenant-A', 'u1', repos).create({
-          id: 'agent-x',
-          nome: 'X',
-          profile_body: validProfile,
-          proposed_reason: 'seed for X division',
-        }),
-      ).rejects.toThrow(TRPCError);
-    },
-  );
+  it.each(['analyst', 'viewer', 'compliance_officer'])('%s gets FORBIDDEN', async (role) => {
+    const repos = makeRepos();
+    await expect(
+      caller(role, 'tenant-A', 'u1', repos).create({
+        id: 'agent-x',
+        nome: 'X',
+        profile_body: validProfile,
+        proposed_reason: 'seed for X division',
+      }),
+    ).rejects.toThrow(TRPCError);
+  });
 
   it('owner can create in own tenant', async () => {
     const repos = makeRepos();
@@ -818,19 +796,16 @@ describe('agentsRouter.updateProfile — invariants', () => {
     ).rejects.toMatchObject({ code: 'NOT_FOUND' });
   });
 
-  it.each(['analyst', 'viewer', 'compliance_officer'])(
-    '%s cannot updateProfile',
-    async (role) => {
-      const repos = makeRepos({ agents: [existingAgent] });
-      await expect(
-        caller(role, 'tenant-A', 'u1', repos).updateProfile({
-          agentId: 'agent-x',
-          profile_body: validProfile,
-          proposed_reason: 'unauthorised update attempt',
-        }),
-      ).rejects.toThrow(TRPCError);
-    },
-  );
+  it.each(['analyst', 'viewer', 'compliance_officer'])('%s cannot updateProfile', async (role) => {
+    const repos = makeRepos({ agents: [existingAgent] });
+    await expect(
+      caller(role, 'tenant-A', 'u1', repos).updateProfile({
+        agentId: 'agent-x',
+        profile_body: validProfile,
+        proposed_reason: 'unauthorised update attempt',
+      }),
+    ).rejects.toThrow(TRPCError);
+  });
 });
 
 /**
@@ -1216,8 +1191,7 @@ describe('agentsRouter — identity.principles field (#193)', () => {
   it('VALORES contract: persisted body with principles is auditable; priorities-only is not', async () => {
     // Lazy require so we don't pollute test imports for unrelated cases.
     type Persisted = { identity?: { principles?: unknown[] } };
-    const { resolveLegacyPayload } =
-      await import('@/identity/profile-legacy-resolver.js');
+    const { resolveLegacyPayload } = await import('@/identity/profile-legacy-resolver.js');
 
     // (1) With principles configured — resolver surfaces them.
     const reposWith = makeRepos();
@@ -1710,7 +1684,6 @@ describe('agentsRouter.updateProfile — principles omission preserves active (#
   });
 });
 
-
 // grant-math is registry-free (importing has no side effects) — safe to load
 // at module top level for the updateCapabilities fixtures below.
 const { TOOL_PACKS } = await import('@/tools/grant-math.js');
@@ -1737,20 +1710,17 @@ describe('agentsRouter.updateCapabilities', () => {
     reason: 'seed',
   };
 
-  it.each(['analyst', 'viewer', 'compliance_officer'])(
-    '%s gets FORBIDDEN',
-    async (role) => {
-      const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
-      await expect(
-        caller(role, 'tenant-A', 'u1', repos).updateCapabilities({
-          agentId: 'agent-cap',
-          granted_packs: ['domain.finance'],
-          denied_tools: [],
-          comment: 'attempt without permission',
-        }),
-      ).rejects.toThrow(TRPCError);
-    },
-  );
+  it.each(['analyst', 'viewer', 'compliance_officer'])('%s gets FORBIDDEN', async (role) => {
+    const repos = makeRepos({ agents: [agent], grants: [baseGrant] });
+    await expect(
+      caller(role, 'tenant-A', 'u1', repos).updateCapabilities({
+        agentId: 'agent-cap',
+        granted_packs: ['domain.finance'],
+        denied_tools: [],
+        comment: 'attempt without permission',
+      }),
+    ).rejects.toThrow(TRPCError);
+  });
 
   it('NOT_FOUND when the agent does not exist in this tenant', async () => {
     const repos = makeRepos({ agents: [] });

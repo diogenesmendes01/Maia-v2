@@ -13,11 +13,7 @@ import { mkdirSync, existsSync } from 'node:fs';
 import { readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { config } from '@/config/env.js';
-import {
-  assertSafeAuthDir,
-  isReservedRootEntry,
-  resolvePrimaryAuthDir,
-} from '@/setup/auth-dir.js';
+import { assertSafeAuthDir, isReservedRootEntry, resolvePrimaryAuthDir } from '@/setup/auth-dir.js';
 import { logger } from '@/lib/logger.js';
 import { sha256 } from '@/lib/utils.js';
 import { mensagensRepo } from '@/db/repositories.js';
@@ -160,24 +156,19 @@ async function registerPrimaryLineSession(): Promise<void> {
     });
     // Review #498 (alto 2): audita sob o ALS do dono do canal — sem o wrap,
     // audit() cai no bucket `system` (colunas e labels de métricas erradas).
-    await runWithTenantContext(
-      { tenant_id: channel.tenant_id, agent_id: channel.agent_id },
-      () =>
-        audit({
-          acao: 'line_session_transition',
-          metadata: {
-            channel_id: channel.id,
-            line_external_id: currentLineE164,
-            state: 'connected',
-            is_primary: true,
-          },
-        }),
+    await runWithTenantContext({ tenant_id: channel.tenant_id, agent_id: channel.agent_id }, () =>
+      audit({
+        acao: 'line_session_transition',
+        metadata: {
+          channel_id: channel.id,
+          line_external_id: currentLineE164,
+          state: 'connected',
+          is_primary: true,
+        },
+      }),
     );
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'line_session.primary_register_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'line_session.primary_register_failed');
   }
 }
 
@@ -320,10 +311,7 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
     currentLineE164 = normalizeLineE164(socket?.user?.id ?? null);
     // Issue #512: writes/updates the channel ownership row — tracked so the
     // drain waits for it instead of `process.exit` cutting it mid-write.
-    void lifecycle.trackBackgroundTask(
-      'primary_line_registration',
-      registerPrimaryLineSession(),
-    );
+    void lifecycle.trackBackgroundTask('primary_line_registration', registerPrimaryLineSession());
     logger.info({ line: currentLineE164 }, 'baileys.connected');
     await audit({ acao: 'whatsapp_connected' });
     // pairing_completed is one-shot per successful pair (spec §4.7(b)). Skip
@@ -412,10 +400,7 @@ async function handleConnectionUpdate(update: ConnectionUpdate): Promise<void> {
         return;
       }
       const delay = reconnectDelayMs(reconnectAttempts);
-      logger.info(
-        { attempt: reconnectAttempts, delay_ms: delay },
-        'baileys.reconnect_scheduled',
-      );
+      logger.info({ attempt: reconnectAttempts, delay_ms: delay }, 'baileys.reconnect_scheduled');
       // Issue #512: the timer is TRACKED so `shutdownBaileys()` can cancel it.
       // A pending reconnect that fires after the socket was closed reopens the
       // transport on a `stopped` process.
@@ -662,10 +647,7 @@ export async function handleMessagesUpdate(
 ): Promise<void> {
   if (!config.FEATURE_MESSAGE_UPDATE) return;
   if (!channel_id && config.MAIA_MULTI_LINE) {
-    logger.warn(
-      { updates: updates.length },
-      'message_update.channel_unresolved_dropped',
-    );
+    logger.warn({ updates: updates.length }, 'message_update.channel_unresolved_dropped');
     await audit({
       acao: 'message_update_channel_unresolved',
       metadata: { dropped_updates: updates.length },
@@ -857,8 +839,7 @@ async function resolveTenantCtxForUpsert(
   const key = msg.key as any;
   const keyHints = {
     senderPn: typeof key?.senderPn === 'string' ? key.senderPn : null,
-    participantPn:
-      typeof key?.participantPn === 'string' ? key.participantPn : null,
+    participantPn: typeof key?.participantPn === 'string' ? key.participantPn : null,
   };
 
   try {
@@ -930,15 +911,10 @@ async function resolveTenantCtxForUpsert(
       (line ? line.botLineE164 : currentLineE164)
     ) {
       const { stageUnroutedInbound } = await import('./unrouted-staging.js');
-      staged = await stageUnroutedInbound(
-        msg,
-        (line ? line.botLineE164 : currentLineE164)!,
-      );
+      staged = await stageUnroutedInbound(msg, (line ? line.botLineE164 : currentLineE164)!);
     }
     await audit({
-      acao: isLidUnmapped
-        ? 'channel_resolution_skipped_lid_unmapped'
-        : 'channel_resolution_failed',
+      acao: isLidUnmapped ? 'channel_resolution_skipped_lid_unmapped' : 'channel_resolution_failed',
       metadata: {
         // mensagem_id intentionally null — the inbound was NOT persisted
         // (we audit BEFORE createInbound runs). whatsapp_id is the only
@@ -950,9 +926,7 @@ async function resolveTenantCtxForUpsert(
         // `channel_resolution_failed` audit.
         whatsapp_id: msg.key?.id ?? null,
         raw_jid: jid,
-        error_code: isResolutionFailure
-          ? 'channel_resolution_failed'
-          : (typed?.code ?? 'unknown'),
+        error_code: isResolutionFailure ? 'channel_resolution_failed' : (typed?.code ?? 'unknown'),
         error_message: (err as Error).message,
         resolver_details: typed?.details ?? null,
         // Surface where this audit was emitted from so triage can
@@ -1078,10 +1052,7 @@ async function handleIncoming(
         ? opts.resolved_tel
         : '+' + remote_jid.split('@')[0]!;
   if (isLid && !realPn && !(opts?.resolved_tel && opts.resolved_tel.length > 0)) {
-    logger.warn(
-      { remote_jid, whatsapp_id },
-      'baileys.lid_without_real_phone',
-    );
+    logger.warn({ remote_jid, whatsapp_id }, 'baileys.lid_without_real_phone');
   }
 
   if (await checkBotAndMaybeBlock(tel)) {
@@ -1089,7 +1060,8 @@ async function handleIncoming(
     return;
   }
 
-  const { type, content, mediaPath, mediaMime, mediaSha256, mediaRejected } = await extractContent(msg);
+  const { type, content, mediaPath, mediaMime, mediaSha256, mediaRejected } =
+    await extractContent(msg);
 
   // Issue #503 — `withTurn` faz o inbound e o turno `received` nascerem na MESMA
   // transação. Se o processo morrer entre o commit e o enqueue, o recovery
@@ -1159,10 +1131,7 @@ async function handleIncoming(
       channel_kind: INGRESS_CHANNEL_KIND,
       whatsapp_id,
     });
-    logger.warn(
-      { whatsapp_id, reason: err.reason },
-      'baileys.stream_identity_unresolved_drop',
-    );
+    logger.warn({ whatsapp_id, reason: err.reason }, 'baileys.stream_identity_unresolved_drop');
     return;
   }
   const { row: stored, duplicate, turn } = ingress;
@@ -1197,7 +1166,10 @@ async function handleIncoming(
   // fornecida); fase 0/global: sessão primária, comportamento inalterado.
   (opts?.read ?? markRead)(remote_jid, whatsapp_id);
   if (duplicate) {
-    await audit({ acao: 'duplicate_message_dropped', metadata: { whatsapp_id, source: 'db_unique' } });
+    await audit({
+      acao: 'duplicate_message_dropped',
+      metadata: { whatsapp_id, source: 'db_unique' },
+    });
     return;
   }
 
@@ -1334,7 +1306,12 @@ async function handleIncoming(
   } catch (err) {
     if (err instanceof QueueRedisUnavailableError) {
       logger.warn(
-        { mensagem_id: stored.id, tel: '[REDACTED]', failure_class: 'redis_unavailable', oom: err.oom },
+        {
+          mensagem_id: stored.id,
+          tel: '[REDACTED]',
+          failure_class: 'redis_unavailable',
+          oom: err.oom,
+        },
         'baileys.enqueue_failed_fail_closed',
       );
       await noteTurnEnqueueFailed(turnHandle, { code: err.code, error: err });
@@ -1359,11 +1336,25 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
 }> {
   const m = msg.message;
   if (!m) {
-    return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
+    return {
+      type: 'sistema',
+      content: null,
+      mediaPath: null,
+      mediaMime: null,
+      mediaSha256: null,
+      mediaRejected: null,
+    };
   }
 
   if (m.conversation) {
-    return { type: 'texto', content: m.conversation, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
+    return {
+      type: 'texto',
+      content: m.conversation,
+      mediaPath: null,
+      mediaMime: null,
+      mediaSha256: null,
+      mediaRejected: null,
+    };
   }
   if (m.extendedTextMessage?.text) {
     return {
@@ -1385,7 +1376,14 @@ async function extractContent(msg: proto.IWebMessageInfo): Promise<{
         ? 'documentMessage'
         : null;
   if (!mediaKind) {
-    return { type: 'sistema', content: null, mediaPath: null, mediaMime: null, mediaSha256: null, mediaRejected: null };
+    return {
+      type: 'sistema',
+      content: null,
+      mediaPath: null,
+      mediaMime: null,
+      mediaSha256: null,
+      mediaRejected: null,
+    };
   }
 
   type MediaEnvelope = {
@@ -1555,9 +1553,9 @@ export async function sendOutboundDocumentVia(
     // 'unknown' marks the turn as "do-not-retry", reviving the HIGH-1 silent-drop
     // that #216 closed for the document path.
     logger.error({ err, path }, 'baileys.send_document.read_failed');
-    const wrapped = new Error(
-      `document_read_failed: ${(err as Error).message}`,
-    ) as Error & { code?: string };
+    const wrapped = new Error(`document_read_failed: ${(err as Error).message}`) as Error & {
+      code?: string;
+    };
     wrapped.code = 'DOC_READ_FAILED';
     throw wrapped;
   }
@@ -1650,7 +1648,10 @@ export const _internal = {
 // Async write (no event-loop-blocking writeFileSync on the ingress hot path).
 // Legacy rows whose midia_url points at the old un-tenanted `<MEDIA_ROOT>/<month>/`
 // dirs still resolve: media-guard containment is checked against MEDIA_ROOT.
-export async function mediaPathFor(buf: Buffer, ext: string): Promise<{ path: string; sha: string }> {
+export async function mediaPathFor(
+  buf: Buffer,
+  ext: string,
+): Promise<{ path: string; sha: string }> {
   // Defensive: ensure MEDIA_ROOT exists even when startBaileys() hasn't run
   // (module load no longer creates it). Idempotent.
   ensureMediaDirs();

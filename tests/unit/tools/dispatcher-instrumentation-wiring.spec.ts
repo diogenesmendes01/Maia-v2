@@ -213,9 +213,9 @@ describe('issue #535 — dispatchTool ainda passa por instrumentToolDispatch', (
       denied_tools: [],
     };
 
-    await expect(
-      dispatchTool({ tool: 'query_balance', args: {}, ctx: fakeCtx }),
-    ).resolves.toEqual({ ok: true });
+    await expect(dispatchTool({ tool: 'query_balance', args: {}, ctx: fakeCtx })).resolves.toEqual({
+      ok: true,
+    });
 
     const corpo = await renderPrometheus();
     expect(valorDaSerie(corpo, serie(METRIC.TOOL_DISPATCH, 'query_balance', 'ok'))).toBe(1);
@@ -243,9 +243,10 @@ describe('issue #535 — dispatchTool ainda passa por instrumentToolDispatch', (
       denied_tools: ['query_balance'],
     };
 
-    await expect(
-      dispatchTool({ tool: 'query_balance', args: {}, ctx: fakeCtx }),
-    ).resolves.toEqual({ error: 'tool_not_granted', details: { tool: 'query_balance' } });
+    await expect(dispatchTool({ tool: 'query_balance', args: {}, ctx: fakeCtx })).resolves.toEqual({
+      error: 'tool_not_granted',
+      details: { tool: 'query_balance' },
+    });
 
     const corpo = await renderPrometheus();
     expect(valorDaSerie(corpo, serie(METRIC.TOOL_DISPATCH, 'query_balance', 'blocked'))).toBe(1);
@@ -269,9 +270,9 @@ describe('issue #535 — dispatchTool ainda passa por instrumentToolDispatch', (
     ).resolves.toEqual({ error: 'unknown_tool', details: { tool: 'query_balance_typo' } });
 
     const corpo = await renderPrometheus();
-    expect(
-      valorDaSerie(corpo, serie(METRIC.TOOL_DISPATCH, 'query_balance_typo', 'invalid')),
-    ).toBe(1);
+    expect(valorDaSerie(corpo, serie(METRIC.TOOL_DISPATCH, 'query_balance_typo', 'invalid'))).toBe(
+      1,
+    );
 
     expect(spansDeDispatch()).toHaveLength(1);
     expect(spansDeDispatch()[0]!.attributes).toMatchObject({

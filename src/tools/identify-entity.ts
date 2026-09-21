@@ -33,10 +33,15 @@ export const identifyEntityTool: Tool<typeof inputSchema, typeof outputSchema> =
     const ents = await entidadesRepo.byIds(ctx.scope.entidades);
     const t = stripDiacritics(args.texto.toLowerCase());
     const scored = ents
-      .map((e) => ({ entidade_id: e.id, nome: e.nome, score: trigramSim(t, stripDiacritics(e.nome.toLowerCase())) }))
+      .map((e) => ({
+        entidade_id: e.id,
+        nome: e.nome,
+        score: trigramSim(t, stripDiacritics(e.nome.toLowerCase())),
+      }))
       .sort((a, b) => b.score - a.score);
 
-    if (scored.length === 0) return { entidade_id: null, confianca: 0, alternativas: [], ambiguous: true };
+    if (scored.length === 0)
+      return { entidade_id: null, confianca: 0, alternativas: [], ambiguous: true };
     const top = scored[0]!;
     const second = scored[1];
     const ambiguous = top.score < 0.4 || (second !== undefined && top.score - second.score < 0.1);

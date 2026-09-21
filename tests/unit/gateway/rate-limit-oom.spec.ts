@@ -42,7 +42,9 @@ function detectOom(err: unknown): boolean {
   const e = err as { name?: string; code?: string; message?: string };
   if (typeof e.code === 'string' && e.code.toUpperCase() === 'OOM') return true;
   const msg = String(e.message ?? '');
-  return (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg);
+  return (
+    (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg)
+  );
 }
 
 vi.mock('@/lib/redis.js', () => ({
@@ -127,9 +129,12 @@ describe('rate-limit — OOM classification, fail-closed preserved (#309 / PR #3
     });
 
     it('NON-OOM → still fail-closed silence, but VISIBLE via redis_error_total{operation="rate_limit.zset"} (NOT re-thrown)', async () => {
-      const boom = Object.assign(new Error('READONLY You can\'t write against a read only replica.'), {
-        name: 'ReplyError',
-      });
+      const boom = Object.assign(
+        new Error("READONLY You can't write against a read only replica."),
+        {
+          name: 'ReplyError',
+        },
+      );
       redisStub.zadd.mockImplementationOnce(async () => {
         throw boom;
       });

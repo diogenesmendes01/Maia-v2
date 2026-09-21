@@ -114,7 +114,7 @@ async function runConversationSummarizerInner(): Promise<void> {
       } catch (err) {
         logger.warn(
           { err: (err as Error).message, conversa_id: c.id },
-          'conversation_closed.reflection.failed'
+          'conversation_closed.reflection.failed',
         );
       }
       continue;
@@ -130,7 +130,12 @@ async function runConversationSummarizerInner(): Promise<void> {
     const transcript = renderTranscript(chronological);
     try {
       const summarized = await summarizeTranscript(chronological, {
-        module: { name: 'conversation-summarizer', triggered_by: 'async_event', timeoutMs: 30000, conversa_id: c.id },
+        module: {
+          name: 'conversation-summarizer',
+          triggered_by: 'async_event',
+          timeoutMs: 30000,
+          conversa_id: c.id,
+        },
         maxChars: 500,
       });
       const summary = summarized.summary;
@@ -158,7 +163,7 @@ async function runConversationSummarizerInner(): Promise<void> {
       } catch (err) {
         logger.warn(
           { err: (err as Error).message, conversa_id: c.id },
-          'conversation_closed.reflection.failed'
+          'conversation_closed.reflection.failed',
         );
       }
     } catch (err) {

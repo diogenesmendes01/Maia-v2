@@ -29,17 +29,18 @@ describe('hashIdempotencyKey', () => {
     expect(hashIdempotencyKey('abcdefgh')).toBe(hashIdempotencyKey('abcdefgh'));
   });
 
-  it.each([['', 'vazia'], ['short', 'curta demais'], ['   \t  ', 'whitespace']])(
-    'rejeita chave %s (%s)',
-    (key) => {
-      try {
-        hashIdempotencyKey(key);
-        throw new Error('deveria ter lançado');
-      } catch (err) {
-        expect((err as OnboardingError).code).toBe('missing_idempotency_key');
-      }
-    },
-  );
+  it.each([
+    ['', 'vazia'],
+    ['short', 'curta demais'],
+    ['   \t  ', 'whitespace'],
+  ])('rejeita chave %s (%s)', (key) => {
+    try {
+      hashIdempotencyKey(key);
+      throw new Error('deveria ter lançado');
+    } catch (err) {
+      expect((err as OnboardingError).code).toBe('missing_idempotency_key');
+    }
+  });
 
   it.each([null, undefined, 12345678, {}])('rejeita não-string (%p)', (key) => {
     expect(() => hashIdempotencyKey(key)).toThrow(OnboardingError);

@@ -101,10 +101,7 @@ async function loadS3Client(): Promise<{
     };
     return { S3Client: mod.S3Client, PutObjectCommand: mod.PutObjectCommand };
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message },
-      'runtime_trace.debug_s3_client_load_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'runtime_trace.debug_s3_client_load_failed');
     return null;
   }
 }

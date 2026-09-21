@@ -47,14 +47,10 @@ const migracaoDown = readFileSync(
 const repoFonte = readFileSync(resolve(raiz, 'src/db/repositories/turn-repos.ts'), 'utf8');
 const runtimeFonte = readFileSync(resolve(raiz, 'src/runtime/turns/stream-debounce.ts'), 'utf8');
 const workerFonte = readFileSync(resolve(raiz, 'src/workers/stream-debounce-closer.ts'), 'utf8');
-const puroFonte = readFileSync(
-  resolve(raiz, 'src/db/repositories/stream-debounce-sql.ts'),
-  'utf8',
-);
+const puroFonte = readFileSync(resolve(raiz, 'src/db/repositories/stream-debounce-sql.ts'), 'utf8');
 
 const dialeto = new PgDialect();
-const compilar = (fragmento: ReturnType<typeof sql>): string =>
-  dialeto.sqlToQuery(fragmento).sql;
+const compilar = (fragmento: ReturnType<typeof sql>): string => dialeto.sqlToQuery(fragmento).sql;
 
 const escopo = {
   tenant: sql`${'t-1'}`,
@@ -247,11 +243,12 @@ describe('#628 — contrato do debounce transacional', () => {
     const chamadasNoRepo = codigoDoRepo.match(/openDebounceWindowMembers\(/g) ?? [];
     expect(chamadasNoRepo.length).toBe(1);
     expect(codigoDoDebounce).toContain('debounceBatchPrefix(');
-    const chamadasNoPuro = puroFonte
-      .split('\n')
-      .filter((l) => !/^\s*(\*|\/\/)/.test(l))
-      .join('\n')
-      .match(/openDebounceWindowMembers\(/g) ?? [];
+    const chamadasNoPuro =
+      puroFonte
+        .split('\n')
+        .filter((l) => !/^\s*(\*|\/\/)/.test(l))
+        .join('\n')
+        .match(/openDebounceWindowMembers\(/g) ?? [];
     // A definição + os dois usos internos (a CTE de lock e a de candidatos).
     expect(chamadasNoPuro.length).toBe(3);
   });
@@ -370,9 +367,7 @@ describe('#628 — contrato do debounce transacional', () => {
     // Sem envelope de transação (CONCURRENTLY o proíbe), a ordem é a única
     // proteção: morrer entre os dois deixa "colunas sem índice", que é
     // funcional e que reexecutar conserta.
-    expect(migracaoDown.indexOf('DROP INDEX')).toBeLessThan(
-      migracaoDown.indexOf('DROP COLUMN'),
-    );
+    expect(migracaoDown.indexOf('DROP INDEX')).toBeLessThan(migracaoDown.indexOf('DROP COLUMN'));
   });
 
   it('nenhum literal dos arquivos no-transaction contém `;` (o runner quebra por `;`)', () => {

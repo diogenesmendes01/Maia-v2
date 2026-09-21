@@ -16,7 +16,9 @@ const inputSchema = z.object({
     .string()
     .uuid()
     .optional()
-    .describe('UUID opaco da entidade. Omita quando o lembrete não for de uma entidade específica.'),
+    .describe(
+      'UUID opaco da entidade. Omita quando o lembrete não for de uma entidade específica.',
+    ),
   quando: z
     .string()
     .refine(

@@ -19,7 +19,10 @@ function envFor(profile: MaiaProfile, overrides: Record<string, string | undefin
   return { ...buildFixture(profile), ...overrides };
 }
 
-function rules(result: { errors: readonly { rule: string }[]; warnings: readonly { rule: string }[] }) {
+function rules(result: {
+  errors: readonly { rule: string }[];
+  warnings: readonly { rule: string }[];
+}) {
   return {
     errors: result.errors.map((p) => p.rule),
     warnings: result.warnings.map((p) => p.rule),
@@ -54,7 +57,9 @@ describe('validateConfig — per-profile fixtures (#515)', () => {
 
   it('an empty environment reports EVERY missing requirement, not just the first', () => {
     const result = validateConfig({ env: {}, profile: 'production' });
-    const missing = result.errors.filter((p) => p.rule === 'profile/required').map((p) => p.variable);
+    const missing = result.errors
+      .filter((p) => p.rule === 'profile/required')
+      .map((p) => p.variable);
     // MAIA_ENV, DATABASE_URL, POSTGRES_*, REDIS_URL, WHATSAPP/OWNER, backup, admin…
     expect(missing.length).toBeGreaterThan(8);
     // and every problem carries a remediation
@@ -233,22 +238,19 @@ describe('validateConfig — cross-field rules (#515)', () => {
     ['true', 'true'],
     ['true', 'false'],
     ['false', 'false'],
-  ] as const)(
-    'MACHINE=%s + AUTHORITATIVE=%s é uma combinação válida',
-    (machine, authoritative) => {
-      const result = validateConfig({
-        env: envFor('production', {
-          FEATURE_TURN_STATE_MACHINE: machine,
-          FEATURE_TURN_STATE_AUTHORITATIVE: authoritative,
-        }),
-        profile: 'production',
-        allowSyntheticFixtures: true,
-      });
-      expect(
-        result.errors.some((p) => p.rule === 'turn-state/authoritative-requires-dual-write'),
-      ).toBe(false);
-    },
-  );
+  ] as const)('MACHINE=%s + AUTHORITATIVE=%s é uma combinação válida', (machine, authoritative) => {
+    const result = validateConfig({
+      env: envFor('production', {
+        FEATURE_TURN_STATE_MACHINE: machine,
+        FEATURE_TURN_STATE_AUTHORITATIVE: authoritative,
+      }),
+      profile: 'production',
+      allowSyntheticFixtures: true,
+    });
+    expect(
+      result.errors.some((p) => p.rule === 'turn-state/authoritative-requires-dual-write'),
+    ).toBe(false);
+  });
 
   it.each([
     ['anthropic', 'ANTHROPIC_API_KEY'],

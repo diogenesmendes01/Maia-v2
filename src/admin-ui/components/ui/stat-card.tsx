@@ -27,16 +27,9 @@ export function StatCard({
 }) {
   const inner = (
     <div className="relative overflow-hidden rounded-xl border border-zinc-200 bg-white px-5 py-4 shadow-card transition-shadow hover:shadow-md">
-      <span
-        aria-hidden
-        className={cn('absolute inset-y-0 left-0 w-1', ACCENT[tone])}
-      />
-      <p className="text-2xs font-semibold uppercase tracking-wide text-zinc-500">
-        {label}
-      </p>
-      <p className="mt-1.5 text-2xl font-semibold tabular-nums text-zinc-900">
-        {value}
-      </p>
+      <span aria-hidden className={cn('absolute inset-y-0 left-0 w-1', ACCENT[tone])} />
+      <p className="text-2xs font-semibold uppercase tracking-wide text-zinc-500">{label}</p>
+      <p className="mt-1.5 text-2xl font-semibold tabular-nums text-zinc-900">{value}</p>
       {hint && <p className="mt-1 text-xs text-zinc-500">{hint}</p>}
     </div>
   );

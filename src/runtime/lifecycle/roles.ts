@@ -87,7 +87,8 @@ const CORE_REQUIRED = ['config', 'db', 'schema', 'redis', 'redis_memory'] as con
 export const ROLE_CONTRACTS: Readonly<Record<ProcessRole, RoleContract>> = {
   all: {
     role: 'all',
-    description: 'single-process compat mode — serves HTTP, drains the queue, schedules crons and owns the WhatsApp sessions',
+    description:
+      'single-process compat mode — serves HTTP, drains the queue, schedules crons and owns the WhatsApp sessions',
     owns: [...LIFECYCLE_COMPONENTS],
     requires: [
       ...CORE_REQUIRED,
@@ -154,9 +155,7 @@ export function parseProcessRole(raw: string | undefined | null): ProcessRole {
   if (raw === undefined || raw === null || raw === '') return 'all';
   const found = PROCESS_ROLES.find((r) => r === raw);
   if (!found) {
-    throw new Error(
-      `invalid process role "${raw}" — expected one of: ${PROCESS_ROLES.join(', ')}`,
-    );
+    throw new Error(`invalid process role "${raw}" — expected one of: ${PROCESS_ROLES.join(', ')}`);
   }
   return found;
 }

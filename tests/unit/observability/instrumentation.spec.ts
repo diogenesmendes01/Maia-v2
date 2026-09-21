@@ -86,9 +86,9 @@ describe('issue #535 — tool dispatch classification', () => {
 
 describe('issue #535 — instrumentToolDispatch', () => {
   it('returns the wrapped value untouched', async () => {
-    await expect(instrumentToolDispatch('listar', async () => ({ ok: 1 }))).resolves.toEqual(
-      { ok: 1 },
-    );
+    await expect(instrumentToolDispatch('listar', async () => ({ ok: 1 }))).resolves.toEqual({
+      ok: 1,
+    });
   });
 
   it('emits counter + histogram with the tool and the outcome', async () => {
@@ -203,9 +203,8 @@ describe('review da PR #554 — instrumentContextLoad é span-only', () => {
       resolve(__dirname, '../../../src/observability/instrumentation.ts'),
       'utf8',
     );
-    const signature = /export async function instrumentContextLoad<T>\(\s*stage:\s*([A-Za-z]+)/.exec(
-      src,
-    );
+    const signature =
+      /export async function instrumentContextLoad<T>\(\s*stage:\s*([A-Za-z]+)/.exec(src);
     expect(signature, 'assinatura de instrumentContextLoad não encontrada').not.toBeNull();
     expect(signature![1]).toBe('ContextLoadStage');
   });

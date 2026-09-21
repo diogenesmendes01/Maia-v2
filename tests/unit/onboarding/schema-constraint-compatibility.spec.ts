@@ -26,16 +26,9 @@
  * Um literal novo que o schema não admita falha aqui, em segundos, sem banco.
  */
 import { describe, it, expect } from 'vitest';
-import {
-  effectiveCheckIn,
-  forwardMigrations,
-  statements,
-} from './_migration-schema.js';
+import { effectiveCheckIn, forwardMigrations, statements } from './_migration-schema.js';
 
-import {
-  SAGA_ENUM_WRITES,
-  SWITCH_BEHAVIOR_DEFAULT,
-} from '../../../src/onboarding/provisioning.js';
+import { SAGA_ENUM_WRITES, SWITCH_BEHAVIOR_DEFAULT } from '../../../src/onboarding/provisioning.js';
 import {
   AUDIT_FALLBACK_TENANT,
   ONBOARDING_EVENT_TYPES,

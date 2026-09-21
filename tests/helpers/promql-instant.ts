@@ -256,11 +256,7 @@ function evalNode(n: Node, db: SeriesDb): Vector | number {
     // `max()`/`min()` do Prometheus IGNORAM `NaN` enquanto houver amostra
     // finita; com TODAS `NaN`, o resultado é `NaN`. Conferido no promtool.
     const value =
-      finite.length === 0
-        ? Number.NaN
-        : n.fn === 'max'
-          ? Math.max(...finite)
-          : Math.min(...finite);
+      finite.length === 0 ? Number.NaN : n.fn === 'max' ? Math.max(...finite) : Math.min(...finite);
     return [{ labels: {}, value }];
   }
 

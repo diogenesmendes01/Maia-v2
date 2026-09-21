@@ -65,8 +65,7 @@ export const operationalTicketCreateTool: Tool<typeof inputSchema, typeof output
     return {
       created: false,
       status: 'stub_not_created' as const,
-      message:
-        'Criação de chamado ainda não implementada (stub): nenhum chamado foi criado.',
+      message: 'Criação de chamado ainda não implementada (stub): nenhum chamado foi criado.',
     };
   },
 };

@@ -178,22 +178,25 @@ import { PgDialect } from 'drizzle-orm/pg-core';
 import type { SQL } from 'drizzle-orm';
 import { runWithTenantContext } from '../../src/db/tenant-context.js';
 const _dialect = new PgDialect();
-import {
-  seriesRepo,
-  occurrencesRepo,
-  tasksRepo,
-  outboxRepo,
-} from '../../src/scheduling/repos.js';
+import { seriesRepo, occurrencesRepo, tasksRepo, outboxRepo } from '../../src/scheduling/repos.js';
 
 const A = { tenant_id: 'tenant-A', agent_id: 'agent-A' };
 const B = { tenant_id: 'tenant-B', agent_id: 'agent-B' };
 
 function seedSeries(over: Partial<Row> & Pick<Row, 'id' | 'tenant_id' | 'agent_id'>): Row {
-  const row = { status: 'active', version: 1, tipo: 'recurring_payment', rrule: null, ...over } as Row;
+  const row = {
+    status: 'active',
+    version: 1,
+    tipo: 'recurring_payment',
+    rrule: null,
+    ...over,
+  } as Row;
   store.series!.push(row);
   return row;
 }
-function seedOcc(over: Partial<Row> & Pick<Row, 'id' | 'tenant_id' | 'agent_id' | 'series_id'>): Row {
+function seedOcc(
+  over: Partial<Row> & Pick<Row, 'id' | 'tenant_id' | 'agent_id' | 'series_id'>,
+): Row {
   const row = {
     status: 'pending',
     scheduled_for: new Date(),
@@ -204,13 +207,21 @@ function seedOcc(over: Partial<Row> & Pick<Row, 'id' | 'tenant_id' | 'agent_id' 
   store.occurrences!.push(row);
   return row;
 }
-function seedTask(over: Partial<Row> & Pick<Row, 'id' | 'tenant_id' | 'agent_id' | 'occurrence_id'>): Row {
+function seedTask(
+  over: Partial<Row> & Pick<Row, 'id' | 'tenant_id' | 'agent_id' | 'occurrence_id'>,
+): Row {
   const row = { status: 'pending', kind: 'fire_reminder', ordem: 1, ...over } as Row;
   store.tasks!.push(row);
   return row;
 }
 function seedOutbox(over: Partial<Row> & Pick<Row, 'id' | 'tenant_id' | 'agent_id'>): Row {
-  const row = { status: 'pending', kind: 'whatsapp_text', payload: {}, attempts: 0, ...over } as Row;
+  const row = {
+    status: 'pending',
+    kind: 'whatsapp_text',
+    payload: {},
+    attempts: 0,
+    ...over,
+  } as Row;
   store.outbox_messages!.push(row);
   return row;
 }
@@ -247,11 +258,27 @@ describe('scheduling tenant isolation — reads', () => {
   it('occurrencesRepo.findActiveByCorrelation: a shared token never crosses tenants', async () => {
     // Same correlation token under both tenants (tokens are only 4 hex chars —
     // collisions across tenants are realistic). A must only ever see its own.
-    seedOcc({ id: 'o-a', series_id: 's-a', ...A, status: 'awaiting_third_party', correlation_token: 'A4F2' });
-    seedOcc({ id: 'o-b', series_id: 's-b', ...B, status: 'awaiting_third_party', correlation_token: 'A4F2' });
-    const asA = await runWithTenantContext(A, () => occurrencesRepo.findActiveByCorrelation('A4F2'));
+    seedOcc({
+      id: 'o-a',
+      series_id: 's-a',
+      ...A,
+      status: 'awaiting_third_party',
+      correlation_token: 'A4F2',
+    });
+    seedOcc({
+      id: 'o-b',
+      series_id: 's-b',
+      ...B,
+      status: 'awaiting_third_party',
+      correlation_token: 'A4F2',
+    });
+    const asA = await runWithTenantContext(A, () =>
+      occurrencesRepo.findActiveByCorrelation('A4F2'),
+    );
     expect(asA?.id).toBe('o-a');
-    const asB = await runWithTenantContext(B, () => occurrencesRepo.findActiveByCorrelation('A4F2'));
+    const asB = await runWithTenantContext(B, () =>
+      occurrencesRepo.findActiveByCorrelation('A4F2'),
+    );
     expect(asB?.id).toBe('o-b');
   });
 
@@ -354,9 +381,9 @@ describe('scheduling tenant isolation — mutations fail loud + revert-check', (
 
   it('outboxRepo.markSent: A marking a B outbox row FAILS LOUD and leaves B untouched', async () => {
     seedOutbox({ id: 'ob-b', ...B, status: 'claimed' });
-    await expect(
-      runWithTenantContext(A, () => outboxRepo.markSent('ob-b')),
-    ).rejects.toThrow(/matched 0 rows|cross-tenant/i);
+    await expect(runWithTenantContext(A, () => outboxRepo.markSent('ob-b'))).rejects.toThrow(
+      /matched 0 rows|cross-tenant/i,
+    );
     expect(store.outbox_messages!.find((r) => r.id === 'ob-b')!.status).toBe('claimed');
     await runWithTenantContext(B, () => outboxRepo.markSent('ob-b'));
     expect(store.outbox_messages!.find((r) => r.id === 'ob-b')!.status).toBe('sent');

@@ -85,20 +85,20 @@ function hold(over: Partial<HoldRecord> = {}): HoldRecord {
   };
 }
 
-function world(opts: {
-  rows?: Row[];
-  files?: Record<string, FileNode>;
-  holds?: readonly HoldRecord[] | null;
-  lyingRemove?: boolean;
-  finalizeThrowsOn?: string;
-  listThrows?: boolean;
-  bindingOverride?: (id: string) => { locator: string } | null | undefined;
-} = {}) {
+function world(
+  opts: {
+    rows?: Row[];
+    files?: Record<string, FileNode>;
+    holds?: readonly HoldRecord[] | null;
+    lyingRemove?: boolean;
+    finalizeThrowsOn?: string;
+    listThrows?: boolean;
+    bindingOverride?: (id: string) => { locator: string } | null | undefined;
+  } = {},
+) {
   const rows = new Map((opts.rows ?? [row()]).map((r) => [r.request_id, { ...r }]));
   const files = new Map<string, FileNode>(
-    Object.entries(
-      opts.files ?? { [nodePath.join(ROOT, `${LOC_A}.enc`)]: {} },
-    ),
+    Object.entries(opts.files ?? { [nodePath.join(ROOT, `${LOC_A}.enc`)]: {} }),
   );
   const audits: { action: string; metadata: Record<string, unknown> }[] = [];
   const logs: { event: string; detail: Record<string, unknown> }[] = [];
@@ -218,9 +218,10 @@ describe('planExportSweep — a decisão pura', () => {
   });
 
   it('mantém o que ainda não venceu', () => {
-    expect(
-      planExportSweep([c({ expires_at: FUTURE })], NOW, () => false)[0].decision,
-    ).toEqual({ action: 'keep', reason: 'not_expired' });
+    expect(planExportSweep([c({ expires_at: FUTURE })], NOW, () => false)[0].decision).toEqual({
+      action: 'keep',
+      reason: 'not_expired',
+    });
   });
 
   it('mantém o que já foi varrido — a segunda passagem não repete trabalho', () => {
@@ -252,9 +253,10 @@ describe('planExportSweep — a decisão pura', () => {
       action: 'keep',
       reason: 'legal_hold',
     });
-    expect(
-      planExportSweep([c({ expires_at: FUTURE })], NOW, () => true)[0].decision,
-    ).toEqual({ action: 'keep', reason: 'legal_hold' });
+    expect(planExportSweep([c({ expires_at: FUTURE })], NOW, () => true)[0].decision).toEqual({
+      action: 'keep',
+      reason: 'legal_hold',
+    });
   });
 });
 

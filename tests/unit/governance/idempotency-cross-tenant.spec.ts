@@ -86,14 +86,12 @@ vi.mock('drizzle-orm', () => {
     },
   });
   const and = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
+    __pred: (row: Row) => conds.every((c) => (isPredObj(c) ? c.__pred(row) : true)),
   });
   // Pass-through stubs for operators imported by `repositories.ts` even if
   // unused on the idempotency paths under test.
   const or = (...conds: unknown[]): PredObj => ({
-    __pred: (row: Row) =>
-      conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
+    __pred: (row: Row) => conds.some((c) => (isPredObj(c) ? c.__pred(row) : false)),
   });
   const inArray = (col: unknown, vals: unknown[]): PredObj => ({
     __pred: (row: Row) => {
@@ -233,7 +231,10 @@ class SelectBuilder {
     return this;
   }
   private exec(): Row[] {
-    return store.filter(this._pred).slice(0, this._limit).map((r) => ({ ...r }));
+    return store
+      .filter(this._pred)
+      .slice(0, this._limit)
+      .map((r) => ({ ...r }));
   }
   then(resolve: (v: Row[]) => unknown, reject?: (e: unknown) => unknown) {
     try {
@@ -305,10 +306,7 @@ vi.mock('@/db/client.js', () => {
 // ---------------------------------------------------------------------------
 // Imports — pulled AFTER mocks per vitest hoisting rules.
 // ---------------------------------------------------------------------------
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 
 const A_CTX = { tenant_id: 'tenant-A', agent_id: 'agent-A' };
 const B_CTX = { tenant_id: 'tenant-B', agent_id: 'agent-B' };

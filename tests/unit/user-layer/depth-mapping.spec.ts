@@ -1,8 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  getUserMaxItems,
-  getKnowledgeMaxes,
-} from '@/user-layer/internal/depth-mapping.js';
+import { getUserMaxItems, getKnowledgeMaxes } from '@/user-layer/internal/depth-mapping.js';
 
 describe('user-layer depth-mapping', () => {
   describe('getUserMaxItems (UserSlice)', () => {

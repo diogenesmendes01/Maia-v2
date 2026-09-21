@@ -163,8 +163,7 @@ async function expiredCounter(): Promise<number> {
   return out
     .split('\n')
     .filter(
-      (l) =>
-        l.startsWith('maia_onboarding_run_cancelled_total{') && l.includes('reason="expired"'),
+      (l) => l.startsWith('maia_onboarding_run_cancelled_total{') && l.includes('reason="expired"'),
     )
     .reduce((acc, l) => acc + Number(l.slice(l.lastIndexOf('} ') + 2)), 0);
 }

@@ -54,7 +54,8 @@ vi.mock('@/db/client.js', () => {
       select: makeSelect,
       insert: () => ({
         values: (v: any) => ({
-          returning: () => Promise.resolve([{ ...v, id: `ins-${Date.now()}`, created_at: new Date() }]),
+          returning: () =>
+            Promise.resolve([{ ...v, id: `ins-${Date.now()}`, created_at: new Date() }]),
         }),
       }),
       update: () => ({
@@ -131,9 +132,9 @@ describe('round-2 finding 1 — tenant-wide skill guard (agent context rejected)
     nextSelectRows = [tenantWideRow('proposed')];
 
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-A' }, async () => {
-      await expect(
-        skillsRepo.activate('tw-skill-id', 'agent-A'),
-      ).rejects.toThrow('tenant_admin_required');
+      await expect(skillsRepo.activate('tw-skill-id', 'agent-A')).rejects.toThrow(
+        'tenant_admin_required',
+      );
     });
   });
 
@@ -143,9 +144,9 @@ describe('round-2 finding 1 — tenant-wide skill guard (agent context rejected)
     nextSelectRows = [tenantWideRow('active')];
 
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-A' }, async () => {
-      await expect(
-        skillsRepo.deprecate('tw-skill-id', 'agent-A', 'reason'),
-      ).rejects.toThrow('tenant_admin_required');
+      await expect(skillsRepo.deprecate('tw-skill-id', 'agent-A', 'reason')).rejects.toThrow(
+        'tenant_admin_required',
+      );
     });
   });
 
@@ -154,9 +155,9 @@ describe('round-2 finding 1 — tenant-wide skill guard (agent context rejected)
     nextSelectRows = [tenantWideRow('active')];
 
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-A' }, async () => {
-      await expect(
-        skillsRepo.rollback('tw-skill-id', 'bad skill', 'agent-A'),
-      ).rejects.toThrow('tenant_admin_required');
+      await expect(skillsRepo.rollback('tw-skill-id', 'bad skill', 'agent-A')).rejects.toThrow(
+        'tenant_admin_required',
+      );
     });
   });
 });
@@ -243,9 +244,9 @@ describe('round-2 finding 3 — tool idempotency key stability', () => {
 
     expect(dispatchedKeys).toHaveLength(1);
     const key = dispatchedKeys[0]!;
-    expect(key).toContain('default');      // tenant
-    expect(key).toContain('agent-A');      // agent
-    expect(key).toContain('tm-idem-1');    // skill id
+    expect(key).toContain('default'); // tenant
+    expect(key).toContain('agent-A'); // agent
+    expect(key).toContain('tm-idem-1'); // skill id
     expect(key).toContain('turn-stable-42'); // turno_id
   });
 
@@ -276,9 +277,19 @@ describe('round-2 finding 3 — tool idempotency key stability', () => {
 
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'agent-A' }, async () => {
       makeLLMResponses();
-      await toolMediatedMode({ skill: baseSkill, input: {}, resolvedPolicies: [], turno_id: 'turn-retry-99' });
+      await toolMediatedMode({
+        skill: baseSkill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: 'turn-retry-99',
+      });
       makeLLMResponses();
-      await toolMediatedMode({ skill: baseSkill, input: {}, resolvedPolicies: [], turno_id: 'turn-retry-99' });
+      await toolMediatedMode({
+        skill: baseSkill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: 'turn-retry-99',
+      });
     });
 
     expect(dispatchedKeys).toHaveLength(2);

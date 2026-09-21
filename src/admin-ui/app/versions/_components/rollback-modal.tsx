@@ -8,11 +8,7 @@ import { Field, Textarea } from '../../../components/ui/field.js';
 import { Alert } from '../../../components/ui/states.js';
 import type { VersionItem } from './versions-table.js';
 
-type SotKind =
-  | 'agent_operational_profile_versions'
-  | 'policy_rules'
-  | 'soul_biases'
-  | 'skills';
+type SotKind = 'agent_operational_profile_versions' | 'policy_rules' | 'soul_biases' | 'skills';
 
 /**
  * Fluxo de reversão (Tela 3). Toda tentativa — sucesso OU falha — é gravada
@@ -70,11 +66,7 @@ export default function RollbackModal({
           <Button variant="secondary" onClick={onClose}>
             Cancelar
           </Button>
-          <Button
-            variant="danger"
-            loading={mutation.isPending}
-            onClick={() => void handleSubmit()}
-          >
+          <Button variant="danger" loading={mutation.isPending} onClick={() => void handleSubmit()}>
             Confirmar reversão
           </Button>
         </>

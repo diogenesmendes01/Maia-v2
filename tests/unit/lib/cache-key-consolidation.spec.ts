@@ -39,10 +39,7 @@ import {
   buildUserSliceCacheKey,
   buildKnowledgeSliceCacheKey,
 } from '@/user-layer/internal/cache-keys.js';
-import {
-  sliceCacheKey,
-  InMemorySliceCache,
-} from '@/runtime/context-packet/cache/slice-cache.js';
+import { sliceCacheKey, InMemorySliceCache } from '@/runtime/context-packet/cache/slice-cache.js';
 import { cacheKey as holidaysCacheKey } from '@/lib/holidays-cache.js';
 
 // `skill-slice-builder.ts` imports `skillsRepo` from the repositories barrel;
@@ -51,9 +48,7 @@ import { cacheKey as holidaysCacheKey } from '@/lib/holidays-cache.js';
 vi.mock('@/db/repositories.js', () => ({ skillsRepo: {} }));
 
 const { skillSliceCacheKey } = await import('@/skills/skill-slice-builder.js');
-const { sliceCache, invalidateSkillSliceCacheForTenant } = await import(
-  '@/skills/cache.js'
-);
+const { sliceCache, invalidateSkillSliceCacheForTenant } = await import('@/skills/cache.js');
 
 // ---------------------------------------------------------------------------
 // user-layer/internal/cache-keys.ts

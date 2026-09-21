@@ -21,10 +21,7 @@ import { incCounter } from '@/lib/metrics.js';
 import { sleep } from '@/lib/utils.js';
 import { knowledgeRepos, KnowledgeConflictError } from './repos.js';
 import { KnowledgeRiskScorer } from './risk-scorer.js';
-import {
-  assertAllowedTransition,
-  IllegalTransitionError,
-} from './transitions.js';
+import { assertAllowedTransition, IllegalTransitionError } from './transitions.js';
 import type {
   KnowledgeKind,
   KnowledgeLifecycleStatus,
@@ -86,9 +83,7 @@ export class KnowledgeStateMachine {
    *     success. Returning `proposal_id: ''` would let callers
    *     audit/cache a nonexistent row.
    */
-  static async propose(
-    input: KnowledgeProposalInput,
-  ): Promise<KnowledgeProposeResult> {
+  static async propose(input: KnowledgeProposalInput): Promise<KnowledgeProposeResult> {
     // Step 1 — score risk under a 300ms budget. On timeout/error we
     // synthesise a conservative score so decideInitialStatus routes to
     // pending_review (master §14 — fail-safe is conservative).
@@ -148,9 +143,7 @@ export class KnowledgeStateMachine {
     };
 
     const evidence_count =
-      input.origin === 'user_explicit' || input.origin === 'human_approved'
-        ? 1
-        : 0;
+      input.origin === 'user_explicit' || input.origin === 'human_approved' ? 1 : 0;
 
     // Step 3 — persist the row synchronously, outside the timeout race.
     // If the DB insert fails we throw — never return success with an
@@ -204,14 +197,10 @@ export class KnowledgeStateMachine {
    * (auto-promoter) treat IllegalTransitionError on parallel-promote
    * races as benign; human-driven paths surface it to the operator.
    */
-  static async transition(
-    args: KnowledgeTransitionInput,
-  ): Promise<KnowledgeTransitionResult> {
+  static async transition(args: KnowledgeTransitionInput): Promise<KnowledgeTransitionResult> {
     const current = await knowledgeRepos.findById(args.kind, args.proposal_id);
     if (!current) {
-      throw new Error(
-        `knowledge_not_found:${args.kind}:${args.proposal_id}`,
-      );
+      throw new Error(`knowledge_not_found:${args.kind}:${args.proposal_id}`);
     }
 
     // Validates ALLOWED_TRANSITIONS table — throws IllegalTransitionError
@@ -224,9 +213,7 @@ export class KnowledgeStateMachine {
       at: new Date().toISOString(),
       reason: args.reason,
       decided_by: args.decided_by,
-      ...(args.evidence_id !== undefined
-        ? { evidence_id: args.evidence_id }
-        : {}),
+      ...(args.evidence_id !== undefined ? { evidence_id: args.evidence_id } : {}),
     };
 
     try {
@@ -240,10 +227,7 @@ export class KnowledgeStateMachine {
         // Re-read to surface what the row actually became — this lets
         // workers tell apart "already promoted by sibling" from "human
         // revoked under us" and skip vs. raise accordingly.
-        const fresh = await knowledgeRepos.findById(
-          args.kind,
-          args.proposal_id,
-        );
+        const fresh = await knowledgeRepos.findById(args.kind, args.proposal_id);
         const now = fresh?.lifecycle_status ?? current.lifecycle_status;
         logger.warn(
           {
@@ -328,9 +312,7 @@ export class KnowledgeStateMachine {
    *   without parsing the generic counter (PR #279 Codex review —
    *   Critical [exhaustion observability]).
    */
-  static async revoke(
-    args: KnowledgeRevokeInput,
-  ): Promise<KnowledgeRevokeResult> {
+  static async revoke(args: KnowledgeRevokeInput): Promise<KnowledgeRevokeResult> {
     const MAX_REVOKE_RETRIES = 3;
 
     // Pre-check: short-circuit before any DB read/write if the caller
@@ -349,9 +331,7 @@ export class KnowledgeStateMachine {
 
     const current = await knowledgeRepos.findById(args.kind, args.proposal_id);
     if (!current) {
-      throw new Error(
-        `knowledge_not_found:${args.kind}:${args.proposal_id}`,
-      );
+      throw new Error(`knowledge_not_found:${args.kind}:${args.proposal_id}`);
     }
 
     if (current.lifecycle_status === 'revoked') {
@@ -396,10 +376,7 @@ export class KnowledgeStateMachine {
       try {
         await knowledgeRepos.update(args.kind, args.proposal_id, {
           lifecycle_status: 'revoked',
-          lifecycle_transitions: [
-            ...observed.lifecycle_transitions,
-            transition,
-          ],
+          lifecycle_transitions: [...observed.lifecycle_transitions, transition],
           expected_previous_status: observed.lifecycle_status,
         });
         logger.warn(
@@ -423,15 +400,9 @@ export class KnowledgeStateMachine {
         lastConflict = err;
 
         // Re-read to see what the row actually became.
-        const fresh = await knowledgeRepos.findById(
-          args.kind,
-          args.proposal_id,
-        );
+        const fresh = await knowledgeRepos.findById(args.kind, args.proposal_id);
         if (!fresh) {
-          throw new Error(
-            `knowledge_not_found:${args.kind}:${args.proposal_id}`,
-            { cause: err },
-          );
+          throw new Error(`knowledge_not_found:${args.kind}:${args.proposal_id}`, { cause: err });
         }
         if (fresh.lifecycle_status === 'revoked') {
           // Concurrent revoke landed first — idempotent no-op. Log +

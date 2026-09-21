@@ -18,10 +18,7 @@ export interface BusinessDayOptions {
   tz?: string;
 }
 
-export async function isBusinessDayBR(
-  date: Date,
-  options?: BusinessDayOptions,
-): Promise<boolean> {
+export async function isBusinessDayBR(date: Date, options?: BusinessDayOptions): Promise<boolean> {
   const kind: BusinessDayKind = options?.kind ?? 'standard';
   const dow = date.getUTCDay();
   if (dow === 0) return false;
@@ -38,8 +35,7 @@ export async function isBusinessDayBR(
     });
     return new Set(
       rows.map(
-        (r) =>
-          `${year}-${String(r.month).padStart(2, '0')}-${String(r.day).padStart(2, '0')}`,
+        (r) => `${year}-${String(r.month).padStart(2, '0')}-${String(r.day).padStart(2, '0')}`,
       ),
     );
   });
@@ -51,10 +47,7 @@ export async function isBusinessDayBR(
 /**
  * Próximo dia útil estritamente após a data dada (limite de segurança: 365 iter).
  */
-export async function nextBusinessDayBR(
-  date: Date,
-  options?: BusinessDayOptions,
-): Promise<Date> {
+export async function nextBusinessDayBR(date: Date, options?: BusinessDayOptions): Promise<Date> {
   let d = new Date(date.getTime());
   for (let i = 0; i < 365; i++) {
     d = new Date(d.getTime() + 86_400_000);
@@ -166,6 +159,10 @@ export async function getNextHoliday(args: {
   entidadeId?: string;
 }): Promise<HolidayInRange | null> {
   const horizonEnd = new Date(args.from.getTime() + 366 * 86_400_000);
-  const all = await getHolidaysInRange({ start: args.from, end: horizonEnd, entidadeId: args.entidadeId });
+  const all = await getHolidaysInRange({
+    start: args.from,
+    end: horizonEnd,
+    entidadeId: args.entidadeId,
+  });
   return all[0] ?? null;
 }

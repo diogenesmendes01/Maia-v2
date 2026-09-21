@@ -10,10 +10,7 @@
  * classification table, and the fail-UP rules (unknown field / incompatible
  * schema_version / unreadable predecessor ⇒ high).
  */
-export {
-  classifyProfileChangeRisk,
-  PROFILE_FIELD_CLASSIFICATIONS,
-} from '../../db/profile-risk.js';
+export { classifyProfileChangeRisk, PROFILE_FIELD_CLASSIFICATIONS } from '../../db/profile-risk.js';
 export type {
   ProfileChangeEntry,
   ProfileFieldClassification,

@@ -130,7 +130,11 @@ import {
   OutboundDeliveryError,
 } from '@/agent/output-dispatch.js';
 
-const pessoa = { id: 'p_1', telefone_whatsapp: '+5511999999999', preferencias: null } as unknown as Pessoa;
+const pessoa = {
+  id: 'p_1',
+  telefone_whatsapp: '+5511999999999',
+  preferencias: null,
+} as unknown as Pessoa;
 const conversa = { id: 'c_1', channel_id: null } as Conversa;
 
 function mkCtx(overrides?: Partial<Parameters<typeof dispatchOutput>[0]>) {
@@ -148,7 +152,12 @@ function mkCtx(overrides?: Partial<Parameters<typeof dispatchOutput>[0]>) {
   };
 }
 
-const audioInbound = { id: 'msg_1', conteudo: 'oi', metadata: null, tipo: 'audio' } as unknown as Mensagem;
+const audioInbound = {
+  id: 'msg_1',
+  conteudo: 'oi',
+  metadata: null,
+  tipo: 'audio',
+} as unknown as Mensagem;
 
 beforeEach(() => {
   vi.clearAllMocks();
@@ -402,9 +411,7 @@ describe('dispatchOutput — PDF + poll phase tagging (Codex #216 round-3)', () 
 
   it('poll happy path ⇒ resolves, persisted once', async () => {
     cfg.FEATURE_ONE_TAP = true;
-    await expect(
-      dispatchOutput(mkCtx({ latestPending: pollPending })),
-    ).resolves.toBeUndefined();
+    await expect(dispatchOutput(mkCtx({ latestPending: pollPending }))).resolves.toBeUndefined();
     expect(m.sendPoll).toHaveBeenCalledOnce();
     expect(m.createMensagem).toHaveBeenCalledOnce();
   });
@@ -615,9 +622,7 @@ describe('dispatchOutput — document discriminator (#227 DOC_READ_FAILED)', () 
     // sets ambiguous=false → ledger 'failed' → retryable; without it the
     // dispatch would record 'unknown' and the boundary guard would block
     // retry, reviving the HIGH-1 silent-drop #216 closed for documents.
-    const docReadErr = new Error(
-      'document_read_failed: ENOENT',
-    ) as Error & { code?: string };
+    const docReadErr = new Error('document_read_failed: ENOENT') as Error & { code?: string };
     docReadErr.code = 'DOC_READ_FAILED';
     m.sendOutboundDocument.mockRejectedValue(docReadErr);
     const err = await dispatchOutput(pdfCtx()).catch((e) => e);
@@ -700,10 +705,6 @@ describe('dispatchOutput — fail-open on claim throw (#227 blocker 6)', () => {
     const err = await dispatchOutput(mkCtx()).catch((e) => e);
     expect(err).toBeInstanceOf(OutboundDeliveryError);
     expect((err as OutboundDeliveryError).delivered).toBe(true);
-    expect(m.markFailed).toHaveBeenCalledWith(
-      'c_1:msg_1',
-      'socket_closed',
-      true,
-    );
+    expect(m.markFailed).toHaveBeenCalledWith('c_1:msg_1', 'socket_closed', true);
   });
 });

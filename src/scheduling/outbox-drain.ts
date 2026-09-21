@@ -28,11 +28,7 @@ import { withDeclaredEgressException } from '@/runtime/outbound/egress-guard.js'
 import { sendAlert } from '@/lib/alerts.js';
 import { outboxRepo, occurrencesRepo, tasksRepo } from './repos.js';
 import { tryAcquireSendSlot, releasePaceKey } from './backpressure.js';
-import type {
-  EmailAlertPayload,
-  WhatsappAlertPayload,
-  WhatsappTextPayload,
-} from './types.js';
+import type { EmailAlertPayload, WhatsappAlertPayload, WhatsappTextPayload } from './types.js';
 import type { OutboxMessage } from '@/db/schema.js';
 import { hostname } from 'node:os';
 import { randomUUID } from 'node:crypto';
@@ -132,9 +128,13 @@ async function processOne(msg: OutboxMessage): Promise<'sent' | 'failed' | 'rate
       // Schedule a backoff that respects the cause:
       //   per_second → 1s    per_recipient → 2s    per_hour → 60s    redis_down → 30s
       const wait =
-        decision.reason === 'per_second' ? 1 :
-        decision.reason === 'per_recipient' ? 2 :
-        decision.reason === 'per_hour' ? 60 : 30;
+        decision.reason === 'per_second'
+          ? 1
+          : decision.reason === 'per_recipient'
+            ? 2
+            : decision.reason === 'per_hour'
+              ? 60
+              : 30;
       await outboxRepo.markFailedRetryable(msg.id, `rate_limit:${decision.reason}`, wait);
       return 'rate_limited';
     }
@@ -271,10 +271,7 @@ async function onMessageDead(msg: OutboxMessage): Promise<void> {
       }
     }
   } catch (err) {
-    logger.warn(
-      { err: (err as Error).message, outbox_id: msg.id },
-      'outbox_drain.on_dead_failed',
-    );
+    logger.warn({ err: (err as Error).message, outbox_id: msg.id }, 'outbox_drain.on_dead_failed');
   }
 }
 
@@ -286,7 +283,12 @@ type Channel =
       /** Recebe a linha JÁ resolvida/gated pelo processOne (nunca null aqui). */
       send: (line: LineOutput | null) => Promise<unknown>;
     }
-  | { kind: 'email'; requiresBaileys: false; jid: null; send: (line: LineOutput | null) => Promise<unknown> };
+  | {
+      kind: 'email';
+      requiresBaileys: false;
+      jid: null;
+      send: (line: LineOutput | null) => Promise<unknown>;
+    };
 
 function pickChannel(msg: OutboxMessage): Channel | null {
   const payload = msg.payload as unknown;
@@ -314,8 +316,8 @@ function pickChannel(msg: OutboxMessage): Channel | null {
     }
     case 'whatsapp_pending_question': {
       void payload; // reserved for future poll-mode usage; engine currently
-                    // enqueues the pergunta as `whatsapp_text` so it goes
-                    // through the standard send path.
+      // enqueues the pergunta as `whatsapp_text` so it goes
+      // through the standard send path.
       return null;
     }
     case 'email_alert': {

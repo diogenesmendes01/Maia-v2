@@ -23,10 +23,7 @@
 import { describe, it, expect } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import { and } from 'drizzle-orm';
-import {
-  absorberFenceCondition,
-  turnWriteConditions,
-} from '@/db/repositories/turn-fence-sql.js';
+import { absorberFenceCondition, turnWriteConditions } from '@/db/repositories/turn-fence-sql.js';
 
 const dialect = new PgDialect();
 

@@ -159,7 +159,10 @@ describe('generated artifacts — semantics (#515)', () => {
 
   it('the manifest answers "which variables belong to this service"', () => {
     const manifest = buildServiceManifest(MAIA_PROFILES) as {
-      services: Record<string, { secrets: string[]; by_profile: Record<string, { required: string[] }> }>;
+      services: Record<
+        string,
+        { secrets: string[]; by_profile: Record<string, { required: string[] }> }
+      >;
     };
     expect(Object.keys(manifest.services).sort()).toEqual(
       ['admin-ui', 'backup', 'maintenance', 'migrator', 'runtime'].sort(),

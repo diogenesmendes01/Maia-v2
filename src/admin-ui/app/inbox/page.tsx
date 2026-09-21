@@ -71,9 +71,7 @@ export default function InboxPage() {
   // fila (contador/tabela/diff/decisão) — o card bespoke e o agregado
   // `pendingProfileApprovals` (#492) foram removidos; o total do header já os
   // inclui via counters.operational_profile.
-  const total = counters
-    ? Object.values(counters).reduce((a, b) => a + b, 0)
-    : null;
+  const total = counters ? Object.values(counters).reduce((a, b) => a + b, 0) : null;
 
   return (
     <div>
@@ -171,8 +169,8 @@ export default function InboxPage() {
       {canBulkReject && selectedIds.length > 0 && (
         <div className="sticky bottom-4 z-10 mt-4 flex flex-wrap items-center justify-between gap-3 rounded-xl border border-zinc-200 bg-white px-5 py-3 shadow-overlay">
           <span className="text-sm text-zinc-700">
-            <strong className="font-semibold">{selectedIds.length}</strong>{' '}
-            proposta{selectedIds.length === 1 ? '' : 's'} selecionada
+            <strong className="font-semibold">{selectedIds.length}</strong> proposta
+            {selectedIds.length === 1 ? '' : 's'} selecionada
             {selectedIds.length === 1 ? '' : 's'}
           </span>
           <div className="flex items-center gap-2">

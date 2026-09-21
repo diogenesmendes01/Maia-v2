@@ -9,20 +9,8 @@ import { Badge, StatusBadge } from '../../../components/ui/badge.js';
 import { Button } from '../../../components/ui/button.js';
 import { Field, Input, Select, Textarea } from '../../../components/ui/field.js';
 import { Modal } from '../../../components/ui/modal.js';
-import {
-  Alert,
-  EmptyState,
-  ErrorState,
-  LoadingState,
-} from '../../../components/ui/states.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../../components/ui/table.js';
+import { Alert, EmptyState, ErrorState, LoadingState } from '../../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../../components/ui/table.js';
 import { IconPlus, IconWrench } from '../../../components/ui/icons.js';
 
 /**
@@ -65,9 +53,9 @@ export default function McpPage() {
       />
 
       <Alert tone="warning" title="Flag de runtime">
-        A visibilidade/execução de tools MCP exige <code>FEATURE_MCP_TOOLS=true</code>{' '}
-        no processo do runtime (default desligado, fail-closed). Aprovações e
-        grants podem ser preparados antes de ligar.
+        A visibilidade/execução de tools MCP exige <code>FEATURE_MCP_TOOLS=true</code> no processo
+        do runtime (default desligado, fail-closed). Aprovações e grants podem ser preparados antes
+        de ligar.
       </Alert>
 
       <div className="mt-5">
@@ -95,8 +83,17 @@ export default function McpPage() {
         ) : (
           <div className="space-y-4">
             {servers.map((s) => {
-              const test = s.last_test_result as { ok?: boolean; tool_count?: number; error?: string } | null;
-              const sync = s.last_sync_result as { ok?: boolean; total?: number; suspended?: number; error?: string } | null;
+              const test = s.last_test_result as {
+                ok?: boolean;
+                tool_count?: number;
+                error?: string;
+              } | null;
+              const sync = s.last_sync_result as {
+                ok?: boolean;
+                total?: number;
+                suspended?: number;
+                error?: string;
+              } | null;
               return (
                 <Card key={s.id}>
                   <CardHeader
@@ -120,7 +117,11 @@ export default function McpPage() {
                     actions={
                       canManage && (
                         <span className="flex flex-wrap gap-2">
-                          <TestSyncButtons tenantId={tenantId} serverId={s.id} onDone={() => void serversQuery.refetch()} />
+                          <TestSyncButtons
+                            tenantId={tenantId}
+                            serverId={s.id}
+                            onDone={() => void serversQuery.refetch()}
+                          />
                           <Button
                             size="sm"
                             variant="secondary"
@@ -134,10 +135,16 @@ export default function McpPage() {
                   />
                   <CardBody className="flex flex-wrap gap-2 text-xs text-zinc-600">
                     <Badge tone={test ? (test.ok ? 'success' : 'danger') : 'neutral'}>
-                      teste: {test ? (test.ok ? `ok (${test.tool_count} tools)` : `falhou`) : 'nunca'}
+                      teste:{' '}
+                      {test ? (test.ok ? `ok (${test.tool_count} tools)` : `falhou`) : 'nunca'}
                     </Badge>
                     <Badge tone={sync ? (sync.ok ? 'success' : 'danger') : 'neutral'}>
-                      sync: {sync ? (sync.ok ? `ok (${sync.total} tools${sync.suspended ? `, ${sync.suspended} suspensas` : ''})` : 'falhou') : 'nunca'}
+                      sync:{' '}
+                      {sync
+                        ? sync.ok
+                          ? `ok (${sync.total} tools${sync.suspended ? `, ${sync.suspended} suspensas` : ''})`
+                          : 'falhou'
+                        : 'nunca'}
                     </Badge>
                     {test && !test.ok && test.error && (
                       <span className="text-red-600">{test.error}</span>
@@ -182,9 +189,7 @@ function TestSyncButtons({
         size="sm"
         variant="ghost"
         loading={testMutation.isPending}
-        onClick={() =>
-          void testMutation.mutateAsync({ tenantId, serverId }).then(onDone)
-        }
+        onClick={() => void testMutation.mutateAsync({ tenantId, serverId }).then(onDone)}
       >
         Testar conexão
       </Button>
@@ -192,9 +197,7 @@ function TestSyncButtons({
         size="sm"
         variant="ghost"
         loading={syncMutation.isPending}
-        onClick={() =>
-          void syncMutation.mutateAsync({ tenantId, serverId }).then(onDone)
-        }
+        onClick={() => void syncMutation.mutateAsync({ tenantId, serverId }).then(onDone)}
       >
         Sincronizar tools
       </Button>
@@ -222,7 +225,12 @@ function ServerDetail({
     name: string;
   } | null>(null);
 
-  if (toolsQuery.isLoading) return <CardBody><LoadingState label="Carregando tools…" /></CardBody>;
+  if (toolsQuery.isLoading)
+    return (
+      <CardBody>
+        <LoadingState label="Carregando tools…" />
+      </CardBody>
+    );
   if (toolsQuery.error)
     return (
       <CardBody>
@@ -257,15 +265,22 @@ function ServerDetail({
                 {tools.map((t) => (
                   <Tr key={t.id}>
                     <Td className="font-mono text-xs">{t.tool_name}</Td>
-                    <Td className="max-w-xs truncate text-xs text-zinc-600" title={t.description ?? ''}>
+                    <Td
+                      className="max-w-xs truncate text-xs text-zinc-600"
+                      title={t.description ?? ''}
+                    >
                       {t.description ?? '—'}
                     </Td>
-                    <Td><StatusBadge status={t.risk_class} /></Td>
+                    <Td>
+                      <StatusBadge status={t.risk_class} />
+                    </Td>
                     <Td>
                       <span className="flex items-center gap-1">
                         <StatusBadge status={t.status} />
                         {t.status === 'approved' && !t.is_read_only && (
-                          <Badge tone="warning" className="text-2xs">write — bloqueada na v1</Badge>
+                          <Badge tone="warning" className="text-2xs">
+                            write — bloqueada na v1
+                          </Badge>
                         )}
                       </span>
                     </Td>
@@ -385,23 +400,53 @@ function RegisterModal({
       description="O registro é auditado e já enfileira a primeira sincronização de tools."
       footer={
         <>
-          <Button variant="secondary" onClick={() => onClose(false)}>Cancelar</Button>
-          <Button onClick={() => void submit()} loading={mutation.isPending}>Registrar</Button>
+          <Button variant="secondary" onClick={() => onClose(false)}>
+            Cancelar
+          </Button>
+          <Button onClick={() => void submit()} loading={mutation.isPending}>
+            Registrar
+          </Button>
         </>
       }
     >
       <div className="space-y-4">
-        <Field label="Nome (slug)" required hint="Vira o pack mcp.<nome> concedível por agente. Ex.: erp">
-          <Input value={name} onChange={(e) => setName(e.target.value)} placeholder="erp" className="font-mono" maxLength={40} />
+        <Field
+          label="Nome (slug)"
+          required
+          hint="Vira o pack mcp.<nome> concedível por agente. Ex.: erp"
+        >
+          <Input
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="erp"
+            className="font-mono"
+            maxLength={40}
+          />
         </Field>
-        <Field label="URL" required hint="Endpoint streamable HTTP do server. Ex.: https://erp.suaempresa.com/mcp">
-          <Input value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://…/mcp" className="font-mono" maxLength={500} />
+        <Field
+          label="URL"
+          required
+          hint="Endpoint streamable HTTP do server. Ex.: https://erp.suaempresa.com/mcp"
+        >
+          <Input
+            value={url}
+            onChange={(e) => setUrl(e.target.value)}
+            placeholder="https://…/mcp"
+            className="font-mono"
+            maxLength={500}
+          />
         </Field>
         <Field
           label="Secret ref (env var)"
           hint="Nome da variável de ambiente NO RUNTIME com o bearer token — o token nunca é salvo no banco. Ex.: MCP_SERVER_ERP_TOKEN"
         >
-          <Input value={secretRef} onChange={(e) => setSecretRef(e.target.value)} placeholder="MCP_SERVER_ERP_TOKEN" className="font-mono" maxLength={100} />
+          <Input
+            value={secretRef}
+            onChange={(e) => setSecretRef(e.target.value)}
+            placeholder="MCP_SERVER_ERP_TOKEN"
+            className="font-mono"
+            maxLength={100}
+          />
         </Field>
         {error && <Alert tone="danger">{error}</Alert>}
       </div>
@@ -456,7 +501,9 @@ function DecideToolModal({
       description="Aprovação é por tool, auditada. Na v1 só tools READ-ONLY executam — writes ficam bloqueadas no bridge mesmo se aprovadas."
       footer={
         <>
-          <Button variant="secondary" onClick={() => onClose(false)}>Cancelar</Button>
+          <Button variant="secondary" onClick={() => onClose(false)}>
+            Cancelar
+          </Button>
           <Button
             variant={decision === 'approved' ? 'success' : 'danger'}
             onClick={() => void submit()}
@@ -469,19 +516,31 @@ function DecideToolModal({
     >
       <div className="space-y-4">
         <Field label="Decisão">
-          <Select value={decision} onChange={(e) => setDecision(e.target.value as 'approved' | 'rejected')}>
+          <Select
+            value={decision}
+            onChange={(e) => setDecision(e.target.value as 'approved' | 'rejected')}
+          >
             <option value="approved">Aprovar</option>
             <option value="rejected">Rejeitar</option>
           </Select>
         </Field>
-        <Field label="Natureza" hint="Declare com base no contrato do seu server (spec §3): reads não têm efeito colateral.">
-          <Select value={isReadOnly ? 'read' : 'write'} onChange={(e) => setIsReadOnly(e.target.value === 'read')}>
+        <Field
+          label="Natureza"
+          hint="Declare com base no contrato do seu server (spec §3): reads não têm efeito colateral."
+        >
+          <Select
+            value={isReadOnly ? 'read' : 'write'}
+            onChange={(e) => setIsReadOnly(e.target.value === 'read')}
+          >
             <option value="read">Somente leitura (executável na v1)</option>
             <option value="write">Escrita / efeito colateral (bloqueada até a v2)</option>
           </Select>
         </Field>
         <Field label="Classe de risco">
-          <Select value={riskClass} onChange={(e) => setRiskClass(e.target.value as typeof riskClass)}>
+          <Select
+            value={riskClass}
+            onChange={(e) => setRiskClass(e.target.value as typeof riskClass)}
+          >
             <option value="low">low</option>
             <option value="medium">medium</option>
             <option value="high">high</option>
@@ -489,7 +548,12 @@ function DecideToolModal({
           </Select>
         </Field>
         <Field label="Comentário (auditado)" required>
-          <Textarea value={comment} onChange={(e) => setComment(e.target.value)} rows={3} maxLength={2000} />
+          <Textarea
+            value={comment}
+            onChange={(e) => setComment(e.target.value)}
+            rows={3}
+            maxLength={2000}
+          />
         </Field>
         {error && <Alert tone="danger">{error}</Alert>}
       </div>

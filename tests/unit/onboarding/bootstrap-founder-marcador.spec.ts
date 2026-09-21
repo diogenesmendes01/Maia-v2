@@ -73,7 +73,7 @@ describe('#519 — founder e marcador de conclusão do bootstrap', () => {
     expect(fonte()).toMatch(/ehBootstrap \? 'bootstrap_initial_admin_created'/);
     // Declarada E emitida — o par que a #535 registra como dívida quando só
     // metade existe.
-    expect((AUDIT_ACTIONS as readonly string[])).toContain('bootstrap_initial_admin_created');
+    expect(AUDIT_ACTIONS as readonly string[]).toContain('bootstrap_initial_admin_created');
   });
 
   it('run de bootstrap sem credencial rastreável falha fechado', () => {

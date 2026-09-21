@@ -108,11 +108,7 @@ function findActive(
 }
 
 function makeFakeRepo(
-  invalidate: (args: {
-    tenant_id: string;
-    agent_id: string | null;
-    descriptor: string;
-  }) => void,
+  invalidate: (args: { tenant_id: string; agent_id: string | null; descriptor: string }) => void,
 ): PolicyRulesRepo {
   const repo: PolicyRulesRepo = {
     async findActiveByDescriptor(args) {
@@ -137,9 +133,7 @@ function makeFakeRepo(
     },
     async listActiveForTenant() {
       const tenant_id = (await import('@/db/tenant-context.js')).getCurrentTenant();
-      return Object.values(state).filter(
-        (r) => r.tenant_id === tenant_id && r.status === 'active',
-      );
+      return Object.values(state).filter((r) => r.tenant_id === tenant_id && r.status === 'active');
     },
     async listVersions(args) {
       const tenant_id = (await import('@/db/tenant-context.js')).getCurrentTenant();
@@ -212,8 +206,7 @@ function makeFakeRepo(
       if (row.status !== 'proposed') {
         return { ok: false, reason: 'invalid_transition' };
       }
-      const requiresDual =
-        row.rule_kind === 'hard_limit' || row.rule_kind === 'lockdown_trigger';
+      const requiresDual = row.rule_kind === 'hard_limit' || row.rule_kind === 'lockdown_trigger';
       if (requiresDual) {
         if (!args.dual_approval_evidence) {
           return { ok: false, reason: 'hard_limit_requires_dual_approval' };
@@ -330,41 +323,35 @@ describe('p8e policy resolver — integration', () => {
   it('seed creates 5 active policies for tenant=default', async () => {
     const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
     const repo = makeFakeRepo((k) => cache.invalidate(k));
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const created = await seedFiveDefaults(repo);
-        expect(created).toBe(5);
-        const active = await repo.listActiveForTenant();
-        expect(active).toHaveLength(5);
-        // Idempotency: second run should not duplicate.
-        const again = await seedFiveDefaults(repo);
-        expect(again).toBe(0);
-        const stillFive = await repo.listActiveForTenant();
-        expect(stillFive).toHaveLength(5);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const created = await seedFiveDefaults(repo);
+      expect(created).toBe(5);
+      const active = await repo.listActiveForTenant();
+      expect(active).toHaveLength(5);
+      // Idempotency: second run should not duplicate.
+      const again = await seedFiveDefaults(repo);
+      expect(again).toBe(0);
+      const stillFive = await repo.listActiveForTenant();
+      expect(stillFive).toHaveLength(5);
+    });
   });
 
   it('resolver returns 5 resolved, 0 unresolved for the seed descriptors', async () => {
     const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
     const repo = makeFakeRepo((k) => cache.invalidate(k));
     const resolver = createPolicyDescriptorResolver(repo, cache);
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        await seedFiveDefaults(repo);
-        // Note: no_action_outside_business_hours_high_risk has scope=whatsapp,
-        // so we pass scope.channel=whatsapp to match it. Other 4 are scope-less.
-        const out = await resolver.resolveDescriptors({
-          tenant_id: 'default',
-          descriptors: [...SEED_DESCRIPTORS],
-          scope: { channel: 'whatsapp' },
-        });
-        expect(out.resolved).toHaveLength(5);
-        expect(out.unresolved).toHaveLength(0);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      await seedFiveDefaults(repo);
+      // Note: no_action_outside_business_hours_high_risk has scope=whatsapp,
+      // so we pass scope.channel=whatsapp to match it. Other 4 are scope-less.
+      const out = await resolver.resolveDescriptors({
+        tenant_id: 'default',
+        descriptors: [...SEED_DESCRIPTORS],
+        scope: { channel: 'whatsapp' },
+      });
+      expect(out.resolved).toHaveLength(5);
+      expect(out.unresolved).toHaveLength(0);
+    });
   });
 
   it('tenant isolation: tenant B cannot resolve tenant A descriptors', async () => {
@@ -373,155 +360,137 @@ describe('p8e policy resolver — integration', () => {
     const resolver = createPolicyDescriptorResolver(repo, cache);
 
     // Tenant A: create a custom descriptor.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'default' },
-      async () => {
-        const p = await repo.propose({
-          rule_kind: 'soft_guidance',
-          rule_descriptor: 'a_only',
-          rule_body: {},
-          source_of_truth: 'tenant_culture',
-          proposed_by: 'op',
-        });
-        const r = await repo.activate({ id: p.id, approved_by: 'op' });
-        expect(r.ok).toBe(true);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
+      const p = await repo.propose({
+        rule_kind: 'soft_guidance',
+        rule_descriptor: 'a_only',
+        rule_body: {},
+        source_of_truth: 'tenant_culture',
+        proposed_by: 'op',
+      });
+      const r = await repo.activate({ id: p.id, approved_by: 'op' });
+      expect(r.ok).toBe(true);
+    });
     // Tenant B: same descriptor should NOT resolve.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-b', agent_id: 'default' },
-      async () => {
-        const out = await resolver.resolveDescriptors({
-          tenant_id: 'tenant-b',
-          descriptors: ['a_only'],
-        });
-        expect(out.resolved).toHaveLength(0);
-        expect(out.unresolved).toEqual(['a_only']);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-b', agent_id: 'default' }, async () => {
+      const out = await resolver.resolveDescriptors({
+        tenant_id: 'tenant-b',
+        descriptors: ['a_only'],
+      });
+      expect(out.resolved).toHaveLength(0);
+      expect(out.unresolved).toEqual(['a_only']);
+    });
     // Tenant A still resolves its own.
-    await runWithTenantContext(
-      { tenant_id: 'tenant-a', agent_id: 'default' },
-      async () => {
-        const out = await resolver.resolveDescriptors({
-          tenant_id: 'tenant-a',
-          descriptors: ['a_only'],
-        });
-        expect(out.resolved).toHaveLength(1);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenant-a', agent_id: 'default' }, async () => {
+      const out = await resolver.resolveDescriptors({
+        tenant_id: 'tenant-a',
+        descriptors: ['a_only'],
+      });
+      expect(out.resolved).toHaveLength(1);
+    });
   });
 
   it('deprecate + cache invalidation → resolver returns unresolved', async () => {
     const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
     const repo = makeFakeRepo((k) => cache.invalidate(k));
     const resolver = createPolicyDescriptorResolver(repo, cache);
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const p = await repo.propose({
-          rule_kind: 'soft_guidance',
-          rule_descriptor: 'to_deprecate',
-          rule_body: {},
-          source_of_truth: 'tenant_culture',
-          proposed_by: 'op',
-        });
-        const act = await repo.activate({ id: p.id, approved_by: 'op' });
-        expect(act.ok).toBe(true);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const p = await repo.propose({
+        rule_kind: 'soft_guidance',
+        rule_descriptor: 'to_deprecate',
+        rule_body: {},
+        source_of_truth: 'tenant_culture',
+        proposed_by: 'op',
+      });
+      const act = await repo.activate({ id: p.id, approved_by: 'op' });
+      expect(act.ok).toBe(true);
 
-        // First resolution caches it.
-        const before = await resolver.resolveDescriptors({
-          tenant_id: 'default',
-          descriptors: ['to_deprecate'],
-        });
-        expect(before.resolved).toHaveLength(1);
+      // First resolution caches it.
+      const before = await resolver.resolveDescriptors({
+        tenant_id: 'default',
+        descriptors: ['to_deprecate'],
+      });
+      expect(before.resolved).toHaveLength(1);
 
-        // Deprecate fires the invalidate callback.
-        const dep = await repo.deprecate({
-          id: p.id,
-          deprecated_by: 'op',
-        });
-        expect(dep.ok).toBe(true);
+      // Deprecate fires the invalidate callback.
+      const dep = await repo.deprecate({
+        id: p.id,
+        deprecated_by: 'op',
+      });
+      expect(dep.ok).toBe(true);
 
-        // Resolver should NOT return the deprecated row.
-        const after = await resolver.resolveDescriptors({
-          tenant_id: 'default',
-          descriptors: ['to_deprecate'],
-        });
-        expect(after.resolved).toHaveLength(0);
-        expect(after.unresolved).toEqual(['to_deprecate']);
-      },
-    );
+      // Resolver should NOT return the deprecated row.
+      const after = await resolver.resolveDescriptors({
+        tenant_id: 'default',
+        descriptors: ['to_deprecate'],
+      });
+      expect(after.resolved).toHaveLength(0);
+      expect(after.unresolved).toEqual(['to_deprecate']);
+    });
   });
 
   it('propose + activate new version → resolver returns the new version', async () => {
     const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
     const repo = makeFakeRepo((k) => cache.invalidate(k));
     const resolver = createPolicyDescriptorResolver(repo, cache);
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        // v1 active.
-        const p1 = await repo.propose({
-          rule_kind: 'soft_guidance',
-          rule_descriptor: 'versioned',
-          rule_body: {},
-          source_of_truth: 'tenant_culture',
-          proposed_by: 'op',
-        });
-        await repo.activate({ id: p1.id, approved_by: 'op' });
-        const v1 = await resolver.resolveDescriptors({
-          tenant_id: 'default',
-          descriptors: ['versioned'],
-        });
-        expect(v1.resolved[0]?.version).toBe(1);
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      // v1 active.
+      const p1 = await repo.propose({
+        rule_kind: 'soft_guidance',
+        rule_descriptor: 'versioned',
+        rule_body: {},
+        source_of_truth: 'tenant_culture',
+        proposed_by: 'op',
+      });
+      await repo.activate({ id: p1.id, approved_by: 'op' });
+      const v1 = await resolver.resolveDescriptors({
+        tenant_id: 'default',
+        descriptors: ['versioned'],
+      });
+      expect(v1.resolved[0]?.version).toBe(1);
 
-        // Deprecate v1, propose+activate v2.
-        await repo.deprecate({ id: p1.id, deprecated_by: 'op' });
-        const p2 = await repo.propose({
-          rule_kind: 'soft_guidance',
-          rule_descriptor: 'versioned',
-          rule_body: { changed: true },
-          source_of_truth: 'tenant_culture',
-          proposed_by: 'op',
-        });
-        const a2 = await repo.activate({ id: p2.id, approved_by: 'op' });
-        expect(a2.ok).toBe(true);
-        if (!a2.ok) return;
-        expect(a2.updated.version).toBe(2);
+      // Deprecate v1, propose+activate v2.
+      await repo.deprecate({ id: p1.id, deprecated_by: 'op' });
+      const p2 = await repo.propose({
+        rule_kind: 'soft_guidance',
+        rule_descriptor: 'versioned',
+        rule_body: { changed: true },
+        source_of_truth: 'tenant_culture',
+        proposed_by: 'op',
+      });
+      const a2 = await repo.activate({ id: p2.id, approved_by: 'op' });
+      expect(a2.ok).toBe(true);
+      if (!a2.ok) return;
+      expect(a2.updated.version).toBe(2);
 
-        const v2 = await resolver.resolveDescriptors({
-          tenant_id: 'default',
-          descriptors: ['versioned'],
-        });
-        expect(v2.resolved).toHaveLength(1);
-        expect(v2.resolved[0]?.version).toBe(2);
-        expect(v2.resolved[0]?.policy_id).toBe(p2.id);
-      },
-    );
+      const v2 = await resolver.resolveDescriptors({
+        tenant_id: 'default',
+        descriptors: ['versioned'],
+      });
+      expect(v2.resolved).toHaveLength(1);
+      expect(v2.resolved[0]?.version).toBe(2);
+      expect(v2.resolved[0]?.policy_id).toBe(p2.id);
+    });
   });
 
   it('cache hit rate is high for repeated identical lookups (gate 5)', async () => {
     const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
     const repo = makeFakeRepo((k) => cache.invalidate(k));
     const resolver = createPolicyDescriptorResolver(repo, cache);
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        await seedFiveDefaults(repo);
-        // 100 identical lookups
-        for (let i = 0; i < 100; i++) {
-          await resolver.resolveDescriptors({
-            tenant_id: 'default',
-            descriptors: ['no_refund_without_validation'],
-          });
-        }
-        const stats = cache.stats();
-        const total = stats.hits + stats.misses;
-        // First is miss; rest are hits → ≥99% hit rate.
-        expect(stats.hits / total).toBeGreaterThanOrEqual(0.8);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      await seedFiveDefaults(repo);
+      // 100 identical lookups
+      for (let i = 0; i < 100; i++) {
+        await resolver.resolveDescriptors({
+          tenant_id: 'default',
+          descriptors: ['no_refund_without_validation'],
+        });
+      }
+      const stats = cache.stats();
+      const total = stats.hits + stats.misses;
+      // First is miss; rest are hits → ≥99% hit rate.
+      expect(stats.hits / total).toBeGreaterThanOrEqual(0.8);
+    });
   });
 
   // ----- Codex review #93: lifecycle pub/sub → cache invalidation wiring -----
@@ -692,11 +661,7 @@ describe('p8e policy resolver — integration', () => {
     it('handlePolicyLifecycleMessage swallows malformed JSON without throwing', () => {
       const cache = new PolicyResolverCacheImpl({ ttl_ms: 60_000, max_entries: 100 });
       expect(() => {
-        handlePolicyLifecycleMessage(
-          buildPolicyLifecycleChannel('default'),
-          'not-json',
-          cache,
-        );
+        handlePolicyLifecycleMessage(buildPolicyLifecycleChannel('default'), 'not-json', cache);
       }).not.toThrow();
     });
 
@@ -718,36 +683,31 @@ describe('p8e policy resolver — integration', () => {
         );
       });
       const resolver = createPolicyDescriptorResolver(repo, cache);
-      await runWithTenantContext(
-        { tenant_id: 'default', agent_id: 'default' },
-        async () => {
-          const p = await repo.propose({
-            rule_kind: 'soft_guidance',
-            rule_descriptor: 'pubsub_e2e',
-            rule_body: {},
-            source_of_truth: 'tenant_culture',
-            proposed_by: 'op',
-          });
-          await repo.activate({ id: p.id, approved_by: 'op' });
+      await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+        const p = await repo.propose({
+          rule_kind: 'soft_guidance',
+          rule_descriptor: 'pubsub_e2e',
+          rule_body: {},
+          source_of_truth: 'tenant_culture',
+          proposed_by: 'op',
+        });
+        await repo.activate({ id: p.id, approved_by: 'op' });
 
-          const before = await resolver.resolveDescriptors({
-            tenant_id: 'default',
-            descriptors: ['pubsub_e2e'],
-          });
-          expect(before.resolved).toHaveLength(1);
+        const before = await resolver.resolveDescriptors({
+          tenant_id: 'default',
+          descriptors: ['pubsub_e2e'],
+        });
+        expect(before.resolved).toHaveLength(1);
 
-          await repo.deprecate({ id: p.id, deprecated_by: 'op' });
+        await repo.deprecate({ id: p.id, deprecated_by: 'op' });
 
-          const after = await resolver.resolveDescriptors({
-            tenant_id: 'default',
-            descriptors: ['pubsub_e2e'],
-          });
-          expect(after.resolved).toHaveLength(0);
-          expect(after.failures).toEqual([
-            { descriptor: 'pubsub_e2e', reason: 'not_found' },
-          ]);
-        },
-      );
+        const after = await resolver.resolveDescriptors({
+          tenant_id: 'default',
+          descriptors: ['pubsub_e2e'],
+        });
+        expect(after.resolved).toHaveLength(0);
+        expect(after.failures).toEqual([{ descriptor: 'pubsub_e2e', reason: 'not_found' }]);
+      });
     });
   });
 });

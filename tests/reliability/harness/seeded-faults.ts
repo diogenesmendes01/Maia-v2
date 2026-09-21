@@ -114,7 +114,9 @@ export function ordemDeFaults<T>(seed: string, faults: readonly T[]): T[] {
  */
 export const SEED_ENV = 'TEST_RELIABILITY_SEED';
 
-export function seedDaRodada(env: Readonly<Record<string, string | undefined>> = process.env): string {
+export function seedDaRodada(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): string {
   const informada = env[SEED_ENV];
   if (informada && informada.trim().length > 0) return informada.trim();
   // Sem seed informada, geramos UMA e ela é logada pelo chamador. O importante

@@ -103,9 +103,7 @@ describe('contrapartesRepo — ALS tenant+agent predicate on new search methods 
         EmptyScopeError,
       );
       await expect(contrapartesRepo.searchByName(empty)).rejects.toBeInstanceOf(EmptyScopeError);
-      await expect(contrapartesRepo.byIdScoped(empty, 'x')).rejects.toBeInstanceOf(
-        EmptyScopeError,
-      );
+      await expect(contrapartesRepo.byIdScoped(empty, 'x')).rejects.toBeInstanceOf(EmptyScopeError);
     });
   });
 });

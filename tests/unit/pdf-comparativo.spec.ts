@@ -53,8 +53,22 @@ describe('generateComparativoPdf', () => {
       date_from: '2026-04-01',
       date_to: '2026-04-30',
       rows: [
-        { entidade_id: 'e1', entidade_nome: 'Empresa A', receita: 5000, despesa: 2000, lucro: 3000, caixa_final: 12000 },
-        { entidade_id: 'e2', entidade_nome: 'Empresa B', receita: 3000, despesa: 1500, lucro: 1500, caixa_final: 8000 },
+        {
+          entidade_id: 'e1',
+          entidade_nome: 'Empresa A',
+          receita: 5000,
+          despesa: 2000,
+          lucro: 3000,
+          caixa_final: 12000,
+        },
+        {
+          entidade_id: 'e2',
+          entidade_nome: 'Empresa B',
+          receita: 3000,
+          despesa: 1500,
+          lucro: 1500,
+          caixa_final: 8000,
+        },
       ],
     });
     expect(result.path).toMatch(/[/\\]tmp[/\\][a-f0-9-]+\.pdf$/);

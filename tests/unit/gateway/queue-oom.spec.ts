@@ -32,7 +32,9 @@ function detectOom(err: unknown): boolean {
   const e = err as { name?: string; code?: string; message?: string };
   if (typeof e.code === 'string' && e.code.toUpperCase() === 'OOM') return true;
   const msg = String(e.message ?? '');
-  return (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg);
+  return (
+    (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg)
+  );
 }
 
 // `queue.ts` only consumes `isRedisOomError` + `recordRedisOomDegraded` from
@@ -129,7 +131,9 @@ describe('enqueueAgent — OOM fail-closed (#309 / PR #324 B1)', () => {
   });
 
   it('a NON-OOM error propagates UNCHANGED (not swallowed, not relabelled, no OOM metric)', async () => {
-    const boom = Object.assign(new Error('WRONGTYPE Operation against a key'), { name: 'ReplyError' });
+    const boom = Object.assign(new Error('WRONGTYPE Operation against a key'), {
+      name: 'ReplyError',
+    });
     queueAdd.mockImplementationOnce(async () => {
       throw boom;
     });

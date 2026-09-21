@@ -166,19 +166,89 @@ describe('P10b — migration smoke (Codex review #102 issue 1)', () => {
     // (We don't parse the matview SQL fully — we just verify the columns
     // we KNOW are referenced exist in the source.)
     const checks: Array<{ table: string; cols: string[] }> = [
-      { table: 'audit_log', cols: ['id', 'tenant_id', 'agent_id', 'conversa_id', 'acao', 'entidade_alvo', 'alvo_id', 'created_at'] },
-      { table: 'cognitive_module_log', cols: ['id', 'tenant_id', 'agent_id', 'conversa_id', 'module_name', 'status', 'latency_ms', 'fallback_triggered', 'created_at'] },
-      { table: 'agent_drift_alerts', cols: ['id', 'tenant_id', 'agent_id', 'drift_type', 'severity', 'decision', 'created_at'] },
-      { table: 'role_selector_decisions', cols: ['id', 'tenant_id', 'agent_id', 'conversa_id', 'decided_role_id', 'decided_by', 'decided_at'] },
-      { table: 'capability_test_results', cols: ['id', 'tenant_id', 'agent_id', 'outcome', 'proposal_id', 'ran_at'] },
-      { table: 'procedure_execution_events', cols: ['id', 'tenant_id', 'agent_id', 'event_type', 'execution_id', 'step_id', 'created_at'] },
-      { table: 'runtime_trace_envelopes', cols: ['trace_id', 'tenant_id', 'agent_id', 'conversa_id', 'decision', 'side_effect_level', 'policy_id', 'body_status', 'redaction_class', 'created_at'] },
+      {
+        table: 'audit_log',
+        cols: [
+          'id',
+          'tenant_id',
+          'agent_id',
+          'conversa_id',
+          'acao',
+          'entidade_alvo',
+          'alvo_id',
+          'created_at',
+        ],
+      },
+      {
+        table: 'cognitive_module_log',
+        cols: [
+          'id',
+          'tenant_id',
+          'agent_id',
+          'conversa_id',
+          'module_name',
+          'status',
+          'latency_ms',
+          'fallback_triggered',
+          'created_at',
+        ],
+      },
+      {
+        table: 'agent_drift_alerts',
+        cols: ['id', 'tenant_id', 'agent_id', 'drift_type', 'severity', 'decision', 'created_at'],
+      },
+      {
+        table: 'role_selector_decisions',
+        cols: [
+          'id',
+          'tenant_id',
+          'agent_id',
+          'conversa_id',
+          'decided_role_id',
+          'decided_by',
+          'decided_at',
+        ],
+      },
+      {
+        table: 'capability_test_results',
+        cols: ['id', 'tenant_id', 'agent_id', 'outcome', 'proposal_id', 'ran_at'],
+      },
+      {
+        table: 'procedure_execution_events',
+        cols: [
+          'id',
+          'tenant_id',
+          'agent_id',
+          'event_type',
+          'execution_id',
+          'step_id',
+          'created_at',
+        ],
+      },
+      {
+        table: 'runtime_trace_envelopes',
+        cols: [
+          'trace_id',
+          'tenant_id',
+          'agent_id',
+          'conversa_id',
+          'decision',
+          'side_effect_level',
+          'policy_id',
+          'body_status',
+          'redaction_class',
+          'created_at',
+        ],
+      },
     ];
     for (const { table, cols } of checks) {
       const actual = getAllColumnsForTable(table);
       for (const col of cols) {
         // The matview must reference a column that actually exists.
-        expect(actual.has(col), `matview references ${table}.${col} but it's not in the schema`).toBe(true);
+        expect(
+          actual.has(col),
+          `matview references ${table}.${col} but it's not in the schema`,
+        ).toBe(true);
         // And the matview must actually reference it (sanity check that
         // our list isn't stale).
         expect(matview, `expected matview to reference ${col} for ${table}`).toContain(col);

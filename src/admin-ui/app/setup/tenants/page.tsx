@@ -8,20 +8,8 @@ import TenantStatusModal from './_components/tenant-status-modal.js';
 import { PageHeader } from '../../../components/ui/page-header.js';
 import { Button } from '../../../components/ui/button.js';
 import { StatusBadge } from '../../../components/ui/badge.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../../components/ui/table.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-  Alert,
-} from '../../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState, Alert } from '../../../components/ui/states.js';
 import { IconUsers, IconPlus } from '../../../components/ui/icons.js';
 
 /**
@@ -49,9 +37,8 @@ export default function TenantsSetupPage() {
       <div>
         <PageHeader title="Tenants" />
         <Alert tone="danger" title="Acesso restrito">
-          A gestão de tenants exige o papel{' '}
-          <code className="font-mono">founder</code>. Seu papel atual é{' '}
-          <code className="font-mono">{role || '(nenhum)'}</code>.
+          A gestão de tenants exige o papel <code className="font-mono">founder</code>. Seu papel
+          atual é <code className="font-mono">{role || '(nenhum)'}</code>.
         </Alert>
       </div>
     );
@@ -65,8 +52,8 @@ export default function TenantsSetupPage() {
         title="Tenants"
         description={
           <>
-            Provisione novos tenants e alterne o status. Toda mudança é
-            auditada em <code className="font-mono">admin_audit_log</code>.
+            Provisione novos tenants e alterne o status. Toda mudança é auditada em{' '}
+            <code className="font-mono">admin_audit_log</code>.
           </>
         }
         actions={
@@ -80,10 +67,7 @@ export default function TenantsSetupPage() {
       {listQuery.isLoading ? (
         <LoadingState label="Carregando tenants…" />
       ) : listQuery.error ? (
-        <ErrorState
-          message={listQuery.error.message}
-          onRetry={() => void listQuery.refetch()}
-        />
+        <ErrorState message={listQuery.error.message} onRetry={() => void listQuery.refetch()} />
       ) : tenants.length === 0 ? (
         <EmptyState
           icon={<IconUsers size={36} />}
@@ -120,9 +104,7 @@ export default function TenantsSetupPage() {
                     <Button
                       variant="ghost"
                       size="sm"
-                      onClick={() =>
-                        setStatusTarget({ id: t.id, nome: t.nome, status: t.status })
-                      }
+                      onClick={() => setStatusTarget({ id: t.id, nome: t.nome, status: t.status })}
                     >
                       Alterar status
                     </Button>

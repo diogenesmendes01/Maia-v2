@@ -22,17 +22,7 @@
  * produção — manter `audit()` fora daqui também evita o ciclo de import
  * governance/audit -> repositories -> turn-repos.
  */
-import {
-  and,
-  asc,
-  eq,
-  inArray,
-  isNull,
-  lte,
-  or,
-  sql,
-  type SQL,
-} from 'drizzle-orm';
+import { and, asc, eq, inArray, isNull, lte, or, sql, type SQL } from 'drizzle-orm';
 import { db, pgErrorCode, pgErrorConstraint, withTx } from '../client.js';
 import {
   agent_stream_blocks,
@@ -67,15 +57,8 @@ import {
   type StreamClaimRecovery,
   type LeaseRenewalResult,
 } from '@/runtime/turns/claim.js';
-import {
-  recordStreamBlocked,
-  recordStreamFifoViolation,
-} from '@/runtime/turns/stream-metrics.js';
-import {
-  statusList,
-  turnWriteConditions,
-  type TurnWriteFence,
-} from './turn-fence-sql.js';
+import { recordStreamBlocked, recordStreamFifoViolation } from '@/runtime/turns/stream-metrics.js';
+import { statusList, turnWriteConditions, type TurnWriteFence } from './turn-fence-sql.js';
 // #626 — a REGRA FIFO, num módulo puro. Os CINCO consumidores dela neste
 // arquivo — o `WHERE` de `claimNextEligibleTurn`, o filtro de
 // `findRecoverableTurns`, o dispatcher cross-tenant, o canário
@@ -470,16 +453,11 @@ export const agentTurnsRepo = {
       // reentrega comum nem chega a abrir transação (§Implementation Notes:
       // "Deduplicação do ingresso deve acontecer antes da alocação de nova
       // sequência").
-      const ingress_seq = input.stream
-        ? await allocateIngressSeq(tx, input.stream)
-        : null;
+      const ingress_seq = input.stream ? await allocateIngressSeq(tx, input.stream) : null;
 
       const guardedMensagem = applyTenantGuard({
         ...input.mensagem,
-        channel_id:
-          input.channel_id ??
-          (input.mensagem['channel_id'] as string | null) ??
-          null,
+        channel_id: input.channel_id ?? (input.mensagem['channel_id'] as string | null) ?? null,
         stream_key: input.stream?.stream_key ?? null,
         stream_key_version: input.stream?.stream_key_version ?? null,
         ingress_seq,
@@ -492,10 +470,7 @@ export const agentTurnsRepo = {
       const turn = await createTurnForMessage(tx, {
         mensagem: row,
         deadline_at: input.deadline_at ?? null,
-        stream:
-          input.stream && ingress_seq !== null
-            ? { ...input.stream, ingress_seq }
-            : null,
+        stream: input.stream && ingress_seq !== null ? { ...input.stream, ingress_seq } : null,
       });
       // #628 (fatia E) — A JANELA DE DEBOUNCE, ABERTA NA MESMA TRANSAÇÃO.
       //
@@ -547,10 +522,7 @@ export const agentTurnsRepo = {
       const ingress_seq = await allocateIngressSeq(tx, input.stream);
       const guardedMensagem = applyTenantGuard({
         ...input.mensagem,
-        channel_id:
-          input.channel_id ??
-          (input.mensagem['channel_id'] as string | null) ??
-          null,
+        channel_id: input.channel_id ?? (input.mensagem['channel_id'] as string | null) ?? null,
         stream_key: input.stream.stream_key,
         stream_key_version: input.stream.stream_key_version,
         ingress_seq,
@@ -572,10 +544,7 @@ export const agentTurnsRepo = {
    * devolve o turno existente sem criar outro.
    */
   async ensureTurnForMessage(
-    mensagem: Pick<
-      Mensagem,
-      'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'
-    >,
+    mensagem: Pick<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'>,
     opts: { deadline_at?: Date | null } = {},
   ): Promise<AgentTurn> {
     return withTx((tx) =>
@@ -609,9 +578,7 @@ export const agentTurnsRepo = {
       .values(guarded)
       .onConflictDoNothing()
       .returning({ id: agent_turn_inputs.id });
-    return rows.length === 1
-      ? { attached: true }
-      : { attached: false, reason: 'already_attached' };
+    return rows.length === 1 ? { attached: true } : { attached: false, reason: 'already_attached' };
   },
 
   /**
@@ -683,9 +650,7 @@ export const agentTurnsRepo = {
         AND ${agent_turns}.first_ingress_seq IS NOT NULL
       RETURNING ${agent_turns}.id
     `);
-    return (
-      Array.from(result.rows as unknown as Array<{ id: string }>).length === 1
-    );
+    return Array.from(result.rows as unknown as Array<{ id: string }>).length === 1;
   },
 
   /**
@@ -731,10 +696,7 @@ export const agentTurnsRepo = {
     /** #629 — ver `runTransition`. Recusa com `order_committed`. */
     guard_committed_order?: boolean;
   }): Promise<TurnTransitionResult> {
-    if (
-      input.expected_claim_token !== undefined &&
-      input.absorber_fence !== undefined
-    ) {
+    if (input.expected_claim_token !== undefined && input.absorber_fence !== undefined) {
       throw new Error(
         'transitionTurn: expected_claim_token e absorber_fence são mutuamente exclusivos — ' +
           'uma gravação tem UMA autoridade (a própria tentativa OU o turno absorvedor).',
@@ -771,21 +733,13 @@ export const agentTurnsRepo = {
       to: input.to,
       outcome,
       sources,
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
         : {}),
-      ...(input.absorber_fence !== undefined
-        ? { absorber_fence: input.absorber_fence }
-        : {}),
-      ...(input.block_stream !== undefined
-        ? { block_stream: input.block_stream }
-        : {}),
-      ...(input.guard_committed_order === true
-        ? { guard_committed_order: true }
-        : {}),
+      ...(input.absorber_fence !== undefined ? { absorber_fence: input.absorber_fence } : {}),
+      ...(input.block_stream !== undefined ? { block_stream: input.block_stream } : {}),
+      ...(input.guard_committed_order === true ? { guard_committed_order: true } : {}),
       patch: input.patch ?? {},
     });
   },
@@ -963,9 +917,7 @@ export const agentTurnsRepo = {
    * o lock de linha de `agent_stream_sequences` só vale até o COMMIT, e é ele
    * que exclui o ingresso concorrente.
    */
-  async closeDueDebounceBatch(input: {
-    stream_key: string;
-  }): Promise<DebounceCloseResult> {
+  async closeDueDebounceBatch(input: { stream_key: string }): Promise<DebounceCloseResult> {
     return withTx((tx) => closeDueDebounceBatchTx(tx, input));
   },
 
@@ -1168,9 +1120,7 @@ export const agentTurnsRepo = {
     return this.transitionTurn({
       turn_id: input.turn_id,
       to: 'queued',
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       patch: { next_attempt_at: null },
     });
   },
@@ -1195,9 +1145,7 @@ export const agentTurnsRepo = {
     return this.transitionTurn({
       turn_id: input.turn_id,
       to: 'claimed',
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
     });
   },
 
@@ -1222,20 +1170,14 @@ export const agentTurnsRepo = {
     return this.transitionTurn({
       turn_id: input.turn_id,
       to: 'running',
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
         : {}),
       patch: {
         bumpAttempt: input.bump_attempt ?? true,
-        ...(input.conversa_id !== undefined
-          ? { conversa_id: input.conversa_id }
-          : {}),
-        ...(input.channel_id !== undefined
-          ? { channel_id: input.channel_id }
-          : {}),
+        ...(input.conversa_id !== undefined ? { conversa_id: input.conversa_id } : {}),
+        ...(input.channel_id !== undefined ? { channel_id: input.channel_id } : {}),
       },
     });
   },
@@ -1257,9 +1199,7 @@ export const agentTurnsRepo = {
       turn_id: input.turn_id,
       to: 'outbound_pending',
       expected_statuses: ['running'],
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
         : {}),
@@ -1282,9 +1222,7 @@ export const agentTurnsRepo = {
       turn_id: input.turn_id,
       to: 'completed',
       outcome: input.outcome,
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
         : {}),
@@ -1303,9 +1241,7 @@ export const agentTurnsRepo = {
       turn_id: input.turn_id,
       to: 'ignored',
       outcome: input.outcome,
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
         : {}),
@@ -1339,9 +1275,7 @@ export const agentTurnsRepo = {
       turn_id: input.turn_id,
       to: 'superseded',
       outcome: 'merged_into_turn',
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
         : {}),
@@ -1439,9 +1373,7 @@ export const agentTurnsRepo = {
     return this.transitionTurn({
       turn_id: input.turn_id,
       to: 'retryable',
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
         : {}),
@@ -1460,10 +1392,7 @@ export const agentTurnsRepo = {
   /** Tentativas esgotadas ou estado que exige intervenção humana. TERMINAL. */
   async markDeadLetter(input: {
     turn_id: string;
-    outcome: Extract<
-      TurnOutcome,
-      'retry_exhausted' | 'operator_cancelled' | 'unsafe_to_retry'
-    >;
+    outcome: Extract<TurnOutcome, 'retry_exhausted' | 'operator_cancelled' | 'unsafe_to_retry'>;
     error_code: string;
     error_summary: string | null;
     expected_version?: number;
@@ -1480,12 +1409,8 @@ export const agentTurnsRepo = {
       turn_id: input.turn_id,
       to: 'dead_letter',
       outcome: input.outcome,
-      ...(input.block_stream !== undefined
-        ? { block_stream: input.block_stream }
-        : {}),
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.block_stream !== undefined ? { block_stream: input.block_stream } : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       ...(input.expected_claim_token !== undefined
         ? { expected_claim_token: input.expected_claim_token }
         : {}),
@@ -1527,9 +1452,7 @@ export const agentTurnsRepo = {
       expected_statuses: ['dead_letter'],
       manual: true,
       ...(input.reconcile === true ? {} : { guard_committed_order: true }),
-      ...(input.expected_version !== undefined
-        ? { expected_version: input.expected_version }
-        : {}),
+      ...(input.expected_version !== undefined ? { expected_version: input.expected_version } : {}),
       patch: { bumpAttempt: true, next_attempt_at: null },
     });
   },
@@ -1568,9 +1491,7 @@ export const agentTurnsRepo = {
    * indistinguível de um turno inexistente, e os dois pedem reações diferentes
    * (o primeiro é corrupção de dado, o segundo é payload forjado ou retenção).
    */
-  async findJobScopeByIdCrossTenant(
-    turn_id: string,
-  ): Promise<TurnJobScopeRow | null> {
+  async findJobScopeByIdCrossTenant(turn_id: string): Promise<TurnJobScopeRow | null> {
     const result = await db.execute<TurnJobScopeRow>(sql`
       SELECT
         t.tenant_id                  AS turn_tenant_id,
@@ -1642,10 +1563,7 @@ export const agentTurnsRepo = {
           eq(agent_turn_inputs.turn_id, turn_id),
         ),
       )
-      .orderBy(
-        asc(agent_turn_inputs.ingress_seq),
-        asc(agent_turn_inputs.created_at),
-      );
+      .orderBy(asc(agent_turn_inputs.ingress_seq), asc(agent_turn_inputs.created_at));
   },
 
   /**
@@ -1687,10 +1605,7 @@ export const agentTurnsRepo = {
    * destravar. É FIFO correto — e é observável por
    * `maia_stream_blocked_total{reason="stream_blocked"}`, que o claim emite.
    */
-  async findRecoverableTurns(
-    stale_ms: number,
-    limit = 200,
-  ): Promise<RecoverableTurn[]> {
+  async findRecoverableTurns(stale_ms: number, limit = 200): Promise<RecoverableTurn[]> {
     const { tenant_id, agent_id } = scope();
     const cutoff = new Date(Date.now() - stale_ms);
     const rows = await db
@@ -1843,9 +1758,7 @@ export const agentTurnsRepo = {
           alvo: sql`${agent_turns}`,
         })}
     `);
-    return Array.from(
-      result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>,
-    );
+    return Array.from(result.rows as unknown as Array<{ tenant_id: string; agent_id: string }>);
   },
 
   /**
@@ -1886,9 +1799,7 @@ export const agentTurnsRepo = {
    * é medida desde `COALESCE(queued_at, created_at)` — a PRIMEIRA entrada na
    * fila, que a promoção (#627) preserva de propósito.
    */
-  async snapshotStreamScheduling(
-    starvation_after_ms: number,
-  ): Promise<StreamSchedulingSnapshot> {
+  async snapshotStreamScheduling(starvation_after_ms: number): Promise<StreamSchedulingSnapshot> {
     const result = await db.execute<{
       live_streams: string;
       active_streams: string;
@@ -2830,9 +2741,7 @@ async function closeDueDebounceBatchTx(
   };
 
   // 1. MUTEX DA STREAM.
-  const travado = await tx.execute<{ stream_key: string }>(
-    sql`${lockStreamForDebounce(membros)}`,
-  );
+  const travado = await tx.execute<{ stream_key: string }>(sql`${lockStreamForDebounce(membros)}`);
   if (Array.from(travado.rows as unknown as unknown[]).length === 0) {
     return { closed: false, reason: 'stream_locked' };
   }
@@ -2983,9 +2892,7 @@ async function closeDueDebounceBatchTx(
       RETURNING u.id
     `);
     absorvidos.push(
-      ...Array.from(supersedidos.rows as unknown as Array<{ id: string }>).map(
-        (r) => r.id,
-      ),
+      ...Array.from(supersedidos.rows as unknown as Array<{ id: string }>).map((r) => r.id),
     );
 
     if (absorvidos.length > 0) {
@@ -3018,9 +2925,9 @@ async function closeDueDebounceBatchTx(
         RETURNING i.mensagem_id
       `);
       mensagensAbsorvidas.push(
-        ...Array.from(
-          repontados.rows as unknown as Array<{ mensagem_id: string }>,
-        ).map((r) => r.mensagem_id),
+        ...Array.from(repontados.rows as unknown as Array<{ mensagem_id: string }>).map(
+          (r) => r.mensagem_id,
+        ),
       );
     }
   }
@@ -3041,10 +2948,7 @@ async function closeDueDebounceBatchTx(
 }
 
 /** O escopo corrente como FRAGMENTOS, que é o que `stream-head-sql` consome. */
-function escopoSql(
-  tenant_id: string,
-  agent_id: string,
-): { tenant: SQL; agent: SQL; alvo: SQL } {
+function escopoSql(tenant_id: string, agent_id: string): { tenant: SQL; agent: SQL; alvo: SQL } {
   return {
     tenant: sql`${tenant_id}`,
     agent: sql`${agent_id}`,
@@ -3097,8 +3001,7 @@ async function claimWithinStreamExclusion(
   // Presente só quando houve o que recuperar: um campo vazio em todo resultado
   // convidaria o caller a tratar `[]` como evento, e o normal é NÃO haver
   // claim expirado nenhum.
-  const trail =
-    recovered.length > 0 ? { recovered_stream_claims: recovered } : {};
+  const trail = recovered.length > 0 ? { recovered_stream_claims: recovered } : {};
 
   // A CONDIÇÃO DE HEAD-OF-LINE. Uma linha, e é a fatia inteira.
   //
@@ -3114,9 +3017,7 @@ async function claimWithinStreamExclusion(
   // flag off ele seria legitimamente > 0 e o alarme viraria ruído.
   const canario = fifo ? earlierLiveTurnCount(escopo) : sql`0`;
 
-  const result = await tx.execute<
-    ClaimRow & { fifo_anteriores: number | string }
-  >(sql`
+  const result = await tx.execute<ClaimRow & { fifo_anteriores: number | string }>(sql`
     UPDATE ${agent_turns}
        SET status            = 'claimed',
            claimed_by        = ${input.worker_id},
@@ -3177,17 +3078,8 @@ async function claimWithinStreamExclusion(
               ) AS wait_seconds,
               ${canario} AS fifo_anteriores
   `);
-  const row = (
-    result.rows as unknown as Array<
-      ClaimRow & { fifo_anteriores: number | string }
-    >
-  )[0];
-  if (!row)
-    return await explainClaimRejection(
-      tx,
-      { tenant_id, agent_id, fifo, ...input },
-      trail,
-    );
+  const row = (result.rows as unknown as Array<ClaimRow & { fifo_anteriores: number | string }>)[0];
+  if (!row) return await explainClaimRejection(tx, { tenant_id, agent_id, fifo, ...input }, trail);
 
   // PÓS-CONDIÇÃO. `> 0` significa que o claim passou por cima de um turno
   // anterior vivo — a inversão de ordem que a #505 existe para impedir, e um
@@ -3291,9 +3183,7 @@ async function explainClaimRejection(
       turn_id: args.turn_id,
     }),
   );
-  const controle = (
-    hold.rows as unknown as Array<{ control_id: string; mode: string }>
-  )[0];
+  const controle = (hold.rows as unknown as Array<{ control_id: string; mode: string }>)[0];
   if (controle) {
     incCounter('maia_turn_claim_total', {
       result: 'conversation_human_control',
@@ -3361,9 +3251,7 @@ async function explainClaimRejection(
         turn_id: args.turn_id,
       }),
     );
-    const head = (
-      bloqueio.rows as unknown as Array<{ id: string; status: string }>
-    )[0];
+    const head = (bloqueio.rows as unknown as Array<{ id: string; status: string }>)[0];
     if (head) {
       // `outbound_pending` é a única situação em que NENHUM claim destrava a
       // stream: quem tira um turno dali é o delivery worker do outbox (#506).
@@ -3436,9 +3324,7 @@ async function allocateIngressSeq(
         AND ${agent_stream_sequences}.agent_id = ${agent_id}
     RETURNING last_ingress_seq
   `);
-  const rows = Array.from(
-    result.rows as unknown as Array<{ last_ingress_seq: string | number }>,
-  );
+  const rows = Array.from(result.rows as unknown as Array<{ last_ingress_seq: string | number }>);
   const raw = rows[0]?.last_ingress_seq;
   const seq = typeof raw === 'string' ? Number(raw) : raw;
   if (typeof seq !== 'number' || !Number.isFinite(seq) || seq < 1) {
@@ -3456,10 +3342,7 @@ async function allocateIngressSeq(
 async function createTurnForMessage(
   tx: Executor,
   args: {
-    mensagem: Pick<
-      Mensagem,
-      'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'
-    >;
+    mensagem: Pick<Mensagem, 'id' | 'tenant_id' | 'agent_id' | 'conversa_id' | 'channel_id'>;
     deadline_at: Date | null;
     /**
      * #505 — a stream e a posição do ingresso representativo. Ausente para
@@ -3577,9 +3460,7 @@ async function absorberStillOwns(
  * O UPDATE compare-and-swap + (quando terminal) a projeção legada, na MESMA
  * transação. Zero rows -> releitura para classificar o conflito.
  */
-async function runTransition(
-  args: RunTransitionArgs,
-): Promise<TurnTransitionResult> {
+async function runTransition(args: RunTransitionArgs): Promise<TurnTransitionResult> {
   // O fence desta gravação, numa forma só. `turnWriteConditions` é a fonte
   // ÚNICA do `WHERE` — nada é acrescentado a ele depois desta chamada, e é o
   // que permite a `tests/unit/db/turn-fence-sql.spec.ts` compilar o predicado
@@ -3620,9 +3501,7 @@ async function runTransitionTx(
   fence: TurnWriteFence,
 ): Promise<TurnTransitionResult> {
   const scoped = scope();
-  const result = await withTx((tx) =>
-    runTransitionOnExecutor(tx, args, fence, scoped),
-  );
+  const result = await withTx((tx) => runTransitionOnExecutor(tx, args, fence, scoped));
   if (result.ok) recordCommittedTransition(args);
   return result;
 }
@@ -3739,9 +3618,7 @@ export async function cancelHeldBacklogTurnInTx(
     scope(),
   );
   if (!result.ok) {
-    throw new Error(
-      `held_backlog_cancellation_conflict:${result.conflict}:${input.turn_id}`,
-    );
+    throw new Error(`held_backlog_cancellation_conflict:${result.conflict}:${input.turn_id}`);
   }
   return result;
 }
@@ -3753,9 +3630,7 @@ export async function cancelHeldBacklogTurnInTx(
  * descartes que o rollback desfez — a métrica mentiria exatamente no incidente
  * em que alguém a consultaria.
  */
-export function recordBacklogCancellationCommitted(input: {
-  cancelados: number;
-}): void {
+export function recordBacklogCancellationCommitted(input: { cancelados: number }): void {
   if (input.cancelados <= 0) return;
   incCounter(
     'maia_turn_transitions_total',
@@ -3786,12 +3661,9 @@ async function runTransitionOnExecutor(
   };
   const stamp = STATE_TIMESTAMP[args.to];
   if (stamp) set[stamp] = sql`now()`;
-  if (args.patch.bumpAttempt)
-    set['attempt_count'] = sql`${agent_turns.attempt_count} + 1`;
-  if (args.patch.conversa_id !== undefined)
-    set['conversa_id'] = args.patch.conversa_id;
-  if (args.patch.channel_id !== undefined)
-    set['channel_id'] = args.patch.channel_id;
+  if (args.patch.bumpAttempt) set['attempt_count'] = sql`${agent_turns.attempt_count} + 1`;
+  if (args.patch.conversa_id !== undefined) set['conversa_id'] = args.patch.conversa_id;
+  if (args.patch.channel_id !== undefined) set['channel_id'] = args.patch.channel_id;
   if (args.patch.next_attempt_at !== undefined) {
     set['next_attempt_at'] = args.patch.next_attempt_at;
   }
@@ -3804,8 +3676,7 @@ async function runTransitionOnExecutor(
   if (args.patch.outbound_message_id !== undefined) {
     set['outbound_message_id'] = args.patch.outbound_message_id;
   }
-  if (args.patch.deadline_at !== undefined)
-    set['deadline_at'] = args.patch.deadline_at;
+  if (args.patch.deadline_at !== undefined) set['deadline_at'] = args.patch.deadline_at;
   if (args.patch.superseded_by_turn_id !== undefined) {
     set['superseded_by_turn_id'] = args.patch.superseded_by_turn_id;
   }
@@ -3913,8 +3784,7 @@ async function runTransitionOnExecutor(
     // só no caminho de fracasso.
     const selfFenceBroken =
       args.expected_claim_token !== undefined &&
-      (row.claim_token !== args.expected_claim_token ||
-        row.lease_live !== true);
+      (row.claim_token !== args.expected_claim_token || row.lease_live !== true);
     const absorberFenceBroken =
       args.absorber_fence !== undefined &&
       !(await absorberStillOwns(tx, {

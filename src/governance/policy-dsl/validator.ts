@@ -39,15 +39,8 @@ import {
   MAX_REGEX_PATTERN,
   MAX_TOTAL_PREDICATE_NODES,
 } from './constants.js';
-import {
-  isFieldPathTooDeep,
-  splitFieldPath,
-} from './field-path.js';
-import {
-  compileSafeRegex,
-  isPatternMarkedInvalid,
-  isPatternMarkedUnsafe,
-} from './regex-cache.js';
+import { isFieldPathTooDeep, splitFieldPath } from './field-path.js';
+import { compileSafeRegex, isPatternMarkedInvalid, isPatternMarkedUnsafe } from './regex-cache.js';
 import type {
   PolicyEffectAction,
   PolicyOperator,
@@ -238,12 +231,7 @@ function validatePredicate(
           });
           return;
         }
-        validatePredicate(
-          child as PolicyPredicate,
-          `${path}.${kind}[${idx}]`,
-          depth + 1,
-          state,
-        );
+        validatePredicate(child as PolicyPredicate, `${path}.${kind}[${idx}]`, depth + 1, state);
       });
       return;
     }
@@ -257,12 +245,7 @@ function validatePredicate(
         });
         return;
       }
-      validatePredicate(
-        branch.predicate as PolicyPredicate,
-        `${path}.not`,
-        depth + 1,
-        state,
-      );
+      validatePredicate(branch.predicate as PolicyPredicate, `${path}.not`, depth + 1, state);
       return;
     }
     default:
@@ -431,11 +414,7 @@ function validateLeaf(
   }
 }
 
-function validateEffect(
-  effect: unknown,
-  path: string,
-  errors: PolicyValidationError[],
-): void {
+function validateEffect(effect: unknown, path: string, errors: PolicyValidationError[]): void {
   if (!effect || typeof effect !== 'object') {
     errors.push({
       code: 'missing_effect',

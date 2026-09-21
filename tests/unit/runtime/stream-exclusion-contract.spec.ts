@@ -73,9 +73,7 @@ describe('#625 — contrato da exclusão por stream', () => {
     // não é escopar: uma colisão de hash, um backfill ou um replay manual
     // fariam duas tenants disputarem a MESMA chave de índice. A issue-mãe trata
     // colisão de stream como risco de SEGURANÇA.
-    expect(migracao).toMatch(
-      /ON agent_turns \(\s*tenant_id\s*,\s*agent_id\s*,\s*stream_key\s*\)/,
-    );
+    expect(migracao).toMatch(/ON agent_turns \(\s*tenant_id\s*,\s*agent_id\s*,\s*stream_key\s*\)/);
   });
 
   it('é CONCURRENTLY e o arquivo carrega o marcador no-transaction', () => {

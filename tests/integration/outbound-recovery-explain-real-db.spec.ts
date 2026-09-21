@@ -98,9 +98,10 @@ let inboundId: string;
 
 /** O plano contém varredura sequencial DA TABELA do outbox? */
 function temSeqScanNoOutbox(plano: string): boolean {
-  return /"Node Type"\s*:\s*"Seq Scan"[^}]*"Relation Name"\s*:\s*"outbound_messages"/.test(
-    plano,
-  ) || /"Relation Name"\s*:\s*"outbound_messages"[^}]*"Node Type"\s*:\s*"Seq Scan"/.test(plano);
+  return (
+    /"Node Type"\s*:\s*"Seq Scan"[^}]*"Relation Name"\s*:\s*"outbound_messages"/.test(plano) ||
+    /"Relation Name"\s*:\s*"outbound_messages"[^}]*"Node Type"\s*:\s*"Seq Scan"/.test(plano)
+  );
 }
 
 /**

@@ -36,7 +36,9 @@ export function scopedFn<A extends unknown[], R>(
 }
 
 /** Idem, para um objeto `{ detect }` (a forma dos detectores de drift). */
-export function scopedDetector<I, O>(d: { detect: (input: I) => Promise<O> }): {
+export function scopedDetector<I, O>(d: {
+  detect: (input: I) => Promise<O>;
+}): {
   detect: (input: I) => Promise<O>;
 } {
   return { detect: scopedFn(d.detect.bind(d)) };

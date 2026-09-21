@@ -63,7 +63,14 @@ describe('list_pending tool', () => {
       },
     ]);
     listPendingTransacoes.mockResolvedValue([
-      { id: 'tx-1', natureza: 'despesa', descricao: 'Aluguel', valor: '1500.00', created_at: now, entidade_id: E1 },
+      {
+        id: 'tx-1',
+        natureza: 'despesa',
+        descricao: 'Aluguel',
+        valor: '1500.00',
+        created_at: now,
+        entidade_id: E1,
+      },
     ]);
 
     const { listPendingTool } = await import('../../../src/tools/list-pending.js');

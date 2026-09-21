@@ -25,13 +25,19 @@ vi.mock('@/db/client.js', async () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     procedureExecutionsRepo: {
       create: vi.fn(async (input: any) => {
         const id = `exec-${Math.random().toString(36).slice(2)}`;
-        execState[id] = { id, ...input, status: 'in_progress', completed_steps: input.completed_steps ?? [] };
+        execState[id] = {
+          id,
+          ...input,
+          status: 'in_progress',
+          completed_steps: input.completed_steps ?? [],
+        };
         return execState[id];
       }),
       createOrFindActive: vi.fn(async (input: any) => {
@@ -39,20 +45,27 @@ vi.mock('@/db/repositories.js', async () => {
         // when there's already an in_progress execution for the same
         // conversa, the second insert no-ops and we return the existing.
         const existing = Object.values(execState).find(
-          (e: any) =>
-            e.conversa_id === input.conversa_id &&
-            e.status === 'in_progress',
+          (e: any) => e.conversa_id === input.conversa_id && e.status === 'in_progress',
         );
         if (existing) {
           return { execution: existing, created: false };
         }
         const id = `exec-${Math.random().toString(36).slice(2)}`;
-        execState[id] = { id, ...input, status: 'in_progress', completed_steps: input.completed_steps ?? [] };
+        execState[id] = {
+          id,
+          ...input,
+          status: 'in_progress',
+          completed_steps: input.completed_steps ?? [],
+        };
         return { execution: execState[id], created: true };
       }),
       findById: vi.fn(async (id: string) => execState[id] ?? null),
       findActiveForConversa: vi.fn(async (conversa_id: string) => {
-        return Object.values(execState).find((e: any) => e.conversa_id === conversa_id && e.status === 'in_progress') ?? null;
+        return (
+          Object.values(execState).find(
+            (e: any) => e.conversa_id === conversa_id && e.status === 'in_progress',
+          ) ?? null
+        );
       }),
       updateState: vi.fn(async (id: string, updates: any) => {
         if (execState[id]) execState[id] = { ...execState[id], ...updates };
@@ -62,12 +75,18 @@ vi.mock('@/db/repositories.js', async () => {
       }),
     },
     procedureExecutionEventsRepo: {
-      record: vi.fn(async (input: any) => { events.push(input); }),
-      recordTx: vi.fn(async (_tx: unknown, input: any) => { events.push(input); }),
+      record: vi.fn(async (input: any) => {
+        events.push(input);
+      }),
+      recordTx: vi.fn(async (_tx: unknown, input: any) => {
+        events.push(input);
+      }),
       listByExecution: vi.fn(async (id: string) => events.filter((e) => e.execution_id === id)),
     },
     procedureSelectorDecisionsRepo: {
-      record: vi.fn(async (input: any) => { decisions.push(input); }),
+      record: vi.fn(async (input: any) => {
+        decisions.push(input);
+      }),
       recentByConversa: vi.fn(async () => decisions),
     },
     procedureDefinitionsRepo: {
@@ -83,7 +102,10 @@ vi.mock('@/db/repositories.js', async () => {
       create: vi.fn(),
       disable: vi.fn(),
     },
-    cognitiveModuleLogRepo: { record: vi.fn(async () => {}), recentByModule: vi.fn(async () => []) },
+    cognitiveModuleLogRepo: {
+      record: vi.fn(async () => {}),
+      recentByModule: vi.fn(async () => []),
+    },
   };
 });
 
@@ -122,7 +144,14 @@ describe('P3b procedure runtime integration', () => {
       steps: [{ id: 'step-1', intencao: 'Descobrir motivo', como: 'Pergunte aberto' }],
       success_criteria: [],
     };
-    assignments.push({ id: 'a1', definition_id: defId, definition_version: 1, target_type: 'agent', target_id: 'default', enabled: true });
+    assignments.push({
+      id: 'a1',
+      definition_id: defId,
+      definition_version: 1,
+      target_type: 'agent',
+      target_id: 'default',
+      enabled: true,
+    });
 
     (callLLM as any).mockResolvedValueOnce({
       content: JSON.stringify({ matches: true, confidence: 0.85, reason: 'matches' }),
@@ -201,8 +230,16 @@ describe('P3b procedure runtime integration', () => {
         conversa_id: 'c3',
         first_step_id: 'step-1',
       });
-      await engine.advanceStep({ execution_id: exec.id, next_step_id: 'step-2', completed_step_id: 'step-1' });
-      await engine.advanceStep({ execution_id: exec.id, next_step_id: null, completed_step_id: 'step-2' });
+      await engine.advanceStep({
+        execution_id: exec.id,
+        next_step_id: 'step-2',
+        completed_step_id: 'step-1',
+      });
+      await engine.advanceStep({
+        execution_id: exec.id,
+        next_step_id: null,
+        completed_step_id: 'step-2',
+      });
       await engine.completeExecution({ execution_id: exec.id, outcome: 'success' });
 
       const state = await engine.replayState(exec.id);

@@ -106,7 +106,9 @@ describe('sendOutboundDocument', () => {
     mod._internal._setSocketForTests(fakeSocket as never, true);
     const quoted = { key: { id: 'WAID-IN' } } as never;
     await mod.sendOutboundDocument('jid', path, {
-      mimetype: 'application/pdf', fileName: 'q.pdf', quoted,
+      mimetype: 'application/pdf',
+      fileName: 'q.pdf',
+      quoted,
     });
     const [, , miscArg] = sendMessage.mock.calls[0]!;
     expect(miscArg).toEqual({ quoted });
@@ -118,7 +120,8 @@ describe('sendOutboundDocument', () => {
     const mod = baileys();
     mod._internal._setSocketForTests(null, false);
     const wid = await mod.sendOutboundDocument('jid', path, {
-      mimetype: 'application/pdf', fileName: 'nc.pdf',
+      mimetype: 'application/pdf',
+      fileName: 'nc.pdf',
     });
     expect(wid).toBeNull();
     expect(sendMessage).not.toHaveBeenCalled();
@@ -132,7 +135,8 @@ describe('sendOutboundDocument', () => {
     mod._internal._setSocketForTests(fakeSocket as never, true);
     await expect(
       mod.sendOutboundDocument('jid', '/no/such/file.pdf', {
-        mimetype: 'application/pdf', fileName: 'gone.pdf',
+        mimetype: 'application/pdf',
+        fileName: 'gone.pdf',
       }),
     ).rejects.toThrow();
     expect(sendMessage).not.toHaveBeenCalled();

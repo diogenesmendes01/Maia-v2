@@ -178,172 +178,175 @@ async function ownerOf(id: string): Promise<{ tenant_id: string; agent_id: strin
   return res.rows[0] ?? null;
 }
 
-d('mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race (issue #290 / PR #311 P0)', () => {
-  beforeAll(async () => {
-    pg = await startPostgresContainer();
-    previousDatabaseUrl = process.env.DATABASE_URL;
-    // Set DATABASE_URL to the container URI BEFORE importing anything that
-    // pulls in @/db/client.js (the pool captures the URL at module load).
-    process.env.DATABASE_URL = pg.uri;
-    repositoriesMod = await import('@/db/repositories.js');
-    tenantContextMod = await import('@/db/tenant-context.js');
-    dbClientMod = await import('@/db/client.js');
-    // Seed the tenants/agents FK parents for every non-default scope the suite
-    // adopts into. MUST run before any test's adoption UPDATE, otherwise the
-    // re-homing trips mensagens_tenant_id_fkey / mensagens_agent_id_fkey.
-    await seedScopeParents();
-  }, /* image pull on first run */ 180_000);
+d(
+  'mensagensRepo.adoptToResolvedTenantCrossTenant — cross-tenant adoption race (issue #290 / PR #311 P0)',
+  () => {
+    beforeAll(async () => {
+      pg = await startPostgresContainer();
+      previousDatabaseUrl = process.env.DATABASE_URL;
+      // Set DATABASE_URL to the container URI BEFORE importing anything that
+      // pulls in @/db/client.js (the pool captures the URL at module load).
+      process.env.DATABASE_URL = pg.uri;
+      repositoriesMod = await import('@/db/repositories.js');
+      tenantContextMod = await import('@/db/tenant-context.js');
+      dbClientMod = await import('@/db/client.js');
+      // Seed the tenants/agents FK parents for every non-default scope the suite
+      // adopts into. MUST run before any test's adoption UPDATE, otherwise the
+      // re-homing trips mensagens_tenant_id_fkey / mensagens_agent_id_fkey.
+      await seedScopeParents();
+    }, /* image pull on first run */ 180_000);
 
-  afterAll(async () => {
-    if (dbClientMod) await dbClientMod.shutdownDb().catch(() => undefined);
-    if (pg) await stopPostgresContainer(pg);
-    if (previousDatabaseUrl === undefined) {
-      delete process.env.DATABASE_URL;
-    } else {
-      process.env.DATABASE_URL = previousDatabaseUrl;
-    }
-  });
-
-  beforeEach(async () => {
-    // Clear any rows from a prior test (both ids + both tenant slugs + the
-    // default rows we seed).
-    await pg.pool.query(
-      `DELETE FROM mensagens WHERE id IN ($1::uuid, $2::uuid)`,
-      [ROW_ID, ROW_ID_2],
-    );
-  });
-
-  // Adoption legitimately runs WITHOUT an ALS context (it IS the entry point
-  // discovering the tenant). We still wrap a couple of assertions in an
-  // explicit context to prove the bypass is not accidentally tenant-scoped.
-  const adopt = (id: string, tenant_id: string, agent_id: string) =>
-    repositoriesMod.mensagensRepo.adoptToResolvedTenantCrossTenant({
-      id,
-      tenant_id,
-      agent_id,
+    afterAll(async () => {
+      if (dbClientMod) await dbClientMod.shutdownDb().catch(() => undefined);
+      if (pg) await stopPostgresContainer(pg);
+      if (previousDatabaseUrl === undefined) {
+        delete process.env.DATABASE_URL;
+      } else {
+        process.env.DATABASE_URL = previousDatabaseUrl;
+      }
     });
 
-  // -------------------------------------------------------------------------
-  // 1. Happy path — a default/default row is adopted into tenant-A exactly once.
-  // -------------------------------------------------------------------------
-  it('adopts a default/default row into tenant-A (returns true; row now owned by tenant-A)', async () => {
-    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-1');
+    beforeEach(async () => {
+      // Clear any rows from a prior test (both ids + both tenant slugs + the
+      // default rows we seed).
+      await pg.pool.query(`DELETE FROM mensagens WHERE id IN ($1::uuid, $2::uuid)`, [
+        ROW_ID,
+        ROW_ID_2,
+      ]);
+    });
 
-    const won = await adopt(ROW_ID, TENANT_A, AGENT_A);
-    expect(won).toBe(true);
+    // Adoption legitimately runs WITHOUT an ALS context (it IS the entry point
+    // discovering the tenant). We still wrap a couple of assertions in an
+    // explicit context to prove the bypass is not accidentally tenant-scoped.
+    const adopt = (id: string, tenant_id: string, agent_id: string) =>
+      repositoriesMod.mensagensRepo.adoptToResolvedTenantCrossTenant({
+        id,
+        tenant_id,
+        agent_id,
+      });
 
-    expect(await ownerOf(ROW_ID)).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
-  });
+    // -------------------------------------------------------------------------
+    // 1. Happy path — a default/default row is adopted into tenant-A exactly once.
+    // -------------------------------------------------------------------------
+    it('adopts a default/default row into tenant-A (returns true; row now owned by tenant-A)', async () => {
+      await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-1');
 
-  // -------------------------------------------------------------------------
-  // 2. THE P0: a row already adopted by tenant-A is NOT re-adoptable by tenant-B.
-  // -------------------------------------------------------------------------
-  it('rejects re-adoption into tenant-B once owned by tenant-A (returns false; owner UNCHANGED — no leak)', async () => {
-    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-2');
+      const won = await adopt(ROW_ID, TENANT_A, AGENT_A);
+      expect(won).toBe(true);
 
-    // tenant-A wins the (only) swap out of default/default.
-    expect(await adopt(ROW_ID, TENANT_A, AGENT_A)).toBe(true);
+      expect(await ownerOf(ROW_ID)).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
+    });
 
-    // tenant-B now tries to steal the SAME row. Pre-fix (WHERE id only) this
-    // UPDATE matched and silently re-homed the row to tenant-B. Post-fix the
-    // WHERE no longer matches (row is tenant-A, not default/default), so the
-    // swap MISSES.
-    const stolen = await adopt(ROW_ID, TENANT_B, AGENT_B);
-    expect(stolen).toBe(false);
+    // -------------------------------------------------------------------------
+    // 2. THE P0: a row already adopted by tenant-A is NOT re-adoptable by tenant-B.
+    // -------------------------------------------------------------------------
+    it('rejects re-adoption into tenant-B once owned by tenant-A (returns false; owner UNCHANGED — no leak)', async () => {
+      await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-2');
 
-    // The load-bearing assertion: the row STILL belongs to tenant-A. A
-    // regression that dropped the default/default guard would surface here as
-    // tenant-B ownership.
-    expect(await ownerOf(ROW_ID)).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
-  });
+      // tenant-A wins the (only) swap out of default/default.
+      expect(await adopt(ROW_ID, TENANT_A, AGENT_A)).toBe(true);
 
-  // -------------------------------------------------------------------------
-  // 3. Idempotency — re-adopting into the SAME tenant after the row moved is a
-  //    rowCount=0 no-op (compare-and-swap miss), NOT a silent success.
-  // -------------------------------------------------------------------------
-  it('re-adopting into the same tenant after the row moved returns false (idempotent no-op, owner unchanged)', async () => {
-    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-3');
+      // tenant-B now tries to steal the SAME row. Pre-fix (WHERE id only) this
+      // UPDATE matched and silently re-homed the row to tenant-B. Post-fix the
+      // WHERE no longer matches (row is tenant-A, not default/default), so the
+      // swap MISSES.
+      const stolen = await adopt(ROW_ID, TENANT_B, AGENT_B);
+      expect(stolen).toBe(false);
 
-    expect(await adopt(ROW_ID, TENANT_A, AGENT_A)).toBe(true);
-    // BullMQ retry: same target tenant. Row is no longer default/default → miss.
-    expect(await adopt(ROW_ID, TENANT_A, AGENT_A)).toBe(false);
-    // Owner is still tenant-A — the caller in agent/core.ts treats this false
-    // as "already owned by me" via findOwnerByIdCrossTenant and proceeds.
-    expect(await ownerOf(ROW_ID)).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
-  });
+      // The load-bearing assertion: the row STILL belongs to tenant-A. A
+      // regression that dropped the default/default guard would surface here as
+      // tenant-B ownership.
+      expect(await ownerOf(ROW_ID)).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
+    });
 
-  // -------------------------------------------------------------------------
-  // 4. CONCURRENCY — two adoptions race on the same default/default row.
-  //    Exactly one wins; the final owner is the winner's tenant, never a blend.
-  // -------------------------------------------------------------------------
-  it('concurrent adoption by tenant-A and tenant-B: exactly one wins, the row never leaks to the loser', async () => {
-    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-RACE-1');
+    // -------------------------------------------------------------------------
+    // 3. Idempotency — re-adopting into the SAME tenant after the row moved is a
+    //    rowCount=0 no-op (compare-and-swap miss), NOT a silent success.
+    // -------------------------------------------------------------------------
+    it('re-adopting into the same tenant after the row moved returns false (idempotent no-op, owner unchanged)', async () => {
+      await insertPrimaryPrimaryRow(ROW_ID, 'WAID-A-3');
 
-    // Fire both adoptions concurrently against the SAME row. Postgres serialises
-    // the two UPDATEs via the row lock; the compare-and-swap guarantees only the
-    // first to acquire the lock matches default/default.
-    const [aWon, bWon] = await Promise.all([
-      adopt(ROW_ID, TENANT_A, AGENT_A),
-      adopt(ROW_ID, TENANT_B, AGENT_B),
-    ]);
+      expect(await adopt(ROW_ID, TENANT_A, AGENT_A)).toBe(true);
+      // BullMQ retry: same target tenant. Row is no longer default/default → miss.
+      expect(await adopt(ROW_ID, TENANT_A, AGENT_A)).toBe(false);
+      // Owner is still tenant-A — the caller in agent/core.ts treats this false
+      // as "already owned by me" via findOwnerByIdCrossTenant and proceeds.
+      expect(await ownerOf(ROW_ID)).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
+    });
 
-    // Exactly one winner — never both, never neither.
-    expect([aWon, bWon].filter(Boolean)).toHaveLength(1);
+    // -------------------------------------------------------------------------
+    // 4. CONCURRENCY — two adoptions race on the same default/default row.
+    //    Exactly one wins; the final owner is the winner's tenant, never a blend.
+    // -------------------------------------------------------------------------
+    it('concurrent adoption by tenant-A and tenant-B: exactly one wins, the row never leaks to the loser', async () => {
+      await insertPrimaryPrimaryRow(ROW_ID, 'WAID-RACE-1');
 
-    const owner = await ownerOf(ROW_ID);
-    expect(owner).not.toBeNull();
-    if (aWon) {
+      // Fire both adoptions concurrently against the SAME row. Postgres serialises
+      // the two UPDATEs via the row lock; the compare-and-swap guarantees only the
+      // first to acquire the lock matches default/default.
+      const [aWon, bWon] = await Promise.all([
+        adopt(ROW_ID, TENANT_A, AGENT_A),
+        adopt(ROW_ID, TENANT_B, AGENT_B),
+      ]);
+
+      // Exactly one winner — never both, never neither.
+      expect([aWon, bWon].filter(Boolean)).toHaveLength(1);
+
+      const owner = await ownerOf(ROW_ID);
+      expect(owner).not.toBeNull();
+      if (aWon) {
+        expect(owner).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
+      } else {
+        expect(owner).toEqual({ tenant_id: TENANT_B, agent_id: AGENT_B });
+      }
+      // Whichever lost, the owner is a SINGLE coherent tenant triplet — there is
+      // no interleaving that leaves the row half-owned or owned by the loser.
+      expect(owner).not.toEqual({ tenant_id: 'primary', agent_id: 'primary' });
+    });
+
+    it('many concurrent adoptions (5 distinct tenants) on one row: exactly one wins; others all miss', async () => {
+      await insertPrimaryPrimaryRow(ROW_ID, 'WAID-RACE-N');
+
+      // Reuse the module-level CONTENDERS so the scopes we race over are exactly
+      // the ones seeded as FK parents in beforeAll (no drift between seed + use).
+      const contenders = CONTENDERS;
+      const results = await Promise.all(contenders.map((c) => adopt(ROW_ID, c.t, c.a)));
+
+      // Precisely one true across all contenders.
+      expect(results.filter(Boolean)).toHaveLength(1);
+
+      const winnerIdx = results.findIndex(Boolean);
+      const winner = contenders[winnerIdx]!;
+      expect(await ownerOf(ROW_ID)).toEqual({ tenant_id: winner.t, agent_id: winner.a });
+
+      // Cleanup the bespoke tenant slugs this test used.
+      await pg.pool.query(`DELETE FROM mensagens WHERE id = $1::uuid`, [ROW_ID]);
+    });
+
+    // -------------------------------------------------------------------------
+    // 5. findOwnerByIdCrossTenant — returns the true owner regardless of ALS.
+    //    This is the helper the caller uses to decide whether a lost swap was an
+    //    idempotent retry (we own it) or a cross-tenant conflict (someone else
+    //    owns it). It MUST ignore the ambient tenant context.
+    // -------------------------------------------------------------------------
+    it('findOwnerByIdCrossTenant returns the real owner even when called under a DIFFERENT tenant context', async () => {
+      await insertPrimaryPrimaryRow(ROW_ID_2, 'WAID-OWNER-1');
+      expect(await adopt(ROW_ID_2, TENANT_A, AGENT_A)).toBe(true);
+
+      // Call the owner lookup while the ALS says tenant-B. A tenant-scoped read
+      // would return null here; the cross-tenant helper must still see tenant-A.
+      const owner = await tenantContextMod.runWithTenantContext(
+        { tenant_id: TENANT_B, agent_id: AGENT_B },
+        () => repositoriesMod.mensagensRepo.findOwnerByIdCrossTenant(ROW_ID_2),
+      );
       expect(owner).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
-    } else {
-      expect(owner).toEqual({ tenant_id: TENANT_B, agent_id: AGENT_B });
-    }
-    // Whichever lost, the owner is a SINGLE coherent tenant triplet — there is
-    // no interleaving that leaves the row half-owned or owned by the loser.
-    expect(owner).not.toEqual({ tenant_id: 'primary', agent_id: 'primary' });
-  });
+    });
 
-  it('many concurrent adoptions (5 distinct tenants) on one row: exactly one wins; others all miss', async () => {
-    await insertPrimaryPrimaryRow(ROW_ID, 'WAID-RACE-N');
-
-    // Reuse the module-level CONTENDERS so the scopes we race over are exactly
-    // the ones seeded as FK parents in beforeAll (no drift between seed + use).
-    const contenders = CONTENDERS;
-    const results = await Promise.all(contenders.map((c) => adopt(ROW_ID, c.t, c.a)));
-
-    // Precisely one true across all contenders.
-    expect(results.filter(Boolean)).toHaveLength(1);
-
-    const winnerIdx = results.findIndex(Boolean);
-    const winner = contenders[winnerIdx]!;
-    expect(await ownerOf(ROW_ID)).toEqual({ tenant_id: winner.t, agent_id: winner.a });
-
-    // Cleanup the bespoke tenant slugs this test used.
-    await pg.pool.query(`DELETE FROM mensagens WHERE id = $1::uuid`, [ROW_ID]);
-  });
-
-  // -------------------------------------------------------------------------
-  // 5. findOwnerByIdCrossTenant — returns the true owner regardless of ALS.
-  //    This is the helper the caller uses to decide whether a lost swap was an
-  //    idempotent retry (we own it) or a cross-tenant conflict (someone else
-  //    owns it). It MUST ignore the ambient tenant context.
-  // -------------------------------------------------------------------------
-  it('findOwnerByIdCrossTenant returns the real owner even when called under a DIFFERENT tenant context', async () => {
-    await insertPrimaryPrimaryRow(ROW_ID_2, 'WAID-OWNER-1');
-    expect(await adopt(ROW_ID_2, TENANT_A, AGENT_A)).toBe(true);
-
-    // Call the owner lookup while the ALS says tenant-B. A tenant-scoped read
-    // would return null here; the cross-tenant helper must still see tenant-A.
-    const owner = await tenantContextMod.runWithTenantContext(
-      { tenant_id: TENANT_B, agent_id: AGENT_B },
-      () => repositoriesMod.mensagensRepo.findOwnerByIdCrossTenant(ROW_ID_2),
-    );
-    expect(owner).toEqual({ tenant_id: TENANT_A, agent_id: AGENT_A });
-  });
-
-  it('findOwnerByIdCrossTenant returns null for a non-existent id', async () => {
-    const owner = await repositoriesMod.mensagensRepo.findOwnerByIdCrossTenant(
-      '00000000-0000-0000-0000-000000009999',
-    );
-    expect(owner).toBeNull();
-  });
-});
+    it('findOwnerByIdCrossTenant returns null for a non-existent id', async () => {
+      const owner = await repositoriesMod.mensagensRepo.findOwnerByIdCrossTenant(
+        '00000000-0000-0000-0000-000000009999',
+      );
+      expect(owner).toBeNull();
+    });
+  },
+);

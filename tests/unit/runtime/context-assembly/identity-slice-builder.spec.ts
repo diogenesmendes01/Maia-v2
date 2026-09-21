@@ -31,9 +31,7 @@ const PROFILE_RECORD: OperationalProfileRecord = {
         confidence_floor_for_action: 0.7,
       },
       priorities: ['proteger autonomia do owner', 'preservar evidência'],
-      learned_voice_modifiers: [
-        { aspect: 'tom', modifier: 'mais direto à noite', strength: 0.6 },
-      ],
+      learned_voice_modifiers: [{ aspect: 'tom', modifier: 'mais direto à noite', strength: 0.6 }],
     },
   },
 };
@@ -225,10 +223,7 @@ describe('IdentitySliceBuilder', () => {
     });
     expect(result.slice.priorities).toEqual([]);
     // Principles surface through the dedicated channel, not via priorities.
-    expect(result.slice.principles).toEqual([
-      'transparência radical',
-      'preservar a evidência',
-    ]);
+    expect(result.slice.principles).toEqual(['transparência radical', 'preservar a evidência']);
   });
 
   it('Issue #200 [MEDIUM]: core_immutable.principles → slice.principles populated for depth=full', async () => {
@@ -263,10 +258,7 @@ describe('IdentitySliceBuilder', () => {
       signal: AbortSignal.timeout(600),
     });
     expect(result.slice.priorities).toEqual([]);
-    expect(result.slice.principles).toEqual([
-      'transparência radical',
-      'preservar a evidência',
-    ]);
+    expect(result.slice.principles).toEqual(['transparência radical', 'preservar a evidência']);
   });
 
   it('Issue #200 [MEDIUM]: depth=minimal does NOT populate slice.principles', async () => {
@@ -398,10 +390,7 @@ describe('IdentitySliceBuilder', () => {
     expect(result.slice.priorities).not.toContain('transparência radical');
     expect(result.slice.priorities).not.toContain('preservar a evidência');
     // Confirms a fresh strict extraction ran.
-    expect(result.slice.priorities).toEqual([
-      'proteger autonomia do owner',
-      'preservar evidência',
-    ]);
+    expect(result.slice.priorities).toEqual(['proteger autonomia do owner', 'preservar evidência']);
   });
 
   it('cache invalidates on identity_profile_activated event', async () => {

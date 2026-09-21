@@ -74,15 +74,9 @@ describe('P10a knowledgeIsVisible — per-state visibility', () => {
     expect(knowledgeIsVisible({ lifecycle_status: 'ephemeral' }).label).toBe(
       '[novo, baixa confiança]',
     );
-    expect(knowledgeIsVisible({ lifecycle_status: 'observed' }).label).toBe(
-      '[observado]',
-    );
-    expect(knowledgeIsVisible({ lifecycle_status: 'reinforced' }).label).toBe(
-      '[reforçado]',
-    );
-    expect(knowledgeIsVisible({ lifecycle_status: 'verified' }).label).toBe(
-      '[verificado]',
-    );
+    expect(knowledgeIsVisible({ lifecycle_status: 'observed' }).label).toBe('[observado]');
+    expect(knowledgeIsVisible({ lifecycle_status: 'reinforced' }).label).toBe('[reforçado]');
+    expect(knowledgeIsVisible({ lifecycle_status: 'verified' }).label).toBe('[verificado]');
     expect(knowledgeIsVisible({ lifecycle_status: 'active' }).label).toBe('[ativo]');
   });
 });
@@ -100,20 +94,14 @@ describe('P10a knowledgeIsVisible — strict mode', () => {
 
   it('strict mode keeps other visible states visible', () => {
     for (const state of ['observed', 'reinforced', 'verified', 'active'] as const) {
-      const result = knowledgeIsVisible(
-        { lifecycle_status: state },
-        { context_mode: 'strict' },
-      );
+      const result = knowledgeIsVisible({ lifecycle_status: state }, { context_mode: 'strict' });
       expect(result.visible).toBe(true);
     }
   });
 
   it('strict mode does not unmask invisible states', () => {
     for (const state of INVISIBLE) {
-      const result = knowledgeIsVisible(
-        { lifecycle_status: state },
-        { context_mode: 'strict' },
-      );
+      const result = knowledgeIsVisible({ lifecycle_status: state }, { context_mode: 'strict' });
       expect(result.visible).toBe(false);
     }
   });

@@ -46,8 +46,7 @@ function isStuckQuery(q: unknown): boolean {
 }
 
 function stubDb(count: number, stuckGroups: unknown[] = []) {
-  return async (q: unknown) =>
-    isStuckQuery(q) ? { rows: stuckGroups } : { rows: [{ c: count }] };
+  return async (q: unknown) => (isStuckQuery(q) ? { rows: stuckGroups } : { rows: [{ c: count }] });
 }
 
 function renderedFor(mock: { mock: { calls: unknown[][] } }, acao: string): string | undefined {

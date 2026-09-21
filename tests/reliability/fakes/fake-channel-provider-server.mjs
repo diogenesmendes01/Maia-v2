@@ -89,7 +89,10 @@ function lerCorpo(req) {
 
 function responder(res, status, corpo) {
   const texto = JSON.stringify(corpo);
-  res.writeHead(status, { 'content-type': 'application/json', 'content-length': Buffer.byteLength(texto) });
+  res.writeHead(status, {
+    'content-type': 'application/json',
+    'content-length': Buffer.byteLength(texto),
+  });
   res.end(texto);
 }
 
@@ -99,7 +102,14 @@ function responder(res, status, corpo) {
  */
 function registrarEnvio({ idempotency_key, payload_hash, tenant_id, agent_id }, comportamento) {
   const agora = Date.now();
-  chamadas.push({ idempotency_key, payload_hash, tenant_id, agent_id, at: agora, kind: comportamento.kind });
+  chamadas.push({
+    idempotency_key,
+    payload_hash,
+    tenant_id,
+    agent_id,
+    at: agora,
+    kind: comportamento.kind,
+  });
 
   const existente = ledger.get(idempotency_key);
 
@@ -141,7 +151,11 @@ function registrarEnvio({ idempotency_key, payload_hash, tenant_id, agent_id }, 
     // uma nova tentativa — é o que um provider real faz num 4xx de validação.
     return {
       status: comportamento.status ?? 422,
-      corpo: { outcome: 'rejected', reason: comportamento.reason ?? 'rejected_by_provider', idempotency_key },
+      corpo: {
+        outcome: 'rejected',
+        reason: comportamento.reason ?? 'rejected_by_provider',
+        idempotency_key,
+      },
     };
   }
 
@@ -251,11 +265,15 @@ const server = createServer((req, res) => {
 });
 
 process.on('uncaughtException', (e) => {
-  process.stdout.write(`${LINHA_FATAL} ${JSON.stringify({ tipo: 'uncaughtException', msg: String(e && e.message) })}\n`);
+  process.stdout.write(
+    `${LINHA_FATAL} ${JSON.stringify({ tipo: 'uncaughtException', msg: String(e && e.message) })}\n`,
+  );
   process.exit(70);
 });
 process.on('unhandledRejection', (e) => {
-  process.stdout.write(`${LINHA_FATAL} ${JSON.stringify({ tipo: 'unhandledRejection', msg: String(e) })}\n`);
+  process.stdout.write(
+    `${LINHA_FATAL} ${JSON.stringify({ tipo: 'unhandledRejection', msg: String(e) })}\n`,
+  );
   process.exit(71);
 });
 process.on('SIGTERM', () => {

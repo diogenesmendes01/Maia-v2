@@ -76,10 +76,7 @@ function formatBootFailure(problems: readonly ConfigProblem[], profile: string):
  * (applied by the caller) plus the `boot`-scope cross-field rules, with their
  * original messages.
  */
-function legacyBootProblems(
-  cfg: Config,
-  raw: Record<string, string | undefined>,
-): ConfigProblem[] {
+function legacyBootProblems(cfg: Config, raw: Record<string, string | undefined>): ConfigProblem[] {
   const { profile } = resolveProfile(raw);
   return evaluateCrossFieldRules({
     values: cfg as unknown as Record<string, unknown>,

@@ -239,7 +239,14 @@ describe('#509 zodToJsonSchema — unions, wrappers, unknown', () => {
   });
 
   it('refine/transform convert their INPUT schema (what the model sends)', () => {
-    expect(prop(z.string().min(3).refine((s) => s !== 'no'))).toEqual({
+    expect(
+      prop(
+        z
+          .string()
+          .min(3)
+          .refine((s) => s !== 'no'),
+      ),
+    ).toEqual({
       type: 'string',
       minLength: 3,
     });
@@ -267,9 +274,7 @@ describe('#509 zodToJsonSchema — unions, wrappers, unknown', () => {
 
 describe('#509 zodToJsonSchema — fail-closed on unsupported constructs', () => {
   it('rejects a tuple', () => {
-    expect(() => conv(z.object({ f: z.tuple([z.string()]) }))).toThrow(
-      ToolSchemaConversionError,
-    );
+    expect(() => conv(z.object({ f: z.tuple([z.string()]) }))).toThrow(ToolSchemaConversionError);
   });
 
   it('rejects a lazy/recursive schema', () => {
@@ -300,9 +305,7 @@ describe('#509 toolInputToJsonSchema — root contract, denylist, hash', () => {
   }
 
   it('object root produces a closed object schema + deterministic hash', () => {
-    const out = toolInputToJsonSchema(
-      tool(z.object({ a: z.string() }), 'root_object'),
-    );
+    const out = toolInputToJsonSchema(tool(z.object({ a: z.string() }), 'root_object'));
     expect(out.input_schema).toEqual({
       type: 'object',
       properties: { a: { type: 'string' } },
@@ -312,8 +315,7 @@ describe('#509 toolInputToJsonSchema — root contract, denylist, hash', () => {
     expect(out.schema_hash).toMatch(/^[0-9a-f]{16}$/);
     // Same contract → same hash (deterministic, cache-safe).
     expect(
-      toolInputToJsonSchema(tool(z.object({ a: z.string() }), 'root_object_2'))
-        .schema_hash,
+      toolInputToJsonSchema(tool(z.object({ a: z.string() }), 'root_object_2')).schema_hash,
     ).toBe(out.schema_hash);
   });
 
@@ -348,9 +350,7 @@ describe('#509 toolInputToJsonSchema — root contract, denylist, hash', () => {
       'api_key',
     ]) {
       expect(() =>
-        toolInputToJsonSchema(
-          tool(z.object({ [forbidden]: z.string() }), `deny_${forbidden}`),
-        ),
+        toolInputToJsonSchema(tool(z.object({ [forbidden]: z.string() }), `deny_${forbidden}`)),
       ).toThrow(ToolSchemaConversionError);
     }
   });

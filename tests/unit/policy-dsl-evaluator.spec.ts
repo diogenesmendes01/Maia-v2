@@ -23,10 +23,7 @@ import {
   MAX_REGEX_INPUT_LENGTH,
   MAX_REGEX_PATTERN,
 } from '@/governance/policy-dsl/constants.js';
-import type {
-  PolicyPredicate,
-  PolicyRuleBody,
-} from '@/governance/policy-dsl/types.js';
+import type { PolicyPredicate, PolicyRuleBody } from '@/governance/policy-dsl/types.js';
 
 afterEach(() => {
   resetRegexCache();
@@ -59,10 +56,7 @@ describe('evaluate — operator semantics', () => {
 
   it('eq deep-equals nested objects', () => {
     const ctx = { a: { b: [1, 2, { c: true }] } };
-    const decision = evaluate(
-      blockBody(leaf('a', 'eq', { b: [1, 2, { c: true }] })),
-      ctx,
-    );
+    const decision = evaluate(blockBody(leaf('a', 'eq', { b: [1, 2, { c: true }] })), ctx);
     expect(decision.matched).toBe(true);
   });
 
@@ -110,10 +104,7 @@ describe('evaluate — operator semantics', () => {
   });
 
   it('contains works for arrays (membership)', () => {
-    const d = evaluate(
-      blockBody(leaf('a', 'contains', { x: 1 })),
-      { a: [{ x: 0 }, { x: 1 }] },
-    );
+    const d = evaluate(blockBody(leaf('a', 'contains', { x: 1 })), { a: [{ x: 0 }, { x: 1 }] });
     expect(d.matched).toBe(true);
   });
 
@@ -189,10 +180,7 @@ describe('evaluate — boolean connectives', () => {
   });
 
   it('NOT inverts inner result', () => {
-    const d = evaluate(
-      blockBody({ kind: 'not', predicate: leaf('a', 'eq', 99) }),
-      { a: 1 },
-    );
+    const d = evaluate(blockBody({ kind: 'not', predicate: leaf('a', 'eq', 99) }), { a: 1 });
     expect(d.matched).toBe(true);
   });
 });
@@ -327,21 +315,21 @@ describe('evaluate — missing-field semantics (per-operator, Codex review #98)'
 
   // For ordinal ops, missing context is an evaluation_error (cannot coerce
   // undefined to a number without changing meaning). PEPs MUST block.
-  it.each(['gt', 'gte', 'lt', 'lte'])('%s on missing field → evaluation_error: missing_field', (op) => {
-    const d = evaluate(blockBody(leaf('amount', op, 100)), {});
-    expect(d.outcome).toBe('evaluation_error');
-    expect(d.matched).toBe(false);
-    expect(d.errors.some((e) => e.code === 'missing_field')).toBe(true);
-  });
+  it.each(['gt', 'gte', 'lt', 'lte'])(
+    '%s on missing field → evaluation_error: missing_field',
+    (op) => {
+      const d = evaluate(blockBody(leaf('amount', op, 100)), {});
+      expect(d.outcome).toBe('evaluation_error');
+      expect(d.matched).toBe(false);
+      expect(d.errors.some((e) => e.code === 'missing_field')).toBe(true);
+    },
+  );
 
   // NOT propagation: `not(not_applicable)` MUST stay `not_applicable`,
   // NOT become `matched=true`. Inverting "we don't know" doesn't give us
   // a definite answer.
   it('not(not_applicable) propagates not_applicable (not inverted to matched)', () => {
-    const d = evaluate(
-      blockBody({ kind: 'not', predicate: leaf('a', 'eq', 1) }),
-      { b: 2 },
-    );
+    const d = evaluate(blockBody({ kind: 'not', predicate: leaf('a', 'eq', 1) }), { b: 2 });
     expect(d.outcome).toBe('not_applicable');
     expect(d.matched).toBe(false);
   });
@@ -551,9 +539,7 @@ describe('evaluate — runtime fan-out and total-node caps (round-2 review)', ()
   it('rejects and branch with > MAX_BRANCH_FANOUT children at runtime', () => {
     // Bypass the validator by constructing a body directly. Simulates a
     // corrupted policy_rules row or one that pre-dates proposal-time caps.
-    const children = Array.from({ length: MAX_BRANCH_FANOUT + 1 }, () =>
-      leaf('a', 'eq', 1),
-    );
+    const children = Array.from({ length: MAX_BRANCH_FANOUT + 1 }, () => leaf('a', 'eq', 1));
     const body = {
       rule_id: 'r',
       predicate: { kind: 'and' as const, predicates: children },
@@ -566,9 +552,7 @@ describe('evaluate — runtime fan-out and total-node caps (round-2 review)', ()
   });
 
   it('rejects or branch with > MAX_BRANCH_FANOUT children at runtime', () => {
-    const children = Array.from({ length: MAX_BRANCH_FANOUT + 1 }, () =>
-      leaf('a', 'eq', 1),
-    );
+    const children = Array.from({ length: MAX_BRANCH_FANOUT + 1 }, () => leaf('a', 'eq', 1));
     const body = {
       rule_id: 'r',
       predicate: { kind: 'or' as const, predicates: children },

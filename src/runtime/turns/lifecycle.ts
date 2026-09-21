@@ -257,7 +257,10 @@ function applyResult(handle: TurnHandle, result: TurnTransitionResult): boolean 
       to_status: result.to,
       conflict: result.conflict,
       ...(result.conflict === 'state_mismatch'
-        ? { current_status: result.current_status, current_state_version: result.current_state_version }
+        ? {
+            current_status: result.current_status,
+            current_state_version: result.current_state_version,
+          }
         : {}),
     },
     'turn.transition_conflict',
@@ -525,12 +528,7 @@ async function beginClaimedExecution(
     // e `stream_poisoned` não some nunca sem um humano. Colapsá-lo em
     // `not_claimed` faria a única recusa que exige operação parecer a mais
     // rotineira de todas.
-    const streamReasons = [
-      'stream_busy',
-      'not_head',
-      'stream_blocked',
-      'stream_poisoned',
-    ] as const;
+    const streamReasons = ['stream_busy', 'not_head', 'stream_blocked', 'stream_poisoned'] as const;
     const rejeicao = acquired.result.ok === false ? acquired.result.reason : null;
     const porStream = streamReasons.find((r) => r === rejeicao);
     return { started: false, reason: porStream ?? 'not_claimed' };
@@ -645,9 +643,7 @@ export async function absorbDebounceInputs(
         // concorrentes. O fence acima diz "posso absorver"; este diz "este
         // irmão ainda está no estado que eu li".
         expected_version: Number(sibling.state_version),
-        ...(fence.kind === 'fenced'
-          ? { absorber_claim_token: fence.expected_claim_token }
-          : {}),
+        ...(fence.kind === 'fenced' ? { absorber_claim_token: fence.expected_claim_token } : {}),
       });
       // `stale_claim` aqui significa que a posse DESTE turno acabou — não que o
       // irmão andou. Parar a rajada inteira é a única reação correta: as
@@ -907,10 +903,7 @@ export const RETRY_JITTER_RATIO = 0.2;
  * A suíte espia `Math.random` no ponto de produção.
  */
 export function retryDelayMs(attempt: number): number {
-  const base = Math.min(
-    30_000 * Math.pow(2, Math.max(0, attempt - 1)),
-    RETRY_BACKOFF_CEILING_MS,
-  );
+  const base = Math.min(30_000 * Math.pow(2, Math.max(0, attempt - 1)), RETRY_BACKOFF_CEILING_MS);
   const jitter = base * RETRY_JITTER_RATIO * (Math.random() * 2 - 1);
   return Math.min(RETRY_BACKOFF_CEILING_MS, Math.max(0, Math.round(base + jitter)));
 }

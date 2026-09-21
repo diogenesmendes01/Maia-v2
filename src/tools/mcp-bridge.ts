@@ -23,11 +23,7 @@ import type { ToolSchema } from '@/lib/claude.js';
 import type { Pessoa, Conversa } from '@/db/schema.js';
 import { featureFlags } from '@/config/feature-flags.js';
 import { getCurrentAgent, getCurrentTenant } from '@/db/tenant-context.js';
-import {
-  agentToolGrantsRepo,
-  mcpServerToolsRepo,
-  mcpPackId,
-} from '@/db/repositories.js';
+import { agentToolGrantsRepo, mcpServerToolsRepo, mcpPackId } from '@/db/repositories.js';
 import { isMcpToolName, mcpToolName, parseMcpToolName } from './mcp-tool-names.js';
 import { mcpCallTool } from '@/lib/mcp-client.js';
 import { constitutionalCheck } from '@/governance/rules.js';
@@ -67,10 +63,7 @@ export { isMcpToolName, mcpToolName, parseMcpToolName };
  * como projetado) separado de `mcp_call_failed` (o servidor externo quebrou).
  * Antes os dois caíam no mesmo balde `error` do SLI operacional.
  */
-export {
-  MCP_BRIDGE_ERROR_CODES,
-  type McpBridgeErrorCode,
-} from './_dispatch-error-codes.js';
+export { MCP_BRIDGE_ERROR_CODES, type McpBridgeErrorCode } from './_dispatch-error-codes.js';
 
 /** Packs `mcp.<server>` presentes no grant do agente corrente (ALS). */
 async function grantedMcpServerNames(): Promise<Set<string>> {
@@ -114,10 +107,7 @@ export type McpDispatchResult =
   | { error: string; details?: Record<string, unknown> };
 
 /** Validação estrutural v1: objeto + required top-level do JSON Schema. */
-function validateArgsStructurally(
-  args: unknown,
-  schema: Record<string, unknown>,
-): string | null {
+function validateArgsStructurally(args: unknown, schema: Record<string, unknown>): string | null {
   if (args === null || typeof args !== 'object' || Array.isArray(args)) {
     return 'args_must_be_object';
   }
@@ -274,9 +264,7 @@ export async function dispatchMcpTool(input: {
       toolArgs: input.args as Record<string, unknown>,
       // O turno continua vivo agora, mas a chamada pode durar: o signal aborta
       // o HTTP se a posse acabar DURANTE ela.
-      ...(getTurnExecutionContext()?.signal
-        ? { signal: getTurnExecutionContext()!.signal }
-        : {}),
+      ...(getTurnExecutionContext()?.signal ? { signal: getTurnExecutionContext()!.signal } : {}),
     });
     const { text, truncated, bytes } = truncateResult(raw);
     await audit({
@@ -307,10 +295,10 @@ export async function dispatchMcpTool(input: {
         error: message.slice(0, 300),
       },
     });
-    logger.warn(
-      { err, tool: input.tool, tenant_id, agent_id },
-      'mcp.tool_call_failed',
-    );
-    return { error: 'mcp_call_failed', details: { tool: input.tool, message: message.slice(0, 300) } };
+    logger.warn({ err, tool: input.tool, tenant_id, agent_id }, 'mcp.tool_call_failed');
+    return {
+      error: 'mcp_call_failed',
+      details: { tool: input.tool, message: message.slice(0, 300) },
+    };
   }
 }

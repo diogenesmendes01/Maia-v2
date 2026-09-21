@@ -129,23 +129,17 @@ describe('advanceInProgressOccurrence — one_shot_reminder must not be finalize
     await runSchedulingTick();
 
     // No `completed` mutation.
-    expect(
-      setStatusMock.mock.calls.find((c) => c[1] === 'completed'),
-    ).toBeUndefined();
+    expect(setStatusMock.mock.calls.find((c) => c[1] === 'completed')).toBeUndefined();
     // Claim released — outbox-drain owns completion.
     expect(releaseClaimMock).toHaveBeenCalledWith(occBase.id, 30);
     // No occurrence_completed audit.
     expect(
-      auditMock.mock.calls.some(
-        (c) => (c[0] as { acao: string }).acao === 'occurrence_completed',
-      ),
+      auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'occurrence_completed'),
     ).toBe(false);
   });
 
   it('recurring_payment in_progress (also unexpected): release claim, no false success', async () => {
-    claimInProgressMock.mockResolvedValue([
-      { ...occBase, id: 'occ-pay-1', series_id: 's-pay-1' },
-    ]);
+    claimInProgressMock.mockResolvedValue([{ ...occBase, id: 'occ-pay-1', series_id: 's-pay-1' }]);
     findSeriesMock.mockResolvedValue({
       id: 's-pay-1',
       tipo: 'recurring_payment',
@@ -162,9 +156,7 @@ describe('advanceInProgressOccurrence — one_shot_reminder must not be finalize
     const { runSchedulingTick } = await import('../../src/scheduling/engine.js');
     await runSchedulingTick();
 
-    expect(
-      setStatusMock.mock.calls.find((c) => c[1] === 'completed'),
-    ).toBeUndefined();
+    expect(setStatusMock.mock.calls.find((c) => c[1] === 'completed')).toBeUndefined();
     expect(releaseClaimMock).toHaveBeenCalledWith('occ-pay-1', 30);
     expect(insertNextMock).not.toHaveBeenCalled();
   });
@@ -189,9 +181,7 @@ describe('advanceInProgressOccurrence — one_shot_reminder must not be finalize
 
     // Cancelled — not completed/fired.
     expect(setStatusMock).toHaveBeenCalledWith(occBase.id, 'cancelled');
-    expect(
-      setStatusMock.mock.calls.find((c) => c[1] === 'completed'),
-    ).toBeUndefined();
+    expect(setStatusMock.mock.calls.find((c) => c[1] === 'completed')).toBeUndefined();
   });
 
   it('with the SQL fix in place, claim returns empty for non-outreach in_progress (normal happy path)', async () => {

@@ -370,9 +370,7 @@ export type ProviderAttemptObservation =
  * `kind` novo virar erro de compilação em vez de cair num ramo genérico. Um
  * default aqui seria o lugar onde "não sei" viraria "deu certo".
  */
-export function normalizeProviderOutcome(
-  obs: ProviderAttemptObservation,
-): OutboundDeliveryOutcome {
+export function normalizeProviderOutcome(obs: ProviderAttemptObservation): OutboundDeliveryOutcome {
   switch (obs.kind) {
     case 'accepted_with_id':
       return 'accepted_confirmed';
@@ -494,8 +492,7 @@ export function retrySafety(input: {
   if (statusForOutcome(input.outcome) === 'failed_terminal') return 'reconcile';
   if (
     isDeliveryUnknown(input.outcome) &&
-    providerIdempotencySupport(input.channel, input.payload_type) ===
-      PROVIDER_IDEMPOTENCY_NATIVE
+    providerIdempotencySupport(input.channel, input.payload_type) === PROVIDER_IDEMPOTENCY_NATIVE
   ) {
     return 'idempotent';
   }
@@ -544,11 +541,7 @@ export class DeliveryFenceError extends Error {
   readonly operation: string;
   readonly reason: DeliveryLeaseLossReason;
 
-  constructor(args: {
-    outbound_id: string;
-    operation: string;
-    reason: DeliveryLeaseLossReason;
-  }) {
+  constructor(args: { outbound_id: string; operation: string; reason: DeliveryLeaseLossReason }) {
     super(
       `outbound_delivery_fence_rejected: a gravação '${args.operation}' da linha ` +
         `${args.outbound_id} foi recusada (${args.reason}) — o claim_token não é mais o ` +

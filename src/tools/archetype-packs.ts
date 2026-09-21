@@ -14,13 +14,7 @@
  * test, and `resolvePackTools` is fail-closed anyway (unknown pack grants
  * nothing).
  */
-export const ARCHETYPE_IDS = [
-  'vendedor',
-  'suporte',
-  'financeiro',
-  'agendador',
-  'custom',
-] as const;
+export const ARCHETYPE_IDS = ['vendedor', 'suporte', 'financeiro', 'agendador', 'custom'] as const;
 
 export type ArchetypeId = (typeof ARCHETYPE_IDS)[number];
 

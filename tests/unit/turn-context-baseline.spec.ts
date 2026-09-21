@@ -1,5 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import type { Mensagem, Pessoa, Conversa, Permissao, PermissionProfile } from '../../src/db/schema.js';
+import type {
+  Mensagem,
+  Pessoa,
+  Conversa,
+  Permissao,
+  PermissionProfile,
+} from '../../src/db/schema.js';
 
 /**
  * Issue #511 — TURN-CONTEXT QUERY BUDGET (kept as the SLOPE guard).
@@ -135,7 +141,10 @@ vi.mock('../../src/db/repositories.js', () => ({
   },
   // --- procedures -------------------------------------------------------
   procedureExecutionsRepo: {
-    findActiveForConversa: h.count('procedureExecutionsRepo.findActiveForConversa', async () => null),
+    findActiveForConversa: h.count(
+      'procedureExecutionsRepo.findActiveForConversa',
+      async () => null,
+    ),
   },
   procedureDefinitionsRepo: {
     findById: h.count('procedureDefinitionsRepo.findById', async () => null),
@@ -221,7 +230,13 @@ function mkScope(n: number): PromptContext['scope'] {
   const byEntity = new Map<string, ResolvedPermission>();
   for (const id of entidades) {
     byEntity.set(id, {
-      permissao: { id: `perm-${id}`, entidade_id: id, profile_id: `profile-${id}`, status: 'ativa', limites: {} } as unknown as Permissao,
+      permissao: {
+        id: `perm-${id}`,
+        entidade_id: id,
+        profile_id: `profile-${id}`,
+        status: 'ativa',
+        limites: {},
+      } as unknown as Permissao,
       profile: mkProfile(`profile-${id}`),
       effective_limits: { valor_max: 1000 },
     });
@@ -297,13 +312,7 @@ describe('#511 baseline — turn-context query cost', () => {
       expect(h.calls['behavioralHintRepo.findActiveForScopes']).toBe(1);
       // …and it still asks for all five scopes.
       const scopes = (h.hintScopeCalls.at(-1) ?? []).map((s) => s.scope_type);
-      expect(scopes).toEqual([
-        'interlocutor',
-        'conversation',
-        'role',
-        'channel',
-        'agent',
-      ]);
+      expect(scopes).toEqual(['interlocutor', 'conversation', 'role', 'channel', 'agent']);
     });
   });
 

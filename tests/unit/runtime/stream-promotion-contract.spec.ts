@@ -28,10 +28,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { sql } from 'drizzle-orm';
 import { PgDialect } from 'drizzle-orm/pg-core';
-import {
-  STREAM_PROMOTION_RESULTS,
-  STREAM_SCHEDULING_RESULTS,
-} from '@/runtime/turns/claim.js';
+import { STREAM_PROMOTION_RESULTS, STREAM_SCHEDULING_RESULTS } from '@/runtime/turns/claim.js';
 import {
   TERMINAL_TURN_STATUSES,
   TURN_TRANSITIONS,
@@ -49,10 +46,7 @@ const migracaoDown = readFileSync(
   resolve(raiz, 'migrations/127_agent_turns_stream_promotion_down.sql'),
   'utf8',
 );
-const repoFonte = readFileSync(
-  resolve(raiz, 'src/db/repositories/turn-repos.ts'),
-  'utf8',
-);
+const repoFonte = readFileSync(resolve(raiz, 'src/db/repositories/turn-repos.ts'), 'utf8');
 
 /** O SQL de verdade: sem os comentários, que aqui falam sobre o que NÃO se faz. */
 const semComentarios = (arquivo: string): string =>
@@ -62,8 +56,7 @@ const semComentarios = (arquivo: string): string =>
     .join('\n');
 
 const dialeto = new PgDialect();
-const compilar = (fragmento: ReturnType<typeof sql>): string =>
-  dialeto.sqlToQuery(fragmento).sql;
+const compilar = (fragmento: ReturnType<typeof sql>): string => dialeto.sqlToQuery(fragmento).sql;
 
 const eleicao = compilar(
   streamSuccessorCandidate({
@@ -83,24 +76,14 @@ describe('#627 — contrato da promoção do sucessor', () => {
     expect(STREAM_SCHEDULING_RESULTS).toContain('promoted');
     expect(STREAM_PROMOTION_RESULTS).toContain('promoted');
     // A tabela de produtores do vocabulário deixou de dizer "ninguém ainda".
-    const claimFonte = readFileSync(
-      resolve(raiz, 'src/runtime/turns/claim.ts'),
-      'utf8',
-    );
-    expect(claimFonte).not.toMatch(
-      /\|\s*`promoted`\s*\|\s*\*\*ninguém ainda\*\*/,
-    );
-    expect(claimFonte).toMatch(
-      /\|\s*`promoted`\s*\|\s*`promoteStreamSuccessor`/,
-    );
+    const claimFonte = readFileSync(resolve(raiz, 'src/runtime/turns/claim.ts'), 'utf8');
+    expect(claimFonte).not.toMatch(/\|\s*`promoted`\s*\|\s*\*\*ninguém ainda\*\*/);
+    expect(claimFonte).toMatch(/\|\s*`promoted`\s*\|\s*`promoteStreamSuccessor`/);
   });
 
   it('recovery do outbox é uma origem tipada de promoção pós-commit', () => {
     expectTypeOf<StreamPromotionSource>().toEqualTypeOf<
-      | 'terminal'
-      | 'stream_claim_recovery'
-      | 'outbound_recovery'
-      | 'recovery_reconciliation'
+      'terminal' | 'stream_claim_recovery' | 'outbound_recovery' | 'recovery_reconciliation'
     >();
   });
 
@@ -109,17 +92,9 @@ describe('#627 — contrato da promoção do sucessor', () => {
     // por fence e recuperação". Os outros dois existem porque, sem eles, os
     // três primeiros são ilegíveis — ver o comentário da constante.
     expect([...STREAM_PROMOTION_RESULTS].sort()).toEqual(
-      [
-        'enqueue_failed',
-        'fence_rejected',
-        'no_successor',
-        'promoted',
-        'recovered',
-      ].sort(),
+      ['enqueue_failed', 'fence_rejected', 'no_successor', 'promoted', 'recovered'].sort(),
     );
-    expect(new Set(STREAM_PROMOTION_RESULTS).size).toBe(
-      STREAM_PROMOTION_RESULTS.length,
-    );
+    expect(new Set(STREAM_PROMOTION_RESULTS).size).toBe(STREAM_PROMOTION_RESULTS.length);
   });
 
   it('`promoted` é o ÚNICO código compartilhado entre os dois vocabulários', () => {
@@ -142,9 +117,7 @@ describe('#627 — contrato da promoção do sucessor', () => {
     // isso é cobrado — remover a aresta deixaria a promoção escrevendo uma
     // transição que a máquina de estados nega.
     const destinos = (from: TurnStatus): readonly string[] =>
-      (TURN_TRANSITIONS[from] ?? []).map((t) =>
-        typeof t === 'string' ? t : t.to,
-      );
+      (TURN_TRANSITIONS[from] ?? []).map((t) => (typeof t === 'string' ? t : t.to));
     expect(destinos('received')).toContain('queued');
     expect(destinos('retryable')).toContain('queued');
   });
@@ -191,9 +164,7 @@ describe('#627 — contrato da promoção do sucessor', () => {
     // turno não terminal com sequência MENOR (backfill, replay, irmão absorvido
     // fora de ordem) ficaria invisível para sempre e a stream avançaria por
     // cima dele. A eleição é ABSOLUTA — o menor vivo da stream.
-    expect(eleicao).not.toMatch(
-      /s\.first_ingress_seq\s*>\s*pred\.first_ingress_seq/,
-    );
+    expect(eleicao).not.toMatch(/s\.first_ingress_seq\s*>\s*pred\.first_ingress_seq/);
   });
 
   it('o repositório NÃO tem uma segunda cópia da regra de posição', () => {
@@ -203,20 +174,14 @@ describe('#627 — contrato da promoção do sucessor', () => {
       .split('\n')
       .filter((l) => !/^\s*(\*|\/\/)/.test(l))
       .join('\n');
-    expect(codigo).not.toMatch(
-      /first_ingress_seq\s*[<>]\s*\S*\.?first_ingress_seq/,
-    );
+    expect(codigo).not.toMatch(/first_ingress_seq\s*[<>]\s*\S*\.?first_ingress_seq/);
   });
 
   // ─── 4. A migration ─────────────────────────────────────────────────────
 
   it('a 127 declara as duas colunas da decisão persistida', () => {
-    expect(migracao).toMatch(
-      /ADD COLUMN IF NOT EXISTS promoted_at timestamptz/,
-    );
-    expect(migracao).toMatch(
-      /ADD COLUMN IF NOT EXISTS promoted_by_turn_id uuid/,
-    );
+    expect(migracao).toMatch(/ADD COLUMN IF NOT EXISTS promoted_at timestamptz/);
+    expect(migracao).toMatch(/ADD COLUMN IF NOT EXISTS promoted_by_turn_id uuid/);
   });
 
   it('a 127 NÃO usa CONCURRENTLY — e por isso não herda a armadilha da #658', () => {

@@ -26,7 +26,13 @@ describe('#511 section budgets', () => {
 
   it('keeps everything when the section fits', () => {
     const items = ['a', 'b', 'c'];
-    const out = applyBudget('facts', items, { max_items: 10, max_bytes: 1000 }, utf8Bytes, truncateUtf8);
+    const out = applyBudget(
+      'facts',
+      items,
+      { max_items: 10, max_bytes: 1000 },
+      utf8Bytes,
+      truncateUtf8,
+    );
     expect(out.items).toEqual(items);
     expect(out.dropped).toBe(0);
     expect(out.clipped).toBe(0);
@@ -35,7 +41,13 @@ describe('#511 section budgets', () => {
 
   it('cuts to max_items and reports how many were lost', () => {
     const items = Array.from({ length: 50 }, (_, i) => `item-${i}`);
-    const out = applyBudget('facts', items, { max_items: 20, max_bytes: 1_000_000 }, utf8Bytes, truncateUtf8);
+    const out = applyBudget(
+      'facts',
+      items,
+      { max_items: 20, max_bytes: 1_000_000 },
+      utf8Bytes,
+      truncateUtf8,
+    );
     expect(out.items).toHaveLength(20);
     expect(out.dropped).toBe(30);
     expect(out.reason).toBe('max_items');
@@ -44,7 +56,13 @@ describe('#511 section budgets', () => {
   it('cuts on bytes even when the item count is legal', () => {
     // 5 items, well under a 100-item cap, but 5 KB against a 2 KB ceiling.
     const items = Array.from({ length: 5 }, () => 'x'.repeat(1000));
-    const out = applyBudget('facts', items, { max_items: 100, max_bytes: 2000 }, utf8Bytes, truncateUtf8);
+    const out = applyBudget(
+      'facts',
+      items,
+      { max_items: 100, max_bytes: 2000 },
+      utf8Bytes,
+      truncateUtf8,
+    );
     expect(out.items).toHaveLength(2);
     expect(out.dropped).toBe(3);
     expect(out.reason).toBe('max_bytes');
@@ -76,7 +94,13 @@ describe('#511 section budgets', () => {
   });
 
   it('meters the clipped item under max_bytes', async () => {
-    applyBudget('rules', ['z'.repeat(9999)], { max_items: 5, max_bytes: 200 }, utf8Bytes, truncateUtf8);
+    applyBudget(
+      'rules',
+      ['z'.repeat(9999)],
+      { max_items: 5, max_bytes: 200 },
+      utf8Bytes,
+      truncateUtf8,
+    );
     const exposition = await renderPrometheus();
     expect(exposition).toContain(
       'maia_turn_context_truncated_total{reason="max_bytes",section="rules"} 1',
@@ -87,7 +111,13 @@ describe('#511 section budgets', () => {
     // 30 items → 20 dropped by count; of the 10 survivors the first alone
     // blows the byte ceiling → 1 clipped + 9 dropped by bytes.
     const items = Array.from({ length: 30 }, () => 'q'.repeat(500));
-    const out = applyBudget('facts', items, { max_items: 10, max_bytes: 100 }, utf8Bytes, truncateUtf8);
+    const out = applyBudget(
+      'facts',
+      items,
+      { max_items: 10, max_bytes: 100 },
+      utf8Bytes,
+      truncateUtf8,
+    );
     expect(out.dropped).toBe(20 + 9);
     expect(out.clipped).toBe(1);
 
@@ -142,7 +172,9 @@ describe('#511 section budgets', () => {
   it('does not meter a truncation when nothing was dropped', async () => {
     applyBudget('rules', ['a'], { max_items: 10, max_bytes: 1000 }, utf8Bytes, truncateUtf8);
     const exposition = await renderPrometheus();
-    expect(exposition).not.toContain('maia_turn_context_truncated_total{reason="max_items",section="rules"}');
+    expect(exposition).not.toContain(
+      'maia_turn_context_truncated_total{reason="max_items",section="rules"}',
+    );
   });
 
   it('measures multi-byte characters in bytes, not code units', () => {

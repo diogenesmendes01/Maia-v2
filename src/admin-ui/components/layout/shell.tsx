@@ -97,9 +97,7 @@ function BrandLink() {
       <span className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand-600 text-sm font-bold text-white">
         M
       </span>
-      <span className="text-sm font-semibold tracking-tight text-white">
-        Maia Console
-      </span>
+      <span className="text-sm font-semibold tracking-tight text-white">Maia Console</span>
     </Link>
   );
 }
@@ -124,9 +122,7 @@ function SidebarContent({
 
       <nav className="scroll-thin grow space-y-5 overflow-y-auto px-3 pb-4">
         {NAV_SECTIONS.map((section, si) => {
-          const items = section.items.filter(
-            (i) => !i.founderOnly || role === 'founder',
-          );
+          const items = section.items.filter((i) => !i.founderOnly || role === 'founder');
           if (items.length === 0) return null;
           return (
             <div key={si}>
@@ -170,9 +166,7 @@ function SidebarContent({
       <div className="border-t border-ink-line px-4 py-3">
         <div className="flex items-center justify-between gap-2">
           <div className="min-w-0">
-            <p className="truncate text-xs font-medium text-zinc-200">
-              {email ?? '—'}
-            </p>
+            <p className="truncate text-xs font-medium text-zinc-200">{email ?? '—'}</p>
             <p className="text-2xs text-zinc-500">
               {role || 'sem papel'} · {tenantId || 'sem tenant'}
             </p>
@@ -309,9 +303,7 @@ export function Shell({ children }: { children: React.ReactNode }) {
           )}
         </header>
 
-        <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">
-          {children}
-        </main>
+        <main className="mx-auto max-w-6xl px-4 py-6 sm:px-6 lg:px-8 lg:py-8">{children}</main>
       </div>
     </div>
   );

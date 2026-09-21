@@ -43,9 +43,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
       public readonly id: string,
       public readonly expected_previous_status: KnowledgeLifecycleStatus,
     ) {
-      super(
-        `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
-      );
+      super(`knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`);
       this.name = 'KnowledgeConflictError';
     }
   }
@@ -55,10 +53,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
       async create(): Promise<string> {
         throw new Error('create_not_used_in_this_suite');
       },
-      async findById(
-        kind: KnowledgeKind,
-        id: string,
-      ): Promise<KnowledgeRow | null> {
+      async findById(kind: KnowledgeKind, id: string): Promise<KnowledgeRow | null> {
         const row = storeByKind.get(kind)?.get(id);
         if (!row) return null;
         // Return a shallow copy so the caller can't mutate the store.
@@ -80,18 +75,12 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
           updates.expected_previous_status !== undefined &&
           row.lifecycle_status !== updates.expected_previous_status
         ) {
-          throw new KnowledgeConflictError(
-            kind,
-            id,
-            updates.expected_previous_status,
-          );
+          throw new KnowledgeConflictError(kind, id, updates.expected_previous_status);
         }
-        if (updates.lifecycle_status !== undefined)
-          row.lifecycle_status = updates.lifecycle_status;
+        if (updates.lifecycle_status !== undefined) row.lifecycle_status = updates.lifecycle_status;
         if (updates.lifecycle_transitions !== undefined)
           row.lifecycle_transitions = updates.lifecycle_transitions;
-        if (updates.evidence_count !== undefined)
-          row.evidence_count = updates.evidence_count;
+        if (updates.evidence_count !== undefined) row.evidence_count = updates.evidence_count;
         row.updated_at = new Date();
       },
     },
@@ -99,9 +88,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: { record: vi.fn().mockResolvedValue(undefined) },
@@ -153,15 +141,10 @@ describe('P10a optimistic concurrency — lost-revoke prevention', () => {
     // re-reads inside its own call, we need to simulate a stale read.
     // We can do this by patching findById to return ephemeral while the
     // store already holds revoked.
-    const reposModule = await import(
-      '@/control-plane/knowledge-state-machine/repos.js'
-    );
+    const reposModule = await import('@/control-plane/knowledge-state-machine/repos.js');
     const originalFindById = reposModule.knowledgeRepos.findById;
     let firstCall = true;
-    (reposModule.knowledgeRepos.findById as unknown) = async (
-      kind: KnowledgeKind,
-      id: string,
-    ) => {
+    (reposModule.knowledgeRepos.findById as unknown) = async (kind: KnowledgeKind, id: string) => {
       if (firstCall) {
         firstCall = false;
         // Return the stale ephemeral snapshot. Meanwhile, mutate the
@@ -193,9 +176,7 @@ describe('P10a optimistic concurrency — lost-revoke prevention', () => {
       ).rejects.toThrow(IllegalTransitionError);
 
       // The store-level state remains revoked — the revoke was preserved.
-      expect(storeByKind.get('fact')!.get('race-1')!.lifecycle_status).toBe(
-        'revoked',
-      );
+      expect(storeByKind.get('fact')!.get('race-1')!.lifecycle_status).toBe('revoked');
     } finally {
       (reposModule.knowledgeRepos.findById as unknown) = originalFindById;
     }
@@ -212,15 +193,10 @@ describe('P10a optimistic concurrency — lost-revoke prevention', () => {
       updated_at: new Date(),
     });
 
-    const reposModule = await import(
-      '@/control-plane/knowledge-state-machine/repos.js'
-    );
+    const reposModule = await import('@/control-plane/knowledge-state-machine/repos.js');
     const originalFindById = reposModule.knowledgeRepos.findById;
     let firstCall = true;
-    (reposModule.knowledgeRepos.findById as unknown) = async (
-      kind: KnowledgeKind,
-      id: string,
-    ) => {
+    (reposModule.knowledgeRepos.findById as unknown) = async (kind: KnowledgeKind, id: string) => {
       if (firstCall) {
         firstCall = false;
         // Stale ephemeral snapshot; meanwhile another writer already
@@ -268,15 +244,10 @@ describe('P10a optimistic concurrency — lost-revoke prevention', () => {
       updated_at: new Date(),
     });
 
-    const reposModule = await import(
-      '@/control-plane/knowledge-state-machine/repos.js'
-    );
+    const reposModule = await import('@/control-plane/knowledge-state-machine/repos.js');
     const originalFindById = reposModule.knowledgeRepos.findById;
     let call = 0;
-    (reposModule.knowledgeRepos.findById as unknown) = async (
-      kind: KnowledgeKind,
-      id: string,
-    ) => {
+    (reposModule.knowledgeRepos.findById as unknown) = async (kind: KnowledgeKind, id: string) => {
       call++;
       if (call === 1) {
         // First read: ephemeral. Meanwhile, promote to observed.
@@ -306,9 +277,7 @@ describe('P10a optimistic concurrency — lost-revoke prevention', () => {
       // After conflict + retry, the row ends up revoked from observed.
       expect(result.from).toBe('observed');
       expect(result.to).toBe('revoked');
-      expect(storeByKind.get('fact')!.get('race-3')!.lifecycle_status).toBe(
-        'revoked',
-      );
+      expect(storeByKind.get('fact')!.get('race-3')!.lifecycle_status).toBe('revoked');
     } finally {
       (reposModule.knowledgeRepos.findById as unknown) = originalFindById;
     }

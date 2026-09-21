@@ -79,10 +79,7 @@ describe('SkillSliceBuilder', () => {
 
   it('mode=candidates loads summarised candidates with reason', async () => {
     const builder = new SkillSliceBuilder(
-      mkRepo({}, [
-        summary('sk1', 'name match'),
-        summary('sk2', 'semantic similarity'),
-      ]),
+      mkRepo({}, [summary('sk1', 'name match'), summary('sk2', 'semantic similarity')]),
       cache,
     );
     const decision = mockDecision({
@@ -123,10 +120,7 @@ describe('SkillSliceBuilder', () => {
   });
 
   it('falls back to candidates mode when selected_only requested but no selected_skill_id', async () => {
-    const builder = new SkillSliceBuilder(
-      mkRepo({}, [summary('sk1', 'rank-1')]),
-      cache,
-    );
+    const builder = new SkillSliceBuilder(mkRepo({}, [summary('sk1', 'rank-1')]), cache);
     const decision = mockDecision({
       routing: {
         agent_id: 'agent1',

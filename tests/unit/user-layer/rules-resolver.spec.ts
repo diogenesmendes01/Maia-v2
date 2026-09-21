@@ -17,9 +17,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
 vi.mock('@/db/tenant-context.js', async () => {
-  const actual = await vi.importActual<typeof import('../../../src/db/tenant-context.js')>(
-    '@/db/tenant-context.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('../../../src/db/tenant-context.js')>(
+      '@/db/tenant-context.js',
+    );
   return { ...actual, tryGetCurrentContext: () => null };
 });
 

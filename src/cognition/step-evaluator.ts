@@ -36,7 +36,11 @@ export type StepEvalResult = {
    * so the executor can record an event and (in P3c) the reaper can sweep.
    * Today: surfaced as a warning + audit event so the stall is observable.
    */
-  stall_reason: null | 'no_criteria_defined' | 'unsupported_criterion_only' | 'unknown_criterion_type';
+  stall_reason:
+    | null
+    | 'no_criteria_defined'
+    | 'unsupported_criterion_only'
+    | 'unknown_criterion_type';
   /**
    * P84-C3: when more than one downstream step is eligible to fire from
    * the current completion (DAG parallel branches), the evaluator picks
@@ -142,9 +146,14 @@ export async function evaluateCurrentStep(args: {
       const calls = args.response_context.tools_called ?? [];
       const matchingCall = calls.find((tc) => tc.name === tool);
       if (matchingCall) {
-        const resultStr = typeof matchingCall.result === 'string' ? matchingCall.result : JSON.stringify(matchingCall.result);
+        const resultStr =
+          typeof matchingCall.result === 'string'
+            ? matchingCall.result
+            : JSON.stringify(matchingCall.result);
         passed = resultStr.toLowerCase().includes(expected.toLowerCase());
-        evidence = passed ? `tool ${tool} returned expected` : `tool ${tool} returned: ${resultStr.slice(0, 100)}`;
+        evidence = passed
+          ? `tool ${tool} returned expected`
+          : `tool ${tool} returned: ${resultStr.slice(0, 100)}`;
       } else {
         passed = false;
         evidence = `tool ${tool} not called`;

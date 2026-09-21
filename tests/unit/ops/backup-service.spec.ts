@@ -7,10 +7,7 @@ import {
 } from '../../../src/ops/backup/service.js';
 import { resolveBackupProfile, type BackupConfigInput } from '../../../src/ops/backup/profile.js';
 import { verifyManifest, singleVersionKeyring } from '../../../src/ops/backup/manifest.js';
-import {
-  canReleaseTraffic,
-  planReconciliation,
-} from '../../../src/ops/retention/tombstones.js';
+import { canReleaseTraffic, planReconciliation } from '../../../src/ops/retention/tombstones.js';
 import { TypedError } from '../../../src/lib/utils.js';
 
 /**
@@ -58,7 +55,10 @@ interface Harness {
   fs: Map<string, string>;
 }
 
-function harness(over: Partial<BackupPorts> = {}, opts: { frozenClock?: boolean; id?: string } = {}): Harness {
+function harness(
+  over: Partial<BackupPorts> = {},
+  opts: { frozenClock?: boolean; id?: string } = {},
+): Harness {
   const runs: Record<string, unknown>[] = [];
   const manifests: { runId: string; signed: unknown }[] = [];
   const audits: { action: string; metadata: Record<string, unknown> }[] = [];
@@ -554,7 +554,10 @@ describe('tombstone ledger probe (round-1 P1)', () => {
         rows_present: false,
       }),
     });
-    const res = await runVerifiedBackup(h.ports, resolveBackupProfile(cfg({ BACKUP_S3_BUCKET: 'b' })));
+    const res = await runVerifiedBackup(
+      h.ports,
+      resolveBackupProfile(cfg({ BACKUP_S3_BUCKET: 'b' })),
+    );
     expect(res.outcome).toBe('failed');
     expect(lastRun(h).error_code).toBe('tombstone_ledger_unavailable');
   });
@@ -655,9 +658,9 @@ describe('a failing audit sink never strands the run (round-1 P2)', () => {
       }
     });
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg()));
-    await expect(
-      runVerifiedBackup(h.ports, resolveBackupProfile(cfg())),
-    ).resolves.toMatchObject({ outcome: 'completed_degraded' });
+    await expect(runVerifiedBackup(h.ports, resolveBackupProfile(cfg()))).resolves.toMatchObject({
+      outcome: 'completed_degraded',
+    });
   });
 
   it('a stranded run WOULD block the next one (the fake proves the hazard is real)', async () => {
@@ -723,7 +726,13 @@ describe('run bookkeeping', () => {
   });
 
   it('records stage durations', async () => {
-    const h = harness({ upload: vi.fn(async () => ({ locator: 'a'.repeat(32), remote_bytes: 1024, remote_sha256: DIGEST })) });
+    const h = harness({
+      upload: vi.fn(async () => ({
+        locator: 'a'.repeat(32),
+        remote_bytes: 1024,
+        remote_sha256: DIGEST,
+      })),
+    });
     await runVerifiedBackup(h.ports, resolveBackupProfile(cfg({ BACKUP_S3_BUCKET: 'b' })));
     expect(lastRun(h).dump_duration_ms).toBeGreaterThan(0);
     expect(lastRun(h).upload_duration_ms).toBeGreaterThanOrEqual(0);

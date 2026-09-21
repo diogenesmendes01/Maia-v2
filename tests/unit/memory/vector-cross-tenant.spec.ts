@@ -82,7 +82,14 @@ const store: StoredRow[] = [];
 let nextId = 1;
 let nextEmbedding: number[] = [0.5, 0.5, 0.5];
 
-function seedRow(over: Partial<StoredRow> & { id: string; tenant_id: string; agent_id: string; embedding: number[] }): void {
+function seedRow(
+  over: Partial<StoredRow> & {
+    id: string;
+    tenant_id: string;
+    agent_id: string;
+    embedding: number[];
+  },
+): void {
   store.push({
     conteudo: 'seeded',
     tipo: 'reflexao',
@@ -131,17 +138,18 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     // VALUES (...):
     //   ($1 tenant_id, $2 agent_id, $3 conteudo, $4 embedding,
     //    $5 tipo, $6 escopo, $7 metadata-jsonb, $8 ref_tabela, $9 ref_id)
-    const [tenant_id, agent_id, conteudo, vec, tipo, escopo, metadataJson, ref_tabela, ref_id] = params as [
-      string,
-      string,
-      string,
-      string,
-      string,
-      string,
-      string,
-      string | null,
-      string | null,
-    ];
+    const [tenant_id, agent_id, conteudo, vec, tipo, escopo, metadataJson, ref_tabela, ref_id] =
+      params as [
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string,
+        string | null,
+        string | null,
+      ];
     const id = `mem_${String(nextId++).padStart(6, '0')}`;
     store.push({
       id,
@@ -184,7 +192,9 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
         escopo.includes(r.escopo) &&
         (tipos ? tipos.includes(r.tipo) : true),
     );
-    filtered = filtered.slice().sort((a, b) => dist(a.embedding, queryVec) - dist(b.embedding, queryVec));
+    filtered = filtered
+      .slice()
+      .sort((a, b) => dist(a.embedding, queryVec) - dist(b.embedding, queryVec));
     const top = filtered.slice(0, limit).map((r) => ({
       conteudo: r.conteudo,
       tipo: r.tipo,
@@ -235,20 +245,76 @@ beforeEach(() => {
 
 function seedTwoTenants() {
   // tenant-A inserted first
-  seedRow({ id: 'mem_A_alpha', tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'A-alpha', escopo: 'global', embedding: [0.5, 0.5, 0.5] });
-  seedRow({ id: 'mem_A_beta',  tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'A-beta',  escopo: 'pessoa:p1', embedding: [0.6, 0.6, 0.6] });
-  seedRow({ id: 'mem_B_gamma', tenant_id: 'tenant-B', agent_id: 'agent-B', conteudo: 'B-gamma', escopo: 'global', embedding: [0.7, 0.7, 0.7] });
-  seedRow({ id: 'mem_B_delta', tenant_id: 'tenant-B', agent_id: 'agent-B', conteudo: 'B-delta', escopo: 'pessoa:p1', embedding: [0.8, 0.8, 0.8] });
+  seedRow({
+    id: 'mem_A_alpha',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-A',
+    conteudo: 'A-alpha',
+    escopo: 'global',
+    embedding: [0.5, 0.5, 0.5],
+  });
+  seedRow({
+    id: 'mem_A_beta',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-A',
+    conteudo: 'A-beta',
+    escopo: 'pessoa:p1',
+    embedding: [0.6, 0.6, 0.6],
+  });
+  seedRow({
+    id: 'mem_B_gamma',
+    tenant_id: 'tenant-B',
+    agent_id: 'agent-B',
+    conteudo: 'B-gamma',
+    escopo: 'global',
+    embedding: [0.7, 0.7, 0.7],
+  });
+  seedRow({
+    id: 'mem_B_delta',
+    tenant_id: 'tenant-B',
+    agent_id: 'agent-B',
+    conteudo: 'B-delta',
+    escopo: 'pessoa:p1',
+    embedding: [0.8, 0.8, 0.8],
+  });
 }
 
 function seedTwoTenantsReverse() {
   // tenant-B FIRST: a missing tenant_id filter would surface tenant-B's row
   // first in store order; if any code path accidentally relied on insertion
   // order this would fail.
-  seedRow({ id: 'mem_B_gamma', tenant_id: 'tenant-B', agent_id: 'agent-B', conteudo: 'B-gamma', escopo: 'global', embedding: [0.7, 0.7, 0.7] });
-  seedRow({ id: 'mem_B_delta', tenant_id: 'tenant-B', agent_id: 'agent-B', conteudo: 'B-delta', escopo: 'pessoa:p1', embedding: [0.8, 0.8, 0.8] });
-  seedRow({ id: 'mem_A_alpha', tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'A-alpha', escopo: 'global', embedding: [0.5, 0.5, 0.5] });
-  seedRow({ id: 'mem_A_beta',  tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'A-beta',  escopo: 'pessoa:p1', embedding: [0.6, 0.6, 0.6] });
+  seedRow({
+    id: 'mem_B_gamma',
+    tenant_id: 'tenant-B',
+    agent_id: 'agent-B',
+    conteudo: 'B-gamma',
+    escopo: 'global',
+    embedding: [0.7, 0.7, 0.7],
+  });
+  seedRow({
+    id: 'mem_B_delta',
+    tenant_id: 'tenant-B',
+    agent_id: 'agent-B',
+    conteudo: 'B-delta',
+    escopo: 'pessoa:p1',
+    embedding: [0.8, 0.8, 0.8],
+  });
+  seedRow({
+    id: 'mem_A_alpha',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-A',
+    conteudo: 'A-alpha',
+    escopo: 'global',
+    embedding: [0.5, 0.5, 0.5],
+  });
+  seedRow({
+    id: 'mem_A_beta',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-A',
+    conteudo: 'A-beta',
+    escopo: 'pessoa:p1',
+    embedding: [0.6, 0.6, 0.6],
+  });
 }
 
 // Adversarial seed: tenant-B's row is embedding-wise closer to the query than
@@ -258,9 +324,23 @@ function seedTwoTenantsReverse() {
 // had: an unscoped similarity recall.
 function seedAdversarialSimilarity(queryVec: number[]) {
   // tenant-A: identical embedding distance "far" from query
-  seedRow({ id: 'mem_A_far', tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'A-far', escopo: 'global', embedding: queryVec.map((v) => v + 0.5) });
+  seedRow({
+    id: 'mem_A_far',
+    tenant_id: 'tenant-A',
+    agent_id: 'agent-A',
+    conteudo: 'A-far',
+    escopo: 'global',
+    embedding: queryVec.map((v) => v + 0.5),
+  });
   // tenant-B: embedding EXACTLY matches the query — would rank #1 by similarity
-  seedRow({ id: 'mem_B_adversary', tenant_id: 'tenant-B', agent_id: 'agent-B', conteudo: 'B-adversary', escopo: 'global', embedding: [...queryVec] });
+  seedRow({
+    id: 'mem_B_adversary',
+    tenant_id: 'tenant-B',
+    agent_id: 'agent-B',
+    conteudo: 'B-adversary',
+    escopo: 'global',
+    embedding: [...queryVec],
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -386,8 +466,22 @@ describe('Issue #229 — vector memory (agent_memories) INSERT + recall are tena
       // Mirror image of the above: an A-row with perfect similarity vs the
       // query must NOT appear when routed as tenant-B.
       const queryVec = [0.1, 0.2, 0.3];
-      seedRow({ id: 'mem_A_adversary', tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'A-adversary', escopo: 'global', embedding: [...queryVec] });
-      seedRow({ id: 'mem_B_far',       tenant_id: 'tenant-B', agent_id: 'agent-B', conteudo: 'B-far',       escopo: 'global', embedding: queryVec.map((v) => v + 0.5) });
+      seedRow({
+        id: 'mem_A_adversary',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        conteudo: 'A-adversary',
+        escopo: 'global',
+        embedding: [...queryVec],
+      });
+      seedRow({
+        id: 'mem_B_far',
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        conteudo: 'B-far',
+        escopo: 'global',
+        embedding: queryVec.map((v) => v + 0.5),
+      });
       const { recall } = await import('@/memory/vector.js');
       nextEmbedding = queryVec;
       const result = await runWithTenantContext(B_CTX, async () =>
@@ -401,8 +495,22 @@ describe('Issue #229 — vector memory (agent_memories) INSERT + recall are tena
     it('CROSS-AGENT — same tenant, different agent: tenant-A/agent-A recall MUST NOT see tenant-A/agent-OTHER rows', async () => {
       // The invariant is BOTH tenant AND agent. A tenant-A agent should not
       // recall another tenant-A agent's vectorized memory.
-      seedRow({ id: 'mem_A_other', tenant_id: 'tenant-A', agent_id: 'agent-OTHER', conteudo: 'A-other-agent', escopo: 'global', embedding: [0.1, 0.2, 0.3] });
-      seedRow({ id: 'mem_A_self',  tenant_id: 'tenant-A', agent_id: 'agent-A',     conteudo: 'A-self',        escopo: 'global', embedding: [0.5, 0.5, 0.5] });
+      seedRow({
+        id: 'mem_A_other',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-OTHER',
+        conteudo: 'A-other-agent',
+        escopo: 'global',
+        embedding: [0.1, 0.2, 0.3],
+      });
+      seedRow({
+        id: 'mem_A_self',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        conteudo: 'A-self',
+        escopo: 'global',
+        embedding: [0.5, 0.5, 0.5],
+      });
       const { recall } = await import('@/memory/vector.js');
       nextEmbedding = [0.1, 0.2, 0.3]; // exactly matches mem_A_other
       const result = await runWithTenantContext(A_CTX, async () =>
@@ -419,9 +527,9 @@ describe('Issue #229 — vector memory (agent_memories) INSERT + recall are tena
       // Production resolves tenant_id/agent_id BEFORE the try/catch around
       // db.execute, so MissingTenantContextError propagates rather than
       // being swallowed by the recall error handler.
-      await expect(
-        recall({ query: 'anything', escopo: ['global'], k: 5 }),
-      ).rejects.toBeInstanceOf(MissingTenantContextError);
+      await expect(recall({ query: 'anything', escopo: ['global'], k: 5 })).rejects.toBeInstanceOf(
+        MissingTenantContextError,
+      );
     });
 
     it('RECALL SQL includes tenant_id AND agent_id predicates', async () => {
@@ -442,8 +550,24 @@ describe('Issue #229 — vector memory (agent_memories) INSERT + recall are tena
       // SELECT renders an extra `AND tipo = ANY($5)`. We assert that a row
       // matching the tipo filter but belonging to a different tenant is STILL
       // filtered out.
-      seedRow({ id: 'mem_A_factual', tenant_id: 'tenant-A', agent_id: 'agent-A', conteudo: 'A-factual', escopo: 'global', tipo: 'reflexao', embedding: [0.5, 0.5, 0.5] });
-      seedRow({ id: 'mem_B_factual', tenant_id: 'tenant-B', agent_id: 'agent-B', conteudo: 'B-factual', escopo: 'global', tipo: 'reflexao', embedding: [0.5, 0.5, 0.5] });
+      seedRow({
+        id: 'mem_A_factual',
+        tenant_id: 'tenant-A',
+        agent_id: 'agent-A',
+        conteudo: 'A-factual',
+        escopo: 'global',
+        tipo: 'reflexao',
+        embedding: [0.5, 0.5, 0.5],
+      });
+      seedRow({
+        id: 'mem_B_factual',
+        tenant_id: 'tenant-B',
+        agent_id: 'agent-B',
+        conteudo: 'B-factual',
+        escopo: 'global',
+        tipo: 'reflexao',
+        embedding: [0.5, 0.5, 0.5],
+      });
       const { recall } = await import('@/memory/vector.js');
       nextEmbedding = [0.5, 0.5, 0.5];
       const result = await runWithTenantContext(A_CTX, async () =>

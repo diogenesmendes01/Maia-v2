@@ -10,19 +10,31 @@ const ProcedureDraftSchema = z.object({
   intencao: z.string(),
   when_apply: z.object({}).passthrough(),
   when_not_apply: z.object({}).passthrough().optional(),
-  steps: z.array(z.object({
-    id: z.string(),
-    intencao: z.string(),
-    como: z.string(),
-    sucesso_criteria_ref: z.string().optional(),
-    armadilhas: z.array(z.string()).optional(),
-    depends_on: z.array(z.string()).optional(),
-    tools_used: z.array(z.string()).optional(),
-  })),
-  success_criteria: z.array(z.object({
-    id: z.string(),
-    type: z.enum(['machine_check', 'tool_result', 'user_signal', 'llm_judge', 'human_confirmed']),
-  }).passthrough()),
+  steps: z.array(
+    z.object({
+      id: z.string(),
+      intencao: z.string(),
+      como: z.string(),
+      sucesso_criteria_ref: z.string().optional(),
+      armadilhas: z.array(z.string()).optional(),
+      depends_on: z.array(z.string()).optional(),
+      tools_used: z.array(z.string()).optional(),
+    }),
+  ),
+  success_criteria: z.array(
+    z
+      .object({
+        id: z.string(),
+        type: z.enum([
+          'machine_check',
+          'tool_result',
+          'user_signal',
+          'llm_judge',
+          'human_confirmed',
+        ]),
+      })
+      .passthrough(),
+  ),
   failure_modes: z.array(z.string()).optional(),
   tools_referenced: z.array(z.string()).optional(),
 });
@@ -61,8 +73,8 @@ export type ProcedureBuilderFailureReason =
   | 'input_too_long'
   | 'llm_empty'
   | 'no_json_envelope'
-  | 'llm_rejected'   // model returned {"error":"..."}
-  | 'invalid_json'   // could not JSON.parse
+  | 'llm_rejected' // model returned {"error":"..."}
+  | 'invalid_json' // could not JSON.parse
   | 'invalid_schema' // JSON parsed but failed schema validation
   | 'llm_call_failed';
 
@@ -78,9 +90,7 @@ type BuilderResult = BuilderOk | BuilderFail;
  * Discriminated union returned by teachProcedure. Callers MUST inspect
  * `ok` before consuming the draft.
  */
-export type TeachProcedureResult =
-  | { ok: true; draft: ProcedureDraft }
-  | BuilderFail;
+export type TeachProcedureResult = { ok: true; draft: ProcedureDraft } | BuilderFail;
 
 /**
  * Modo ENSINO entry-point.

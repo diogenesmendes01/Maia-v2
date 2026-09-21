@@ -109,8 +109,7 @@ export async function judgeStepCriterion(input: LLMJudgeInput): Promise<LLMJudge
         return { passed: false, score: 0, reasoning: 'judge_score_not_numeric' };
       }
       const score = Math.max(0, Math.min(1, rawScore));
-      const reasoning =
-        typeof parsed.reasoning === 'string' ? parsed.reasoning.slice(0, 500) : '';
+      const reasoning = typeof parsed.reasoning === 'string' ? parsed.reasoning.slice(0, 500) : '';
       return {
         passed: score >= input.threshold,
         score,

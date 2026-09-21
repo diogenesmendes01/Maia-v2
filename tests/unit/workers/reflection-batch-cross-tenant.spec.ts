@@ -60,10 +60,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { PgDialect } from 'drizzle-orm/pg-core';
 import type { SQL } from 'drizzle-orm';
-import {
-  runWithTenantContext,
-  tryGetCurrentContext,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, tryGetCurrentContext } from '@/db/tenant-context.js';
 
 // ---------------------------------------------------------------------------
 // In-memory audit_log + db.execute fake
@@ -114,9 +111,7 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     const agent_id = params[1] as string;
     const filtered = auditStore.filter(
       (r) =>
-        r.acao === 'transaction_corrected' &&
-        r.tenant_id === tenant_id &&
-        r.agent_id === agent_id,
+        r.acao === 'transaction_corrected' && r.tenant_id === tenant_id && r.agent_id === agent_id,
     );
     return {
       rows: filtered.map((r) => ({
@@ -148,10 +143,7 @@ const poolConnectMock = vi.fn(async () => {
   let clientReleased = false;
   const client = {
     query: vi.fn(
-      async (
-        text: string,
-        params: unknown[],
-      ): Promise<{ rows: Array<{ locked?: boolean }> }> => {
+      async (text: string, params: unknown[]): Promise<{ rows: Array<{ locked?: boolean }> }> => {
         if (/pg_try_advisory_lock/i.test(text)) {
           // params[0] = composite key string, params[1] = namespace seed (text).
           const key = params[0] as string;
@@ -221,32 +213,34 @@ const auditCalls: AuditCall[] = [];
 let nextRuleSeq = 1;
 
 vi.mock('@/memory/vector.js', () => ({
-  writeMemory: vi.fn(async (input: {
-    conteudo: string;
-    tipo: string;
-    escopo: string;
-    metadata?: Record<string, unknown>;
-  }) => {
-    // Capture the ACTIVE tenant context — production resolves tenant_id /
-    // agent_id from `getCurrentTenant()`/`getCurrentAgent()` before writing
-    // to `agent_memories`. We mirror that here to PROVE the worker opened
-    // the right context before calling writeMemory.
-    const ctx = tryGetCurrentContext();
-    if (!ctx) {
-      throw new Error(
-        'writeMemory called outside tenant context — would throw MissingTenantContextError in prod',
-      );
-    }
-    writeMemoryCalls.push({
-      conteudo: input.conteudo,
-      tipo: input.tipo,
-      escopo: input.escopo,
-      metadata: input.metadata,
-      tenant_id: ctx.tenant_id,
-      agent_id: ctx.agent_id,
-    });
-    return { id: `mem_${writeMemoryCalls.length.toString().padStart(6, '0')}` };
-  }),
+  writeMemory: vi.fn(
+    async (input: {
+      conteudo: string;
+      tipo: string;
+      escopo: string;
+      metadata?: Record<string, unknown>;
+    }) => {
+      // Capture the ACTIVE tenant context — production resolves tenant_id /
+      // agent_id from `getCurrentTenant()`/`getCurrentAgent()` before writing
+      // to `agent_memories`. We mirror that here to PROVE the worker opened
+      // the right context before calling writeMemory.
+      const ctx = tryGetCurrentContext();
+      if (!ctx) {
+        throw new Error(
+          'writeMemory called outside tenant context — would throw MissingTenantContextError in prod',
+        );
+      }
+      writeMemoryCalls.push({
+        conteudo: input.conteudo,
+        tipo: input.tipo,
+        escopo: input.escopo,
+        metadata: input.metadata,
+        tenant_id: ctx.tenant_id,
+        agent_id: ctx.agent_id,
+      });
+      return { id: `mem_${writeMemoryCalls.length.toString().padStart(6, '0')}` };
+    },
+  ),
 }));
 
 vi.mock('@/db/repositories.js', () => ({
@@ -275,25 +269,27 @@ vi.mock('@/db/repositories.js', () => ({
 }));
 
 vi.mock('@/governance/audit.js', () => ({
-  audit: vi.fn(async (input: {
-    acao: string;
-    alvo_id?: string | null;
-    metadata?: Record<string, unknown>;
-  }) => {
-    // Capture the ACTIVE tenant context too — the audit() row inherits
-    // (tenant_id, agent_id) via tryGetCurrentContext + applyTenantGuard.
-    const ctx = tryGetCurrentContext();
-    auditCalls.push({
-      acao: input.acao,
-      alvo_id: input.alvo_id,
-      metadata: input.metadata,
-      // If there's no context we record 'system' to match the production
-      // fallback wrap — the test then asserts tenant_id !== 'system' for
-      // routed reflections.
-      tenant_id: ctx?.tenant_id ?? 'system',
-      agent_id: ctx?.agent_id ?? 'system',
-    });
-  }),
+  audit: vi.fn(
+    async (input: {
+      acao: string;
+      alvo_id?: string | null;
+      metadata?: Record<string, unknown>;
+    }) => {
+      // Capture the ACTIVE tenant context too — the audit() row inherits
+      // (tenant_id, agent_id) via tryGetCurrentContext + applyTenantGuard.
+      const ctx = tryGetCurrentContext();
+      auditCalls.push({
+        acao: input.acao,
+        alvo_id: input.alvo_id,
+        metadata: input.metadata,
+        // If there's no context we record 'system' to match the production
+        // fallback wrap — the test then asserts tenant_id !== 'system' for
+        // routed reflections.
+        tenant_id: ctx?.tenant_id ?? 'system',
+        agent_id: ctx?.agent_id ?? 'system',
+      });
+    },
+  ),
 }));
 
 // ---------------------------------------------------------------------------
@@ -413,7 +409,7 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     expect(writeMemoryCalls[0]!.agent_id).toBe('agent-B');
   });
 
-  it('MULTI-TENANT — both tenants processed; each tenant\'s writes scoped to its own (tenant_id, agent_id)', async () => {
+  it("MULTI-TENANT — both tenants processed; each tenant's writes scoped to its own (tenant_id, agent_id)", async () => {
     // tenant-A cluster
     seedCorrection(A_CTX, 'compra mercado pequeno almoço');
     seedCorrection(A_CTX, 'compra mercado pequeno almoço');
@@ -662,11 +658,9 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #1: fail-isolated per-tenant', () =
     // reviewer flagged: errors here would escape the create/write try/catch
     // and unwind the per-tenant loop).
     const repos = await import('@/db/repositories.js');
-    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(
-      async () => {
-        throw new Error('synthetic tenant-A failure');
-      },
-    );
+    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      throw new Error('synthetic tenant-A failure');
+    });
     // Subsequent calls (tenant-B) return null as the default behavior.
 
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
@@ -689,11 +683,9 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #1: fail-isolated per-tenant', () =
     seedCorrection(B_CTX, 'B ok');
 
     const repos = await import('@/db/repositories.js');
-    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(
-      async () => {
-        throw new Error('synthetic failure for log assertion');
-      },
-    );
+    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      throw new Error('synthetic failure for log assertion');
+    });
 
     const loggerMod = await import('@/lib/logger.js');
     const warnSpy = loggerMod.logger.warn as ReturnType<typeof vi.fn>;
@@ -722,7 +714,9 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #1: fail-isolated per-tenant', () =
       (c) => c[1] === 'reflection_batch.tenant_done',
     );
     expect(tenantDoneLogs.length).toBeGreaterThanOrEqual(1);
-    const doneTenants = new Set(tenantDoneLogs.map((c) => (c[0] as { tenant_id: string }).tenant_id));
+    const doneTenants = new Set(
+      tenantDoneLogs.map((c) => (c[0] as { tenant_id: string }).tenant_id),
+    );
     expect(doneTenants.has('tenant-B')).toBe(true);
   });
 
@@ -733,11 +727,9 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #1: fail-isolated per-tenant', () =
     seedCorrection(B_CTX, 'B ok');
 
     const repos = await import('@/db/repositories.js');
-    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(
-      async () => {
-        throw new Error('boom');
-      },
-    );
+    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      throw new Error('boom');
+    });
 
     const loggerMod = await import('@/lib/logger.js');
     const infoSpy = loggerMod.logger.info as ReturnType<typeof vi.fn>;
@@ -852,11 +844,9 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #2: concurrent worker guard (adviso
     seedCorrection(A_CTX, 'A boom');
 
     const repos = await import('@/db/repositories.js');
-    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(
-      async () => {
-        throw new Error('synthetic failure');
-      },
-    );
+    (repos.rulesRepo.findByContext as ReturnType<typeof vi.fn>).mockImplementationOnce(async () => {
+      throw new Error('synthetic failure');
+    });
 
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
     await runReflectionBatch();

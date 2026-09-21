@@ -31,9 +31,7 @@ export async function runSeriesNextSchedulerWorker(): Promise<void> {
 
   for (const { tenant_id, agent_id } of tenants) {
     try {
-      const r = await runWithTenantContext({ tenant_id, agent_id }, () =>
-        runSeriesNextScheduler(),
-      );
+      const r = await runWithTenantContext({ tenant_id, agent_id }, () => runSeriesNextScheduler());
       totalScheduled += r.scheduled;
       tenantsProcessed++;
     } catch (err) {

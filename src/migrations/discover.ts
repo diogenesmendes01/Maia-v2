@@ -391,11 +391,19 @@ type NoTxToken = 'string literal' | 'quoted identifier' | 'block comment';
  * What `splitNoTxStatements` would do to ONE token it cannot see. `body` is
  * the token's full source text (delimiters included), `start` its offset.
  */
-function tokenHazard(kind: NoTxToken, body: string, sql: string, start: number): NoTxSplitAnalysis | null {
+function tokenHazard(
+  kind: NoTxToken,
+  body: string,
+  sql: string,
+  start: number,
+): NoTxSplitAnalysis | null {
   const where = `(line ${lineOf(sql, start)})`;
   if (body.includes(';')) {
     return kind === 'string literal'
-      ? { hazard: 'semicolon_in_string_literal', detail: `contains a string literal with a ";" inside it ${where}` }
+      ? {
+          hazard: 'semicolon_in_string_literal',
+          detail: `contains a string literal with a ";" inside it ${where}`,
+        }
       : {
           hazard: 'hidden_semicolon',
           detail: `contains a ${kind} with a ";" inside it ${where} — the splitter would cut the statement there`,

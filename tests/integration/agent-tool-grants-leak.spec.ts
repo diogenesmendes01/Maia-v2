@@ -50,13 +50,7 @@ async function mkGrant(
   const r = await c.query<{ id: string }>(
     `INSERT INTO agent_tool_grants (tenant_id, agent_id, granted_packs, granted_tools, denied_tools)
      VALUES ($1, $2, $3, $4, $5) RETURNING id`,
-    [
-      args.tenant,
-      args.agent,
-      args.packs ?? ['baseline.core'],
-      args.tools ?? [],
-      args.denied ?? [],
-    ],
+    [args.tenant, args.agent, args.packs ?? ['baseline.core'], args.tools ?? [], args.denied ?? []],
   );
   return r.rows[0]!.id;
 }
@@ -120,13 +114,20 @@ dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
     try {
       await ensureTenantAgent(c, 'primary', 'agentG1');
       await ensureTenantAgent(c, 'primary', 'agentG2');
-      created.push(await mkGrant(c, { tenant: 'primary', agent: 'agentG1', packs: ['baseline.core', 'domain.finance'] }));
-      created.push(await mkGrant(c, { tenant: 'primary', agent: 'agentG2', packs: ['baseline.core'] }));
+      created.push(
+        await mkGrant(c, {
+          tenant: 'primary',
+          agent: 'agentG1',
+          packs: ['baseline.core', 'domain.finance'],
+        }),
+      );
+      created.push(
+        await mkGrant(c, { tenant: 'primary', agent: 'agentG2', packs: ['baseline.core'] }),
+      );
 
       const { agentToolGrantsRepo } = await loadRepos();
-      const fromG1 = await runWithTenantContext(
-        { tenant_id: 'primary', agent_id: 'agentG1' },
-        () => agentToolGrantsRepo.findForCurrentAgent(),
+      const fromG1 = await runWithTenantContext({ tenant_id: 'primary', agent_id: 'agentG1' }, () =>
+        agentToolGrantsRepo.findForCurrentAgent(),
       );
       expect(fromG1?.granted_packs).toContain('domain.finance');
       expect(fromG1?.agent_id).toBe('agentG1');
@@ -153,7 +154,9 @@ dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
               capabilities: [],
               boundaries: [],
               escalation_rules: [],
-            } as unknown as Parameters<typeof agentsRepo.createWithSeedAndAudit>[0]['seed_profile']['profile_body'],
+            } as unknown as Parameters<
+              typeof agentsRepo.createWithSeedAndAudit
+            >[0]['seed_profile']['profile_body'],
             proposed_by: 'system',
             proposed_reason: 'grant test',
           },
@@ -164,18 +167,21 @@ dRepo('agentToolGrantsRepo — ALS-scoped reads + default grant (#408)', () => {
 
       // The grant row must exist for the new agent, seeded with the
       // BASE_AGENT_PACKS floor (baseline.core + domain.calendar).
-      const grant = await runWithTenantContext(
-        { tenant_id: 'primary', agent_id: agentId },
-        () => agentToolGrantsRepo.findForCurrentAgent(),
+      const grant = await runWithTenantContext({ tenant_id: 'primary', agent_id: agentId }, () =>
+        agentToolGrantsRepo.findForCurrentAgent(),
       );
       expect(grant).not.toBeNull();
       expect(grant!.granted_packs).toEqual(['baseline.core', 'domain.calendar']);
     } finally {
-      await c.query(`DELETE FROM agent_tool_grants WHERE agent_id = $1`, [agentId]).catch(() => undefined);
+      await c
+        .query(`DELETE FROM agent_tool_grants WHERE agent_id = $1`, [agentId])
+        .catch(() => undefined);
       await c
         .query(`DELETE FROM agent_operational_profile_versions WHERE agent_id = $1`, [agentId])
         .catch(() => undefined);
-      await c.query(`DELETE FROM admin_audit_log WHERE resource_id = $1`, [agentId]).catch(() => undefined);
+      await c
+        .query(`DELETE FROM admin_audit_log WHERE resource_id = $1`, [agentId])
+        .catch(() => undefined);
       await c.query(`DELETE FROM agents WHERE id = $1`, [agentId]).catch(() => undefined);
       c.release();
     }

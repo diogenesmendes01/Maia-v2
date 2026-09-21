@@ -62,14 +62,14 @@ describe('isPrivateAddress', () => {
 });
 
 describe('assertSafeMcpUrlSyntax — IPv4-mapped hex (revisão adversarial)', () => {
-  it.each([
-    'https://[::ffff:7f00:1]/mcp',
-    'https://[::ffff:a9fe:a9fe]/latest/meta-data/',
-  ])('rejeita %s', (url) => {
-    expect(() => assertSafeMcpUrlSyntax(url, { allowLocalhostHttp: false })).toThrowError(
-      McpGuardError,
-    );
-  });
+  it.each(['https://[::ffff:7f00:1]/mcp', 'https://[::ffff:a9fe:a9fe]/latest/meta-data/'])(
+    'rejeita %s',
+    (url) => {
+      expect(() => assertSafeMcpUrlSyntax(url, { allowLocalhostHttp: false })).toThrowError(
+        McpGuardError,
+      );
+    },
+  );
 });
 
 describe('assertSafeMcpUrlSyntax', () => {
@@ -122,6 +122,8 @@ describe('assertResolvesPublic', () => {
     ).rejects.toThrowError(McpGuardError);
   });
   it('IP literal público passa sem DNS', async () => {
-    await expect(assertResolvesPublic(new URL('https://8.8.8.8/mcp'), prod)).resolves.toBeUndefined();
+    await expect(
+      assertResolvesPublic(new URL('https://8.8.8.8/mcp'), prod),
+    ).resolves.toBeUndefined();
   });
 });

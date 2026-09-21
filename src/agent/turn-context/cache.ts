@@ -664,10 +664,7 @@ export async function stopTurnContextCacheInvalidationSubscriber(): Promise<void
     await sub.quit?.();
   } catch (err) {
     // Already down, or never finished connecting. Nothing left to close.
-    logger.warn(
-      { err: (err as Error).message },
-      'turn_context_cache.subscriber_close_failed',
-    );
+    logger.warn({ err: (err as Error).message }, 'turn_context_cache.subscriber_close_failed');
   }
 }
 

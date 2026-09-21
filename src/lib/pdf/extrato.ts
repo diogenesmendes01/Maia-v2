@@ -74,7 +74,10 @@ export async function generateExtratoPdf(input: ExtratoInput): Promise<ExtratoRe
   if (truncated.length === 0) {
     tableBody.push([
       { text: 'Sem transações no período', colSpan: 5, alignment: 'center', italics: true },
-      {}, {}, {}, {},
+      {},
+      {},
+      {},
+      {},
     ]);
   } else {
     for (const t of truncated) {

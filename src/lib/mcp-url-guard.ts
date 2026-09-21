@@ -120,10 +120,7 @@ const BLOCKED_PORTS = new Set(['5432', '6379', '9200', '27017', '3306', '11211']
  * https obrigatório (http apenas com `allowLocalhostHttp` E host localhost),
  * sem userinfo, sem porta de datastore, IP literal privado rejeitado.
  */
-export function assertSafeMcpUrlSyntax(
-  raw: string,
-  opts: { allowLocalhostHttp: boolean },
-): URL {
+export function assertSafeMcpUrlSyntax(raw: string, opts: { allowLocalhostHttp: boolean }): URL {
   let url: URL;
   try {
     url = new URL(raw);

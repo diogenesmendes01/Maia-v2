@@ -48,9 +48,24 @@ const confirmBeforeWriteBody = {
   predicate: {
     kind: 'or',
     predicates: [
-      { kind: 'leaf', field: 'skill.selected.allowed_tools', op: 'contains', value: 'boleto_cancel' },
-      { kind: 'leaf', field: 'skill.selected.allowed_tools', op: 'contains', value: 'company_campaign_remove' },
-      { kind: 'leaf', field: 'skill.selected.allowed_tools', op: 'contains', value: 'refund_create' },
+      {
+        kind: 'leaf',
+        field: 'skill.selected.allowed_tools',
+        op: 'contains',
+        value: 'boleto_cancel',
+      },
+      {
+        kind: 'leaf',
+        field: 'skill.selected.allowed_tools',
+        op: 'contains',
+        value: 'company_campaign_remove',
+      },
+      {
+        kind: 'leaf',
+        field: 'skill.selected.allowed_tools',
+        op: 'contains',
+        value: 'refund_create',
+      },
     ],
   },
   effect: {

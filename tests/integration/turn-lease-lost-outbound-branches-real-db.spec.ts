@@ -279,10 +279,16 @@ async function ctxFor(ramo: Ramo, inbound: Mensagem) {
     inbound,
     jid: '5511000000000@s.whatsapp.net',
     text: 'resposta do turno',
-    latestPending: null as { id: string; opcoes_validas: Array<{ key: string; label: string }> } | null,
-    latestReportPdf: null as
-      | { path: string; fileName: string; mimetype: string; tipo: 'extrato' | 'comparativo' }
-      | null,
+    latestPending: null as {
+      id: string;
+      opcoes_validas: Array<{ key: string; label: string }>;
+    } | null,
+    latestReportPdf: null as {
+      path: string;
+      fileName: string;
+      mimetype: string;
+      tipo: 'extrato' | 'comparativo';
+    } | null,
     turnHasSensitive: false,
     sensitiveTools: [] as string[],
   };
@@ -402,7 +408,9 @@ d('#504 — lease perdida: os ramos PDF / voz / poll do outbound', () => {
         `a linha deveria ter recebido um envio de ${ramo}`,
       ).toEqual([ramo]);
       expect(await countOutboundLedger(inbound.id), 'ledger reivindicado').toBe(1);
-      expect(await countOutRows(inbound.id), 'a mensagem de saída deveria estar persistida').toBe(1);
+      expect(await countOutRows(inbound.id), 'a mensagem de saída deveria estar persistida').toBe(
+        1,
+      );
       expect(outcome).toEqual({ status: 'delivered' });
     }, 60_000);
 
@@ -430,10 +438,9 @@ d('#504 — lease perdida: os ramos PDF / voz / poll do outbound', () => {
         await countOutboundLedger(inbound.id),
         'nenhum outbound pode ter sido sequer reivindicado sem posse',
       ).toBe(0);
-      expect(
-        wire.calls,
-        `o ramo ${ramo} não pode ter chamado a linha de saída sem posse`,
-      ).toEqual([]);
+      expect(wire.calls, `o ramo ${ramo} não pode ter chamado a linha de saída sem posse`).toEqual(
+        [],
+      );
       expect(await countOutRows(inbound.id), 'nenhuma row de saída sem posse').toBe(0);
 
       expect(outcome).not.toBeNull();
@@ -542,14 +549,9 @@ d('#504 — lease perdida: os ramos PDF / voz / poll do outbound', () => {
       const { turn_id, lease } = await claimWithLease(inbound.id);
       await runWithTurnExecution(lease.context(), async () => {
         await loseOwnershipForReal(turn_id, lease);
-        err = await sendOutboundPoll(
-          pessoa.id,
-          conversa.id,
-          'escolha',
-          inbound.id,
-          pending,
-          { channel_id: conversa.channel_id },
-        ).then(
+        err = await sendOutboundPoll(pessoa.id, conversa.id, 'escolha', inbound.id, pending, {
+          channel_id: conversa.channel_id,
+        }).then(
           () => null,
           (e: unknown) => e as Error & { delivered?: boolean },
         );

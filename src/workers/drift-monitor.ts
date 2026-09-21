@@ -57,10 +57,7 @@ import {
   type AgentOperationalProfileVersion,
 } from '@/db/schema.js';
 import { runWithTenantContext, getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
-import {
-  operationalProfileVersionsRepo,
-  capabilitiesSkillRepo,
-} from '@/db/repositories.js';
+import { operationalProfileVersionsRepo, capabilitiesSkillRepo } from '@/db/repositories.js';
 import {
   runAllDriftDetectors,
   type DriftDetectionInput,
@@ -204,7 +201,8 @@ async function assembleDriftInput(
       id: String(r.id),
       from: r.direcao === 'out' ? ('agent' as const) : ('user' as const),
       text: r.conteudo ?? '',
-      created_at: r.created_at instanceof Date ? r.created_at : new Date(r.created_at ?? Date.now()),
+      created_at:
+        r.created_at instanceof Date ? r.created_at : new Date(r.created_at ?? Date.now()),
     }));
   } catch (err) {
     logger.warn({ err: (err as Error).message }, 'drift_monitor.recent_messages_failed');
@@ -232,7 +230,8 @@ async function assembleDriftInput(
     const skills = await capabilitiesSkillRepo.listAll();
     self_model_skills = skills.map((s) => ({
       skill_name: s.skill_name,
-      confidence: typeof s.confidence === 'string' ? Number(s.confidence) : Number(s.confidence ?? 0),
+      confidence:
+        typeof s.confidence === 'string' ? Number(s.confidence) : Number(s.confidence ?? 0),
       evidence_count: s.evidence_count ?? 0,
     }));
   } catch (err) {
@@ -272,7 +271,8 @@ async function assembleDriftInput(
       .orderBy(sql`created_at DESC`);
     recent_procedures = rows.map((r) => ({
       id: String(r.id),
-      created_at: r.created_at instanceof Date ? r.created_at : new Date(r.created_at ?? Date.now()),
+      created_at:
+        r.created_at instanceof Date ? r.created_at : new Date(r.created_at ?? Date.now()),
       // procedure_definitions ainda não rastreia evidence_count direto — 0
       // mantém o detector conservador (gatilha quando o agente cria muitos
       // procedures sem evidência consolidada). Quando o tracking existir,

@@ -89,12 +89,7 @@ export type ActionMode =
   // the core.ts call site. Side-effecting modes (`tool_mediated` /
   // `procedure_adapter`) are explicitly NOT routed here — they remain Phase 2.
   | 'execute_skill';
-export type PolicyDecision =
-  | 'allow'
-  | 'block'
-  | 'warn'
-  | 'require_dual_approval'
-  | 'escalate';
+export type PolicyDecision = 'allow' | 'block' | 'warn' | 'require_dual_approval' | 'escalate';
 
 /**
  * P9b: PEP discriminator. P8a originally stubbed only `early|mid`; the Late
@@ -289,17 +284,10 @@ export interface KnowledgeSlice {
  * truncated_to, cache_key, resolved_at }` defined in
  * `src/runtime/context-assembly/types/soul-slice.ts`.
  */
-import type {
-  SoulSlice,
-  SoulSliceBias,
-} from '../context-assembly/types/soul-slice.js';
+import type { SoulSlice, SoulSliceBias } from '../context-assembly/types/soul-slice.js';
 export type { SoulSlice, SoulSliceBias };
 
-export type PolicyRuleKind =
-  | 'hard_limit'
-  | 'soft_guidance'
-  | 'dual_approval'
-  | 'lockdown_trigger';
+export type PolicyRuleKind = 'hard_limit' | 'soft_guidance' | 'dual_approval' | 'lockdown_trigger';
 
 export interface PolicySlice {
   applicable_rules: Array<{

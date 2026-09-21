@@ -82,7 +82,8 @@ describe('BaseContextBuilder — active_sensitive_memory_count population', () =
       agent_id: 'agent-A',
     });
 
-    const callArgs = (counter.countActiveSensitive as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as {
+    const callArgs = (counter.countActiveSensitive as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0] as {
       tenant_id: string;
       agent_id: string;
       conversation_id?: string;

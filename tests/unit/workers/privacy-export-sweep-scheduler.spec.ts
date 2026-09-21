@@ -153,9 +153,7 @@ describe('privacy_export_sweep é uma entrada REAL do registro de workers', () =
 
   it('não colide com o minuto dos outros jobs de ops', () => {
     const outros = JOBS.filter((j) =>
-      ['nightly_backup', 'backup_retention', 'restore_drill', 'inactivity_sweep'].includes(
-        j.name,
-      ),
+      ['nightly_backup', 'backup_retention', 'restore_drill', 'inactivity_sweep'].includes(j.name),
     ).map((j) => j.cron.split(' ')[0]);
     expect(outros).not.toContain('50');
   });

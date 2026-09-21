@@ -175,9 +175,7 @@ describe('oidcProviderEnabled — gating', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     process.env.OIDC_ISSUER = 'http://idp.internal/realms/maia';
-    expect(() => oidcProviderEnabled()).toThrow(
-      /OIDC_ISSUER must use https:\/\/ in production/,
-    );
+    expect(() => oidcProviderEnabled()).toThrow(/OIDC_ISSUER must use https:\/\/ in production/);
     // Message must surface the offending protocol AND the issuer value so
     // an operator reading the crash log can immediately see what was set.
     expect(() => oidcProviderEnabled()).toThrow(/http:\/\//);
@@ -188,18 +186,14 @@ describe('oidcProviderEnabled — gating', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     process.env.OIDC_ISSUER = 'http://localhost:8080/realms/maia';
-    expect(() => oidcProviderEnabled()).toThrow(
-      /OIDC_ISSUER must use https:\/\/ in production/,
-    );
+    expect(() => oidcProviderEnabled()).toThrow(/OIDC_ISSUER must use https:\/\/ in production/);
   });
 
   it('PROD: OIDC_ISSUER malformed (unparseable) ⇒ THROWS (fail-fast, descriptive)', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     process.env.OIDC_ISSUER = 'not-a-url';
-    expect(() => oidcProviderEnabled()).toThrow(
-      /OIDC_ISSUER is set but is not a valid URL/,
-    );
+    expect(() => oidcProviderEnabled()).toThrow(/OIDC_ISSUER is set but is not a valid URL/);
     // The bad value should be in the error message so operators can spot it.
     expect(() => oidcProviderEnabled()).toThrow(/not-a-url/);
   });
@@ -208,9 +202,7 @@ describe('oidcProviderEnabled — gating', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     process.env.OIDC_ISSUER = 'ftp://idp.example.com/realms/maia';
-    expect(() => oidcProviderEnabled()).toThrow(
-      /OIDC_ISSUER must use https:\/\/ in production/,
-    );
+    expect(() => oidcProviderEnabled()).toThrow(/OIDC_ISSUER must use https:\/\/ in production/);
   });
 
   it('PROD: OIDC_ISSUER unset ⇒ false silently (NOT throw — "not configured" is OK)', () => {
@@ -376,9 +368,7 @@ describe('oidcProviderEnabled — gating', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     process.env.OIDC_CLIENT_SECRET = '';
-    expect(() => oidcProviderEnabled()).toThrow(
-      /OIDC_CLIENT_SECRET is missing or too short/,
-    );
+    expect(() => oidcProviderEnabled()).toThrow(/OIDC_CLIENT_SECRET is missing or too short/);
     // Length must be reported so operators can self-diagnose; secret value
     // must NEVER leak into the message.
     expect(() => oidcProviderEnabled()).toThrow(/length: 0/);
@@ -388,9 +378,7 @@ describe('oidcProviderEnabled — gating', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     delete process.env.OIDC_CLIENT_SECRET;
-    expect(() => oidcProviderEnabled()).toThrow(
-      /OIDC_CLIENT_SECRET is missing or too short/,
-    );
+    expect(() => oidcProviderEnabled()).toThrow(/OIDC_CLIENT_SECRET is missing or too short/);
     expect(() => oidcProviderEnabled()).toThrow(/length: 0/);
   });
 
@@ -399,9 +387,7 @@ describe('oidcProviderEnabled — gating', () => {
     process.env.NODE_ENV = 'production';
     const weakSecret = 'placeholder-x42'; // 15 chars (below threshold)
     process.env.OIDC_CLIENT_SECRET = weakSecret;
-    expect(() => oidcProviderEnabled()).toThrow(
-      /OIDC_CLIENT_SECRET is missing or too short/,
-    );
+    expect(() => oidcProviderEnabled()).toThrow(/OIDC_CLIENT_SECRET is missing or too short/);
     expect(() => oidcProviderEnabled()).toThrow(/length: 15/);
     expect(() => oidcProviderEnabled()).toThrow(/required: >=16/);
     // Critical: the secret VALUE itself must never appear in the error.
@@ -421,8 +407,7 @@ describe('oidcProviderEnabled — gating', () => {
     setOidcEnabledEnv();
     process.env.NODE_ENV = 'production';
     // The literal `.env.example` value (post-fix): 32-64 chars, "__SET_ME__".
-    process.env.OIDC_CLIENT_SECRET =
-      '__SET_ME__copy_from_IdP_typically_32_to_64_random_chars';
+    process.env.OIDC_CLIENT_SECRET = '__SET_ME__copy_from_IdP_typically_32_to_64_random_chars';
     expect(() => oidcProviderEnabled()).toThrow(/known placeholder pattern/i);
     // Value itself must not appear in the error.
     try {
@@ -584,17 +569,14 @@ describe('resolveSecret — production hardening', () => {
       // The literal 'dev-secret-change-in-prod' is 25 chars — fails the
       // length guard first. Pad to test the placeholder-rejection arm
       // hits even when the length check passes.
-      process.env.NEXTAUTH_SECRET =
-        'dev-secret-change-in-prod-padded-to-pass-length-guard';
+      process.env.NEXTAUTH_SECRET = 'dev-secret-change-in-prod-padded-to-pass-length-guard';
       expect(() => resolveSecret()).toThrow(/placeholder/i);
     });
 
     it('rejects the literal short dev fallback for being too short (length guard fires first)', () => {
       process.env.NODE_ENV = 'production';
       process.env.NEXTAUTH_SECRET = 'dev-secret-change-in-prod'; // 25 chars
-      expect(() => resolveSecret()).toThrow(
-        /must be set to a >=32-char value|placeholder/i,
-      );
+      expect(() => resolveSecret()).toThrow(/must be set to a >=32-char value|placeholder/i);
     });
 
     it.each([
@@ -623,8 +605,7 @@ describe('resolveSecret — production hardening', () => {
     it('does NOT match high-entropy operator secrets that happen to share a substring (regression)', () => {
       process.env.NODE_ENV = 'production';
       // No "changeme", no "__PLACEHOLDER", no "__SET_ME__" — must pass.
-      process.env.NEXTAUTH_SECRET =
-        'jH8xL4mP9qN3vK7tF2cR6yS5wB1zA0eD8gM4nQ6uV9pT3rX2hY7kJ5fZ';
+      process.env.NEXTAUTH_SECRET = 'jH8xL4mP9qN3vK7tF2cR6yS5wB1zA0eD8gM4nQ6uV9pT3rX2hY7kJ5fZ';
       expect(() => resolveSecret()).not.toThrow();
     });
 

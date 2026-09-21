@@ -110,9 +110,8 @@ d('[High] schema_ready consome `getSchemaReadiness`, nunca `schema_migrations` c
    */
   it('uma migration `dirty` REPROVA — mesmo com zero pendentes — e muda a fingerprint', async () => {
     const { loadSchemaState } = await import('../../src/onboarding/readiness-facts.js');
-    const { evaluateReadinessFacts, schemaFingerprint } = await import(
-      '../../src/onboarding/readiness.js'
-    );
+    const { evaluateReadinessFacts, schemaFingerprint } =
+      await import('../../src/onboarding/readiness.js');
 
     const healthy = await loadSchemaState();
     const healthyFp = schemaFingerprint(healthy);
@@ -295,9 +294,8 @@ d('[High] a leitura de `agents` não vaza existência entre tenants', () => {
   });
 
   it('o diagnóstico GLOBAL existe, mas só para `founder` e deixa trilha', async () => {
-    const { diagnoseAgentOwnershipGlobally } = await import(
-      '../../src/onboarding/readiness-facts.js'
-    );
+    const { diagnoseAgentOwnershipGlobally } =
+      await import('../../src/onboarding/readiness-facts.js');
 
     await expect(
       diagnoseAgentOwnershipGlobally({
@@ -347,9 +345,8 @@ type SagaState = {
 
 /** Leva uma run nova de ZERO até `channel_ready`, num escopo exclusivo. */
 async function driveToChannelReady(suffix: string, line: string): Promise<SagaState> {
-  const { startOnboardingRun, executeOnboardingStep } = await import(
-    '../../src/onboarding/wizard.js'
-  );
+  const { startOnboardingRun, executeOnboardingStep } =
+    await import('../../src/onboarding/wizard.js');
   const tenant = `rev541-${suffix}`;
   const agent = `rev541-${suffix}-bot`;
   tenants.add(tenant);
@@ -388,7 +385,10 @@ async function driveToChannelReady(suffix: string, line: string): Promise<SagaSt
   };
 
   await step('provision_tenant', { tenant_id: tenant, nome: `Rev541 ${suffix}` });
-  await step('provision_admin', { user_id: `rev541-${suffix}-admin`, email: `${suffix}@rev541.test` });
+  await step('provision_admin', {
+    user_id: `rev541-${suffix}-admin`,
+    email: `${suffix}@rev541.test`,
+  });
   await step('provision_agent', { agent_id: agent, nome: `Bot ${suffix}` });
   await step('configure_profile', { approve: true });
   await step('apply_capability_packs', { granted_packs: [], denied_tools: [] });
@@ -436,9 +436,7 @@ async function driveToChannelReady(suffix: string, line: string): Promise<SagaSt
 d('[High] o pareamento entra na TRANSAÇÃO do passo, nunca antes dela', () => {
   it('o comando fica na fila de #518 e a auditoria cai no MESMO commit', async () => {
     const s = await driveToChannelReady('pair', '+5511987650041');
-    expect(s.command_id).toMatch(
-      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
-    );
+    expect(s.command_id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
 
     const c = await pool.connect();
     try {
@@ -499,10 +497,9 @@ d('[High] o pareamento entra na TRANSAÇÃO do passo, nunca antes dela', () => {
           [s.channel_id],
         );
         if (sabotage) await c.query(sabotage, [s.run_id]);
-        const before = await c.query(
-          'SELECT command FROM channel_line_state WHERE channel_id=$1',
-          [s.channel_id],
-        );
+        const before = await c.query('SELECT command FROM channel_line_state WHERE channel_id=$1', [
+          s.channel_id,
+        ]);
         expect(before.rows[0].command).toBeNull();
       } finally {
         c.release();
@@ -575,9 +572,8 @@ d('[High] o retrato de readiness da ativação é atômico', () => {
         // é exatamente a janela que a review descreve.
         evaluateReadiness: async (scope, ctx) => {
           const { evaluateAgentReadiness } = await import('../../src/onboarding/readiness.js');
-          const { loadReadinessFactsWith } = await import(
-            '../../src/onboarding/readiness-facts.js'
-          );
+          const { loadReadinessFactsWith } =
+            await import('../../src/onboarding/readiness-facts.js');
 
           racerPromise = racer
             .query('BEGIN')
@@ -663,9 +659,8 @@ d('[High] o retrato de readiness da ativação é atômico', () => {
       deps: {
         evaluateReadiness: async (scope, ctx) => {
           const { evaluateAgentReadiness } = await import('../../src/onboarding/readiness.js');
-          const { loadReadinessFactsWith } = await import(
-            '../../src/onboarding/readiness-facts.js'
-          );
+          const { loadReadinessFactsWith } =
+            await import('../../src/onboarding/readiness-facts.js');
           const { sql } = await import('drizzle-orm');
           const r = await evaluateAgentReadiness(
             scope,

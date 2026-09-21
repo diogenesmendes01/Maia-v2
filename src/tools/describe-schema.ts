@@ -51,9 +51,7 @@ interface ZodDefLike {
   // ZodUnion / ZodDiscriminatedUnion — variant schemas. zod@3 stores these
   // as an array on `.options`; some builds key discriminated-union options by
   // their discriminator value in a Map, so we accept either.
-  options?:
-    | ReadonlyArray<{ _def?: ZodDefLike }>
-    | Map<unknown, { _def?: ZodDefLike }>;
+  options?: ReadonlyArray<{ _def?: ZodDefLike }> | Map<unknown, { _def?: ZodDefLike }>;
   // ZodDiscriminatedUnion — the field whose literal selects the variant.
   discriminator?: string;
 }
@@ -166,9 +164,7 @@ function shapeOf(
 }
 
 /** Flatten a single ZodObject's shape into field descriptors. */
-function fieldsFromObject(
-  schema: { _def?: ZodDefLike } | undefined,
-): FieldDescriptor[] {
+function fieldsFromObject(schema: { _def?: ZodDefLike } | undefined): FieldDescriptor[] {
   const shape = shapeOf(schema);
   if (!shape) return [];
   return Object.entries(shape).map(([name, fieldSchema]) => {
@@ -185,9 +181,7 @@ function fieldsFromObject(
  * Normalise a union/discriminated-union's `.options` (array OR Map) into a
  * flat array of variant schemas.
  */
-function unionOptions(
-  def: ZodDefLike | undefined,
-): Array<{ _def?: ZodDefLike }> {
+function unionOptions(def: ZodDefLike | undefined): Array<{ _def?: ZodDefLike }> {
   const opts = def?.options;
   if (opts === undefined) return [];
   if (opts instanceof Map) return Array.from(opts.values());
@@ -302,10 +296,7 @@ export function describeZodObject(schema: z.ZodTypeAny): FieldDescriptor[] {
     return fieldsFromObject(unwrappedInstance(root));
   }
 
-  if (
-    rootDef?.typeName === 'ZodDiscriminatedUnion' ||
-    rootDef?.typeName === 'ZodUnion'
-  ) {
+  if (rootDef?.typeName === 'ZodDiscriminatedUnion' || rootDef?.typeName === 'ZodUnion') {
     return describeUnion(rootDef);
   }
 

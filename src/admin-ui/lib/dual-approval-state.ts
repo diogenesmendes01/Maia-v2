@@ -18,11 +18,7 @@
 import { requiredRolesFor, requiresDualApproval } from './approval-matrix.js';
 import type { ApprovalClassId } from '../../db/schema.js';
 
-export type DualApprovalStatus =
-  | 'pending'
-  | 'partial'
-  | 'fully_approved'
-  | 'rejected';
+export type DualApprovalStatus = 'pending' | 'partial' | 'fully_approved' | 'rejected';
 
 export interface ApprovalRecord {
   approver_user_id: string;

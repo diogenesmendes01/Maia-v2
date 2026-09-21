@@ -53,16 +53,18 @@ vi.mock('node:fs/promises', () => ({
 // Mock para permitir injetar comportamento custom no transition (para o caso
 // race: already_has_active).
 let transitionOverride:
-  | ((args: { id: string; to: string; approved_by?: string; rollback_reason?: string }) => Promise<{
-      ok: false;
-      reason: 'not_found' | 'invalid_transition' | 'already_has_active' | 'terminal';
-    } | { ok: true; updated: ProfileRow }>)
+  | ((args: { id: string; to: string; approved_by?: string; rollback_reason?: string }) => Promise<
+      | {
+          ok: false;
+          reason: 'not_found' | 'invalid_transition' | 'already_has_active' | 'terminal';
+        }
+      | { ok: true; updated: ProfileRow }
+    >)
   | null = null;
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
 
   const computeNextVersion = (tenant_id: string, agent_id: string): number => {
     const rows = Object.values(profilesState).filter(
@@ -83,35 +85,33 @@ vi.mock('@/db/repositories.js', async () => {
   return {
     ...actual,
     operationalProfileVersionsRepo: {
-      create: vi.fn(async (input: {
-        profile_body: unknown;
-        proposed_by: string;
-        proposed_reason?: string;
-      }) => {
-        const tenant_id = 'default';
-        const agent_id = 'default';
-        const id = `prof-${Math.random().toString(36).slice(2)}`;
-        const version = computeNextVersion(tenant_id, agent_id);
-        const row: ProfileRow = {
-          id,
-          tenant_id,
-          agent_id,
-          version,
-          status: 'proposed',
-          profile_body: input.profile_body,
-          proposed_by: input.proposed_by,
-          proposed_reason: input.proposed_reason ?? null,
-          approved_by: null,
-          approved_at: null,
-          activated_at: null,
-          frozen_at: null,
-          rolled_back_at: null,
-          rollback_reason: null,
-          created_at: new Date(),
-        };
-        profilesState[id] = row;
-        return row;
-      }),
+      create: vi.fn(
+        async (input: { profile_body: unknown; proposed_by: string; proposed_reason?: string }) => {
+          const tenant_id = 'default';
+          const agent_id = 'default';
+          const id = `prof-${Math.random().toString(36).slice(2)}`;
+          const version = computeNextVersion(tenant_id, agent_id);
+          const row: ProfileRow = {
+            id,
+            tenant_id,
+            agent_id,
+            version,
+            status: 'proposed',
+            profile_body: input.profile_body,
+            proposed_by: input.proposed_by,
+            proposed_reason: input.proposed_reason ?? null,
+            approved_by: null,
+            approved_at: null,
+            activated_at: null,
+            frozen_at: null,
+            rolled_back_at: null,
+            rollback_reason: null,
+            created_at: new Date(),
+          };
+          profilesState[id] = row;
+          return row;
+        },
+      ),
       getActive: vi.fn(async () => findActive('default', 'default')),
       getById: vi.fn(async (id: string) => profilesState[id] ?? null),
       listByStatus: vi.fn(async (status: string) =>
@@ -129,7 +129,8 @@ vi.mock('@/db/repositories.js', async () => {
           if (!row) return { ok: false as const, reason: 'not_found' as const };
           const from = row.status;
           if (from === 'rolled_back') return { ok: false as const, reason: 'terminal' as const };
-          if (from === args.to) return { ok: false as const, reason: 'invalid_transition' as const };
+          if (from === args.to)
+            return { ok: false as const, reason: 'invalid_transition' as const };
 
           const allowed: Record<string, string[]> = {
             proposed: ['active', 'frozen', 'rolled_back'],
@@ -218,218 +219,197 @@ describe('seedInitialOperationalProfile', () => {
       Object.values(profilesState).find(
         (r) => r.tenant_id === 'default' && r.agent_id === 'default' && r.status === 'active',
       ) ?? null;
-    vi.mocked(operationalProfileVersionsRepo.getActive).mockImplementation(
-      async () => findActive(),
+    vi.mocked(operationalProfileVersionsRepo.getActive).mockImplementation(async () =>
+      findActive(),
     );
   });
 
   it('first seed creates active v1 with 4 camadas populated', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
-        const result = await seedInitialOperationalProfile();
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
+      const result = await seedInitialOperationalProfile();
 
-        expect(result.created).toBe(true);
-        if (!result.created) throw new Error('expected created=true');
+      expect(result.created).toBe(true);
+      if (!result.created) throw new Error('expected created=true');
 
-        const v = result.version;
-        expect(v.status).toBe('active');
-        expect(v.version).toBe(1);
-        expect(v.proposed_by).toBe('system_seed');
-        expect(v.proposed_reason).toContain('initial seed');
-        expect(v.approved_by).toBe('system_seed');
-        expect(v.activated_at).toBeInstanceOf(Date);
+      const v = result.version;
+      expect(v.status).toBe('active');
+      expect(v.version).toBe(1);
+      expect(v.proposed_by).toBe('system_seed');
+      expect(v.proposed_reason).toContain('initial seed');
+      expect(v.approved_by).toBe('system_seed');
+      expect(v.activated_at).toBeInstanceOf(Date);
 
-        // The generator packs the legacy 4-layer keys inside profile_body
-        // during the v3.1.1 migration window. Read them from there.
-        const body = v.profile_body as {
-          core_immutable: { identity_block: string; principles: string[] };
-          operational_profile: { voice_descriptor: string; thresholds: Record<string, unknown> };
-          episodic_temp: unknown;
-          growth_backlog: unknown;
-        };
-        expect(body.core_immutable.identity_block).toContain('Você é a **Maia**');
-        expect(Array.isArray(body.core_immutable.principles)).toBe(true);
-        expect(body.core_immutable.principles.length).toBeGreaterThanOrEqual(3);
-        expect(body.core_immutable.principles[0]).toContain('Separação');
+      // The generator packs the legacy 4-layer keys inside profile_body
+      // during the v3.1.1 migration window. Read them from there.
+      const body = v.profile_body as {
+        core_immutable: { identity_block: string; principles: string[] };
+        operational_profile: { voice_descriptor: string; thresholds: Record<string, unknown> };
+        episodic_temp: unknown;
+        growth_backlog: unknown;
+      };
+      expect(body.core_immutable.identity_block).toContain('Você é a **Maia**');
+      expect(Array.isArray(body.core_immutable.principles)).toBe(true);
+      expect(body.core_immutable.principles.length).toBeGreaterThanOrEqual(3);
+      expect(body.core_immutable.principles[0]).toContain('Separação');
 
-        // operational_profile
-        expect(body.operational_profile.voice_descriptor).toContain('Português brasileiro');
-        expect(body.operational_profile.thresholds).toEqual({});
+      // operational_profile
+      expect(body.operational_profile.voice_descriptor).toContain('Português brasileiro');
+      expect(body.operational_profile.thresholds).toEqual({});
 
-        // episodic_temp + growth_backlog
-        expect(body.episodic_temp).toEqual({});
-        expect(body.growth_backlog).toEqual([]);
-      },
-    );
+      // episodic_temp + growth_backlog
+      expect(body.episodic_temp).toEqual({});
+      expect(body.growth_backlog).toEqual([]);
+    });
   });
 
   it('idempotency: when active already exists, returns { created: false, existing, already_active } without calling create/transition', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
 
-        // First seed
-        const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
-        const first = await seedInitialOperationalProfile();
-        expect(first.created).toBe(true);
+      // First seed
+      const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
+      const first = await seedInitialOperationalProfile();
+      expect(first.created).toBe(true);
 
-        // Reset spies so we can detect that create/transition NÃO foram chamadas no 2º seed
-        vi.mocked(operationalProfileVersionsRepo.create).mockClear();
-        vi.mocked(operationalProfileVersionsRepo.transition).mockClear();
+      // Reset spies so we can detect that create/transition NÃO foram chamadas no 2º seed
+      vi.mocked(operationalProfileVersionsRepo.create).mockClear();
+      vi.mocked(operationalProfileVersionsRepo.transition).mockClear();
 
-        const second = await seedInitialOperationalProfile();
-        expect(second.created).toBe(false);
-        if (second.created) throw new Error('expected created=false');
-        expect(second.reason).toBe('already_active');
-        expect(second.existing.status).toBe('active');
-        expect(second.existing.id).toBe((first as { created: true; version: ProfileRow }).version.id);
+      const second = await seedInitialOperationalProfile();
+      expect(second.created).toBe(false);
+      if (second.created) throw new Error('expected created=false');
+      expect(second.reason).toBe('already_active');
+      expect(second.existing.status).toBe('active');
+      expect(second.existing.id).toBe((first as { created: true; version: ProfileRow }).version.id);
 
-        // Critical: idempotência não deve chamar create/transition de novo
-        expect(operationalProfileVersionsRepo.create).not.toHaveBeenCalled();
-        expect(operationalProfileVersionsRepo.transition).not.toHaveBeenCalled();
-      },
-    );
+      // Critical: idempotência não deve chamar create/transition de novo
+      expect(operationalProfileVersionsRepo.create).not.toHaveBeenCalled();
+      expect(operationalProfileVersionsRepo.transition).not.toHaveBeenCalled();
+    });
   });
 
   it('self_state null → episodic_temp = {}, growth_backlog = [], thresholds = {}', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
-        const result = await seedInitialOperationalProfile({ source_self_state: null });
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
+      const result = await seedInitialOperationalProfile({ source_self_state: null });
 
-        expect(result.created).toBe(true);
-        if (!result.created) throw new Error('expected created=true');
+      expect(result.created).toBe(true);
+      if (!result.created) throw new Error('expected created=true');
 
-        const v = result.version;
-        const body2 = v.profile_body as {
-          episodic_temp: unknown;
-          growth_backlog: unknown;
-          operational_profile: { thresholds: Record<string, unknown> };
-        };
-        expect(body2.episodic_temp).toEqual({});
-        expect(body2.growth_backlog).toEqual([]);
-        expect(body2.operational_profile.thresholds).toEqual({});
-      },
-    );
+      const v = result.version;
+      const body2 = v.profile_body as {
+        episodic_temp: unknown;
+        growth_backlog: unknown;
+        operational_profile: { thresholds: Record<string, unknown> };
+      };
+      expect(body2.episodic_temp).toEqual({});
+      expect(body2.growth_backlog).toEqual([]);
+      expect(body2.operational_profile.thresholds).toEqual({});
+    });
   });
 
   it('self_state with resumo_aprendizados → thresholds includes resumo + versao_legacy', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
-        const fakeSelf: SelfState = {
-          id: 'self-1',
-          tenant_id: 'default',
-          agent_id: 'default',
-          versao: 42,
-          system_prompt: 'whatever',
-          resumo_aprendizados: 'Mendes prefere objetividade.',
-          ativa: true,
-          created_at: new Date(),
-        };
-        const result = await seedInitialOperationalProfile({ source_self_state: fakeSelf });
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
+      const fakeSelf: SelfState = {
+        id: 'self-1',
+        tenant_id: 'default',
+        agent_id: 'default',
+        versao: 42,
+        system_prompt: 'whatever',
+        resumo_aprendizados: 'Mendes prefere objetividade.',
+        ativa: true,
+        created_at: new Date(),
+      };
+      const result = await seedInitialOperationalProfile({ source_self_state: fakeSelf });
 
-        expect(result.created).toBe(true);
-        if (!result.created) throw new Error('expected created=true');
+      expect(result.created).toBe(true);
+      if (!result.created) throw new Error('expected created=true');
 
-        const body3 = result.version.profile_body as {
-          operational_profile: { thresholds: { resumo: string; versao_legacy: number } };
-        };
-        expect(body3.operational_profile.thresholds.resumo).toBe('Mendes prefere objetividade.');
-        expect(body3.operational_profile.thresholds.versao_legacy).toBe(42);
-      },
-    );
+      const body3 = result.version.profile_body as {
+        operational_profile: { thresholds: { resumo: string; versao_legacy: number } };
+      };
+      expect(body3.operational_profile.thresholds.resumo).toBe('Mendes prefere objetividade.');
+      expect(body3.operational_profile.thresholds.versao_legacy).toBe(42);
+    });
   });
 
   it('maia-prompt.md missing/unreadable → throws seed_prompt_unavailable with path', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        readFileImpl = async () => {
-          const err = new Error('ENOENT: no such file');
-          (err as unknown as { code: string }).code = 'ENOENT';
-          throw err;
-        };
-        const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
-        await expect(
-          seedInitialOperationalProfile({ source_prompt_path: 'src/identity/maia-prompt.md' }),
-        ).rejects.toThrow(/seed_prompt_unavailable/);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      readFileImpl = async () => {
+        const err = new Error('ENOENT: no such file');
+        (err as unknown as { code: string }).code = 'ENOENT';
+        throw err;
+      };
+      const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
+      await expect(
+        seedInitialOperationalProfile({ source_prompt_path: 'src/identity/maia-prompt.md' }),
+      ).rejects.toThrow(/seed_prompt_unavailable/);
+    });
   });
 
   it('race: transition returns already_has_active → returns { created: false, existing }', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { operationalProfileVersionsRepo } = await import('@/db/repositories.js');
 
-        // Pre-populate state with an "active" row created by another agent/race
-        const sneakRow: ProfileRow = {
-          id: 'sneaky-active',
-          tenant_id: 'default',
-          agent_id: 'default',
-          version: 99,
-          status: 'active',
-          profile_body: {},
-          proposed_by: 'race-condition',
-          proposed_reason: null,
-          approved_by: 'race',
-          approved_at: new Date(),
-          activated_at: new Date(),
-          frozen_at: null,
-          rolled_back_at: null,
-          rollback_reason: null,
-          created_at: new Date(),
-        };
+      // Pre-populate state with an "active" row created by another agent/race
+      const sneakRow: ProfileRow = {
+        id: 'sneaky-active',
+        tenant_id: 'default',
+        agent_id: 'default',
+        version: 99,
+        status: 'active',
+        profile_body: {},
+        proposed_by: 'race-condition',
+        proposed_reason: null,
+        approved_by: 'race',
+        approved_at: new Date(),
+        activated_at: new Date(),
+        frozen_at: null,
+        rolled_back_at: null,
+        rollback_reason: null,
+        created_at: new Date(),
+      };
 
-        // Simulate: getActive returns null first (when we check at the top), then
-        // by the time we transition the just-created row, another process won.
-        const getActiveMock = vi.mocked(operationalProfileVersionsRepo.getActive);
-        let callCount = 0;
-        getActiveMock.mockImplementation(async () => {
-          callCount += 1;
-          // 1st call (idempotency check at top): null
-          if (callCount === 1) return null;
-          // Subsequent calls (after transition failure): return the racing row
-          return sneakRow;
-        });
+      // Simulate: getActive returns null first (when we check at the top), then
+      // by the time we transition the just-created row, another process won.
+      const getActiveMock = vi.mocked(operationalProfileVersionsRepo.getActive);
+      let callCount = 0;
+      getActiveMock.mockImplementation(async () => {
+        callCount += 1;
+        // 1st call (idempotency check at top): null
+        if (callCount === 1) return null;
+        // Subsequent calls (after transition failure): return the racing row
+        return sneakRow;
+      });
 
-        // Force the transition to return already_has_active
-        transitionOverride = async () => ({
-          ok: false as const,
-          reason: 'already_has_active' as const,
-        });
+      // Force the transition to return already_has_active
+      transitionOverride = async () => ({
+        ok: false as const,
+        reason: 'already_has_active' as const,
+      });
 
-        const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
-        const result = await seedInitialOperationalProfile();
-        expect(result.created).toBe(false);
-        if (result.created) throw new Error('expected created=false');
-        expect(result.reason).toBe('already_active');
-        expect(result.existing.id).toBe('sneaky-active');
-      },
-    );
+      const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
+      const result = await seedInitialOperationalProfile();
+      expect(result.created).toBe(false);
+      if (result.created) throw new Error('expected created=false');
+      expect(result.reason).toBe('already_active');
+      expect(result.existing.id).toBe('sneaky-active');
+    });
   });
 
   it('uses default prompt path when source_prompt_path is omitted', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const capturedPaths: string[] = [];
-        readFileImpl = async (path: string) => {
-          capturedPaths.push(path);
-          return MAIA_PROMPT_FIXTURE;
-        };
-        const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
-        await seedInitialOperationalProfile();
-        expect(capturedPaths.length).toBeGreaterThan(0);
-        expect(capturedPaths[0]).toContain('maia-prompt.md');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const capturedPaths: string[] = [];
+      readFileImpl = async (path: string) => {
+        capturedPaths.push(path);
+        return MAIA_PROMPT_FIXTURE;
+      };
+      const { seedInitialOperationalProfile } = await import('@/identity/proposal-generator.js');
+      await seedInitialOperationalProfile();
+      expect(capturedPaths.length).toBeGreaterThan(0);
+      expect(capturedPaths[0]).toContain('maia-prompt.md');
+    });
   });
 });

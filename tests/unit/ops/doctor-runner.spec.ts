@@ -63,9 +63,10 @@ describe('maia doctor · runner', () => {
   it('a check that exceeds its own deadline FAILS as timed out, it does not hang', async () => {
     const hangs = check(
       'a.hangs',
-      () => new Promise<DoctorResult>(() => {
-        /* never settles */
-      }),
+      () =>
+        new Promise<DoctorResult>(() => {
+          /* never settles */
+        }),
       { deadlineMs: 20 },
     );
     const run = await runDoctor([hangs], ctx(), { totalDeadlineMs: 5_000 });
@@ -157,9 +158,13 @@ describe('maia doctor · runner', () => {
   });
 
   it('an ADVISORY failure does not block the verdict; a BLOCKER failure does', async () => {
-    const advisory = check('a.adv', { status: 'fail', summary: 'nope' }, {
-      criticality: 'advisory',
-    });
+    const advisory = check(
+      'a.adv',
+      { status: 'fail', summary: 'nope' },
+      {
+        criticality: 'advisory',
+      },
+    );
     const advisoryRun = await runDoctor([advisory], ctx());
     expect(advisoryRun.ok).toBe(true);
     expect(exitCodeFor(advisoryRun, false)).toBe(0);
@@ -188,9 +193,13 @@ describe('maia doctor · runner', () => {
     });
 
     it('um ADVISORY pulado não muda nada: não havia bloqueio para provar', async () => {
-      const skipped = check('a.adv', { status: 'skip', summary: 'não aplicável' }, {
-        criticality: 'advisory',
-      });
+      const skipped = check(
+        'a.adv',
+        { status: 'skip', summary: 'não aplicável' },
+        {
+          criticality: 'advisory',
+        },
+      );
       const run = await runDoctor([skipped, check('b.ok', ok)], ctx());
       expect(run.ok).toBe(true);
       expect(exitCodeFor(run, false)).toBe(0);
@@ -226,9 +235,10 @@ describe('maia doctor · runner', () => {
   it('the TOTAL deadline stops the run and the unreached checks say so', async () => {
     const slow = check(
       'a.slow',
-      () => new Promise<DoctorResult>(() => {
-        /* never */
-      }),
+      () =>
+        new Promise<DoctorResult>(() => {
+          /* never */
+        }),
       { deadlineMs: 5_000 },
     );
     const never = check('b.never', ok, { dependsOn: ['a.slow'] });

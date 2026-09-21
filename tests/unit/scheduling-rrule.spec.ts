@@ -41,12 +41,16 @@ describe('parseRRule', () => {
 describe('computeNext basics', () => {
   it('DAILY: same day if BYHOUR not yet passed', () => {
     const after = new Date('2026-05-11T06:00:00Z'); // 03:00 BRT
-    expect(computeNext('FREQ=DAILY;BYHOUR=9', after).toISOString()).toBe('2026-05-11T12:00:00.000Z');
+    expect(computeNext('FREQ=DAILY;BYHOUR=9', after).toISOString()).toBe(
+      '2026-05-11T12:00:00.000Z',
+    );
   });
 
   it('DAILY: next day if BYHOUR already passed', () => {
     const after = new Date('2026-05-11T15:00:00Z'); // 12:00 BRT
-    expect(computeNext('FREQ=DAILY;BYHOUR=9', after).toISOString()).toBe('2026-05-12T12:00:00.000Z');
+    expect(computeNext('FREQ=DAILY;BYHOUR=9', after).toISOString()).toBe(
+      '2026-05-12T12:00:00.000Z',
+    );
   });
 
   it('strictly after: candidate equal to `after` rejected', () => {

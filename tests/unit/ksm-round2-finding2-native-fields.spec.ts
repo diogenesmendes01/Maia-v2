@@ -32,9 +32,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
         lifecycle_status: string;
         native?: Record<string, unknown>;
       }): Promise<string> {
-        const id = `00000000-0000-0000-0000-${Math.floor(
-          Math.random() * 1e12,
-        )
+        const id = `00000000-0000-0000-0000-${Math.floor(Math.random() * 1e12)
           .toString(16)
           .padStart(12, '0')}`;
         captured.set(id, {
@@ -54,9 +52,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: { record: vi.fn().mockResolvedValue(undefined) },
@@ -77,9 +74,8 @@ afterEach(() => {
 
 describe('Finding 2 — KSM propose persists table-native columns', () => {
   it('fact with native.fact_escopo/chave round-trips into the create payload', async () => {
-    const { KnowledgeStateMachine } = await import(
-      '@/control-plane/knowledge-state-machine/state-machine.js'
-    );
+    const { KnowledgeStateMachine } =
+      await import('@/control-plane/knowledge-state-machine/state-machine.js');
     const pessoaId = '11111111-2222-3333-4444-555555555555';
     const result = await KnowledgeStateMachine.propose({
       trace_id: 't',
@@ -108,9 +104,8 @@ describe('Finding 2 — KSM propose persists table-native columns', () => {
   });
 
   it('rule with native preserves tipo/contexto/acao verbatim', async () => {
-    const { KnowledgeStateMachine } = await import(
-      '@/control-plane/knowledge-state-machine/state-machine.js'
-    );
+    const { KnowledgeStateMachine } =
+      await import('@/control-plane/knowledge-state-machine/state-machine.js');
     const result = await KnowledgeStateMachine.propose({
       trace_id: 't',
       tenant_id: 'tenant-a',
@@ -138,9 +133,8 @@ describe('Finding 2 — KSM propose persists table-native columns', () => {
   });
 
   it('memory with interlocutor scope preserves subject_id + interlocutor_id', async () => {
-    const { KnowledgeStateMachine } = await import(
-      '@/control-plane/knowledge-state-machine/state-machine.js'
-    );
+    const { KnowledgeStateMachine } =
+      await import('@/control-plane/knowledge-state-machine/state-machine.js');
     const pid = '22222222-3333-4444-5555-666666666666';
     const result = await KnowledgeStateMachine.propose({
       trace_id: 't',
@@ -170,15 +164,9 @@ describe('Finding 2 — KSM propose persists table-native columns', () => {
   });
 
   it('hint with native.hint_scope_type preserves role/channel/conversation/interlocutor', async () => {
-    const { KnowledgeStateMachine } = await import(
-      '@/control-plane/knowledge-state-machine/state-machine.js'
-    );
-    for (const scopeType of [
-      'role',
-      'channel',
-      'conversation',
-      'interlocutor',
-    ] as const) {
+    const { KnowledgeStateMachine } =
+      await import('@/control-plane/knowledge-state-machine/state-machine.js');
+    for (const scopeType of ['role', 'channel', 'conversation', 'interlocutor'] as const) {
       const result = await KnowledgeStateMachine.propose({
         trace_id: 't',
         tenant_id: 'tenant-a',

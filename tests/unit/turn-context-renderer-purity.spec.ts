@@ -24,11 +24,9 @@ import type { Conversa, Mensagem, Permissao, Pessoa } from '../../src/db/schema.
  */
 
 const h = vi.hoisted(() => ({
-  boom:
-    (name: string) =>
-    (): never => {
-      throw new Error(`${name} must not be called during rendering`);
-    },
+  boom: (name: string) => (): never => {
+    throw new Error(`${name} must not be called during rendering`);
+  },
 }));
 
 vi.mock('../../src/db/repositories.js', () => ({
@@ -49,7 +47,9 @@ vi.mock('../../src/db/repositories.js', () => ({
     listByLevel: h.boom('capabilityGapsRepo.listByLevel'),
     listParaOTurno: h.boom('capabilityGapsRepo.listParaOTurno'),
   },
-  procedureExecutionsRepo: { findActiveForConversa: h.boom('procedureExecutionsRepo.findActiveForConversa') },
+  procedureExecutionsRepo: {
+    findActiveForConversa: h.boom('procedureExecutionsRepo.findActiveForConversa'),
+  },
   procedureDefinitionsRepo: { findById: h.boom('procedureDefinitionsRepo.findById') },
   permissoesRepo: { forPessoa: h.boom('permissoesRepo.forPessoa') },
   profilesRepo: { forAuthorization: h.boom('profilesRepo.forAuthorization') },

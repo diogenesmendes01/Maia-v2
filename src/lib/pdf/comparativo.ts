@@ -77,7 +77,10 @@ export async function generateComparativoPdf(input: ComparativoInput): Promise<C
     { text: 'Consolidado', style: 'totalRow' },
     { text: fmtBRLSigned(totals.receita), style: ['totalRow', 'cellRight'] },
     { text: fmtBRLSigned(totals.despesa), style: ['totalRow', 'cellRight'] },
-    { text: fmtBRLSigned(totals.lucro), style: ['totalRow', 'cellRight', totals.lucro < 0 ? 'cellNegative' : ''] },
+    {
+      text: fmtBRLSigned(totals.lucro),
+      style: ['totalRow', 'cellRight', totals.lucro < 0 ? 'cellNegative' : ''],
+    },
     { text: fmtBRLSigned(totals.caixa_final), style: ['totalRow', 'cellRight'] },
   ]);
 

@@ -74,9 +74,7 @@ vi.mock('../../src/lib/logger.js', () => ({
  * find them regardless of which access path is active, and cast the result to
  * satisfy TypeScript without touching production code.
  */
-function buildVersion(
-  overrides: Record<string, unknown>,
-): AgentOperationalProfileVersion {
+function buildVersion(overrides: Record<string, unknown>): AgentOperationalProfileVersion {
   return {
     id: 'prof-1',
     tenant_id: 'default',

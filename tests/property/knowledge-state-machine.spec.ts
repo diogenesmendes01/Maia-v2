@@ -34,10 +34,7 @@ function seedRow(kind: KnowledgeKind, row: KnowledgeRow): void {
   storeByKind.get(kind)!.set(row.id, row);
 }
 
-function listByStatus(
-  kind: KnowledgeKind,
-  status: KnowledgeLifecycleStatus,
-): KnowledgeRow[] {
+function listByStatus(kind: KnowledgeKind, status: KnowledgeLifecycleStatus): KnowledgeRow[] {
   const rows = storeByKind.get(kind);
   if (!rows) return [];
   return [...rows.values()].filter((r) => r.lifecycle_status === status);
@@ -53,18 +50,14 @@ type EligibleFilter = {
 let currentFilter: EligibleFilter = {};
 
 vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
-  const drizzle = await vi.importActual<typeof import('drizzle-orm')>(
-    'drizzle-orm',
-  );
+  const drizzle = await vi.importActual<typeof import('drizzle-orm')>('drizzle-orm');
   class KnowledgeConflictError extends Error {
     constructor(
       public readonly kind: KnowledgeKind,
       public readonly id: string,
       public readonly expected_previous_status: KnowledgeLifecycleStatus,
     ) {
-      super(
-        `knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`,
-      );
+      super(`knowledge_conflict:${kind}:${id}:expected_${expected_previous_status}`);
       this.name = 'KnowledgeConflictError';
     }
   }
@@ -93,10 +86,7 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
         });
         return id;
       },
-      async findById(
-        kind: KnowledgeKind,
-        id: string,
-      ): Promise<KnowledgeRow | null> {
+      async findById(kind: KnowledgeKind, id: string): Promise<KnowledgeRow | null> {
         return storeByKind.get(kind)?.get(id) ?? null;
       },
       async update(
@@ -115,18 +105,12 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
           updates.expected_previous_status !== undefined &&
           row.lifecycle_status !== updates.expected_previous_status
         ) {
-          throw new KnowledgeConflictError(
-            kind,
-            id,
-            updates.expected_previous_status,
-          );
+          throw new KnowledgeConflictError(kind, id, updates.expected_previous_status);
         }
-        if (updates.lifecycle_status !== undefined)
-          row.lifecycle_status = updates.lifecycle_status;
+        if (updates.lifecycle_status !== undefined) row.lifecycle_status = updates.lifecycle_status;
         if (updates.lifecycle_transitions !== undefined)
           row.lifecycle_transitions = updates.lifecycle_transitions;
-        if (updates.evidence_count !== undefined)
-          row.evidence_count = updates.evidence_count;
+        if (updates.evidence_count !== undefined) row.evidence_count = updates.evidence_count;
         row.updated_at = new Date();
       },
       async listEligible(args: {
@@ -170,9 +154,8 @@ vi.mock('@/control-plane/knowledge-state-machine/repos.js', async () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: { record: vi.fn().mockResolvedValue(undefined) },
@@ -191,9 +174,9 @@ vi.mock('@/lib/logger.js', () => ({
 // Worker now uses featureFlags.isEnabled(); override the singleton so
 // the property test isn't dependent on the test-runner env.
 vi.mock('@/config/feature-flags.js', async () => {
-  const actual = await vi.importActual<
-    typeof import('@/config/feature-flags.js')
-  >('@/config/feature-flags.js');
+  const actual = await vi.importActual<typeof import('@/config/feature-flags.js')>(
+    '@/config/feature-flags.js',
+  );
   return {
     ...actual,
     FEATURE_KNOWLEDGE_STATE_MACHINE_V1: true,
@@ -219,9 +202,7 @@ import { runKnowledgeStatePromoter } from '@/workers/knowledge-state-promoter.js
 // Property 1 — BFS reachability: revoked → active is impossible.
 // ---------------------------------------------------------------------
 describe('P10a property: ALLOWED_TRANSITIONS graph invariants', () => {
-  function bfsReachable(
-    start: KnowledgeLifecycleStatus,
-  ): Set<KnowledgeLifecycleStatus> {
+  function bfsReachable(start: KnowledgeLifecycleStatus): Set<KnowledgeLifecycleStatus> {
     const reached = new Set<KnowledgeLifecycleStatus>([start]);
     const queue: KnowledgeLifecycleStatus[] = [start];
     while (queue.length) {
@@ -289,9 +270,7 @@ describe('P10a property: ALLOWED_TRANSITIONS graph invariants', () => {
         if (allowed.has(to)) {
           expect(() => assertAllowedTransition(from, to)).not.toThrow();
         } else if (from !== to) {
-          expect(() => assertAllowedTransition(from, to)).toThrow(
-            IllegalTransitionError,
-          );
+          expect(() => assertAllowedTransition(from, to)).toThrow(IllegalTransitionError);
         }
       }
     }
@@ -401,8 +380,6 @@ describe('P10a property: auto-promoter idempotency (100 iterations)', () => {
       await runKnowledgeStatePromoter();
     }
 
-    expect(storeByKind.get('fact')!.get('fact-revoked-1')!.lifecycle_status).toBe(
-      'revoked',
-    );
+    expect(storeByKind.get('fact')!.get('fact-revoked-1')!.lifecycle_status).toBe('revoked');
   });
 });

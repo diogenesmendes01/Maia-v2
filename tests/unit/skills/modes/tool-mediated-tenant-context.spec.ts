@@ -29,10 +29,7 @@
  *     (regression guard against the old fallback).
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 
 vi.mock('@/lib/claude.js', () => ({ callLLM: vi.fn() }));
 
@@ -128,18 +125,15 @@ describe('tool_mediated: tenant context fail-closed (#262)', () => {
         model: 'x',
       });
 
-    await runWithTenantContext(
-      { tenant_id: 'acme', agent_id: 'sofia' },
-      async () => {
-        const out = await toolMediatedMode({
-          skill: baseSkill,
-          input: {},
-          resolvedPolicies: [],
-          turno_id: TURNO,
-        });
-        expect(out.answer).toBe('done');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
+      const out = await toolMediatedMode({
+        skill: baseSkill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: TURNO,
+      });
+      expect(out.answer).toBe('done');
+    });
 
     expect(capturedKey).toBeDefined();
     // Key shape: tenant:agent:skill_id:skill_version:exec_id:tool_name:args_hash
@@ -168,17 +162,14 @@ describe('tool_mediated: tenant context fail-closed (#262)', () => {
         model: 'x',
       });
 
-    await runWithTenantContext(
-      { tenant_id: 'tenantA', agent_id: 'agentA' },
-      async () => {
-        await toolMediatedMode({
-          skill: baseSkill,
-          input: {},
-          resolvedPolicies: [],
-          turno_id: TURNO,
-        });
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: 'agentA' }, async () => {
+      await toolMediatedMode({
+        skill: baseSkill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: TURNO,
+      });
+    });
 
     expect(capturedKey).toBeDefined();
     // Adversarial: the literal string 'unknown' must not appear anywhere.
@@ -218,28 +209,22 @@ describe('tool_mediated: tenant context fail-closed (#262)', () => {
     // context, not from the skill row.
     const sharedSkill = { ...baseSkill, agent_id: null };
 
-    await runWithTenantContext(
-      { tenant_id: 'tenantA', agent_id: 'agentA' },
-      async () => {
-        await toolMediatedMode({
-          skill: sharedSkill,
-          input: {},
-          resolvedPolicies: [],
-          turno_id: TURNO,
-        });
-      },
-    );
-    await runWithTenantContext(
-      { tenant_id: 'tenantB', agent_id: 'agentB' },
-      async () => {
-        await toolMediatedMode({
-          skill: sharedSkill,
-          input: {},
-          resolvedPolicies: [],
-          turno_id: TURNO,
-        });
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: 'agentA' }, async () => {
+      await toolMediatedMode({
+        skill: sharedSkill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: TURNO,
+      });
+    });
+    await runWithTenantContext({ tenant_id: 'tenantB', agent_id: 'agentB' }, async () => {
+      await toolMediatedMode({
+        skill: sharedSkill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: TURNO,
+      });
+    });
 
     expect(captured).toHaveLength(2);
     expect(captured[0]).toMatch(/^tenantA:agentA:/);
@@ -308,17 +293,14 @@ describe('tool_mediated: tenant context fail-closed (#262)', () => {
       model: 'x',
     });
 
-    await runWithTenantContext(
-      { tenant_id: 'acme', agent_id: 'sofia' },
-      async () => {
-        await toolMediatedMode({
-          skill: baseSkill,
-          input: {},
-          resolvedPolicies: [],
-          turno_id: TURNO,
-        });
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'acme', agent_id: 'sofia' }, async () => {
+      await toolMediatedMode({
+        skill: baseSkill,
+        input: {},
+        resolvedPolicies: [],
+        turno_id: TURNO,
+      });
+    });
 
     const missingCtxCalls = warnSpy.mock.calls.filter(
       (c) => c[1] === 'p9a.tool_mediated.missing_tenant_context',

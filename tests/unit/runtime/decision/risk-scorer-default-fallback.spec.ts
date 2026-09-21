@@ -40,9 +40,8 @@ vi.mock('@anthropic-ai/sdk', () => {
 // cognitive_module_log. Mock the repo so a regression doesn't hit the DB AND
 // so we can assert the gate's audit path was never entered.
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {

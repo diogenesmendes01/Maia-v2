@@ -14,16 +14,8 @@ export { validatePolicyRuleBody } from './validator.js';
 export type { ValidatePolicyOptions } from './validator.js';
 export { enforce } from './enforcement.js';
 export type { EnforcementAction } from './enforcement.js';
-export {
-  compileSafeRegex,
-  getRegexCacheStats,
-  resetRegexCache,
-} from './regex-cache.js';
-export {
-  resolveFieldPath,
-  splitFieldPath,
-  isFieldPathTooDeep,
-} from './field-path.js';
+export { compileSafeRegex, getRegexCacheStats, resetRegexCache } from './regex-cache.js';
+export { resolveFieldPath, splitFieldPath, isFieldPathTooDeep } from './field-path.js';
 export {
   ALLOWED_EFFECT_ACTIONS,
   ALLOWED_OPERATORS,

@@ -35,8 +35,6 @@ export function safeFailure(err: unknown): SafeFailure {
   const code =
     typeof e?.code === 'string' && /^[A-Za-z0-9_]{1,16}$/.test(e.code) ? e.code : 'unknown';
   const reason =
-    typeof e?.message === 'string'
-      ? e.message.replace(URI_RE, '[REDACTED_URL]').slice(0, 200)
-      : '';
+    typeof e?.message === 'string' ? e.message.replace(URI_RE, '[REDACTED_URL]').slice(0, 200) : '';
   return { name, code, reason };
 }

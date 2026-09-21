@@ -76,7 +76,12 @@ describe('buildToolCatalog — feature-gated tools listed as disabled (FIX 2)', 
     expect(REGISTRY.schedule_reminder).toBeDefined();
 
     const catalog = buildToolCatalog();
-    const names = ['schedule_reminder', 'cancel_reminder', 'start_recurring_outreach', 'start_recurring_payment'];
+    const names = [
+      'schedule_reminder',
+      'cancel_reminder',
+      'start_recurring_outreach',
+      'start_recurring_payment',
+    ];
     for (const name of names) {
       const entry = catalog.find((e) => e.tool.name === name);
       expect(entry, `${name} missing from catalog`).toBeDefined();

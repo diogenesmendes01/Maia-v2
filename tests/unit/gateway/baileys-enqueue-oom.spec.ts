@@ -191,12 +191,16 @@ describe('baileys non-debounced enqueue — OOM fail-closed (#309 / PR #324 B1)'
     expect(handlerState.upsertHandler).not.toBeNull();
 
     // Must not reject — the ingress survives the OOM.
-    await expect(handlerState.upsertHandler!({ messages: [fakeTextMsg()] })).resolves.toBeUndefined();
+    await expect(
+      handlerState.upsertHandler!({ messages: [fakeTextMsg()] }),
+    ).resolves.toBeUndefined();
 
     expect(createInboundMock).toHaveBeenCalledTimes(1);
     expect(enqueueAgentMock).toHaveBeenCalledWith({ mensagem_id: 'msg-uuid-1' });
 
-    const failClosed = logWarn.mock.calls.find((c) => c[1] === 'baileys.enqueue_failed_fail_closed');
+    const failClosed = logWarn.mock.calls.find(
+      (c) => c[1] === 'baileys.enqueue_failed_fail_closed',
+    );
     expect(failClosed).toBeTruthy();
     expect(failClosed![0]).toMatchObject({
       mensagem_id: 'msg-uuid-1',
@@ -210,7 +214,9 @@ describe('baileys non-debounced enqueue — OOM fail-closed (#309 / PR #324 B1)'
   });
 
   it('NON-OOM: error is NOT absorbed by the fail-closed branch — propagates to baileys.handle_failed', async () => {
-    const boom = Object.assign(new Error('WRONGTYPE Operation against a key'), { name: 'ReplyError' });
+    const boom = Object.assign(new Error('WRONGTYPE Operation against a key'), {
+      name: 'ReplyError',
+    });
     enqueueAgentMock.mockRejectedValueOnce(boom);
 
     await startBaileys();
@@ -219,12 +225,16 @@ describe('baileys non-debounced enqueue — OOM fail-closed (#309 / PR #324 B1)'
     // The outer upsert handler catch logs and continues (does not re-throw),
     // so the handler still resolves — but via the GENERIC error path, proving
     // the non-OOM error was NOT swallowed by the OOM-specific fail-closed branch.
-    await expect(handlerState.upsertHandler!({ messages: [fakeTextMsg()] })).resolves.toBeUndefined();
+    await expect(
+      handlerState.upsertHandler!({ messages: [fakeTextMsg()] }),
+    ).resolves.toBeUndefined();
 
     const outer = logError.mock.calls.find((c) => c[1] === 'baileys.handle_failed');
     expect(outer).toBeTruthy();
     // It did NOT take the OOM fail-closed branch.
-    const failClosed = logWarn.mock.calls.find((c) => c[1] === 'baileys.enqueue_failed_fail_closed');
+    const failClosed = logWarn.mock.calls.find(
+      (c) => c[1] === 'baileys.enqueue_failed_fail_closed',
+    );
     expect(failClosed).toBeFalsy();
   });
 

@@ -22,7 +22,11 @@ type BiasRow = {
   scope_value: string;
   principle: string;
   guidance: string;
-  origin: 'founder_explicit' | 'human_approved' | 'tenant_culture_explicit' | 'learned_strong_evidence';
+  origin:
+    | 'founder_explicit'
+    | 'human_approved'
+    | 'tenant_culture_explicit'
+    | 'learned_strong_evidence';
   strength: string;
   activation_context: unknown;
   status: 'proposed' | 'active' | 'deprecated' | 'rolled_back';
@@ -60,9 +64,7 @@ vi.mock('@/control-plane/soul/soul-biases-repo.js', async () => {
     previous_version_id?: string;
   };
 
-  type ActivateResult =
-    | { ok: true; bias: BiasRow }
-    | { ok: false; reason: string };
+  type ActivateResult = { ok: true; bias: BiasRow } | { ok: false; reason: string };
 
   // Helpers — these mirror what the real repo computes.
   const computeNextVersion = (
@@ -186,10 +188,7 @@ vi.mock('@/control-plane/soul/soul-biases-repo.js', async () => {
         const limit = args.limit ?? 20;
         return Object.values(biasState)
           .filter(
-            (r) =>
-              r.tenant_id === tenant_id &&
-              r.agent_id === agent_id &&
-              r.status === 'proposed',
+            (r) => r.tenant_id === tenant_id && r.agent_id === agent_id && r.status === 'proposed',
           )
           .sort((a, b) => b.created_at.getTime() - a.created_at.getTime())
           .slice(0, limit);
@@ -200,10 +199,7 @@ vi.mock('@/control-plane/soul/soul-biases-repo.js', async () => {
         const limit = args.limit ?? 50;
         return Object.values(biasState)
           .filter(
-            (r) =>
-              r.tenant_id === tenant_id &&
-              r.agent_id === agent_id &&
-              r.status === 'active',
+            (r) => r.tenant_id === tenant_id && r.agent_id === agent_id && r.status === 'active',
           )
           .sort((a, b) => parseFloat(b.strength) - parseFloat(a.strength))
           .slice(0, limit);
@@ -252,25 +248,23 @@ vi.mock('@/control-plane/soul/soul-biases-repo.js', async () => {
         },
       ),
 
-      deprecate: vi.fn(
-        async (args: { id: string; deprecated_reason: string }) => {
-          const { tenant_id, agent_id } = await ctxRequire();
-          const row = biasState[args.id];
-          if (!row) return { ok: false, reason: 'bias_not_found' };
-          if (row.tenant_id !== tenant_id || row.agent_id !== agent_id) {
-            return { ok: false, reason: 'bias_not_found' };
-          }
-          if (row.status !== 'active') return { ok: false, reason: 'not_active' };
-          const updated: BiasRow = {
-            ...row,
-            status: 'deprecated',
-            deprecated_at: new Date(),
-            deprecated_reason: args.deprecated_reason,
-          };
-          biasState[args.id] = updated;
-          return { ok: true, bias: updated };
-        },
-      ),
+      deprecate: vi.fn(async (args: { id: string; deprecated_reason: string }) => {
+        const { tenant_id, agent_id } = await ctxRequire();
+        const row = biasState[args.id];
+        if (!row) return { ok: false, reason: 'bias_not_found' };
+        if (row.tenant_id !== tenant_id || row.agent_id !== agent_id) {
+          return { ok: false, reason: 'bias_not_found' };
+        }
+        if (row.status !== 'active') return { ok: false, reason: 'not_active' };
+        const updated: BiasRow = {
+          ...row,
+          status: 'deprecated',
+          deprecated_at: new Date(),
+          deprecated_reason: args.deprecated_reason,
+        };
+        biasState[args.id] = updated;
+        return { ok: true, bias: updated };
+      }),
 
       rollback: vi.fn(
         async (args: { id: string; rollback_reason: string; rolled_back_by: string }) => {
@@ -304,335 +298,299 @@ describe('soulBiasesRepo (P8b)', () => {
   });
 
   it('propose() cria bias com status=proposed e version=1 quando primeira', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const bias = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'humildade_epistemica',
-          guidance: 'Quando confianca da inferencia esta abaixo de 0.7.',
-          origin: 'founder_explicit',
-          strength: 0.9,
-          proposed_by: 'founder',
-        });
-        expect(bias.status).toBe('proposed');
-        expect(bias.version).toBe(1);
-        expect(bias.principle).toBe('humildade_epistemica');
-        expect(bias.origin).toBe('founder_explicit');
-        expect(bias.strength).toBe('0.900');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const bias = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'humildade_epistemica',
+        guidance: 'Quando confianca da inferencia esta abaixo de 0.7.',
+        origin: 'founder_explicit',
+        strength: 0.9,
+        proposed_by: 'founder',
+      });
+      expect(bias.status).toBe('proposed');
+      expect(bias.version).toBe(1);
+      expect(bias.principle).toBe('humildade_epistemica');
+      expect(bias.origin).toBe('founder_explicit');
+      expect(bias.strength).toBe('0.900');
+    });
   });
 
   it('propose() incrementa version para a mesma chave (tenant, scope, scope_value, principle)', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const v1 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'first version guidance',
-          origin: 'founder_explicit',
-          strength: 0.5,
-          proposed_by: 'a',
-        });
-        const v2 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'second version guidance',
-          origin: 'founder_explicit',
-          strength: 0.6,
-          proposed_by: 'a',
-          previous_version_id: v1.id,
-        });
-        expect(v1.version).toBe(1);
-        expect(v2.version).toBe(2);
-        expect(v2.previous_version_id).toBe(v1.id);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const v1 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'first version guidance',
+        origin: 'founder_explicit',
+        strength: 0.5,
+        proposed_by: 'a',
+      });
+      const v2 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'second version guidance',
+        origin: 'founder_explicit',
+        strength: 0.6,
+        proposed_by: 'a',
+        previous_version_id: v1.id,
+      });
+      expect(v1.version).toBe(1);
+      expect(v2.version).toBe(2);
+      expect(v2.previous_version_id).toBe(v1.id);
+    });
   });
 
   it('activate() transiciona proposed → active e marca timestamps', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const b = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'guidance text ok',
-          origin: 'founder_explicit',
-          strength: 0.8,
-          proposed_by: 'a',
-        });
-        const r = await soulBiasesRepo.activate({ id: b.id, approved_by: 'admin' });
-        expect(r.ok).toBe(true);
-        if (r.ok) {
-          expect(r.bias.status).toBe('active');
-          expect(r.bias.approved_by).toBe('admin');
-          expect(r.bias.activated_at).toBeInstanceOf(Date);
-          expect(r.bias.approved_at).toBeInstanceOf(Date);
-        }
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const b = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'guidance text ok',
+        origin: 'founder_explicit',
+        strength: 0.8,
+        proposed_by: 'a',
+      });
+      const r = await soulBiasesRepo.activate({ id: b.id, approved_by: 'admin' });
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.bias.status).toBe('active');
+        expect(r.bias.approved_by).toBe('admin');
+        expect(r.bias.activated_at).toBeInstanceOf(Date);
+        expect(r.bias.approved_at).toBeInstanceOf(Date);
+      }
+    });
   });
 
   it('activate() falha quando bias já não é proposed', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const b = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'guidance text ok',
-          origin: 'founder_explicit',
-          strength: 0.8,
-          proposed_by: 'a',
-        });
-        await soulBiasesRepo.activate({ id: b.id, approved_by: 'admin' });
-        const r = await soulBiasesRepo.activate({ id: b.id, approved_by: 'admin' });
-        expect(r.ok).toBe(false);
-        if (!r.ok) expect(r.reason).toBe('not_proposed');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const b = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'guidance text ok',
+        origin: 'founder_explicit',
+        strength: 0.8,
+        proposed_by: 'a',
+      });
+      await soulBiasesRepo.activate({ id: b.id, approved_by: 'admin' });
+      const r = await soulBiasesRepo.activate({ id: b.id, approved_by: 'admin' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe('not_proposed');
+    });
   });
 
   it('activate() exige previous_version_id quando já existe active na chave', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const v1 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'g1 guidance text',
-          origin: 'founder_explicit',
-          strength: 0.8,
-          proposed_by: 'a',
-        });
-        await soulBiasesRepo.activate({ id: v1.id, approved_by: 'admin' });
-        // v2 SEM previous_version_id deve falhar ao activate.
-        const v2 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'g2 guidance text',
-          origin: 'founder_explicit',
-          strength: 0.9,
-          proposed_by: 'a',
-        });
-        const r = await soulBiasesRepo.activate({ id: v2.id, approved_by: 'admin' });
-        expect(r.ok).toBe(false);
-        if (!r.ok) expect(r.reason).toBe('no_lineage_to_replace_active');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const v1 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'g1 guidance text',
+        origin: 'founder_explicit',
+        strength: 0.8,
+        proposed_by: 'a',
+      });
+      await soulBiasesRepo.activate({ id: v1.id, approved_by: 'admin' });
+      // v2 SEM previous_version_id deve falhar ao activate.
+      const v2 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'g2 guidance text',
+        origin: 'founder_explicit',
+        strength: 0.9,
+        proposed_by: 'a',
+      });
+      const r = await soulBiasesRepo.activate({ id: v2.id, approved_by: 'admin' });
+      expect(r.ok).toBe(false);
+      if (!r.ok) expect(r.reason).toBe('no_lineage_to_replace_active');
+    });
   });
 
   it('activate() com previous_version_id correto deprecia a v1 vigente atomicamente', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const v1 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'g1 guidance text',
-          origin: 'founder_explicit',
-          strength: 0.8,
-          proposed_by: 'a',
-        });
-        await soulBiasesRepo.activate({ id: v1.id, approved_by: 'admin' });
-        const v2 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'g2 guidance text',
-          origin: 'founder_explicit',
-          strength: 0.9,
-          proposed_by: 'a',
-          previous_version_id: v1.id,
-        });
-        const r = await soulBiasesRepo.activate({ id: v2.id, approved_by: 'admin' });
-        expect(r.ok).toBe(true);
-        const v1After = await soulBiasesRepo.getById(v1.id);
-        const v2After = await soulBiasesRepo.getById(v2.id);
-        expect(v1After?.status).toBe('deprecated');
-        expect(v2After?.status).toBe('active');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const v1 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'g1 guidance text',
+        origin: 'founder_explicit',
+        strength: 0.8,
+        proposed_by: 'a',
+      });
+      await soulBiasesRepo.activate({ id: v1.id, approved_by: 'admin' });
+      const v2 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'g2 guidance text',
+        origin: 'founder_explicit',
+        strength: 0.9,
+        proposed_by: 'a',
+        previous_version_id: v1.id,
+      });
+      const r = await soulBiasesRepo.activate({ id: v2.id, approved_by: 'admin' });
+      expect(r.ok).toBe(true);
+      const v1After = await soulBiasesRepo.getById(v1.id);
+      const v2After = await soulBiasesRepo.getById(v2.id);
+      expect(v1After?.status).toBe('deprecated');
+      expect(v2After?.status).toBe('active');
+    });
   });
 
   it('deprecate() transiciona active → deprecated', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const b = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'guidance text ok',
-          origin: 'founder_explicit',
-          strength: 0.8,
-          proposed_by: 'a',
-        });
-        await soulBiasesRepo.activate({ id: b.id, approved_by: 'admin' });
-        const r = await soulBiasesRepo.deprecate({ id: b.id, deprecated_reason: 'outdated' });
-        expect(r.ok).toBe(true);
-        const after = await soulBiasesRepo.getById(b.id);
-        expect(after?.status).toBe('deprecated');
-        expect(after?.deprecated_reason).toBe('outdated');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const b = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'guidance text ok',
+        origin: 'founder_explicit',
+        strength: 0.8,
+        proposed_by: 'a',
+      });
+      await soulBiasesRepo.activate({ id: b.id, approved_by: 'admin' });
+      const r = await soulBiasesRepo.deprecate({ id: b.id, deprecated_reason: 'outdated' });
+      expect(r.ok).toBe(true);
+      const after = await soulBiasesRepo.getById(b.id);
+      expect(after?.status).toBe('deprecated');
+      expect(after?.deprecated_reason).toBe('outdated');
+    });
   });
 
   it('rollback() é irreversível — não reativa previous_version_id', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const v1 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'g1 guidance text',
-          origin: 'founder_explicit',
-          strength: 0.8,
-          proposed_by: 'a',
-        });
-        await soulBiasesRepo.activate({ id: v1.id, approved_by: 'admin' });
-        const v2 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'g2 guidance text',
-          origin: 'founder_explicit',
-          strength: 0.9,
-          proposed_by: 'a',
-          previous_version_id: v1.id,
-        });
-        await soulBiasesRepo.activate({ id: v2.id, approved_by: 'admin' });
-        const r = await soulBiasesRepo.rollback({
-          id: v2.id,
-          rollback_reason: 'wrong',
-          rolled_back_by: 'admin',
-        });
-        expect(r.ok).toBe(true);
-        const v1After = await soulBiasesRepo.getById(v1.id);
-        const v2After = await soulBiasesRepo.getById(v2.id);
-        expect(v2After?.status).toBe('rolled_back');
-        // v1 NÃO retorna a active — rollback é declaração de erro, não promote anterior.
-        expect(v1After?.status).toBe('deprecated');
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const v1 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'g1 guidance text',
+        origin: 'founder_explicit',
+        strength: 0.8,
+        proposed_by: 'a',
+      });
+      await soulBiasesRepo.activate({ id: v1.id, approved_by: 'admin' });
+      const v2 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'g2 guidance text',
+        origin: 'founder_explicit',
+        strength: 0.9,
+        proposed_by: 'a',
+        previous_version_id: v1.id,
+      });
+      await soulBiasesRepo.activate({ id: v2.id, approved_by: 'admin' });
+      const r = await soulBiasesRepo.rollback({
+        id: v2.id,
+        rollback_reason: 'wrong',
+        rolled_back_by: 'admin',
+      });
+      expect(r.ok).toBe(true);
+      const v1After = await soulBiasesRepo.getById(v1.id);
+      const v2After = await soulBiasesRepo.getById(v2.id);
+      expect(v2After?.status).toBe('rolled_back');
+      // v1 NÃO retorna a active — rollback é declaração de erro, não promote anterior.
+      expect(v1After?.status).toBe('deprecated');
+    });
   });
 
   it('findActiveForScope() retorna apenas status=active ordenado por strength DESC', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const low = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'low',
-          guidance: 'low strength guidance',
-          origin: 'founder_explicit',
-          strength: 0.5,
-          proposed_by: 'a',
-        });
-        const high = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'high',
-          guidance: 'high strength guidance',
-          origin: 'founder_explicit',
-          strength: 0.9,
-          proposed_by: 'a',
-        });
-        await soulBiasesRepo.activate({ id: high.id, approved_by: 'admin' });
-        const active = await soulBiasesRepo.findActiveForScope({ limit: 10 });
-        expect(active.length).toBe(1);
-        expect(active[0]!.principle).toBe('high');
-        expect(active.find((b) => b.id === low.id)).toBeUndefined();
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const low = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'low',
+        guidance: 'low strength guidance',
+        origin: 'founder_explicit',
+        strength: 0.5,
+        proposed_by: 'a',
+      });
+      const high = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'high',
+        guidance: 'high strength guidance',
+        origin: 'founder_explicit',
+        strength: 0.9,
+        proposed_by: 'a',
+      });
+      await soulBiasesRepo.activate({ id: high.id, approved_by: 'admin' });
+      const active = await soulBiasesRepo.findActiveForScope({ limit: 10 });
+      expect(active.length).toBe(1);
+      expect(active[0]!.principle).toBe('high');
+      expect(active.find((b) => b.id === low.id)).toBeUndefined();
+    });
   });
 
   it('tenant guard — getById retorna null para bias de outro tenant', async () => {
     let biasId = '';
-    await runWithTenantContext(
-      { tenant_id: 'tenantA', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const b = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'guidance text ok',
-          origin: 'founder_explicit',
-          strength: 0.8,
-          proposed_by: 'a',
-        });
-        biasId = b.id;
-      },
-    );
-    await runWithTenantContext(
-      { tenant_id: 'tenantB', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const found = await soulBiasesRepo.getById(biasId);
-        expect(found).toBeNull();
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'tenantA', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const b = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'guidance text ok',
+        origin: 'founder_explicit',
+        strength: 0.8,
+        proposed_by: 'a',
+      });
+      biasId = b.id;
+    });
+    await runWithTenantContext({ tenant_id: 'tenantB', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const found = await soulBiasesRepo.getById(biasId);
+      expect(found).toBeNull();
+    });
   });
 
   it('listVersions() retorna todas versões em ordem crescente', async () => {
-    await runWithTenantContext(
-      { tenant_id: 'default', agent_id: 'default' },
-      async () => {
-        const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
-        const v1 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'g1 guidance text',
-          origin: 'founder_explicit',
-          strength: 0.8,
-          proposed_by: 'a',
-        });
-        await soulBiasesRepo.activate({ id: v1.id, approved_by: 'admin' });
-        const v2 = await soulBiasesRepo.propose({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-          guidance: 'g2 guidance text',
-          origin: 'founder_explicit',
-          strength: 0.9,
-          proposed_by: 'a',
-          previous_version_id: v1.id,
-        });
-        const versions = await soulBiasesRepo.listVersions({
-          scope: 'tenant',
-          scope_value: '*',
-          principle: 'p',
-        });
-        expect(versions.length).toBe(2);
-        expect(versions[0]!.version).toBe(1);
-        expect(versions[1]!.version).toBe(2);
-        expect(versions[0]!.id).toBe(v1.id);
-        expect(versions[1]!.id).toBe(v2.id);
-      },
-    );
+    await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
+      const { soulBiasesRepo } = await import('@/control-plane/soul/soul-biases-repo.js');
+      const v1 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'g1 guidance text',
+        origin: 'founder_explicit',
+        strength: 0.8,
+        proposed_by: 'a',
+      });
+      await soulBiasesRepo.activate({ id: v1.id, approved_by: 'admin' });
+      const v2 = await soulBiasesRepo.propose({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+        guidance: 'g2 guidance text',
+        origin: 'founder_explicit',
+        strength: 0.9,
+        proposed_by: 'a',
+        previous_version_id: v1.id,
+      });
+      const versions = await soulBiasesRepo.listVersions({
+        scope: 'tenant',
+        scope_value: '*',
+        principle: 'p',
+      });
+      expect(versions.length).toBe(2);
+      expect(versions[0]!.version).toBe(1);
+      expect(versions[1]!.version).toBe(2);
+      expect(versions[0]!.id).toBe(v1.id);
+      expect(versions[1]!.id).toBe(v2.id);
+    });
   });
 });

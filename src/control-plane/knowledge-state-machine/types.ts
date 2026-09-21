@@ -8,20 +8,9 @@
  * union or the decided_by union require founder approval (CODEOWNERS).
  */
 
-export type KnowledgeKind =
-  | 'fact'
-  | 'rule'
-  | 'memory'
-  | 'behavioral_hint'
-  | 'procedure_hint';
+export type KnowledgeKind = 'fact' | 'rule' | 'memory' | 'behavioral_hint' | 'procedure_hint';
 
-export type KnowledgeScope =
-  | 'turn'
-  | 'session'
-  | 'user'
-  | 'agent'
-  | 'tenant'
-  | 'global';
+export type KnowledgeScope = 'turn' | 'session' | 'user' | 'agent' | 'tenant' | 'global';
 
 /**
  * 9-state lifecycle. Order in this union mirrors §3.1 of the spec.
@@ -92,11 +81,7 @@ export interface KnowledgeProposalNativeFields {
   fact_chave?: string;
 
   // rule
-  rule_tipo?:
-    | 'classificacao'
-    | 'identificacao_entidade'
-    | 'tom_resposta'
-    | 'recorrencia';
+  rule_tipo?: 'classificacao' | 'identificacao_entidade' | 'tom_resposta' | 'recorrencia';
   rule_contexto?: string;
   rule_acao?: string;
   rule_contexto_jsonb?: Record<string, unknown>;
@@ -181,11 +166,7 @@ export interface KnowledgeRevokeInput {
   kind: KnowledgeKind;
   proposal_id: string;
   reason: string;
-  decided_by:
-    | 'human_rejection'
-    | 'incident_response'
-    | 'drift_decision'
-    | 'contraevidence';
+  decided_by: 'human_rejection' | 'incident_response' | 'drift_decision' | 'contraevidence';
   /**
    * Optional cancellation signal. When provided, an abort during the
    * bounded retry loop's backoff sleep clears the timer and rejects with

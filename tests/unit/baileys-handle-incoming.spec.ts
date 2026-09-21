@@ -14,17 +14,13 @@ const { AUTH_DIR, MEDIA_DIR } = vi.hoisted(() => {
   return { AUTH_DIR: path.join(base, '.baileys'), MEDIA_DIR: path.join(base, 'media') };
 });
 
-const {
-  downloadMediaMessageMock,
-  createInboundMock,
-  enqueueAgentMock,
-  resolveScopeForJidMock,
-} = vi.hoisted(() => ({
-  downloadMediaMessageMock: vi.fn(),
-  createInboundMock: vi.fn(),
-  enqueueAgentMock: vi.fn().mockResolvedValue(undefined),
-  resolveScopeForJidMock: vi.fn(),
-}));
+const { downloadMediaMessageMock, createInboundMock, enqueueAgentMock, resolveScopeForJidMock } =
+  vi.hoisted(() => ({
+    downloadMediaMessageMock: vi.fn(),
+    createInboundMock: vi.fn(),
+    enqueueAgentMock: vi.fn().mockResolvedValue(undefined),
+    resolveScopeForJidMock: vi.fn(),
+  }));
 
 vi.mock('@whiskeysockets/baileys', () => ({
   default: vi.fn(),
@@ -90,11 +86,7 @@ vi.mock('../../src/gateway/bot-detection.js', () => ({
 }));
 
 import { isReactionStub, ingressUpsertMessage } from '../../src/gateway/baileys.js';
-import {
-  MAX_IMAGE_BYTES,
-  MAX_AUDIO_BYTES,
-  MAX_DOCUMENT_BYTES,
-} from '../../src/lib/media-guard.js';
+import { MAX_IMAGE_BYTES, MAX_AUDIO_BYTES, MAX_DOCUMENT_BYTES } from '../../src/lib/media-guard.js';
 
 afterAll(() => {
   rmSync(join(MEDIA_DIR, '..'), { recursive: true, force: true });
@@ -137,7 +129,10 @@ const PNG = Buffer.concat([
 ]);
 
 let waidSeq = 0;
-function mediaMsg(kind: 'imageMessage' | 'audioMessage' | 'documentMessage', envelope: Record<string, unknown>) {
+function mediaMsg(
+  kind: 'imageMessage' | 'audioMessage' | 'documentMessage',
+  envelope: Record<string, unknown>,
+) {
   return {
     key: {
       fromMe: false,
@@ -238,9 +233,7 @@ describe('baileys handleIncoming — media caps / magic / tenant-scoped storage 
   });
 
   it('rejects bad magic: bytes that do not sniff as an image ⇒ midia_url null + media_rejected', async () => {
-    downloadMediaMessageMock.mockResolvedValueOnce(
-      Buffer.from('#!/bin/sh\necho not-an-image\n'),
-    );
+    downloadMediaMessageMock.mockResolvedValueOnce(Buffer.from('#!/bin/sh\necho not-an-image\n'));
     const out = await ingressUpsertMessage(
       mediaMsg('imageMessage', { mimetype: 'image/jpeg', caption: 'diz que é imagem' }),
     );

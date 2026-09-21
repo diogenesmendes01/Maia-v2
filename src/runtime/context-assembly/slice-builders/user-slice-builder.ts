@@ -20,11 +20,7 @@ import { createHash } from 'node:crypto';
 import type { BaseContextPacket, UserSlice } from '../../context-packet/types.js';
 import { sliceCacheKey, type SliceCache } from '../../context-packet/cache/slice-cache.js';
 import { getTTLForSlice } from '../../context-packet/cache/ttl-policy.js';
-import type {
-  SliceBuilder,
-  SliceBuilderInput,
-  SliceBuilderResult,
-} from './_types.js';
+import type { SliceBuilder, SliceBuilderInput, SliceBuilderResult } from './_types.js';
 
 export interface UserRequirements {
   depth: 'none' | 'minimal' | 'relevant' | 'deep';
@@ -60,19 +56,13 @@ export interface BehavioralHintRecord {
  * memory_entry repo and the P8c user-layer namespace (`src/user-layer/`).
  */
 export interface UserLayerPort {
-  getPessoa(
-    tenant_id: string,
-    pessoa_id: string | null,
-  ): Promise<PessoaRecord | null>;
+  getPessoa(tenant_id: string, pessoa_id: string | null): Promise<PessoaRecord | null>;
   listMemories(
     tenant_id: string,
     pessoa_id: string | null,
     opts: { depth: UserRequirements['depth']; max_items: number },
   ): Promise<MemoryEntryRecord[]>;
-  listBehavioralHints(
-    tenant_id: string,
-    pessoa_id: string | null,
-  ): Promise<BehavioralHintRecord[]>;
+  listBehavioralHints(tenant_id: string, pessoa_id: string | null): Promise<BehavioralHintRecord[]>;
 }
 
 const EMPTY_USER: UserSlice = {
@@ -83,9 +73,7 @@ const EMPTY_USER: UserSlice = {
   truncated: false,
 };
 
-export class UserSliceBuilder
-  implements SliceBuilder<UserRequirements, UserSlice>
-{
+export class UserSliceBuilder implements SliceBuilder<UserRequirements, UserSlice> {
   readonly name = 'user' as const;
 
   constructor(
@@ -104,9 +92,7 @@ export class UserSliceBuilder
     return sliceCacheKey(base.tenant_id, base.agent_id, 'user', scope);
   }
 
-  async build(
-    input: SliceBuilderInput<UserRequirements>,
-  ): Promise<SliceBuilderResult<UserSlice>> {
+  async build(input: SliceBuilderInput<UserRequirements>): Promise<SliceBuilderResult<UserSlice>> {
     const start = performance.now();
     throwIfAborted(input.signal);
     const key = this.cacheKey(input.base, input.requirements);
@@ -138,10 +124,7 @@ export class UserSliceBuilder
         // Ask for max_items+1 so we can detect truncation reliably.
         max_items: maxItems + 1,
       }),
-      this.port.listBehavioralHints(
-        input.base.tenant_id,
-        input.base.actor.pessoa_id,
-      ),
+      this.port.listBehavioralHints(input.base.tenant_id, input.base.actor.pessoa_id),
     ]);
 
     // Filter: only proactive_use=true memories enter the slice.
@@ -192,8 +175,5 @@ function throwIfAborted(signal: AbortSignal): void {
 }
 
 function hashShort(obj: Record<string, unknown>): string {
-  return createHash('sha256')
-    .update(JSON.stringify(obj))
-    .digest('hex')
-    .substring(0, 12);
+  return createHash('sha256').update(JSON.stringify(obj)).digest('hex').substring(0, 12);
 }

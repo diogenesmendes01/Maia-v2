@@ -50,9 +50,7 @@ const {
   // branch. The dedicated race specs override per-case.
   const adoptToResolvedTenantMock = vi.fn().mockResolvedValue(true);
   const findOwnerByIdCrossTenantMock = vi.fn();
-  const runWithTenantContextMock = vi.fn(
-    async (_ctx: unknown, fn: () => Promise<unknown>) => fn(),
-  );
+  const runWithTenantContextMock = vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn());
   const buildPromptMock = vi.fn();
   const runReActLoopMock = vi.fn();
   // Mock para o `db.select().from().where().limit()` chain — uma .limit() por chamada.
@@ -111,7 +109,7 @@ vi.mock('@/lib/logger.js', () => ({ logger: loggerMock }));
  */
 vi.mock('@/observability/tracer.js', () => ({
   publishSpanAttribution: publishSpanAttributionMock,
-  withSpan: <T,>(_name: string, fn: () => Promise<T>) => fn(),
+  withSpan: <T>(_name: string, fn: () => Promise<T>) => fn(),
   recordElapsedSpan: vi.fn(),
 }));
 
@@ -198,13 +196,13 @@ vi.mock('@/db/repositories.js', () => ({
   },
   agentAudienceProfilesRepo: {
     findByPessoa: vi.fn().mockResolvedValue({
-      id: "aud-1",
-      tenant_id: "primary",
-      agent_id: "primary",
-      pessoa_id: "p1",
-      audience_type: "owner",
-      trust_level: "trusted_internal",
-      status: "active",
+      id: 'aud-1',
+      tenant_id: 'primary',
+      agent_id: 'primary',
+      pessoa_id: 'p1',
+      audience_type: 'owner',
+      trust_level: 'trusted_internal',
+      status: 'active',
       permission_profile_ids: [],
       labels: [],
       metadata: {},
@@ -212,13 +210,13 @@ vi.mock('@/db/repositories.js', () => ({
   },
   channelPoliciesRepo: {
     getByChannelId: vi.fn(async (channel_id: string) => ({
-      id: "policy-1",
-      tenant_id: "primary",
-      agent_id: "primary",
+      id: 'policy-1',
+      tenant_id: 'primary',
+      agent_id: 'primary',
       channel_id,
-      default_role_id: "role-default",
-      switch_behavior: "fixed",
-      announce_mode: "never",
+      default_role_id: 'role-default',
+      switch_behavior: 'fixed',
+      announce_mode: 'never',
       by_context_guards: {},
       allowed_role_ids: [],
     })),
@@ -226,11 +224,11 @@ vi.mock('@/db/repositories.js', () => ({
   rolesRepo: {
     listActive: vi.fn().mockResolvedValue([
       {
-        id: "role-default",
-        tenant_id: "primary",
-        agent_id: "primary",
-        role_key: "default",
-        display_name: "Default",
+        id: 'role-default',
+        tenant_id: 'primary',
+        agent_id: 'primary',
+        role_key: 'default',
+        display_name: 'Default',
         description: null,
         prompt_addendum: null,
         granted_packs: [],
@@ -240,11 +238,11 @@ vi.mock('@/db/repositories.js', () => ({
       },
     ]),
     getById: vi.fn().mockResolvedValue({
-      id: "role-default",
-      tenant_id: "primary",
-      agent_id: "primary",
-      role_key: "default",
-      display_name: "Default",
+      id: 'role-default',
+      tenant_id: 'primary',
+      agent_id: 'primary',
+      role_key: 'default',
+      display_name: 'Default',
       description: null,
       prompt_addendum: null,
       granted_packs: [],
@@ -402,20 +400,20 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     findOwnerByIdCrossTenantMock.mockResolvedValue(null);
     loadConversationMock.mockResolvedValue({
       conversa: {
-        id: "c1",
-        pessoa_id: "p1",
-        status: "ativa",
+        id: 'c1',
+        pessoa_id: 'p1',
+        status: 'ativa',
         metadata: {},
         channel_id: null,
       },
       pessoa: {
-        id: "p1",
-        tenant_id: "primary",
-        agent_id: "primary",
-        telefone_whatsapp: "+5511888888888",
-        nome: "Usr",
-        tipo: "owner",
-        status: "ativa",
+        id: 'p1',
+        tenant_id: 'primary',
+        agent_id: 'primary',
+        telefone_whatsapp: '+5511888888888',
+        nome: 'Usr',
+        tipo: 'owner',
+        status: 'ativa',
         preferencias: {},
       },
     });
@@ -505,43 +503,43 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     );
   });
 
-  it("bloqueia quando o canal resolvido diverge do canal persistido na conversa", async () => {
+  it('bloqueia quando o canal resolvido diverge do canal persistido na conversa', async () => {
     resolveChannelMock.mockResolvedValueOnce({
-      tenant_id: "primary",
-      agent_id: "primary",
-      channel_id: "ch-resolved",
+      tenant_id: 'primary',
+      agent_id: 'primary',
+      channel_id: 'ch-resolved',
     });
     loadConversationMock.mockResolvedValueOnce({
       conversa: {
-        id: "c1",
-        pessoa_id: "p1",
-        status: "ativa",
+        id: 'c1',
+        pessoa_id: 'p1',
+        status: 'ativa',
         metadata: {},
-        channel_id: "ch-other",
+        channel_id: 'ch-other',
       },
       pessoa: {
-        id: "p1",
-        tenant_id: "primary",
-        agent_id: "primary",
-        telefone_whatsapp: "+5511888888888",
-        nome: "Usr",
-        tipo: "owner",
-        status: "ativa",
+        id: 'p1',
+        tenant_id: 'primary',
+        agent_id: 'primary',
+        telefone_whatsapp: '+5511888888888',
+        nome: 'Usr',
+        tipo: 'owner',
+        status: 'ativa',
         preferencias: {},
       },
     });
 
-    const { runAgentForMensagem } = await import("@/agent/core.js");
-    await runAgentForMensagem("msg1");
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    await runAgentForMensagem('msg1');
 
     expect(auditMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        acao: "channel_resolution_failed",
+        acao: 'channel_resolution_failed',
         metadata: expect.objectContaining({
-          error_code: "channel_scope_mismatch",
+          error_code: 'channel_scope_mismatch',
           channel_bindings: {
-            resolver: "ch-resolved",
-            conversation: "ch-other",
+            resolver: 'ch-resolved',
+            conversation: 'ch-other',
           },
         }),
       }),
@@ -550,55 +548,55 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(runReActLoopMock).not.toHaveBeenCalled();
   });
 
-  it("bloqueia quando o canal persistido no inbound diverge da conversa resolvida", async () => {
+  it('bloqueia quando o canal persistido no inbound diverge da conversa resolvida', async () => {
     resolveChannelMock.mockResolvedValueOnce({
-      tenant_id: "primary",
-      agent_id: "primary",
-      channel_id: "ch-resolved",
+      tenant_id: 'primary',
+      agent_id: 'primary',
+      channel_id: 'ch-resolved',
     });
     findMensagemMock.mockResolvedValueOnce({
-      id: "msg1",
-      conversa_id: "c1",
-      channel_id: "ch-inbound",
-      direcao: "in",
-      tipo: "texto",
-      conteudo: "oi",
-      metadata: { telefone: "+5511888888888" },
+      id: 'msg1',
+      conversa_id: 'c1',
+      channel_id: 'ch-inbound',
+      direcao: 'in',
+      tipo: 'texto',
+      conteudo: 'oi',
+      metadata: { telefone: '+5511888888888' },
       processada_em: null,
       created_at: new Date(),
     });
     loadConversationMock.mockResolvedValueOnce({
       conversa: {
-        id: "c1",
-        pessoa_id: "p1",
-        status: "ativa",
+        id: 'c1',
+        pessoa_id: 'p1',
+        status: 'ativa',
         metadata: {},
-        channel_id: "ch-resolved",
+        channel_id: 'ch-resolved',
       },
       pessoa: {
-        id: "p1",
-        tenant_id: "primary",
-        agent_id: "primary",
-        telefone_whatsapp: "+5511888888888",
-        nome: "Usr",
-        tipo: "owner",
-        status: "ativa",
+        id: 'p1',
+        tenant_id: 'primary',
+        agent_id: 'primary',
+        telefone_whatsapp: '+5511888888888',
+        nome: 'Usr',
+        tipo: 'owner',
+        status: 'ativa',
         preferencias: {},
       },
     });
 
-    const { runAgentForMensagem } = await import("@/agent/core.js");
-    await runAgentForMensagem("msg1");
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    await runAgentForMensagem('msg1');
 
     expect(auditMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        acao: "channel_resolution_failed",
+        acao: 'channel_resolution_failed',
         metadata: expect.objectContaining({
-          error_code: "channel_scope_mismatch",
+          error_code: 'channel_scope_mismatch',
           channel_bindings: {
-            resolver: "ch-resolved",
-            inbound: "ch-inbound",
-            conversation: "ch-resolved",
+            resolver: 'ch-resolved',
+            inbound: 'ch-inbound',
+            conversation: 'ch-resolved',
           },
         }),
       }),
@@ -607,7 +605,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(runReActLoopMock).not.toHaveBeenCalled();
   });
 
-  it("multi-tenant: resolveChannel sucesso → tenant/agent reais, sem audit de falha, adoção chamada ANTES do runWithTenantContext", async () => {
+  it('multi-tenant: resolveChannel sucesso → tenant/agent reais, sem audit de falha, adoção chamada ANTES do runWithTenantContext', async () => {
     resolveChannelMock.mockResolvedValueOnce({
       tenant_id: 'tenant-acme',
       agent_id: 'agent-main',
@@ -761,8 +759,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
 
     // A conflict audit is emitted so operators can spot the race.
     const conflictAudits = auditMock.mock.calls.filter(
-      (call) =>
-        call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
+      (call) => call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
     );
     expect(conflictAudits).toHaveLength(1);
     expect(conflictAudits[0]![0].mensagem_id).toBe('msg1');
@@ -793,8 +790,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     expect(findOwnerByIdCrossTenantMock).toHaveBeenCalledWith('msg1');
     // No conflict audit — this is a benign idempotent re-run.
     const conflictAudits = auditMock.mock.calls.filter(
-      (call) =>
-        call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
+      (call) => call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
     );
     expect(conflictAudits).toHaveLength(0);
     // Proceeds under the tenant we resolved (and that we confirmed we own).
@@ -822,8 +818,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     await expect(runAgentForMensagem('msg1')).rejects.toBeInstanceOf(TypedError);
     expect(runWithTenantContextMock).not.toHaveBeenCalled();
     const conflictAudits = auditMock.mock.calls.filter(
-      (call) =>
-        call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
+      (call) => call[0]?.metadata?.error_code === 'cross_tenant_adoption_conflict',
     );
     expect(conflictAudits).toHaveLength(1);
     expect(conflictAudits[0]![0].metadata.owner_present).toBe(false);
@@ -854,11 +849,9 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
   it('multi-tenant: resolveChannel throw → adoção NÃO é chamada (não há tenant resolvido)', async () => {
     const { TypedError } = await import('@/lib/utils.js');
     resolveChannelMock.mockRejectedValueOnce(
-      new TypedError(
-        'channel_resolution_failed',
-        'channel not found or inactive',
-        { resolver_path: 'unknown_or_inactive_channel' },
-      ),
+      new TypedError('channel_resolution_failed', 'channel not found or inactive', {
+        resolver_path: 'unknown_or_inactive_channel',
+      }),
     );
 
     const { runAgentForMensagem } = await import('@/agent/core.js');
@@ -905,20 +898,20 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
     probeQueryMock.mockResolvedValueOnce([{ metadata: {} }]);
     loadConversationMock.mockResolvedValueOnce({
       conversa: {
-        id: "c1",
-        pessoa_id: "p1",
-        status: "ativa",
+        id: 'c1',
+        pessoa_id: 'p1',
+        status: 'ativa',
         metadata: {},
-        channel_id: "ch-fallback",
+        channel_id: 'ch-fallback',
       },
       pessoa: {
-        id: "p1",
-        tenant_id: "primary",
-        agent_id: "primary",
-        telefone_whatsapp: "+5511888888888",
-        nome: "Usr",
-        tipo: "owner",
-        status: "ativa",
+        id: 'p1',
+        tenant_id: 'primary',
+        agent_id: 'primary',
+        telefone_whatsapp: '+5511888888888',
+        nome: 'Usr',
+        tipo: 'owner',
+        status: 'ativa',
         preferencias: {},
       },
     });

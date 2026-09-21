@@ -1,8 +1,5 @@
 import { config } from '@/config/env.js';
-import {
-  onboardingRunsRepo,
-  type ExpiredRunScope,
-} from '@/db/repositories/onboarding-repos.js';
+import { onboardingRunsRepo, type ExpiredRunScope } from '@/db/repositories/onboarding-repos.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import { safeFailure } from '@/lib/safe-failure.js';

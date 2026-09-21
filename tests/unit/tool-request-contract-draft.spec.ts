@@ -27,9 +27,7 @@ import type { AgentCapabilityGapObservation } from '@/db/schema.js';
 
 const GAP_ID = '11111111-1111-4111-8111-111111111111';
 
-function obs(
-  over: Partial<AgentCapabilityGapObservation> = {},
-): AgentCapabilityGapObservation {
+function obs(over: Partial<AgentCapabilityGapObservation> = {}): AgentCapabilityGapObservation {
   return {
     id: '22222222-2222-4222-8222-222222222222',
     tenant_id: 't1',
@@ -88,10 +86,7 @@ describe('#636 — inferência de tipo Zod a partir do valor observado', () => {
 
 describe('#636 — campos derivados de evidência', () => {
   it('required só quando a chave aparece em TODAS as ocorrências', () => {
-    const campos = derivarCampos([
-      { produto_id: 'p1', deposito: 'sp' },
-      { produto_id: 'p2' },
-    ]);
+    const campos = derivarCampos([{ produto_id: 'p1', deposito: 'sp' }, { produto_id: 'p2' }]);
     const porNome = new Map(campos.map((c) => [c.name, c]));
     expect(porNome.get('produto_id')).toMatchObject({ required: true, observed_in: 2 });
     expect(porNome.get('deposito')).toMatchObject({ required: false, observed_in: 1 });
@@ -116,12 +111,7 @@ describe('#636 — campos derivados de evidência', () => {
   it('nenhum campo carrega VALOR observado (attempted_args vem de turno real)', () => {
     const campos = derivarCampos([{ cpf: '123.456.789-00' }]);
     expect(JSON.stringify(campos)).not.toContain('123.456.789-00');
-    expect(Object.keys(campos[0]!).sort()).toEqual([
-      'name',
-      'observed_in',
-      'required',
-      'zod',
-    ]);
+    expect(Object.keys(campos[0]!).sort()).toEqual(['name', 'observed_in', 'required', 'zod']);
   });
 });
 

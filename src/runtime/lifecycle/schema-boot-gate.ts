@@ -252,7 +252,9 @@ function renderSchemaBootFailure(f: Omit<SchemaBootFailure, 'message'>): string 
     lines.push(`  checksum expected (packaged file): ${f.expected_checksum ?? 'none'}`);
     lines.push(`  checksum found    (ledger row):    ${f.found_checksum ?? 'none'}`);
   }
-  lines.push(`  expected head: ${f.expected_head ?? 'none'} · applied head: ${f.applied_head ?? 'none'}`);
+  lines.push(
+    `  expected head: ${f.expected_head ?? 'none'} · applied head: ${f.applied_head ?? 'none'}`,
+  );
   if (f.blocker_kinds.length > 1) {
     lines.push(`  other blockers: ${f.blocker_kinds.filter((k) => k !== f.kind).join(', ')}`);
   }

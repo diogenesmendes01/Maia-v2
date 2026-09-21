@@ -19,21 +19,34 @@ function validateProfileBodyP8d(body: ProfileBody): void {
   if (!identity) return;
 
   const cl = identity.cognitive_limits as
-    | { max_inference_depth?: unknown; max_speculation_in_response?: unknown; confidence_floor_for_action?: unknown }
+    | {
+        max_inference_depth?: unknown;
+        max_speculation_in_response?: unknown;
+        confidence_floor_for_action?: unknown;
+      }
     | undefined;
   if (cl) {
     // Aceita 0 (semente inicial pode não ter calibrado ainda) mas rejeita
     // valores negativos/fora-range tipados.
-    if (typeof cl.max_inference_depth !== 'number' ||
-        cl.max_inference_depth < 0 || cl.max_inference_depth > 10) {
+    if (
+      typeof cl.max_inference_depth !== 'number' ||
+      cl.max_inference_depth < 0 ||
+      cl.max_inference_depth > 10
+    ) {
       throw new Error('cognitive_limits.max_inference_depth out of range [0,10]');
     }
-    if (typeof cl.max_speculation_in_response !== 'number' ||
-        cl.max_speculation_in_response < 0 || cl.max_speculation_in_response > 1) {
+    if (
+      typeof cl.max_speculation_in_response !== 'number' ||
+      cl.max_speculation_in_response < 0 ||
+      cl.max_speculation_in_response > 1
+    ) {
       throw new Error('cognitive_limits.max_speculation_in_response out of range [0,1]');
     }
-    if (typeof cl.confidence_floor_for_action !== 'number' ||
-        cl.confidence_floor_for_action < 0 || cl.confidence_floor_for_action > 1) {
+    if (
+      typeof cl.confidence_floor_for_action !== 'number' ||
+      cl.confidence_floor_for_action < 0 ||
+      cl.confidence_floor_for_action > 1
+    ) {
       throw new Error('cognitive_limits.confidence_floor_for_action out of range [0,1]');
     }
   }

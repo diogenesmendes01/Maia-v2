@@ -13,10 +13,7 @@ import { deriveBehavioralHint } from './behavioral-hint-deriver.js';
 import { validateBehavioralHint } from '@/workers/behavioral-hint-validator.js';
 import { initialFactConfidence, initialRuleConfidence } from './confidence.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/index.js';
-import {
-  getCurrentTenant,
-  getCurrentAgent,
-} from '@/db/tenant-context.js';
+import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 
 /**
  * Origin of a `persistCandidate` call. Codex round-2 finding 1:
@@ -159,18 +156,12 @@ export async function persistCandidate(
                 }
               }
             } catch (err) {
-              logger.warn(
-                { err: (err as Error).message },
-                'persister.hint_derivation_failed',
-              );
+              logger.warn({ err: (err as Error).message }, 'persister.hint_derivation_failed');
             }
           }
         }
       } catch (err) {
-        logger.warn(
-          { err: (err as Error).message },
-          'persister.memory_entry_persist_failed',
-        );
+        logger.warn({ err: (err as Error).message }, 'persister.memory_entry_persist_failed');
       }
 
       return {
@@ -232,10 +223,7 @@ export async function persistCandidate(
         });
         gapPersisted = true;
       } catch (err) {
-        logger.warn(
-          { err: (err as Error).message },
-          'persister.capability_gap_upsert_failed',
-        );
+        logger.warn({ err: (err as Error).message }, 'persister.capability_gap_upsert_failed');
       }
 
       return {
@@ -257,10 +245,7 @@ export async function persistCandidate(
       return { persisted_to: 'cognitive_candidates', id: row.id };
     }
     case 'descarte': {
-      logger.info(
-        { reason: candidate.reason, event_type: event.type },
-        'persister.discarded',
-      );
+      logger.info({ reason: candidate.reason, event_type: event.type }, 'persister.discarded');
       return { persisted_to: 'log_only' };
     }
   }
@@ -312,17 +297,9 @@ async function persistViaKSM(
     // column so factsRepo reads can find the row after approval.
     const subject = candidate.subject_id ?? null;
     const ksmScope =
-      candidate.scope === 'agent'
-        ? 'agent'
-        : candidate.scope === 'role'
-          ? 'agent'
-          : 'session';
+      candidate.scope === 'agent' ? 'agent' : candidate.scope === 'role' ? 'agent' : 'session';
     const legacyEscopo =
-      candidate.scope === 'agent'
-        ? subject
-          ? `entidade:${subject}`
-          : 'global'
-        : candidate.scope;
+      candidate.scope === 'agent' ? (subject ? `entidade:${subject}` : 'global') : candidate.scope;
     const chave = slugKey(candidate.content);
 
     const result = await KnowledgeStateMachine.propose({
@@ -348,9 +325,7 @@ async function persistViaKSM(
       // Defensive — decideInitialStatus never returns 'active', but if
       // a future change accidentally let one through we refuse to honor
       // it. Bypass detection is the whole point of finding 1.
-      throw new Error(
-        `persister.ksm_returned_active_status_for_${origin}_origin`,
-      );
+      throw new Error(`persister.ksm_returned_active_status_for_${origin}_origin`);
     }
 
     logger.info(
@@ -373,9 +348,7 @@ async function persistViaKSM(
   // above handles 'fato', so this branch is exclusively RegraCandidate.
   if (candidate.type !== 'regra') {
     // Exhaustive — should be unreachable.
-    throw new Error(
-      `persister.persistViaKSM_unexpected_candidate_type:${String(candidate.type)}`,
-    );
+    throw new Error(`persister.persistViaKSM_unexpected_candidate_type:${String(candidate.type)}`);
   }
   const regra = candidate;
   const result = await KnowledgeStateMachine.propose({
@@ -402,9 +375,7 @@ async function persistViaKSM(
   });
 
   if (result.initial_status === 'active') {
-    throw new Error(
-      `persister.ksm_returned_active_status_for_${origin}_origin`,
-    );
+    throw new Error(`persister.ksm_returned_active_status_for_${origin}_origin`);
   }
 
   // Rules always land in pending_review per master §2.6 — assert it so

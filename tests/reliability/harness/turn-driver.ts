@@ -343,9 +343,9 @@ export class TurnDriver {
   }
 
   /** Quantos INGRESSOS (rows de `mensagens`) o mesmo evento produziu. */
-  async ingressosDoEvento(whatsapp_id: string): Promise<
-    Array<{ id: string; turn_id: string | null; ingress_seq: number | null }>
-  > {
+  async ingressosDoEvento(
+    whatsapp_id: string,
+  ): Promise<Array<{ id: string; turn_id: string | null; ingress_seq: number | null }>> {
     const r = await this.pool.query<{
       id: string;
       turn_id: string | null;
@@ -476,10 +476,7 @@ export class TurnDriver {
    * estado terminal novo à máquina — que é exatamente o momento em que o
    * harness deveria falar.
    */
-  async esperarTerminal(
-    turn_id: string,
-    opts: { timeoutMs?: number } = {},
-  ): Promise<LinhaDoTurno> {
+  async esperarTerminal(turn_id: string, opts: { timeoutMs?: number } = {}): Promise<LinhaDoTurno> {
     return await eventually(
       async () => {
         const linha = await this.linhaDoTurno(turn_id);

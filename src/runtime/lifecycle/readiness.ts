@@ -200,7 +200,12 @@ async function probeComponent(component: LifecycleComponent): Promise<ReadinessC
   }
 }
 
-type CacheEntry = { at: number; state: LifecycleState; role: ProcessRole; checks: ReadinessCheck[] };
+type CacheEntry = {
+  at: number;
+  state: LifecycleState;
+  role: ProcessRole;
+  checks: ReadinessCheck[];
+};
 let cache: CacheEntry | null = null;
 
 async function evaluateComponents(
@@ -208,7 +213,12 @@ async function evaluateComponents(
   state: LifecycleState,
 ): Promise<ReadinessCheck[]> {
   const now = Date.now();
-  if (cache && cache.role === role && cache.state === state && now - cache.at < config.READINESS_CACHE_MS) {
+  if (
+    cache &&
+    cache.role === role &&
+    cache.state === state &&
+    now - cache.at < config.READINESS_CACHE_MS
+  ) {
     return cache.checks;
   }
   const contract = getRoleContract(role);
@@ -293,9 +303,7 @@ export async function checkRoleReadiness(): Promise<RoleReadinessReport> {
   const stateAfter = lifecycle.state;
   if (NOT_READY_STATES.includes(stateAfter)) return notReadyByState(stateAfter, role);
 
-  const blocking = checks.filter(
-    (c) => c.required && c.status !== 'ok' && c.status !== 'degraded',
-  );
+  const blocking = checks.filter((c) => c.required && c.status !== 'ok' && c.status !== 'degraded');
   if (blocking.length > 0) {
     return {
       ready: false,

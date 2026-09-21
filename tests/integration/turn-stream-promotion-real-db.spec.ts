@@ -536,9 +536,7 @@ d('#627 — promoção do sucessor (DB real)', () => {
 
     expect(enqueueAgentMock).toHaveBeenCalled();
     expect(
-      enqueueAgentMock.mock.calls.some(
-        (c) => (c[0] as { turn_id?: string }).turn_id === m2,
-      ),
+      enqueueAgentMock.mock.calls.some((c) => (c[0] as { turn_id?: string }).turn_id === m2),
     ).toBe(true);
     expect(await contador('recovered')).toBe(1);
     const trilha = await pool.query(

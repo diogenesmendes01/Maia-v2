@@ -278,7 +278,10 @@ async function maybeAlert(rule: Rule, detail: string): Promise<void> {
   const last = lastAlertedAt.get(rule.id) ?? 0;
   if (Date.now() - last < THROTTLE_MS) {
     logger.debug(
-      { rule: rule.id, throttle_remaining_s: Math.round((THROTTLE_MS - (Date.now() - last)) / 1000) },
+      {
+        rule: rule.id,
+        throttle_remaining_s: Math.round((THROTTLE_MS - (Date.now() - last)) / 1000),
+      },
       'audit_watcher.throttled',
     );
     return;
@@ -287,10 +290,7 @@ async function maybeAlert(rule: Rule, detail: string): Promise<void> {
   const subject = `[${rule.severity.toUpperCase()}] audit_watcher: ${rule.id}`;
   const body = `Audit watcher rule "${rule.id}" tripped.\n\n${detail}\n\nReview the audit log around the indicated window.`;
   await sendAlert({ subject, body }).catch((err) =>
-    logger.warn(
-      { err: (err as Error).message, rule: rule.id },
-      'audit_watcher.alert_send_failed',
-    ),
+    logger.warn({ err: (err as Error).message, rule: rule.id }, 'audit_watcher.alert_send_failed'),
   );
   logger.warn({ rule: rule.id, severity: rule.severity, detail }, 'audit_watcher.alerted');
 }
@@ -307,10 +307,7 @@ export async function runAuditWatcher(): Promise<void> {
         if (rule.kind === 'threshold') await checkThreshold(rule);
         else await checkStuck(rule);
       } catch (err) {
-        logger.error(
-          { err: (err as Error).message, rule: rule.id },
-          'audit_watcher.check_failed',
-        );
+        logger.error({ err: (err as Error).message, rule: rule.id }, 'audit_watcher.check_failed');
       }
     }
   });

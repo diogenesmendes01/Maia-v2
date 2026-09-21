@@ -155,7 +155,9 @@ function esbuildCopies(packages: Record<string, LockEntry>): { path: string; ver
  * lockfile impossível, e a política trata como violação em vez de "sem
  * vulnerável, logo verde".
  */
-function resolucaoEfetiva(packages: Record<string, LockEntry>): { path: string; version: string } | null {
+function resolucaoEfetiva(
+  packages: Record<string, LockEntry>,
+): { path: string; version: string } | null {
   const aninhada = esbuildCopies(packages).find((c) =>
     c.path.endsWith(`${PACOTE_DA_CADEIA}/node_modules/esbuild`),
   );
@@ -168,7 +170,8 @@ function resolucaoEfetiva(packages: Record<string, LockEntry>): { path: string; 
 /** A cadeia deprecada ainda está resolvida neste lockfile? */
 function cadeiaResolvida(packages: Record<string, LockEntry>): boolean {
   return Object.keys(packages).some(
-    (p) => p === `node_modules/${PACOTE_DA_CADEIA}` || p.endsWith(`/node_modules/${PACOTE_DA_CADEIA}`),
+    (p) =>
+      p === `node_modules/${PACOTE_DA_CADEIA}` || p.endsWith(`/node_modules/${PACOTE_DA_CADEIA}`),
   );
 }
 
@@ -233,9 +236,9 @@ describe('GHSA-67mh-4wv8-2f99 — nenhuma cópia vulnerável de esbuild nos lock
     it(`${par.pkg}: o override de ${PACOTE_DA_CADEIA} está sincronizado com a cadeia real`, () => {
       const lock = readJson(par.lock) as Lockfile;
       const manifest = readJson(par.pkg) as Manifest;
-      expect(avaliarPoliticaDoOverride({ packages: lock.packages, overrides: manifest.overrides })).toEqual(
-        [],
-      );
+      expect(
+        avaliarPoliticaDoOverride({ packages: lock.packages, overrides: manifest.overrides }),
+      ).toEqual([]);
     });
   }
 

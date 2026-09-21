@@ -18,7 +18,16 @@
  *
  * Skipped without TEST_DB_URL.
  */
-import { describe, it as itRaw, expect, beforeAll, afterAll, beforeEach, afterEach, vi } from 'vitest';
+import {
+  describe,
+  it as itRaw,
+  expect,
+  beforeAll,
+  afterAll,
+  beforeEach,
+  afterEach,
+  vi,
+} from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 // Wrap every test body in the 'primary' tenant context (issue #323 retired the
@@ -138,12 +147,7 @@ async function insertAssistantMsg(
      )
      VALUES ('primary', 'primary', $1, 'out', 'texto', $2, NOW(), $3::jsonb, $4::timestamptz)
      RETURNING id`,
-    [
-      args.conversa_id,
-      args.conteudo,
-      JSON.stringify(args.ferramentas_chamadas ?? []),
-      created,
-    ],
+    [args.conversa_id, args.conteudo, JSON.stringify(args.ferramentas_chamadas ?? []), created],
   );
   return r.rows[0]!.id;
 }
@@ -233,9 +237,16 @@ d('issue #73 — anchoring fix: scope-change sentinel + persisted events block',
         cc.release();
       }
     })();
-    const inbound1 = (await (await import('../../src/db/repositories.js')).mensagensRepo.findById(inbound1Id))!;
+    const inbound1 = (await (
+      await import('../../src/db/repositories.js')
+    ).mensagensRepo.findById(inbound1Id))!;
 
-    const built1 = await buildPrompt({ pessoa, conversa: conversa1, scope: scope1, inbound: inbound1 });
+    const built1 = await buildPrompt({
+      pessoa,
+      conversa: conversa1,
+      scope: scope1,
+      inbound: inbound1,
+    });
     // First turn — no prior assistant exists, no sentinel.
     expect(built1.system).not.toMatch(/Mudan[çc]a de escopo desde sua [úu]ltima resposta/i);
 
@@ -280,10 +291,17 @@ d('issue #73 — anchoring fix: scope-change sentinel + persisted events block',
         cc.release();
       }
     })();
-    const inbound2 = (await (await import('../../src/db/repositories.js')).mensagensRepo.findById(inbound2Id))!;
+    const inbound2 = (await (
+      await import('../../src/db/repositories.js')
+    ).mensagensRepo.findById(inbound2Id))!;
     const conversa2 = (await conversasRepo.byId(conversa_id))!;
 
-    const built2 = await buildPrompt({ pessoa, conversa: conversa2, scope: scope2, inbound: inbound2 });
+    const built2 = await buildPrompt({
+      pessoa,
+      conversa: conversa2,
+      scope: scope2,
+      inbound: inbound2,
+    });
 
     // The fix: this prompt must announce the scope change to the LLM.
     expect(built2.system).toMatch(/Mudan[çc]a de escopo desde sua [úu]ltima resposta/i);
@@ -298,7 +316,8 @@ d('issue #73 — anchoring fix: scope-change sentinel + persisted events block',
 
   it('Repro 2: when prior assistant turn has tool summaries, next prompt surfaces them in "## Eventos confirmados pelo backend"', async () => {
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
-    const { conversasRepo, pessoasRepo, mensagensRepo } = await import('../../src/db/repositories.js');
+    const { conversasRepo, pessoasRepo, mensagensRepo } =
+      await import('../../src/db/repositories.js');
     const { resolveScope } = await import('../../src/governance/permissions.js');
 
     const pessoa = (await pessoasRepo.findById(pessoa_id))!;
@@ -370,7 +389,8 @@ d('issue #73 — anchoring fix: scope-change sentinel + persisted events block',
 
   it('Repro 2 (contradiction overlay): a stale "não consegui" assistant text gets explicitly invalidated when paired with a successful schedule_reminder', async () => {
     const { buildPrompt } = await import('../../src/agent/prompt-builder.js');
-    const { conversasRepo, pessoasRepo, mensagensRepo } = await import('../../src/db/repositories.js');
+    const { conversasRepo, pessoasRepo, mensagensRepo } =
+      await import('../../src/db/repositories.js');
     const { resolveScope } = await import('../../src/governance/permissions.js');
 
     const pessoa = (await pessoasRepo.findById(pessoa_id))!;

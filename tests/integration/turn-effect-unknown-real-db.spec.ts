@@ -164,9 +164,7 @@ async function reservationStates(key: string): Promise<string[]> {
   return r.rows.map((row) => row.state);
 }
 
-async function effectUnknownAudits(
-  mensagem_id: string,
-): Promise<Array<Record<string, unknown>>> {
+async function effectUnknownAudits(mensagem_id: string): Promise<Array<Record<string, unknown>>> {
   const r = await pool.query<{ metadata: Record<string, unknown> }>(
     `SELECT metadata FROM audit_log
       WHERE tenant_id=$1 AND agent_id=$2 AND mensagem_id=$3 AND acao='tool_effect_unknown'`,
@@ -322,13 +320,11 @@ d('#507 — efeito possível + cancelamento tardio = `effect_unknown` (banco rea
     const originalHandler = tool.handler;
     let turnIdParaPerder = '';
     let leaseParaPerder: { alive: boolean; lostReason: string | null } | null = null;
-    const handlerSpy = vi
-      .spyOn(tool, 'handler')
-      .mockImplementation(async (args, handlerCtx) => {
-        const written = await originalHandler(args, handlerCtx);
-        await loseOwnershipForReal(turnIdParaPerder, leaseParaPerder!);
-        return written;
-      });
+    const handlerSpy = vi.spyOn(tool, 'handler').mockImplementation(async (args, handlerCtx) => {
+      const written = await originalHandler(args, handlerCtx);
+      await loseOwnershipForReal(turnIdParaPerder, leaseParaPerder!);
+      return written;
+    });
 
     let out: unknown;
     try {
@@ -391,13 +387,11 @@ d('#507 — efeito possível + cancelamento tardio = `effect_unknown` (banco rea
     const originalHandler = tool.handler;
     let turnIdParaPerder = '';
     let leaseParaPerder: { alive: boolean; lostReason: string | null } | null = null;
-    const handlerSpy = vi
-      .spyOn(tool, 'handler')
-      .mockImplementation(async (args, handlerCtx) => {
-        const read = await originalHandler(args, handlerCtx);
-        await loseOwnershipForReal(turnIdParaPerder, leaseParaPerder!);
-        return read;
-      });
+    const handlerSpy = vi.spyOn(tool, 'handler').mockImplementation(async (args, handlerCtx) => {
+      const read = await originalHandler(args, handlerCtx);
+      await loseOwnershipForReal(turnIdParaPerder, leaseParaPerder!);
+      return read;
+    });
 
     let out: unknown;
     try {

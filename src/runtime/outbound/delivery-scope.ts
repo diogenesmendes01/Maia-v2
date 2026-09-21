@@ -128,10 +128,7 @@ type ScopeRow = {
   pessoa_telefone: string | null;
 };
 
-async function refuse(
-  reason: OutboundScopeRejection,
-  outbound_id: string,
-): Promise<never> {
+async function refuse(reason: OutboundScopeRejection, outbound_id: string): Promise<never> {
   const shaped = UUID_RE.test(outbound_id);
   counter(METRIC.OUTBOUND_DELIVERY_CLAIM, { result: 'not_found' });
   logger.error(
@@ -145,7 +142,11 @@ async function refuse(
   await audit({
     acao: 'outbound_dispatch_failed',
     ...(shaped ? { alvo_id: outbound_id } : {}),
-    metadata: { reason, stage: 'scope_resolution', outbound_id_shape: shaped ? 'uuid' : 'malformed' },
+    metadata: {
+      reason,
+      stage: 'scope_resolution',
+      outbound_id_shape: shaped ? 'uuid' : 'malformed',
+    },
   });
   throw new OutboundScopeUnresolvedError(reason, outbound_id);
 }

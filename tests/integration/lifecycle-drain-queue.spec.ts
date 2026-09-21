@@ -21,7 +21,8 @@ import {
   shutdownQueue,
 } from '@/gateway/queue.js';
 
-const SHOULD_RUN = !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
+const SHOULD_RUN =
+  !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

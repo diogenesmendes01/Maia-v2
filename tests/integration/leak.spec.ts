@@ -11,12 +11,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
-import {
-  mkEntidade,
-  mkConta,
-  mkTransacao,
-  mkContraparte,
-} from '../factories/db.js';
+import { mkEntidade, mkConta, mkTransacao, mkContraparte } from '../factories/db.js';
 
 const SHOULD_RUN = !!process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;

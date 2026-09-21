@@ -69,7 +69,7 @@ describe('migration 061 down — issue #194 priority-as-principle contamination 
     expect(sql.length).toBeGreaterThan(0);
   });
 
-  it('does NOT reference profile_body->\'identity\'->\'priorities\' as a fallback for principles', () => {
+  it("does NOT reference profile_body->'identity'->'priorities' as a fallback for principles", () => {
     // This is the exact bug: a COALESCE chain that promotes priorities
     // into the principles slot. The contamination guard is "priorities
     // must never feed the principles builder", not "priorities must

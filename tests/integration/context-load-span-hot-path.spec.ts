@@ -95,12 +95,7 @@ import { runAgentForMensagem } from '@/agent/core.js';
 import { runWithSystemContext } from '@/db/tenant-context.js';
 import { runWithCorrelation } from '@/observability/correlation.js';
 import { setSpanSink, withSpan, type EndedSpan } from '@/observability/tracer.js';
-import {
-  CONTEXT_LOAD_STAGE,
-  SPAN,
-  SPAN_EMISSION,
-  SPAN_PARENT,
-} from '@/observability/taxonomy.js';
+import { CONTEXT_LOAD_STAGE, SPAN, SPAN_EMISSION, SPAN_PARENT } from '@/observability/taxonomy.js';
 import { renderPrometheus, _resetForTests } from '@/lib/metrics.js';
 
 const SHOULD_RUN =

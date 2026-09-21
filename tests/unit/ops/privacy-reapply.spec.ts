@@ -80,7 +80,10 @@ function pendingPlan(tombstones: TombstoneRecord[]) {
 describe('reaplicação — o caminho feliz fecha a cadeia', () => {
   it('reaplica cada tombstone pendente e libera o tráfego', async () => {
     const r = recorder();
-    const plan = pendingPlan([tombstone(), tombstone({ id: 'ts-b', data_class: 'postgres.memory' })]);
+    const plan = pendingPlan([
+      tombstone(),
+      tombstone({ id: 'ts-b', data_class: 'postgres.memory' }),
+    ]);
     const out = await reapplyTombstones(plan, r.ports, { ledger_independent: true });
 
     expect(out.release).toBe(true);
@@ -127,11 +130,15 @@ describe('reaplicação — o gate recebe o CONFIRMADO, não o pretendido', () =
   it('um tombstone que falhou bloqueia a liberação', async () => {
     const r = recorder({
       purge: async (job) => {
-        if (job.data_class === 'postgres.memory') throw Object.assign(new Error('x'), { code: 'purge_failed' });
+        if (job.data_class === 'postgres.memory')
+          throw Object.assign(new Error('x'), { code: 'purge_failed' });
         return 1;
       },
     });
-    const plan = pendingPlan([tombstone(), tombstone({ id: 'ts-b', data_class: 'postgres.memory' })]);
+    const plan = pendingPlan([
+      tombstone(),
+      tombstone({ id: 'ts-b', data_class: 'postgres.memory' }),
+    ]);
     const out = await reapplyTombstones(plan, r.ports, { ledger_independent: true });
 
     expect(out.release).toBe(false);
@@ -145,7 +152,8 @@ describe('reaplicação — o gate recebe o CONFIRMADO, não o pretendido', () =
   it('uma falha no meio NÃO interrompe os demais — mais dado ressuscitado morre', async () => {
     const r = recorder({
       purge: async (job) => {
-        if (job.data_class === 'postgres.memory') throw Object.assign(new Error('x'), { code: 'purge_failed' });
+        if (job.data_class === 'postgres.memory')
+          throw Object.assign(new Error('x'), { code: 'purge_failed' });
         return 1;
       },
     });

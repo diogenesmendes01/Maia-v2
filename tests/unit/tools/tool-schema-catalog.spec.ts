@@ -31,7 +31,10 @@ import { unknownKeywords } from '../../helpers/json-schema-validator.js';
 const catalog = buildToolCatalog();
 
 /** Every object node in a schema tree (root + nested + anyOf variants + items). */
-function objectNodes(node: unknown, path = '$'): Array<{ path: string; node: Record<string, unknown> }> {
+function objectNodes(
+  node: unknown,
+  path = '$',
+): Array<{ path: string; node: Record<string, unknown> }> {
   if (node === null || typeof node !== 'object') return [];
   if (Array.isArray(node)) {
     return node.flatMap((child, i) => objectNodes(child, `${path}[${i}]`));
@@ -105,8 +108,9 @@ describe('#509 catalog lint — every registered tool produces a strict JSON Sch
       // Only meaningful for object-rooted contracts; union roots are covered by
       // the per-variant checks above.
       if (built.input_schema.anyOf !== undefined) continue;
-      const shape = (tool.input_schema as unknown as { shape?: Record<string, { isOptional?: () => boolean }> })
-        .shape;
+      const shape = (
+        tool.input_schema as unknown as { shape?: Record<string, { isOptional?: () => boolean }> }
+      ).shape;
       if (!shape) continue;
       const expected = Object.entries(shape)
         .filter(([, field]) => field.isOptional?.() !== true)

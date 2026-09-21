@@ -62,18 +62,14 @@ beforeEach(() => {
 
 describe('loadReadinessFactsFromDb — predicados de escopo', () => {
   it('TODA leitura carrega o escopo — inclusive a de `agents`', async () => {
-    const { loadReadinessFactsFromDb } = await import(
-      '../../../src/onboarding/readiness-facts.js'
-    );
+    const { loadReadinessFactsFromDb } = await import('../../../src/onboarding/readiness-facts.js');
     await loadReadinessFactsFromDb({ tenant_id: 'tA', agent_id: 'agA' });
 
     // 8 leituras: tenants, agents, profile, grant, roles, channels, policies, drift.
     expect(captured.length).toBe(8);
 
     const compiled = captured.map(compile);
-    const scoped = compiled.filter(
-      (c) => c.params.includes('tA') && c.params.includes('agA'),
-    );
+    const scoped = compiled.filter((c) => c.params.includes('tA') && c.params.includes('agA'));
     // 7 das 8 ligam os DOIS parâmetros de escopo: agents, profile, grant,
     // roles, channels, policies, drift. Antes eram 6 — `agents` era a exceção
     // que vazava.
@@ -90,14 +86,10 @@ describe('loadReadinessFactsFromDb — predicados de escopo', () => {
   });
 
   it('a leitura de `agents` carrega `tenant_id` — sem ele, existência vaza entre tenants', async () => {
-    const { loadReadinessFactsFromDb } = await import(
-      '../../../src/onboarding/readiness-facts.js'
-    );
+    const { loadReadinessFactsFromDb } = await import('../../../src/onboarding/readiness-facts.js');
     await loadReadinessFactsFromDb({ tenant_id: 'tA', agent_id: 'agA' });
 
-    const agentRead = captured
-      .map(compile)
-      .find((c) => c.sql.includes('"agents"."id"'));
+    const agentRead = captured.map(compile).find((c) => c.sql.includes('"agents"."id"'));
     expect(agentRead, 'nenhuma leitura de `agents` foi capturada').toBeDefined();
     // O predicado precisa citar as DUAS colunas e ligar os DOIS parâmetros.
     expect(agentRead!.sql).toMatch(/"agents"\."id"/);
@@ -106,9 +98,7 @@ describe('loadReadinessFactsFromDb — predicados de escopo', () => {
   });
 
   it('nenhum predicado vaza um escopo diferente do requisitado', async () => {
-    const { loadReadinessFactsFromDb } = await import(
-      '../../../src/onboarding/readiness-facts.js'
-    );
+    const { loadReadinessFactsFromDb } = await import('../../../src/onboarding/readiness-facts.js');
     await loadReadinessFactsFromDb({ tenant_id: 'tenant-x', agent_id: 'agent-x' });
     for (const where of captured) {
       const { params } = compile(where);

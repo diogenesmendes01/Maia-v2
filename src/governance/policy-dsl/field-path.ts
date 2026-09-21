@@ -49,10 +49,7 @@ export function isFieldPathTooDeep(path: string): boolean {
  *
  * The empty path returns the root `context` value as-is.
  */
-export function resolveFieldPath(
-  context: unknown,
-  path: string,
-): unknown {
+export function resolveFieldPath(context: unknown, path: string): unknown {
   const segments = splitFieldPath(path);
   if (segments.length === 0) return context;
   if (segments.length > MAX_FIELD_PATH_DEPTH) return undefined;

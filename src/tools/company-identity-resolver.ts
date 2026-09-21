@@ -200,9 +200,7 @@ export const companyIdentityResolverTool: Tool<typeof inputSchema, typeof output
         company_id: undefined,
         cnpj: undefined,
         matched_by: matchedBy,
-        match_reasons: top
-          ? ['fuzzy_name_ambiguous']
-          : ['no_fuzzy_candidate'],
+        match_reasons: top ? ['fuzzy_name_ambiguous'] : ['no_fuzzy_candidate'],
         alternatives,
         needs_confirmation: true,
         question:

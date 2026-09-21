@@ -105,9 +105,10 @@ d('#571 — duas worktrees não se enxergam (canários em Postgres e Redis)', ()
     for (const s of sondas ?? []) {
       const url = s.ambiente?.DATABASE_URL ?? '';
       if (!url) continue;
-      await comAdmin(url, `DROP DATABASE IF EXISTS "${nomeDoBanco(url).replace(/"/g, '""')}"`).catch(
-        () => undefined,
-      );
+      await comAdmin(
+        url,
+        `DROP DATABASE IF EXISTS "${nomeDoBanco(url).replace(/"/g, '""')}"`,
+      ).catch(() => undefined);
     }
     repo?.destruir();
   }, PRAZO);

@@ -21,11 +21,21 @@ import { DOMAIN_PACKS } from '@/tools/packs.js';
 import { BOLETO_WRITE_RISK_POLICY_DESCRIPTORS } from '@/control-plane/policy/boleto-write-policies.js';
 
 const MIGRATION = readFileSync(
-  fileURLToPath(new URL('../../../migrations/079_boleto_proposta_attendant_role_and_skills.sql', import.meta.url)),
+  fileURLToPath(
+    new URL(
+      '../../../migrations/079_boleto_proposta_attendant_role_and_skills.sql',
+      import.meta.url,
+    ),
+  ),
   'utf8',
 );
 const MIGRATION_DOWN = readFileSync(
-  fileURLToPath(new URL('../../../migrations/079_boleto_proposta_attendant_role_and_skills_down.sql', import.meta.url)),
+  fileURLToPath(
+    new URL(
+      '../../../migrations/079_boleto_proposta_attendant_role_and_skills_down.sql',
+      import.meta.url,
+    ),
+  ),
   'utf8',
 );
 
@@ -321,7 +331,9 @@ describe('Issue #415 — correctness rules (taxonomy §3, §6, §7)', () => {
 
 describe('Issue #415 — migration shape', () => {
   it('adds the two NEW capability-taxonomy axis columns idempotently', () => {
-    expect(MIGRATION).toMatch(/ALTER TABLE roles\s+ADD COLUMN IF NOT EXISTS granted_packs TEXT\[\]/);
+    expect(MIGRATION).toMatch(
+      /ALTER TABLE roles\s+ADD COLUMN IF NOT EXISTS granted_packs TEXT\[\]/,
+    );
     expect(MIGRATION).toMatch(
       /ALTER TABLE skills\s+ADD COLUMN IF NOT EXISTS applicable_to_role TEXT\[\]/,
     );

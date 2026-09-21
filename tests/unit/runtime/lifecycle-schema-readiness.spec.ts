@@ -103,7 +103,7 @@ function fakeDb(
         if (options.delayMs) await new Promise((r) => setTimeout(r, options.delayMs));
         if (options.connectError) throw options.connectError;
         const client: ReadOnlyPoolClient = {
-          query: <R,>(text: string): Promise<{ rows: R[] }> => {
+          query: <R>(text: string): Promise<{ rows: R[] }> => {
             // #658 — a sonda de `pg_index`. Reconhecida explicitamente: sem
             // isto o `else` devolveria as linhas do LEDGER para a consulta de
             // catálogo, e todo veredito nasceria com um índice inválido
@@ -113,18 +113,18 @@ function fakeDb(
             const out = text.includes('NOT i.indisvalid')
               ? []
               : text.includes('information_schema.columns')
-              ? columns.map((column_name) => ({ column_name }))
-              : rows.map((r) => ({
-                  applied_at: '2026-01-01T00:00:00.000Z',
-                  started_at: null,
-                  execution_ms: 12,
-                  app_version: '3.1.0',
-                  runner_version: '2',
-                  error_class: null,
-                  repaired_at: null,
-                  repair_reason: null,
-                  ...r,
-                }));
+                ? columns.map((column_name) => ({ column_name }))
+                : rows.map((r) => ({
+                    applied_at: '2026-01-01T00:00:00.000Z',
+                    started_at: null,
+                    execution_ms: 12,
+                    app_version: '3.1.0',
+                    runner_version: '2',
+                    error_class: null,
+                    repaired_at: null,
+                    repair_reason: null,
+                    ...r,
+                  }));
             return Promise.resolve({ rows: out as unknown as R[] });
           },
           release: () => {
@@ -174,9 +174,7 @@ describe('checkSchemaReadiness — the verdict', () => {
   });
 
   it('a DIRTY ledger row blocks', async () => {
-    await install(
-      fakeDb([appliedRow('001_first.sql'), appliedRow(HEAD, { status: 'dirty' })]),
-    );
+    await install(fakeDb([appliedRow('001_first.sql'), appliedRow(HEAD, { status: 'dirty' })]));
     const r = await checkSchemaReadiness();
     expect(r.state).toBe('blocked');
     expect(r.ready).toBe(false);
@@ -185,10 +183,7 @@ describe('checkSchemaReadiness — the verdict', () => {
 
   it('a CHECKSUM DIVERGENCE between the packaged file and the ledger blocks', async () => {
     await install(
-      fakeDb([
-        appliedRow('001_first.sql'),
-        appliedRow(HEAD, { checksum_sha256: 'f'.repeat(64) }),
-      ]),
+      fakeDb([appliedRow('001_first.sql'), appliedRow(HEAD, { checksum_sha256: 'f'.repeat(64) })]),
     );
     const r = await checkSchemaReadiness();
     expect(r.state).toBe('blocked');
@@ -200,7 +195,12 @@ describe('checkSchemaReadiness — the verdict', () => {
       fakeDb([
         appliedRow('001_first.sql'),
         appliedRow(HEAD),
-        { id: '003_from_the_future.sql', status: 'applied', checksum_sha256: 'a'.repeat(64), checksum_source: 'computed' },
+        {
+          id: '003_from_the_future.sql',
+          status: 'applied',
+          checksum_sha256: 'a'.repeat(64),
+          checksum_source: 'computed',
+        },
       ]),
     );
     const r = await checkSchemaReadiness();
@@ -354,9 +354,7 @@ describe('checkSchemaReadiness — cost control', () => {
 
 describe('describeSchemaReadiness — what reaches the public probe body', () => {
   it('names the blocker kinds and the reason', async () => {
-    await install(
-      fakeDb([appliedRow('001_first.sql'), appliedRow(HEAD, { status: 'dirty' })]),
-    );
+    await install(fakeDb([appliedRow('001_first.sql'), appliedRow(HEAD, { status: 'dirty' })]));
     const detail = describeSchemaReadiness(await checkSchemaReadiness());
     expect(detail).toMatch(/^blocked \(dirty_migration\): /);
     expect(detail).toContain(HEAD);

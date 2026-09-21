@@ -300,9 +300,18 @@ export interface RestoreDrillResult {
  * `assertSafeDatabaseName` proves that before any adapter uses it.
  */
 export function drillDatabaseName(base: string, at: Date, drillId: string): string {
-  const stamp = at.toISOString().replace(/[^0-9]/g, '').slice(0, 14);
-  const discriminator = drillId.replace(/[^0-9a-f]/gi, '').slice(0, 12).toLowerCase();
-  const safeBase = base.toLowerCase().replace(/[^a-z0-9_]/g, '_').slice(0, 24);
+  const stamp = at
+    .toISOString()
+    .replace(/[^0-9]/g, '')
+    .slice(0, 14);
+  const discriminator = drillId
+    .replace(/[^0-9a-f]/gi, '')
+    .slice(0, 12)
+    .toLowerCase();
+  const safeBase = base
+    .toLowerCase()
+    .replace(/[^a-z0-9_]/g, '_')
+    .slice(0, 24);
   return `${safeBase}_drill_${stamp}_${discriminator}`;
 }
 
@@ -723,8 +732,9 @@ export async function runRestoreDrill(
     }
 
     // ── manifest: version, then signature ────────────────────────────────
-    const declaredVersion = (candidate.signed_manifest as { manifest?: { manifest_version?: unknown } })
-      ?.manifest?.manifest_version;
+    const declaredVersion = (
+      candidate.signed_manifest as { manifest?: { manifest_version?: unknown } }
+    )?.manifest?.manifest_version;
     if (declaredVersion !== MANIFEST_VERSION) {
       // Manifest v1's `remote_checksum_verified` could be true because the
       // uploader's own metadata stamp came back from HEAD. Reading it with v2
@@ -816,10 +826,7 @@ export async function runRestoreDrill(
       plaintextPath = stagedPlain;
       const plain = await ports.decrypt(fetched.path, stagedPlain);
       restorePath = stagedPlain;
-      if (
-        !digestsMatch(plain.sha256, manifest.sha256) ||
-        plain.bytes !== manifest.size_bytes
-      ) {
+      if (!digestsMatch(plain.sha256, manifest.sha256) || plain.bytes !== manifest.size_bytes) {
         throw new TypedError(
           'plaintext_checksum_mismatch',
           'decrypted artifact does not match the plaintext digest the manifest signed',
@@ -889,9 +896,13 @@ export async function runRestoreDrill(
     }
 
     if (!suite.passed) {
-      throw new TypedError('probe_failed', 'a required sanity probe failed on the restored snapshot', {
-        failed: suite.failed_required,
-      });
+      throw new TypedError(
+        'probe_failed',
+        'a required sanity probe failed on the restored snapshot',
+        {
+          failed: suite.failed_required,
+        },
+      );
     }
   } catch (err) {
     failure = drillFailureCode(err);

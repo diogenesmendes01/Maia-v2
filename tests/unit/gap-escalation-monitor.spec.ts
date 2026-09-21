@@ -82,17 +82,14 @@ async function currentKey(): Promise<string> {
 }
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     capabilityGapsRepo: {
       ...actual.capabilityGapsRepo,
       listByLevels: vi.fn(async () => {
-        const { getCurrentTenant, getCurrentAgent } = await import(
-          '@/db/tenant-context.js'
-        );
+        const { getCurrentTenant, getCurrentAgent } = await import('@/db/tenant-context.js');
         const tid = getCurrentTenant();
         const aid = getCurrentAgent();
         contextsSeen.push({ tenant_id: tid, agent_id: aid });
@@ -209,7 +206,12 @@ describe('runGapEscalationMonitor', () => {
   it('cenário 1: silent + freq=3 (threshold default) → escala para dashboard, log emitido, proposer NÃO chamado', async () => {
     seedTuple('tenant-a', 'agent-1', {
       gaps: [
-        makeGap({ id: 'gap-1', current_level: GapLevel.SILENT, frequency_score: 3, severity_score: 1 }),
+        makeGap({
+          id: 'gap-1',
+          current_level: GapLevel.SILENT,
+          frequency_score: 3,
+          severity_score: 1,
+        }),
       ],
     });
 
@@ -256,13 +258,24 @@ describe('runGapEscalationMonitor', () => {
     proposeCapabilityForGapMock.mockResolvedValueOnce({
       ok: true,
       proposal_id: 'prop-1',
-      draft: { capability_type: 'tool', title: 't', description: 'd', proposed_spec: {}, motivation: 'm', expected_impact: '', test_scenarios: [] },
+      draft: {
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        expected_impact: '',
+        test_scenarios: [],
+      },
     });
 
     await runGapEscalationMonitor();
     await flushMicrotasks();
 
-    expect(updateLevelMock).toHaveBeenCalledWith({ id: 'gap-mention', new_level: GapLevel.PROPOSED });
+    expect(updateLevelMock).toHaveBeenCalledWith({
+      id: 'gap-mention',
+      new_level: GapLevel.PROPOSED,
+    });
     expect(proposeCapabilityForGapMock).toHaveBeenCalledTimes(1);
     const arg = proposeCapabilityForGapMock.mock.calls[0]![0] as { gap: AgentCapabilityGap };
     expect(arg.gap.id).toBe('gap-mention');
@@ -323,7 +336,12 @@ describe('runGapEscalationMonitor', () => {
   it('cenário 5: rules customizadas sobrescrevem defaults — freq_threshold=5; gap freq=4 permanece em silent', async () => {
     seedTuple('tenant-a', 'agent-1', {
       gaps: [
-        makeGap({ id: 'gap-5', current_level: GapLevel.SILENT, frequency_score: 4, severity_score: 1 }),
+        makeGap({
+          id: 'gap-5',
+          current_level: GapLevel.SILENT,
+          frequency_score: 4,
+          severity_score: 1,
+        }),
       ],
       rules: makeRules({ dashboard_freq_threshold: 5 }),
     });
@@ -368,7 +386,15 @@ describe('runGapEscalationMonitor', () => {
     proposeCapabilityForGapMock.mockResolvedValueOnce({
       ok: true,
       proposal_id: 'prop-a',
-      draft: { capability_type: 'tool', title: 't', description: 'd', proposed_spec: {}, motivation: 'm', expected_impact: '', test_scenarios: [] },
+      draft: {
+        capability_type: 'tool',
+        title: 't',
+        description: 'd',
+        proposed_spec: {},
+        motivation: 'm',
+        expected_impact: '',
+        test_scenarios: [],
+      },
     });
 
     await runGapEscalationMonitor();
@@ -436,9 +462,7 @@ describe('runGapEscalationMonitor', () => {
 
     // AMBOS os gaps (de agents distintos no mesmo tenant) escalaram.
     expect(updateLevelMock).toHaveBeenCalledTimes(2);
-    const escalatedIds = updateLevelMock.mock.calls
-      .map((c) => (c[0] as { id: string }).id)
-      .sort();
+    const escalatedIds = updateLevelMock.mock.calls.map((c) => (c[0] as { id: string }).id).sort();
     expect(escalatedIds).toEqual(['gap-a1', 'gap-a2']);
 
     // contextos: os DOIS agents reais — e NENHUM 'default'.

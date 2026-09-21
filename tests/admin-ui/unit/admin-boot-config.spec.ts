@@ -140,7 +140,12 @@ describe('boot do admin-ui — fail-closed no sign-in (#596)', () => {
     );
     expect(err, 'o boot aceitou um console SEM provider de sign-in').not.toBeNull();
     const message = err!.message;
-    for (const name of ['OIDC_ISSUER', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_TENANT_SLUGS']) {
+    for (const name of [
+      'OIDC_ISSUER',
+      'OIDC_CLIENT_ID',
+      'OIDC_CLIENT_SECRET',
+      'OIDC_TENANT_SLUGS',
+    ]) {
       expect(message, `a mensagem de boot não nomeia ${name}`).toContain(name);
     }
     expect(message).toContain('profile/required');
@@ -184,7 +189,10 @@ describe('boot do admin-ui — fail-closed no sign-in (#596)', () => {
   });
 
   it('no runtime EDGE `register()` não valida nada (o contrato é código de Node)', async () => {
-    useEnv({ ...semAs('OIDC_ISSUER', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_TENANT_SLUGS'), NEXT_RUNTIME: 'edge' });
+    useEnv({
+      ...semAs('OIDC_ISSUER', 'OIDC_CLIENT_ID', 'OIDC_CLIENT_SECRET', 'OIDC_TENANT_SLUGS'),
+      NEXT_RUNTIME: 'edge',
+    });
     await expect(register()).resolves.toBeUndefined();
   });
 });
@@ -205,7 +213,7 @@ describe('o hook está onde o Next.js o procura', () => {
     expect(nextConfig).toMatch(/pageExtensions:\s*\[[^\]]*'ts'/);
   });
 
-  it('o `import()` do contrato está DENTRO de um `NEXT_RUNTIME === \'nodejs\'` positivo', async () => {
+  it("o `import()` do contrato está DENTRO de um `NEXT_RUNTIME === 'nodejs'` positivo", async () => {
     // Lock textual, e a razão de ele existir é que a falha que ele previne só
     // aparece em `next build` — que não roda nesta suíte.
     //
@@ -222,7 +230,8 @@ describe('o hook está onde o Next.js o procura', () => {
       resolve(__dirname, '../../../src/admin-ui/instrumentation.ts'),
       'utf8',
     ).replace(/\/\*[\s\S]*?\*\//g, '');
-    const bloco = /if\s*\(\s*process\.env\.NEXT_RUNTIME\s*===\s*'nodejs'\s*\)\s*\{([\s\S]*?)\n {2}\}/.exec(src);
+    const bloco =
+      /if\s*\(\s*process\.env\.NEXT_RUNTIME\s*===\s*'nodejs'\s*\)\s*\{([\s\S]*?)\n {2}\}/.exec(src);
     expect(bloco, 'o guard positivo de NEXT_RUNTIME sumiu de instrumentation.ts').not.toBeNull();
     expect(bloco![1]).toContain("await import('./lib/boot-config.js')");
     expect(bloco![1]).toContain('assertAdminBootConfig()');

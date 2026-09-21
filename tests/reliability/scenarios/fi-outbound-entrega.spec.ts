@@ -294,230 +294,222 @@ d('#510 FI-17/FI-18 — claim de entrega e efeito não repetido, com réplicas d
   // ─────────────────────────────────────────────────────────────────────────
   // FI-17
   // ─────────────────────────────────────────────────────────────────────────
-  it(
-    'FI-17 — dois delivery workers na MESMA linha: um claim, um envio lógico',
-    async () => {
-      const alvo = await saidaNova();
-      await provider.roteirizar([{ kind: 'accept' }, { kind: 'accept' }]);
+  it('FI-17 — dois delivery workers na MESMA linha: um claim, um envio lógico', async () => {
+    const alvo = await saidaNova();
+    await provider.roteirizar([{ kind: 'accept' }, { kind: 'accept' }]);
 
-      const oracle = new InvariantOracle({
-        pool,
-        escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
-        turnIds: [alvo.turn_id],
-      });
+    const oracle = new InvariantOracle({
+      pool,
+      escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
+      turnIds: [alvo.turn_id],
+    });
 
-      // O gate segura o VENCEDOR logo depois do claim — é o que garante que a
-      // foto do banco seja tirada com a corrida já decidida e ninguém adiante.
-      servidor.arm('after_outbound_claim_before_send', 'pause');
+    // O gate segura o VENCEDOR logo depois do claim — é o que garante que a
+    // foto do banco seja tirada com a corrida já decidida e ninguém adiante.
+    servidor.arm('after_outbound_claim_before_send', 'pause');
 
-      const a = subirReplica('entrega-a', alvo, { TEST_FI_BARREIRA: 'largada' });
-      const b = subirReplica('entrega-b', alvo, { TEST_FI_BARREIRA: 'largada' });
+    const a = subirReplica('entrega-a', alvo, { TEST_FI_BARREIRA: 'largada' });
+    const b = subirReplica('entrega-b', alvo, { TEST_FI_BARREIRA: 'largada' });
 
-      await servidor.esperarNaBarreira('largada', 2, 60_000);
-      expect(servidor.abrirBarreira('largada')).toBe(2);
+    await servidor.esperarNaBarreira('largada', 2, 60_000);
+    expect(servidor.abrirBarreira('largada')).toBe(2);
 
-      const [pa, pb] = await Promise.all([prontidaoDe(a), prontidaoDe(b)]);
-      expect(a.pid).not.toBe(b.pid);
+    const [pa, pb] = await Promise.all([prontidaoDe(a), prontidaoDe(b)]);
+    expect(a.pid).not.toBe(b.pid);
 
-      const vencedores = [pa, pb].filter((p) => p.acquired);
-      const perdedores = [pa, pb].filter((p) => !p.acquired);
-      expect(
-        vencedores.length,
-        `esperava UM vencedor; a=${JSON.stringify(pa)} b=${JSON.stringify(pb)}`,
-      ).toBe(1);
-      const vencedor = vencedores[0]!;
-      const perdedor = perdedores[0]!;
+    const vencedores = [pa, pb].filter((p) => p.acquired);
+    const perdedores = [pa, pb].filter((p) => !p.acquired);
+    expect(
+      vencedores.length,
+      `esperava UM vencedor; a=${JSON.stringify(pa)} b=${JSON.stringify(pb)}`,
+    ).toBe(1);
+    const vencedor = vencedores[0]!;
+    const perdedor = perdedores[0]!;
 
-      // A recusa do perdedor tem NOME. "Não conseguiu" sem motivo também seria
-      // o que um processo que nem tentou reportaria.
-      expect(perdedor.motivo).toContain('DeliveryFenceError');
-      expect(perdedor.claim_token).toBeNull();
+    // A recusa do perdedor tem NOME. "Não conseguiu" sem motivo também seria
+    // o que um processo que nem tentou reportaria.
+    expect(perdedor.motivo).toContain('DeliveryFenceError');
+    expect(perdedor.claim_token).toBeNull();
 
-      // A linha reflete UMA posse, e `attempt` andou UMA vez. Se as duas
-      // réplicas tivessem reivindicado, `attempt` seria 2 — o incremento está
-      // dentro do mesmo UPDATE atômico do claim.
-      const linha = await linhaDeSaida(alvo.outbound_id);
-      expect(linha.status).toBe('sending');
-      expect(linha.attempt).toBe(1);
-      expect(linha.claim_token).toBe(vencedor.claim_token);
+    // A linha reflete UMA posse, e `attempt` andou UMA vez. Se as duas
+    // réplicas tivessem reivindicado, `attempt` seria 2 — o incremento está
+    // dentro do mesmo UPDATE atômico do claim.
+    const linha = await linhaDeSaida(alvo.outbound_id);
+    expect(linha.status).toBe('sending');
+    expect(linha.attempt).toBe(1);
+    expect(linha.claim_token).toBe(vencedor.claim_token);
 
-      // NENHUM efeito ainda: o vencedor está parado ANTES da chamada.
-      const antes = await provider.ledger();
-      expect(antes.physical_call_total).toBe(0);
-      expect(antes.logical_effect_total).toBe(0);
+    // NENHUM efeito ainda: o vencedor está parado ANTES da chamada.
+    const antes = await provider.ledger();
+    expect(antes.physical_call_total).toBe(0);
+    expect(antes.logical_effect_total).toBe(0);
 
-      // Solta o vencedor. Ele chama o provider e para no gate 2.
-      servidor.arm('after_provider_accept_before_delivery_persist', 'pause');
-      // Esperar o vencedor estar PARADO no gate 1 antes de soltá-lo. A
-      // prontidão diz que ele reportou; o gate diz que ele chegou. São coisas
-      // diferentes, e soltar um gate vazio devolve 0.
-      await servidor.esperarParadoEm('after_outbound_claim_before_send', 1, 30_000);
-      expect(servidor.liberar('after_outbound_claim_before_send')).toBe(1);
+    // Solta o vencedor. Ele chama o provider e para no gate 2.
+    servidor.arm('after_provider_accept_before_delivery_persist', 'pause');
+    // Esperar o vencedor estar PARADO no gate 1 antes de soltá-lo. A
+    // prontidão diz que ele reportou; o gate diz que ele chegou. São coisas
+    // diferentes, e soltar um gate vazio devolve 0.
+    await servidor.esperarParadoEm('after_outbound_claim_before_send', 1, 30_000);
+    expect(servidor.liberar('after_outbound_claim_before_send')).toBe(1);
 
-      await eventually(
-        async () => (await provider.ledger()).logical_effect_total === 1,
-        { timeoutMs: 30_000, label: 'o vencedor registra UM efeito lógico no provider' },
-      );
+    await eventually(async () => (await provider.ledger()).logical_effect_total === 1, {
+      timeoutMs: 30_000,
+      label: 'o vencedor registra UM efeito lógico no provider',
+    });
 
-      // Solta o gate 2: o desfecho é gravado.
-      //
-      // O `eventually` acima observa o LEDGER DO PROVIDER — um sinal indireto.
-      // O filho registra o efeito lá e só DEPOIS estaciona neste gate; soltar
-      // com base no ledger é apostar que ele já chegou. Foi essa aposta que
-      // reprovou este cenário no CI (`liberar` devolveu 0). Esperar o filho
-      // parado AQUI é esperar o sinal certo.
-      await servidor.esperarParadoEm('after_provider_accept_before_delivery_persist', 1, 30_000);
-      expect(servidor.liberar('after_provider_accept_before_delivery_persist')).toBe(1);
+    // Solta o gate 2: o desfecho é gravado.
+    //
+    // O `eventually` acima observa o LEDGER DO PROVIDER — um sinal indireto.
+    // O filho registra o efeito lá e só DEPOIS estaciona neste gate; soltar
+    // com base no ledger é apostar que ele já chegou. Foi essa aposta que
+    // reprovou este cenário no CI (`liberar` devolveu 0). Esperar o filho
+    // parado AQUI é esperar o sinal certo.
+    await servidor.esperarParadoEm('after_provider_accept_before_delivery_persist', 1, 30_000);
+    expect(servidor.liberar('after_provider_accept_before_delivery_persist')).toBe(1);
 
-      await eventually(
-        async () => (await linhaDeSaida(alvo.outbound_id)).delivery_outcome !== null,
-        { timeoutMs: 30_000, label: 'o desfecho da entrega é persistido' },
-      );
+    await eventually(async () => (await linhaDeSaida(alvo.outbound_id)).delivery_outcome !== null, {
+      timeoutMs: 30_000,
+      label: 'o desfecho da entrega é persistido',
+    });
 
-      const depois = await linhaDeSaida(alvo.outbound_id);
-      expect(depois.delivery_outcome).toBe('accepted_confirmed');
+    const depois = await linhaDeSaida(alvo.outbound_id);
+    expect(depois.delivery_outcome).toBe('accepted_confirmed');
 
-      // ── O CONTROLE. O perdedor continua VIVO, e o ledger continua com UMA
-      //    chamada física. Sem esta asserção, "um efeito" também passaria num
-      //    cenário em que o perdedor tivesse morrido antes de tentar.
-      expect(b.vivo || a.vivo).toBe(true);
-      const ledger = await provider.ledger();
-      expect(ledger.physical_call_total).toBe(1);
-      expect(ledger.logical_effect_total).toBe(1);
-      const entrada = await provider.entrada(alvo.idempotency_key);
-      expect(entrada?.logical_effect_count).toBe(1);
-      expect(entrada?.outcome).toBe('accepted');
+    // ── O CONTROLE. O perdedor continua VIVO, e o ledger continua com UMA
+    //    chamada física. Sem esta asserção, "um efeito" também passaria num
+    //    cenário em que o perdedor tivesse morrido antes de tentar.
+    expect(b.vivo || a.vivo).toBe(true);
+    const ledger = await provider.ledger();
+    expect(ledger.physical_call_total).toBe(1);
+    expect(ledger.logical_effect_total).toBe(1);
+    const entrada = await provider.entrada(alvo.idempotency_key);
+    expect(entrada?.logical_effect_count).toBe(1);
+    expect(entrada?.outcome).toBe('accepted');
 
-      // E o perdedor nunca chegou sequer a emitir um envio.
-      expect(linhasDe(perdedor === pa ? a : b, '##fi-envio##')).toHaveLength(0);
+    // E o perdedor nunca chegou sequer a emitir um envio.
+    expect(linhasDe(perdedor === pa ? a : b, '##fi-envio##')).toHaveLength(0);
 
-      await oracle.assertInvariantes('FI-17');
-    },
-    180_000,
-  );
+    await oracle.assertInvariantes('FI-17');
+  }, 180_000);
 
   // ─────────────────────────────────────────────────────────────────────────
   // FI-18
   // ─────────────────────────────────────────────────────────────────────────
-  it(
-    'FI-18 — provider aceita e o worker MORRE antes de gravar: o sucessor não reenvia',
-    async () => {
-      const alvo = await saidaNova();
-      // `accept_then_drop`: o efeito é registrado e a conexão cai antes da
-      // resposta. O emissor NÃO pode concluir "falhou".
-      await provider.roteirizar([{ kind: 'accept_then_drop' }, { kind: 'accept' }]);
+  it('FI-18 — provider aceita e o worker MORRE antes de gravar: o sucessor não reenvia', async () => {
+    const alvo = await saidaNova();
+    // `accept_then_drop`: o efeito é registrado e a conexão cai antes da
+    // resposta. O emissor NÃO pode concluir "falhou".
+    await provider.roteirizar([{ kind: 'accept_then_drop' }, { kind: 'accept' }]);
 
-      const oracle = new InvariantOracle({
-        pool,
-        escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
-        turnIds: [alvo.turn_id],
-      });
+    const oracle = new InvariantOracle({
+      pool,
+      escopo: [{ tenant_id: TENANT, agent_id: AGENTE }],
+      turnIds: [alvo.turn_id],
+    });
 
-      // O gate fica DEPOIS da chamada ao provider e ANTES da persistência —
-      // a janela mais perigosa do caminho de saída inteiro.
-      servidor.arm('after_provider_accept_before_delivery_persist', 'pause');
+    // O gate fica DEPOIS da chamada ao provider e ANTES da persistência —
+    // a janela mais perigosa do caminho de saída inteiro.
+    servidor.arm('after_provider_accept_before_delivery_persist', 'pause');
 
-      const morto = subirReplica('entrega-morto', alvo);
-      const p1 = await prontidaoDe(morto);
-      expect(p1.acquired).toBe(true);
+    const morto = subirReplica('entrega-morto', alvo);
+    const p1 = await prontidaoDe(morto);
+    expect(p1.acquired).toBe(true);
 
-      // O efeito ACONTECEU: o provider registrou antes de derrubar a conexão.
-      await eventually(
-        async () => (await provider.ledger()).logical_effect_total === 1,
-        { timeoutMs: 30_000, label: 'o provider registra o efeito antes do drop' },
-      );
+    // O efeito ACONTECEU: o provider registrou antes de derrubar a conexão.
+    await eventually(async () => (await provider.ledger()).logical_effect_total === 1, {
+      timeoutMs: 30_000,
+      label: 'o provider registra o efeito antes do drop',
+    });
 
-      // O worker está parado no gate 2, com o efeito externo já existente e
-      // NADA persistido. Agora ele morre — sem `finally`, sem fechar pool, sem
-      // cancelar timer.
-      const linhaAntes = await linhaDeSaida(alvo.outbound_id);
-      expect(linhaAntes.status).toBe('sending');
-      expect(linhaAntes.delivery_outcome).toBeNull();
+    // O worker está parado no gate 2, com o efeito externo já existente e
+    // NADA persistido. Agora ele morre — sem `finally`, sem fechar pool, sem
+    // cancelar timer.
+    const linhaAntes = await linhaDeSaida(alvo.outbound_id);
+    expect(linhaAntes.status).toBe('sending');
+    expect(linhaAntes.delivery_outcome).toBeNull();
 
-      // O `SIGKILL` precisa acertar o filho PARADO no gate 2, não em algum
-      // lugar por ali: o ledger já provou que o efeito aconteceu, mas só isto
-      // prova que ele está bloqueado esperando decisão do cenário.
-      await servidor.esperarParadoEm('after_provider_accept_before_delivery_persist', 1, 30_000);
-      sup.hardKill(morto);
-      const enc = await morto.esperarSaida(10_000);
-      expect(enc.signal).toBe('SIGKILL');
+    // O `SIGKILL` precisa acertar o filho PARADO no gate 2, não em algum
+    // lugar por ali: o ledger já provou que o efeito aconteceu, mas só isto
+    // prova que ele está bloqueado esperando decisão do cenário.
+    await servidor.esperarParadoEm('after_provider_accept_before_delivery_persist', 1, 30_000);
+    sup.hardKill(morto);
+    const enc = await morto.esperarSaida(10_000);
+    expect(enc.signal).toBe('SIGKILL');
 
-      // A linha continua em `sending`: o crash não gravou nada. Este é o
-      // estado que diz "a chamada foi iniciada, o desfecho é desconhecido".
-      const linhaDepoisDoKill = await linhaDeSaida(alvo.outbound_id);
-      expect(linhaDepoisDoKill.status).toBe('sending');
-      expect(linhaDepoisDoKill.delivery_outcome).toBeNull();
+    // A linha continua em `sending`: o crash não gravou nada. Este é o
+    // estado que diz "a chamada foi iniciada, o desfecho é desconhecido".
+    const linhaDepoisDoKill = await linhaDeSaida(alvo.outbound_id);
+    expect(linhaDepoisDoKill.status).toBe('sending');
+    expect(linhaDepoisDoKill.delivery_outcome).toBeNull();
 
-      // ── O CONTROLE DE PRAZO. ANTES do vencimento, o sucessor é RECUSADO.
-      //    Sem isto, "o sucessor assumiu" também passaria num sistema sem
-      //    lease nenhuma.
-      expect(await jaVenceu(linhaDepoisDoKill.lease_expires_at)).toBe(false);
+    // ── O CONTROLE DE PRAZO. ANTES do vencimento, o sucessor é RECUSADO.
+    //    Sem isto, "o sucessor assumiu" também passaria num sistema sem
+    //    lease nenhuma.
+    expect(await jaVenceu(linhaDepoisDoKill.lease_expires_at)).toBe(false);
 
-      // A lease vence pelo relógio do BANCO. Nenhum UPDATE finge o tempo.
-      await eventually(
-        async () => jaVenceu((await linhaDeSaida(alvo.outbound_id)).lease_expires_at),
-        { timeoutMs: 30_000, label: 'a lease da entrega vence pelo relógio do banco' },
-      );
+    // A lease vence pelo relógio do BANCO. Nenhum UPDATE finge o tempo.
+    await eventually(
+      async () => jaVenceu((await linhaDeSaida(alvo.outbound_id)).lease_expires_at),
+      { timeoutMs: 30_000, label: 'a lease da entrega vence pelo relógio do banco' },
+    );
 
-      // ── O SUCESSOR. Ele roda o ciclo de produção inteiro sobre a mesma linha.
-      servidor.disarm('after_provider_accept_before_delivery_persist');
-      const sucessor = subirReplica('entrega-sucessor', alvo);
-      const p2 = await prontidaoDe(sucessor);
+    // ── O SUCESSOR. Ele roda o ciclo de produção inteiro sobre a mesma linha.
+    servidor.disarm('after_provider_accept_before_delivery_persist');
+    const sucessor = subirReplica('entrega-sucessor', alvo);
+    const p2 = await prontidaoDe(sucessor);
 
-      // ── A AFIRMAÇÃO CENTRAL, e ela vem PRIMEIRO de propósito: é o dano real.
-      //
-      //    O ledger vive num processo que SOBREVIVEU ao `SIGKILL`, então ele
-      //    pode responder a pergunta que um fake in-process não pode: o
-      //    sucessor reenviou?
-      //
-      //    `estavelDurante` e não uma leitura única: afirmar um NEGATIVO ("não
-      //    houve segunda chamada") com uma foto instantânea passaria também no
-      //    caso em que a segunda chamada ainda não saiu. A janela dá ao
-      //    sucessor tempo de sobra para reenviar — e é exatamente ela que fica
-      //    vermelha quando a trava estrutural do `sending` é removida.
-      await estavelDurante(async () => (await provider.ledger()).physical_call_total, {
-        label: 'o sucessor NÃO chama o provider uma segunda vez',
-        janelaMs: 3_000,
-        intervalMs: 100,
-        justificativa:
-          'é uma afirmação negativa sobre um efeito EXTERNO; não há evento de ' +
-          '"não enviei" para esperar, então a janela é o único observável honesto.',
-      });
+    // ── A AFIRMAÇÃO CENTRAL, e ela vem PRIMEIRO de propósito: é o dano real.
+    //
+    //    O ledger vive num processo que SOBREVIVEU ao `SIGKILL`, então ele
+    //    pode responder a pergunta que um fake in-process não pode: o
+    //    sucessor reenviou?
+    //
+    //    `estavelDurante` e não uma leitura única: afirmar um NEGATIVO ("não
+    //    houve segunda chamada") com uma foto instantânea passaria também no
+    //    caso em que a segunda chamada ainda não saiu. A janela dá ao
+    //    sucessor tempo de sobra para reenviar — e é exatamente ela que fica
+    //    vermelha quando a trava estrutural do `sending` é removida.
+    await estavelDurante(async () => (await provider.ledger()).physical_call_total, {
+      label: 'o sucessor NÃO chama o provider uma segunda vez',
+      janelaMs: 3_000,
+      intervalMs: 100,
+      justificativa:
+        'é uma afirmação negativa sobre um efeito EXTERNO; não há evento de ' +
+        '"não enviei" para esperar, então a janela é o único observável honesto.',
+    });
 
-      // Ele reivindicou a linha — e foi RECUSADO pela disposição da chamada em
-      // voo. `beginInlineDelivery` lança `DeliveryFenceError` de propósito: a
-      // próxima linha do chamador seria a chamada ao canal.
-      expect(p2.acquired).toBe(false);
-      expect(p2.motivo).toContain('DeliveryFenceError');
+    // Ele reivindicou a linha — e foi RECUSADO pela disposição da chamada em
+    // voo. `beginInlineDelivery` lança `DeliveryFenceError` de propósito: a
+    // próxima linha do chamador seria a chamada ao canal.
+    expect(p2.acquired).toBe(false);
+    expect(p2.motivo).toContain('DeliveryFenceError');
 
-      const ledger = await provider.ledger();
-      expect(ledger.physical_call_total).toBe(1);
-      expect(ledger.logical_effect_total).toBe(1);
-      const entrada = await provider.entrada(alvo.idempotency_key);
-      expect(entrada?.physical_call_count).toBe(1);
-      expect(entrada?.logical_effect_count).toBe(1);
+    const ledger = await provider.ledger();
+    expect(ledger.physical_call_total).toBe(1);
+    expect(ledger.logical_effect_total).toBe(1);
+    const entrada = await provider.entrada(alvo.idempotency_key);
+    expect(entrada?.physical_call_count).toBe(1);
+    expect(entrada?.logical_effect_count).toBe(1);
 
-      // E o sucessor nunca emitiu um envio sequer.
-      expect(linhasDe(sucessor, '##fi-envio##')).toHaveLength(0);
+    // E o sucessor nunca emitiu um envio sequer.
+    expect(linhasDe(sucessor, '##fi-envio##')).toHaveLength(0);
 
-      // ── O ESTADO É HONESTO. Não `delivered` (ninguém confirmou), não
-      //    `retryable` (reenviar duplicaria), e sim `delivery_unknown` — a
-      //    fila da reconciliação.
-      await eventually(
-        async () => (await linhaDeSaida(alvo.outbound_id)).status === 'delivery_unknown',
-        { timeoutMs: 30_000, label: 'a linha vai para delivery_unknown' },
-      );
-      const finalLinha = await linhaDeSaida(alvo.outbound_id);
-      expect(finalLinha.delivery_outcome).toBe('cancelled_after_send_unknown');
-      expect(['pending', 'retryable']).not.toContain(finalLinha.status);
-      // Posse liberada — nenhum worker fantasma segurando a linha.
-      expect(finalLinha.claim_token).toBeNull();
-      expect(finalLinha.claimed_by).toBeNull();
+    // ── O ESTADO É HONESTO. Não `delivered` (ninguém confirmou), não
+    //    `retryable` (reenviar duplicaria), e sim `delivery_unknown` — a
+    //    fila da reconciliação.
+    await eventually(
+      async () => (await linhaDeSaida(alvo.outbound_id)).status === 'delivery_unknown',
+      { timeoutMs: 30_000, label: 'a linha vai para delivery_unknown' },
+    );
+    const finalLinha = await linhaDeSaida(alvo.outbound_id);
+    expect(finalLinha.delivery_outcome).toBe('cancelled_after_send_unknown');
+    expect(['pending', 'retryable']).not.toContain(finalLinha.status);
+    // Posse liberada — nenhum worker fantasma segurando a linha.
+    expect(finalLinha.claim_token).toBeNull();
+    expect(finalLinha.claimed_by).toBeNull();
 
-      // O oracle confere a família `outbound` inteira, inclusive
-      // `desconhecido_nao_e_entregue`.
-      await oracle.assertInvariantes('FI-18');
-    },
-    180_000,
-  );
+    // O oracle confere a família `outbound` inteira, inclusive
+    // `desconhecido_nao_e_entregue`.
+    await oracle.assertInvariantes('FI-18');
+  }, 180_000);
 });

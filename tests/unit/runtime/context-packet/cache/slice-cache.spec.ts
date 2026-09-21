@@ -5,10 +5,7 @@
  * RedisSliceCache is exercised via integration tests.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import {
-  InMemorySliceCache,
-  sliceCacheKey,
-} from '@/runtime/context-packet/cache/slice-cache.js';
+import { InMemorySliceCache, sliceCacheKey } from '@/runtime/context-packet/cache/slice-cache.js';
 import { InvalidCacheScopeError } from '@/user-layer/internal/cache-keys.js';
 
 describe('SliceCache (in-memory)', () => {
@@ -127,14 +124,10 @@ describe('SliceCache (in-memory)', () => {
   });
 
   it('Issue #235: sliceCacheKey throws when tenant_id is empty string (fail-closed)', () => {
-    expect(() => sliceCacheKey('', 'agent1', 'identity', 'scope1')).toThrow(
-      InvalidCacheScopeError,
-    );
+    expect(() => sliceCacheKey('', 'agent1', 'identity', 'scope1')).toThrow(InvalidCacheScopeError);
   });
 
   it('Issue #235: sliceCacheKey throws when both tenant_id and agent_id are empty', () => {
-    expect(() => sliceCacheKey('', '', 'identity', 'scope1')).toThrow(
-      InvalidCacheScopeError,
-    );
+    expect(() => sliceCacheKey('', '', 'identity', 'scope1')).toThrow(InvalidCacheScopeError);
   });
 });

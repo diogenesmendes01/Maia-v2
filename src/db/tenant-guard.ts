@@ -23,14 +23,10 @@ export function applyTenantGuard<T extends Record<string, unknown>>(
   const inputAgent = input.agent_id as string | undefined;
 
   if (inputTenant && inputTenant !== ctxTenant) {
-    throw new Error(
-      `tenant mismatch: input ${inputTenant} vs context ${ctxTenant}`,
-    );
+    throw new Error(`tenant mismatch: input ${inputTenant} vs context ${ctxTenant}`);
   }
   if (inputAgent && inputAgent !== ctxAgent) {
-    throw new Error(
-      `agent mismatch: input ${inputAgent} vs context ${ctxAgent}`,
-    );
+    throw new Error(`agent mismatch: input ${inputAgent} vs context ${ctxAgent}`);
   }
 
   return {

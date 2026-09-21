@@ -179,13 +179,7 @@ describe('Context Packet types (v3.1.1)', () => {
 
   it('KnowledgeLifecycleStatus union excludes proposed and pending_review (master §15 invariant 9)', () => {
     // This is a compile-time guarantee — verified by tsc, asserted at runtime.
-    const validStatuses = [
-      'ephemeral',
-      'observed',
-      'reinforced',
-      'verified',
-      'active',
-    ];
+    const validStatuses = ['ephemeral', 'observed', 'reinforced', 'verified', 'active'];
     // proposed / pending_review intentionally absent — never exposed in packet.
     expect(validStatuses).not.toContain('proposed');
     expect(validStatuses).not.toContain('pending_review');

@@ -56,9 +56,9 @@ export default function TenantStatusModal({ target, onClose }: Props) {
     >
       <div className="space-y-4">
         <p className="text-sm leading-relaxed text-zinc-600">
-          O tenant <code className="font-mono">{target.id}</code> ({target.nome})
-          está atualmente <strong>{target.status}</strong>. A mudança para{' '}
-          <strong>{nextStatus}</strong> será registrada no log de auditoria.
+          O tenant <code className="font-mono">{target.id}</code> ({target.nome}) está atualmente{' '}
+          <strong>{target.status}</strong>. A mudança para <strong>{nextStatus}</strong> será
+          registrada no log de auditoria.
         </p>
         <Field label="Motivo (auditado, mín. 10 caracteres)" required>
           <Textarea

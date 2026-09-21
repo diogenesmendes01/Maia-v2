@@ -64,8 +64,7 @@ export async function seedInitialOperationalProfile(args?: {
   };
   const thresholds = extractThresholdsFromSelf(args?.source_self_state) ?? {};
   const operational_profile = {
-    voice_descriptor:
-      sections.get('como você fala') ?? sections.get('como voce fala') ?? '',
+    voice_descriptor: sections.get('como você fala') ?? sections.get('como voce fala') ?? '',
     thresholds,
   };
   const episodic_temp: Record<string, unknown> = {};
@@ -102,7 +101,11 @@ export async function seedInitialOperationalProfile(args?: {
       learned_voice_modifiers: [],
     },
     style: { language: 'pt-BR', rhythm: {} },
-    metadata: { effective_from: new Date().toISOString(), created_by: 'system_seed', previous_version_id: null },
+    metadata: {
+      effective_from: new Date().toISOString(),
+      created_by: 'system_seed',
+      previous_version_id: null,
+    },
     // legacy mirror for renderer/detector consumers (TODO migrate)
     core_immutable,
     operational_profile,

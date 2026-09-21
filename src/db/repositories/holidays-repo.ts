@@ -15,12 +15,7 @@ import { getCurrentTenant } from '../tenant-context.js';
 import { and, eq, sql, or, isNull, inArray } from 'drizzle-orm';
 import type { Holiday } from '../schema.js';
 
-export type HolidayType =
-  | 'national'
-  | 'state'
-  | 'municipal'
-  | 'entity_custom'
-  | 'holding_recess';
+export type HolidayType = 'national' | 'state' | 'municipal' | 'entity_custom' | 'holding_recess';
 
 export const holidaysRepo = {
   /**
@@ -75,11 +70,7 @@ export const holidaysRepo = {
       eq(holidays.type, 'national'),
       uf ? and(eq(holidays.type, 'state'), eq(holidays.uf, uf))! : sql`false`,
       uf && cidade
-        ? and(
-            eq(holidays.type, 'municipal'),
-            eq(holidays.uf, uf),
-            eq(holidays.cidade, cidade),
-          )!
+        ? and(eq(holidays.type, 'municipal'), eq(holidays.uf, uf), eq(holidays.cidade, cidade))!
         : sql`false`,
       customIds.length > 0 ? inArray(holidays.id, customIds) : sql`false`,
     );
@@ -94,11 +85,7 @@ export const holidaysRepo = {
    * findInRange — feriados aplicáveis num range (mesmo ano). Caller do cache
    * passa Jan-Dez, então tabela retornada é pequena. Filtra month/day no app.
    */
-  async findInRange(args: {
-    entidadeId?: string;
-    start: Date;
-    end: Date;
-  }): Promise<Holiday[]> {
+  async findInRange(args: { entidadeId?: string; start: Date; end: Date }): Promise<Holiday[]> {
     const tenant_id = getCurrentTenant();
     const year = args.start.getUTCFullYear();
 
@@ -135,11 +122,7 @@ export const holidaysRepo = {
         eq(holidays.type, 'national'),
         uf ? and(eq(holidays.type, 'state'), eq(holidays.uf, uf))! : sql`false`,
         uf && cidade
-          ? and(
-              eq(holidays.type, 'municipal'),
-              eq(holidays.uf, uf),
-              eq(holidays.cidade, cidade),
-            )!
+          ? and(eq(holidays.type, 'municipal'), eq(holidays.uf, uf), eq(holidays.cidade, cidade))!
           : sql`false`,
         customIds.length > 0 ? inArray(holidays.id, customIds) : sql`false`,
       );

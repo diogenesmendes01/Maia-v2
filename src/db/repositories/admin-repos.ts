@@ -24,10 +24,7 @@ import type {
 } from '../schema.js';
 import { TypedError } from '@/lib/utils.js';
 import { deriveCapabilityRisk, deriveCapabilityLocks } from '../capability-risk.js';
-import {
-  classifyProfileChangeRisk,
-  type ProfileChangeEntry,
-} from '../profile-risk.js';
+import { classifyProfileChangeRisk, type ProfileChangeEntry } from '../profile-risk.js';
 import {
   operationalProfileVersionsRepo,
   ProfileTransitionError,
@@ -71,9 +68,9 @@ export const appUsersRepo = {
  * Cursor ilegível/estranho ⇒ null (primeira página) — nunca lança.
  */
 export function encodeListCursor(item: { proposed_at: Date; id: string }): string {
-  return Buffer.from(
-    JSON.stringify({ ts: item.proposed_at.toISOString(), id: item.id }),
-  ).toString('base64url');
+  return Buffer.from(JSON.stringify({ ts: item.proposed_at.toISOString(), id: item.id })).toString(
+    'base64url',
+  );
 }
 
 export function decodeListCursor(
@@ -553,38 +550,42 @@ export const proposalsUnifiedRepo = {
     /** True ⇒ the gate is satisfied; perform the source transition.
      * Ignored when gateParams is present (recomputed inside tx). */
     dualComplete: boolean;
-  }): Promise<{
-    ok: true;
-    sourceTransitioned: boolean;
-    approval: ProposalApproval;
-    finalStatus: ProposalUnifiedStatus;
-    /** Recomputed inside transaction. */
-    dualComplete: boolean;
-    /** Presente só no source operational_profile (shim legado da aba Versões). */
-    profile?: {
-      activated: { id: string; version: number } | null;
-      frozen_previous: { id: string; version: number } | null;
-    };
-  } | {
-    ok: false;
-    reason:
-      | 'not_found'
-      | 'invalid_source_status'
-      | 'source_not_supported'
-      | 'transition_failed'
-      | 'already_approved_by_user'
-      | 'already_approved_by_role';
-  } | {
-    /**
-     * Spec perfil-inbox v4 §1.4 — falha tipada dos guards de perfil
-     * (predecessor_conflict, migrated_legacy_proposal, missing_predecessor,
-     * …), capturada FORA do withTx: o rollback já desfez approval + audit.
-     * O router traduz com as mesmas mensagens do caminho legado.
-     */
-    ok: false;
-    reason: 'profile_transition_failed';
-    detail: ProfileTransitionFailure;
-  }> {
+  }): Promise<
+    | {
+        ok: true;
+        sourceTransitioned: boolean;
+        approval: ProposalApproval;
+        finalStatus: ProposalUnifiedStatus;
+        /** Recomputed inside transaction. */
+        dualComplete: boolean;
+        /** Presente só no source operational_profile (shim legado da aba Versões). */
+        profile?: {
+          activated: { id: string; version: number } | null;
+          frozen_previous: { id: string; version: number } | null;
+        };
+      }
+    | {
+        ok: false;
+        reason:
+          | 'not_found'
+          | 'invalid_source_status'
+          | 'source_not_supported'
+          | 'transition_failed'
+          | 'already_approved_by_user'
+          | 'already_approved_by_role';
+      }
+    | {
+        /**
+         * Spec perfil-inbox v4 §1.4 — falha tipada dos guards de perfil
+         * (predecessor_conflict, migrated_legacy_proposal, missing_predecessor,
+         * …), capturada FORA do withTx: o rollback já desfez approval + audit.
+         * O router traduz com as mesmas mensagens do caminho legado.
+         */
+        ok: false;
+        reason: 'profile_transition_failed';
+        detail: ProfileTransitionFailure;
+      }
+  > {
     // Spec perfil-inbox v4 — source operational_profile tem caminho próprio:
     // a transição delega aos primitivos InTx do repo de perfis (guards de
     // predecessor intactos) e o contrato de falha é THROW→rollback→catch.
@@ -639,9 +640,11 @@ export const proposalsUnifiedRepo = {
             );
 
           // Idempotency by user: same user cannot record two approvals.
-          if (existingInTx.some(
-            (a) => a.approver_user_id === input.actorId && a.decision === 'approved',
-          )) {
+          if (
+            existingInTx.some(
+              (a) => a.approver_user_id === input.actorId && a.decision === 'approved',
+            )
+          ) {
             return { ok: false, reason: 'already_approved_by_user' as const };
           }
 
@@ -649,9 +652,11 @@ export const proposalsUnifiedRepo = {
 
           // For non-lockdown dual classes: same role cannot double-sign.
           if (dualRequired && allLocks.length === 0) {
-            if (existingInTx.some(
-              (a) => a.approver_role === input.actorRole && a.decision === 'approved',
-            )) {
+            if (
+              existingInTx.some(
+                (a) => a.approver_role === input.actorRole && a.decision === 'approved',
+              )
+            ) {
               return { ok: false, reason: 'already_approved_by_role' as const };
             }
           }
@@ -711,8 +716,7 @@ export const proposalsUnifiedRepo = {
             approval_class: input.approvalClass,
             comment: input.comment,
             dual_complete: resolvedDualComplete,
-            source_transition_attempted:
-              input.decision === 'rejected' || resolvedDualComplete,
+            source_transition_attempted: input.decision === 'rejected' || resolvedDualComplete,
           },
         });
 
@@ -934,9 +938,7 @@ export const proposalsUnifiedRepo = {
             resolvedDualComplete = priorFounderIds.size >= 2;
           } else if (dualRequired) {
             const approvedRoles = new Set(
-              existingInTx
-                .filter((a) => a.decision === 'approved')
-                .map((a) => a.approver_role),
+              existingInTx.filter((a) => a.decision === 'approved').map((a) => a.approver_role),
             );
             approvedRoles.add(input.actorRole);
             resolvedDualComplete = requiredRoles.every((r) => approvedRoles.has(r));
@@ -980,8 +982,7 @@ export const proposalsUnifiedRepo = {
             approval_class: input.approvalClass,
             comment: input.comment,
             dual_complete: resolvedDualComplete,
-            source_transition_attempted:
-              input.decision === 'rejected' || resolvedDualComplete,
+            source_transition_attempted: input.decision === 'rejected' || resolvedDualComplete,
           },
         });
 
@@ -1048,9 +1049,7 @@ export const proposalsUnifiedRepo = {
       // (staleness then falls back to the TTL bound) and never fails the
       // operator's approval, which is already committed and audited.
       if (activatedIdentity) {
-        const { publishTurnContextInvalidation } = await import(
-          '@/agent/turn-context/cache.js'
-        );
+        const { publishTurnContextInvalidation } = await import('@/agent/turn-context/cache.js');
         await publishTurnContextInvalidation({
           ...(activatedIdentity as { tenant_id: string; agent_id: string }),
           resource: 'identity',
@@ -1291,10 +1290,7 @@ export const debugSnapshotGrantsRepo = {
  * after a stable key sort). All values stored in `global_settings` so
  * far are plain JSON (no functions, dates, etc.), so this is safe.
  */
-function matchesExpected(
-  locked: unknown,
-  expected: Record<string, unknown> | null,
-): boolean {
+function matchesExpected(locked: unknown, expected: Record<string, unknown> | null): boolean {
   if (expected === null) {
     // "Expect no row" — locked must be one of the null shapes.
     return locked === null;
@@ -1336,7 +1332,9 @@ export const globalSettingsRepo = {
    * try/catch in `getCurrent*Model` (DB hiccup → env default rather than
    * blocking the LLM call).
    */
-  async getByKey(key: string): Promise<{ value: unknown; updated_at: Date; updated_by: string | null } | null> {
+  async getByKey(
+    key: string,
+  ): Promise<{ value: unknown; updated_at: Date; updated_by: string | null } | null> {
     const rows = await db
       .select()
       .from(global_settings)
@@ -1443,13 +1441,11 @@ export const globalSettingsRepo = {
       const before: Record<string, unknown> = {};
       const after: Record<string, unknown> = {};
       let changedCount = 0;
-      let conflict:
-        | {
-            key: string;
-            expected: Record<string, unknown> | null;
-            current: unknown;
-          }
-        | null = null;
+      let conflict: {
+        key: string;
+        expected: Record<string, unknown> | null;
+        current: unknown;
+      } | null = null;
 
       // (1) Lock each row FOR UPDATE in deterministic key order. Sorting
       // the keys before locking prevents two concurrent updates that touch

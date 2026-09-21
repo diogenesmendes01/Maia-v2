@@ -337,240 +337,232 @@ d('#510 FI-15/FI-16 — as duas janelas de crash em volta do commit do outbox', 
   // ─────────────────────────────────────────────────────────────────────────
   // FI-15
   // ─────────────────────────────────────────────────────────────────────────
-  it(
-    'FI-15 — SIGKILL com a resposta pronta e o outbox ainda vazio: o retry cria UMA saída',
-    async () => {
-      const alvo = await turnoNovo(ESCOPO_A);
-      const oracle = new InvariantOracle({ pool, escopo: [ESCOPO_A], turnIds: [alvo.turn_id] });
+  it('FI-15 — SIGKILL com a resposta pronta e o outbox ainda vazio: o retry cria UMA saída', async () => {
+    const alvo = await turnoNovo(ESCOPO_A);
+    const oracle = new InvariantOracle({ pool, escopo: [ESCOPO_A], turnIds: [alvo.turn_id] });
 
-      servidor.arm('after_response_built_before_outbox_commit', 'pause');
-      const morto = subirCommit(ESCOPO_A, 'commit-morto', alvo);
-      const p1 = await prontidaoDe(morto);
-      expect(p1.acquired, `o dono não conseguiu o claim: ${JSON.stringify(p1)}`).toBe(true);
+    servidor.arm('after_response_built_before_outbox_commit', 'pause');
+    const morto = subirCommit(ESCOPO_A, 'commit-morto', alvo);
+    const p1 = await prontidaoDe(morto);
+    expect(p1.acquired, `o dono não conseguiu o claim: ${JSON.stringify(p1)}`).toBe(true);
 
-      // O anúncio traz os IDs — o cenário CONFERE o estágio antes de agir.
-      const evento = await servidor.waitForReached('after_response_built_before_outbox_commit', {
+    // O anúncio traz os IDs — o cenário CONFERE o estágio antes de agir.
+    const evento = await servidor.waitForReached('after_response_built_before_outbox_commit', {
+      timeoutMs: 30_000,
+    });
+    expect(evento.context).toMatchObject({ turn_id: alvo.turn_id, attempt: 1 });
+    await servidor.esperarParadoEm('after_response_built_before_outbox_commit', 1);
+
+    // ── O SUCESSOR SOBE ANTES DO CRASH, e essa ordem é o que torna o
+    //    controle DETERMINÍSTICO.
+    //
+    // A ordem óbvia — matar e só então subir o sucessor — faz o controle
+    // ("antes do prazo ele é RECUSADO") depender de o import a frio do grafo
+    // de produção caber dentro do TTL da lease. Ele custa de 1.9s a 6.8s
+    // (`AGENTS.md` §7.1), o TTL aqui é 6s, e o cenário reprovou em 4 de 5
+    // rodadas seguidas justamente assim: o sucessor terminava de importar
+    // depois do vencimento e entrava na PRIMEIRA tentativa, sem nunca ter
+    // sido barrado. Subir antes tira o relógio do caminho: ele é recusado
+    // ENQUANTO o dono está vivo, e as recusas são observadas antes de o
+    // `SIGKILL` acontecer.
+    servidor.disarm('after_response_built_before_outbox_commit');
+    const sucessor = subirCommit(ESCOPO_A, 'commit-sucessor', alvo, {
+      TEST_FI_TENTATIVAS: '200',
+      TEST_FI_INTERVALO_MS: '250',
+      TEST_FI_COMMITS: '2',
+    });
+
+    // O CONTROLE DE PRAZO, observado com o dono AINDA VIVO: a lease dele
+    // barra o sucessor. Sem isto, "o sucessor assumiu" também passaria num
+    // sistema sem lease nenhuma.
+    const recusas = await eventually(
+      () => {
+        const tentativas = linhasDe(sucessor, '##fi-claim##').filter(
+          (t) => t.result !== 'acquired',
+        );
+        return tentativas.length >= 2 ? tentativas : undefined;
+      },
+      {
+        label: 'o sucessor é RECUSADO enquanto o dono vivo segura a lease',
+        timeoutMs: 60_000,
+        abortSignal: sup.sinalDeFalha,
+        describeState: () => ({ stdout: sucessor.stdout.split('\n').slice(-8) }),
+      },
+    );
+    for (const r of recusas) expect(r.result).toBe('not_eligible');
+
+    // A FALHA: `SIGKILL` num processo PARADO com a resposta construída e o
+    // banco ainda sem saber dela.
+    sup.hardKill(morto);
+    expect((await morto.esperarSaida(10_000)).signal).toBe('SIGKILL');
+
+    // ── A REAÇÃO, e ela é NEGATIVA: nenhuma saída nasceu. Uma foto
+    //    instantânea passaria também no caso em que o INSERT ainda estava em
+    //    voo — a janela é o único observável honesto para "não aconteceu".
+    await estavelDurante(async () => (await saidasDoTurno(alvo.turn_id)).length, {
+      label: 'nenhuma linha do outbox existe depois do crash pré-commit',
+      janelaMs: 1_500,
+      intervalMs: 100,
+      justificativa:
+        'a invariante é NEGATIVA ("a saída não foi comprometida"); não existe evento de ' +
+        'INSERT que não aconteceu, e sem linha durável não há nada que um worker de ' +
+        'entrega possa reivindicar — o envio é estruturalmente impossível.',
+    });
+    expect(await saidasDoTurno(alvo.turn_id)).toHaveLength(0);
+    // O turno ficou como o morto o deixou: `running`, com a lease dele.
+    expect((await statusDoTurno(alvo.turn_id)).status).toBe('running');
+    expect(await jaVenceu((await statusDoTurno(alvo.turn_id)).lease)).toBe(false);
+
+    // ── E ENTÃO o sucessor assume — depois do vencimento, decidido pelo
+    //    BANCO. Ele commita a MESMA saída lógica DUAS vezes
+    //    (`TEST_FI_COMMITS=2`); a segunda é o caso de controle.
+    const p2 = await prontidaoDe(sucessor, 90_000);
+    expect(p2.acquired, `o sucessor nunca assumiu: ${JSON.stringify(p2)}`).toBe(true);
+
+    const commits = await eventually(
+      () => {
+        const linhas = linhasDe(sucessor, '##fi-commit##');
+        return linhas.length >= 2 ? linhas : undefined;
+      },
+      {
+        label: 'o sucessor commita a mesma saída lógica duas vezes',
         timeoutMs: 30_000,
-      });
-      expect(evento.context).toMatchObject({ turn_id: alvo.turn_id, attempt: 1 });
-      await servidor.esperarParadoEm('after_response_built_before_outbox_commit', 1);
+        // O sinal do supervisor ABORTA a espera no instante em que o filho
+        // morre sem permissão — em vez de queimar o prazo inteiro esperando
+        // por uma linha que ninguém mais vai imprimir. É o caminho pelo qual
+        // um commit que EXPLODE (chave não determinística, unique de posição)
+        // vira um vermelho que nomeia o filho morto.
+        abortSignal: sup.sinalDeFalha,
+        describeState: () => ({ stdout: sucessor.stdout.split('\n').slice(-8) }),
+      },
+    );
 
-      // ── O SUCESSOR SOBE ANTES DO CRASH, e essa ordem é o que torna o
-      //    controle DETERMINÍSTICO.
-      //
-      // A ordem óbvia — matar e só então subir o sucessor — faz o controle
-      // ("antes do prazo ele é RECUSADO") depender de o import a frio do grafo
-      // de produção caber dentro do TTL da lease. Ele custa de 1.9s a 6.8s
-      // (`AGENTS.md` §7.1), o TTL aqui é 6s, e o cenário reprovou em 4 de 5
-      // rodadas seguidas justamente assim: o sucessor terminava de importar
-      // depois do vencimento e entrava na PRIMEIRA tentativa, sem nunca ter
-      // sido barrado. Subir antes tira o relógio do caminho: ele é recusado
-      // ENQUANTO o dono está vivo, e as recusas são observadas antes de o
-      // `SIGKILL` acontecer.
-      servidor.disarm('after_response_built_before_outbox_commit');
-      const sucessor = subirCommit(ESCOPO_A, 'commit-sucessor', alvo, {
-        TEST_FI_TENTATIVAS: '200',
-        TEST_FI_INTERVALO_MS: '250',
-        TEST_FI_COMMITS: '2',
-      });
+    // A REAÇÃO POSITIVA: a primeira commitou de verdade…
+    expect(commits[0]).toMatchObject({ committed: true, inserted: true });
+    // …e o CONTROLE: a segunda encontrou a saída lógica JÁ comprometida.
+    expect(commits[1]).toMatchObject({ committed: true, inserted: false });
+    expect(commits[1]!.outbound_id).toBe(commits[0]!.outbound_id);
 
-      // O CONTROLE DE PRAZO, observado com o dono AINDA VIVO: a lease dele
-      // barra o sucessor. Sem isto, "o sucessor assumiu" também passaria num
-      // sistema sem lease nenhuma.
-      const recusas = await eventually(
-        () => {
-          const tentativas = linhasDe(sucessor, '##fi-claim##').filter(
-            (t) => t.result !== 'acquired',
-          );
-          return tentativas.length >= 2 ? tentativas : undefined;
-        },
-        {
-          label: 'o sucessor é RECUSADO enquanto o dono vivo segura a lease',
-          timeoutMs: 60_000,
-          abortSignal: sup.sinalDeFalha,
-          describeState: () => ({ stdout: sucessor.stdout.split('\n').slice(-8) }),
-        },
-      );
-      for (const r of recusas) expect(r.result).toBe('not_eligible');
+    // UMA linha, e a `logical_dedupe_key` é o mecanismo que a manteve única.
+    const saidas = await saidasDoTurno(alvo.turn_id);
+    expect(saidas, `duas tentativas produziram ${saidas.length} linhas`).toHaveLength(1);
+    criados.push(saidas[0]!.id);
+    expect(saidas[0]!.id).toBe(commits[0]!.outbound_id);
+    // E ninguém tentou entregar nada: a linha nasceu agora, sem dono e sem
+    // desfecho. É a forma observável de "nenhum send".
+    expect(saidas[0]!.attempt).toBe(0);
+    expect(saidas[0]!.claim_token).toBeNull();
+    expect(saidas[0]!.delivery_outcome).toBeNull();
 
-      // A FALHA: `SIGKILL` num processo PARADO com a resposta construída e o
-      // banco ainda sem saber dela.
-      sup.hardKill(morto);
-      expect((await morto.esperarSaida(10_000)).signal).toBe('SIGKILL');
-
-      // ── A REAÇÃO, e ela é NEGATIVA: nenhuma saída nasceu. Uma foto
-      //    instantânea passaria também no caso em que o INSERT ainda estava em
-      //    voo — a janela é o único observável honesto para "não aconteceu".
-      await estavelDurante(async () => (await saidasDoTurno(alvo.turn_id)).length, {
-        label: 'nenhuma linha do outbox existe depois do crash pré-commit',
-        janelaMs: 1_500,
-        intervalMs: 100,
-        justificativa:
-          'a invariante é NEGATIVA ("a saída não foi comprometida"); não existe evento de ' +
-          'INSERT que não aconteceu, e sem linha durável não há nada que um worker de ' +
-          'entrega possa reivindicar — o envio é estruturalmente impossível.',
-      });
-      expect(await saidasDoTurno(alvo.turn_id)).toHaveLength(0);
-      // O turno ficou como o morto o deixou: `running`, com a lease dele.
-      expect((await statusDoTurno(alvo.turn_id)).status).toBe('running');
-      expect(await jaVenceu((await statusDoTurno(alvo.turn_id)).lease)).toBe(false);
-
-      // ── E ENTÃO o sucessor assume — depois do vencimento, decidido pelo
-      //    BANCO. Ele commita a MESMA saída lógica DUAS vezes
-      //    (`TEST_FI_COMMITS=2`); a segunda é o caso de controle.
-      const p2 = await prontidaoDe(sucessor, 90_000);
-      expect(p2.acquired, `o sucessor nunca assumiu: ${JSON.stringify(p2)}`).toBe(true);
-
-      const commits = await eventually(
-        () => {
-          const linhas = linhasDe(sucessor, '##fi-commit##');
-          return linhas.length >= 2 ? linhas : undefined;
-        },
-        {
-          label: 'o sucessor commita a mesma saída lógica duas vezes',
-          timeoutMs: 30_000,
-          // O sinal do supervisor ABORTA a espera no instante em que o filho
-          // morre sem permissão — em vez de queimar o prazo inteiro esperando
-          // por uma linha que ninguém mais vai imprimir. É o caminho pelo qual
-          // um commit que EXPLODE (chave não determinística, unique de posição)
-          // vira um vermelho que nomeia o filho morto.
-          abortSignal: sup.sinalDeFalha,
-          describeState: () => ({ stdout: sucessor.stdout.split('\n').slice(-8) }),
-        },
-      );
-
-      // A REAÇÃO POSITIVA: a primeira commitou de verdade…
-      expect(commits[0]).toMatchObject({ committed: true, inserted: true });
-      // …e o CONTROLE: a segunda encontrou a saída lógica JÁ comprometida.
-      expect(commits[1]).toMatchObject({ committed: true, inserted: false });
-      expect(commits[1]!.outbound_id).toBe(commits[0]!.outbound_id);
-
-      // UMA linha, e a `logical_dedupe_key` é o mecanismo que a manteve única.
-      const saidas = await saidasDoTurno(alvo.turn_id);
-      expect(saidas, `duas tentativas produziram ${saidas.length} linhas`).toHaveLength(1);
-      criados.push(saidas[0]!.id);
-      expect(saidas[0]!.id).toBe(commits[0]!.outbound_id);
-      // E ninguém tentou entregar nada: a linha nasceu agora, sem dono e sem
-      // desfecho. É a forma observável de "nenhum send".
-      expect(saidas[0]!.attempt).toBe(0);
-      expect(saidas[0]!.claim_token).toBeNull();
-      expect(saidas[0]!.delivery_outcome).toBeNull();
-
-      expect((await statusDoTurno(alvo.turn_id)).status).toBe('outbound_pending');
-      await oracle.assertInvariantes('FI-15');
-    },
-    180_000,
-  );
+    expect((await statusDoTurno(alvo.turn_id)).status).toBe('outbound_pending');
+    await oracle.assertInvariantes('FI-15');
+  }, 180_000);
 
   // ─────────────────────────────────────────────────────────────────────────
   // FI-16
   // ─────────────────────────────────────────────────────────────────────────
-  it(
-    'FI-16 — SIGKILL depois do commit e antes do transporte: a varredura recupera e entrega UMA vez',
-    async () => {
-      const alvo = await turnoNovo(ESCOPO_B);
-      await provider.roteirizar([{ kind: 'accept' }, { kind: 'accept' }]);
-      const oracle = new InvariantOracle({ pool, escopo: [ESCOPO_B], turnIds: [alvo.turn_id] });
+  it('FI-16 — SIGKILL depois do commit e antes do transporte: a varredura recupera e entrega UMA vez', async () => {
+    const alvo = await turnoNovo(ESCOPO_B);
+    await provider.roteirizar([{ kind: 'accept' }, { kind: 'accept' }]);
+    const oracle = new InvariantOracle({ pool, escopo: [ESCOPO_B], turnIds: [alvo.turn_id] });
 
-      // O gate fica DEPOIS do commit e ANTES de o artefato virar trabalho.
-      servidor.arm('after_outbox_commit_before_delivery_enqueue', 'pause');
-      const morto = subirCommit(ESCOPO_B, 'commit-morto', alvo, { TEST_FI_ENFILEIRAR: 'sim' });
-      expect((await prontidaoDe(morto)).acquired).toBe(true);
+    // O gate fica DEPOIS do commit e ANTES de o artefato virar trabalho.
+    servidor.arm('after_outbox_commit_before_delivery_enqueue', 'pause');
+    const morto = subirCommit(ESCOPO_B, 'commit-morto', alvo, { TEST_FI_ENFILEIRAR: 'sim' });
+    expect((await prontidaoDe(morto)).acquired).toBe(true);
 
-      const evento = await servidor.waitForReached('after_outbox_commit_before_delivery_enqueue', {
-        timeoutMs: 30_000,
-      });
-      expect(evento.context).toMatchObject({ turn_id: alvo.turn_id });
-      await servidor.esperarParadoEm('after_outbox_commit_before_delivery_enqueue', 1);
+    const evento = await servidor.waitForReached('after_outbox_commit_before_delivery_enqueue', {
+      timeoutMs: 30_000,
+    });
+    expect(evento.context).toMatchObject({ turn_id: alvo.turn_id });
+    await servidor.esperarParadoEm('after_outbox_commit_before_delivery_enqueue', 1);
 
-      // A linha DURÁVEL já existe — é o que distingue FI-16 de FI-15.
-      const antes = await saidasDoTurno(alvo.turn_id);
-      expect(antes).toHaveLength(1);
-      const outbound_id = antes[0]!.id;
-      criados.push(outbound_id);
-      expect(antes[0]!.status).toBe('pending');
+    // A linha DURÁVEL já existe — é o que distingue FI-16 de FI-15.
+    const antes = await saidasDoTurno(alvo.turn_id);
+    expect(antes).toHaveLength(1);
+    const outbound_id = antes[0]!.id;
+    criados.push(outbound_id);
+    expect(antes[0]!.status).toBe('pending');
 
-      // A FALHA: o processo morre com o artefato durável e NINGUÉM sabendo.
-      sup.hardKill(morto);
-      expect((await morto.esperarSaida(10_000)).signal).toBe('SIGKILL');
+    // A FALHA: o processo morre com o artefato durável e NINGUÉM sabendo.
+    sup.hardKill(morto);
+    expect((await morto.esperarSaida(10_000)).signal).toBe('SIGKILL');
 
-      // ── O CONTROLE, e ele vem PRIMEIRO de propósito: enquanto ninguém varre,
-      //    NADA acontece. Sem esta janela, "a varredura recuperou" também
-      //    passaria num sistema em que outra coisa qualquer entregou a linha.
-      expect(await jobDeEntrega(outbound_id)).toEqual({ existe: false, naFila: 0 });
-      await estavelDurante(
-        async () => {
-          const l = (await saidasDoTurno(alvo.turn_id))[0]!;
-          return {
-            chamadas: (await provider.ledger()).physical_call_total,
-            status: l.status,
-            attempt: l.attempt,
-          };
-        },
-        {
-          label: 'sem varredura, o artefato órfão não é entregue nem tocado',
-          janelaMs: 1_500,
-          intervalMs: 100,
-          justificativa:
-            'a invariante é NEGATIVA ("ninguém entrega o que ninguém sabe que existe"); ' +
-            'não há evento de "não entreguei" para esperar.',
-        },
-      );
-
-      // ── A RECUPERAÇÃO, pelo caminho de produção.
-      servidor.disarm('after_outbox_commit_before_delivery_enqueue');
-      const varredura = subirVarredura(ESCOPO_B, 'varredura');
-      const stats = (await prontidaoDe(varredura)) as unknown as {
-        rodadas: Array<{ rearmed: number }>;
-      };
-      expect(stats.rodadas[0]!.rearmed, 'a varredura não rearmou o artefato órfão').toBe(1);
-
-      // O artefato virou trabalho: UM job, com o id determinístico da produção.
-      expect(await jobDeEntrega(outbound_id)).toEqual({ existe: true, naFila: 1 });
-
-      // ── A ENTREGA, pelo ciclo real (`beginInlineDelivery`/`recordInlineDelivery`).
-      const entrega = subirEntrega(ESCOPO_B, 'entrega', {
-        outbound_id,
-        idempotency_key: antes[0]!.provider_idempotency_key,
-        payload_hash: antes[0]!.payload_hash,
-      });
-      const pe = await prontidaoDe(entrega);
-      expect(pe.acquired, `a entrega não reivindicou a linha: ${JSON.stringify(pe)}`).toBe(true);
-
-      await eventually(
-        async () => (await saidasDoTurno(alvo.turn_id))[0]!.delivery_outcome !== null,
-        {
-          timeoutMs: 30_000,
-          label: 'o desfecho da entrega é persistido',
-          abortSignal: sup.sinalDeFalha,
-        },
-      );
-      const depois = (await saidasDoTurno(alvo.turn_id))[0]!;
-      expect(depois.delivery_outcome).toBe('accepted_confirmed');
-      expect(depois.status).toBe('delivered');
-
-      // UM efeito, no ledger de um processo que sobreviveu ao `SIGKILL`.
-      const ledger = await provider.ledger();
-      expect(ledger.physical_call_total).toBe(1);
-      expect(ledger.logical_effect_total).toBe(1);
-
-      // ── O SEGUNDO CONTROLE: uma varredura NOVA sobre a linha já entregue não
-      //    produz um segundo efeito. "Entregue uma vez" atravessa o tick
-      //    seguinte, que é quando um rearme cego duplicaria a mensagem.
-      const varredura2 = subirVarredura(ESCOPO_B, 'varredura-2');
-      await prontidaoDe(varredura2);
-      await estavelDurante(async () => (await provider.ledger()).physical_call_total, {
-        label: 'a segunda varredura não produz um segundo envio',
-        janelaMs: 2_000,
+    // ── O CONTROLE, e ele vem PRIMEIRO de propósito: enquanto ninguém varre,
+    //    NADA acontece. Sem esta janela, "a varredura recuperou" também
+    //    passaria num sistema em que outra coisa qualquer entregou a linha.
+    expect(await jobDeEntrega(outbound_id)).toEqual({ existe: false, naFila: 0 });
+    await estavelDurante(
+      async () => {
+        const l = (await saidasDoTurno(alvo.turn_id))[0]!;
+        return {
+          chamadas: (await provider.ledger()).physical_call_total,
+          status: l.status,
+          attempt: l.attempt,
+        };
+      },
+      {
+        label: 'sem varredura, o artefato órfão não é entregue nem tocado',
+        janelaMs: 1_500,
         intervalMs: 100,
         justificativa:
-          'é uma afirmação negativa sobre um efeito EXTERNO; a janela é o único observável ' +
-          'honesto, e é ela que fica vermelha se o rearme voltar a tocar uma linha entregue.',
-      });
+          'a invariante é NEGATIVA ("ninguém entrega o que ninguém sabe que existe"); ' +
+          'não há evento de "não entreguei" para esperar.',
+      },
+    );
 
-      expect(await saidasDoTurno(alvo.turn_id)).toHaveLength(1);
-      await oracle.assertInvariantes('FI-16');
-    },
-    240_000,
-  );
+    // ── A RECUPERAÇÃO, pelo caminho de produção.
+    servidor.disarm('after_outbox_commit_before_delivery_enqueue');
+    const varredura = subirVarredura(ESCOPO_B, 'varredura');
+    const stats = (await prontidaoDe(varredura)) as unknown as {
+      rodadas: Array<{ rearmed: number }>;
+    };
+    expect(stats.rodadas[0]!.rearmed, 'a varredura não rearmou o artefato órfão').toBe(1);
+
+    // O artefato virou trabalho: UM job, com o id determinístico da produção.
+    expect(await jobDeEntrega(outbound_id)).toEqual({ existe: true, naFila: 1 });
+
+    // ── A ENTREGA, pelo ciclo real (`beginInlineDelivery`/`recordInlineDelivery`).
+    const entrega = subirEntrega(ESCOPO_B, 'entrega', {
+      outbound_id,
+      idempotency_key: antes[0]!.provider_idempotency_key,
+      payload_hash: antes[0]!.payload_hash,
+    });
+    const pe = await prontidaoDe(entrega);
+    expect(pe.acquired, `a entrega não reivindicou a linha: ${JSON.stringify(pe)}`).toBe(true);
+
+    await eventually(
+      async () => (await saidasDoTurno(alvo.turn_id))[0]!.delivery_outcome !== null,
+      {
+        timeoutMs: 30_000,
+        label: 'o desfecho da entrega é persistido',
+        abortSignal: sup.sinalDeFalha,
+      },
+    );
+    const depois = (await saidasDoTurno(alvo.turn_id))[0]!;
+    expect(depois.delivery_outcome).toBe('accepted_confirmed');
+    expect(depois.status).toBe('delivered');
+
+    // UM efeito, no ledger de um processo que sobreviveu ao `SIGKILL`.
+    const ledger = await provider.ledger();
+    expect(ledger.physical_call_total).toBe(1);
+    expect(ledger.logical_effect_total).toBe(1);
+
+    // ── O SEGUNDO CONTROLE: uma varredura NOVA sobre a linha já entregue não
+    //    produz um segundo efeito. "Entregue uma vez" atravessa o tick
+    //    seguinte, que é quando um rearme cego duplicaria a mensagem.
+    const varredura2 = subirVarredura(ESCOPO_B, 'varredura-2');
+    await prontidaoDe(varredura2);
+    await estavelDurante(async () => (await provider.ledger()).physical_call_total, {
+      label: 'a segunda varredura não produz um segundo envio',
+      janelaMs: 2_000,
+      intervalMs: 100,
+      justificativa:
+        'é uma afirmação negativa sobre um efeito EXTERNO; a janela é o único observável ' +
+        'honesto, e é ela que fica vermelha se o rearme voltar a tocar uma linha entregue.',
+    });
+
+    expect(await saidasDoTurno(alvo.turn_id)).toHaveLength(1);
+    await oracle.assertInvariantes('FI-16');
+  }, 240_000);
 });

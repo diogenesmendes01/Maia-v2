@@ -45,7 +45,10 @@ export function isRiskLevel(value: unknown): value is RiskLevel {
  * Use quando o caller exige que a string seja válida (ex.: deserialização
  * de uma row do DB onde o schema deveria ter garantido o enum).
  */
-export function assertRiskLevel(value: unknown, context = 'risk level'): asserts value is RiskLevel {
+export function assertRiskLevel(
+  value: unknown,
+  context = 'risk level',
+): asserts value is RiskLevel {
   if (!isRiskLevel(value)) {
     throw new InvalidRiskLevelError(value, context);
   }

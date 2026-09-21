@@ -30,7 +30,13 @@ export async function sendAlertWithDelivery(input: {
   return { delivered, attempted: tasks.length };
 }
 
-async function sendTelegram({ subject, body }: { subject: string; body: string }): Promise<boolean> {
+async function sendTelegram({
+  subject,
+  body,
+}: {
+  subject: string;
+  body: string;
+}): Promise<boolean> {
   const token = config.TELEGRAM_BOT_TOKEN;
   const chat_id = config.TELEGRAM_CHAT_ID;
   if (!token || !chat_id) return false;

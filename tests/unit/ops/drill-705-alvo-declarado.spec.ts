@@ -101,12 +101,15 @@ const AMBIENTES_POLUIDOS: ReadonlyArray<readonly [string, Record<string, string>
   ['POSTGRES_URL exportada', { POSTGRES_URL: DSN_REMOTO }],
   ['TEST_DB_URL exportada', { TEST_DB_URL: DSN_REMOTO }],
   ['PGHOST/PGDATABASE exportadas', { PGHOST: 'db.staging.invalido', PGDATABASE: 'maia' }],
-  ['todas de uma vez', {
-    DATABASE_URL: DSN_REMOTO,
-    POSTGRES_URL: DSN_REMOTO,
-    TEST_DB_URL: DSN_REMOTO,
-    PGHOST: 'db.staging.invalido',
-  }],
+  [
+    'todas de uma vez',
+    {
+      DATABASE_URL: DSN_REMOTO,
+      POSTGRES_URL: DSN_REMOTO,
+      TEST_DB_URL: DSN_REMOTO,
+      PGHOST: 'db.staging.invalido',
+    },
+  ],
 ];
 
 describe('drill #705 — o alvo é declarado, nunca herdado', () => {
@@ -146,9 +149,7 @@ describe('drill #705 — o alvo é declarado, nunca herdado', () => {
      */
     it('com --fase e --dsn-env resolvíveis, mas SEM --alvo: sai 2 e NÃO cria pool', async () => {
       const b = bancada({ ...env, DRILL_705_DSN: DSN_REMOTO });
-      await expect(
-        main(['--fase=contexto', '--dsn-env=DRILL_705_DSN'], b.deps),
-      ).resolves.toBe(2);
+      await expect(main(['--fase=contexto', '--dsn-env=DRILL_705_DSN'], b.deps)).resolves.toBe(2);
       expect(b.poolsCriados()).toBe(0);
     });
 
@@ -238,10 +239,7 @@ describe('drill #705 — escrever exige autorização explícita', () => {
     async (fase) => {
       const b = bancada({ DRILL_705_DSN: DSN_REMOTO });
       await expect(
-        main(
-          [`--fase=${fase}`, '--alvo=staging', '--dsn-env=DRILL_705_DSN', '--executar'],
-          b.deps,
-        ),
+        main([`--fase=${fase}`, '--alvo=staging', '--dsn-env=DRILL_705_DSN', '--executar'], b.deps),
       ).resolves.toBe(2);
       expect(b.poolsCriados()).toBe(0);
     },

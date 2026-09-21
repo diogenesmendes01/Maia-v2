@@ -46,10 +46,7 @@ vi.mock('@/db/repositories.js', () => ({
 // Importing from `auth-resolver.js` (not `auth.js`) keeps the test free of
 // any next-auth dependency, so it runs cleanly from the repo-root vitest job
 // where next-auth is not installed.
-import {
-  resolveOidcAppUser,
-  type ResolveOidcAppUserDeps,
-} from '@/admin-ui/lib/auth-resolver.js';
+import { resolveOidcAppUser, type ResolveOidcAppUserDeps } from '@/admin-ui/lib/auth-resolver.js';
 
 type AppUserRow = {
   id: string;
@@ -115,7 +112,11 @@ function makeDeps(opts: {
   };
 }
 
-function makeOwner(tenant_id: string, email: string, overrides: Partial<AppUserRow> = {}): AppUserRow {
+function makeOwner(
+  tenant_id: string,
+  email: string,
+  overrides: Partial<AppUserRow> = {},
+): AppUserRow {
   return {
     id: `user-${tenant_id}-${email}`,
     tenant_id,
@@ -175,7 +176,7 @@ describe('resolveOidcAppUser — issue #164 ambiguous-tenant fix', () => {
     const w = deps._logger.warnings[0]!;
     expect(w.msg).toMatch(/ambiguous binding/i);
     expect((w.meta as { tenant_count: number }).tenant_count).toBe(2);
-    expect(((w.meta as { tenants: string[] }).tenants).sort()).toEqual(['demo', 'foundry']);
+    expect((w.meta as { tenants: string[] }).tenants.sort()).toEqual(['demo', 'foundry']);
   });
 
   it('email present in all 3 allowed tenants ⇒ sign-in REJECTED', async () => {

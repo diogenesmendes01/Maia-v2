@@ -37,7 +37,9 @@ function detectOom(err: unknown): boolean {
   const e = err as { name?: string; code?: string; message?: string };
   if (typeof e.code === 'string' && e.code.toUpperCase() === 'OOM') return true;
   const msg = String(e.message ?? '');
-  return (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg);
+  return (
+    (e.name === 'ReplyError' && /^\s*OOM\b/i.test(msg)) || /^\s*OOM command not allowed/i.test(msg)
+  );
 }
 
 vi.mock('@/lib/redis.js', () => ({
@@ -172,10 +174,7 @@ describe('backpressure — cleanup error is metered+logged, never swallowed (#32
       throw Object.assign(new Error('READONLY'), { name: 'ReplyError' });
     });
     await tryAcquireSendSlot(JID);
-    expect(logWarn).toHaveBeenCalledWith(
-      expect.anything(),
-      'backpressure.cleanup_pace_failed',
-    );
+    expect(logWarn).toHaveBeenCalledWith(expect.anything(), 'backpressure.cleanup_pace_failed');
   });
 
   it('attributes an OOM during cleanup to redis_oom_degraded_total{operation="backpressure.cleanup"}', async () => {

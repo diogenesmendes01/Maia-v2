@@ -37,7 +37,12 @@ const { redisMock, invalidateModelCacheMock } = vi.hoisted(() => ({
 
 vi.mock('ioredis', () => ({
   default: vi.fn(function (this: unknown) {
-    return { on: vi.fn(), connect: vi.fn(async () => undefined), subscribe: vi.fn(), quit: vi.fn() };
+    return {
+      on: vi.fn(),
+      connect: vi.fn(async () => undefined),
+      subscribe: vi.fn(),
+      quit: vi.fn(),
+    };
   }),
 }));
 

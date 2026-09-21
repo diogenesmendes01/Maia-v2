@@ -48,7 +48,9 @@ function prodOk(over: Readonly<Record<string, string>> = {}): Record<string, str
 
 describe('admin boot gates — paridade com src/admin-ui/lib/auth-gating.ts', () => {
   it('espelha MIN_OIDC_CLIENT_SECRET_LEN', () => {
-    expect(GATING).toContain(`export const MIN_OIDC_CLIENT_SECRET_LEN = ${MIN_OIDC_CLIENT_SECRET_LEN};`);
+    expect(GATING).toContain(
+      `export const MIN_OIDC_CLIENT_SECRET_LEN = ${MIN_OIDC_CLIENT_SECRET_LEN};`,
+    );
   });
 
   it('espelha o piso do NEXTAUTH_SECRET aplicado por resolveSecret()', () => {
@@ -77,7 +79,9 @@ describe('admin boot gates — paridade com src/admin-ui/lib/auth-gating.ts', ()
 
 describe('admin boot gates — a fronteira de profile é a do gate real', () => {
   it('fora de production não afirma nada: o console tolera e cai no provider de dev', () => {
-    expect(adminBootGateProblems({ NODE_ENV: 'development', NEXTAUTH_SECRET: 'n'.repeat(4) })).toEqual([]);
+    expect(
+      adminBootGateProblems({ NODE_ENV: 'development', NEXTAUTH_SECRET: 'n'.repeat(4) }),
+    ).toEqual([]);
   });
 
   it('em production, um ambiente completo e forte não tem problema algum', () => {
@@ -86,7 +90,12 @@ describe('admin boot gates — a fronteira de profile é a do gate real', () => 
 
   it('OIDC_ISSUER vazio é silêncio — é o estado de um deploy sem OIDC', () => {
     const problems = adminBootGateProblems(
-      prodOk({ OIDC_ISSUER: '', OIDC_CLIENT_ID: '', OIDC_CLIENT_SECRET: '', OIDC_TENANT_SLUGS: '' }),
+      prodOk({
+        OIDC_ISSUER: '',
+        OIDC_CLIENT_ID: '',
+        OIDC_CLIENT_SECRET: '',
+        OIDC_TENANT_SLUGS: '',
+      }),
     );
     expect(problems).toEqual([]);
   });
@@ -130,7 +139,11 @@ describe('admin boot gates — a fresta entre o contrato e o boot', () => {
 
   it('não para no primeiro: o operador conserta tudo numa passada', () => {
     const problems = adminBootGateProblems(
-      prodOk({ NEXTAUTH_SECRET: 'n'.repeat(4), OIDC_CLIENT_SECRET: 'c'.repeat(2), OIDC_CLIENT_ID: '' }),
+      prodOk({
+        NEXTAUTH_SECRET: 'n'.repeat(4),
+        OIDC_CLIENT_SECRET: 'c'.repeat(2),
+        OIDC_CLIENT_ID: '',
+      }),
     );
     expect(problems.map((p) => p.variable).sort()).toEqual([
       'NEXTAUTH_SECRET',

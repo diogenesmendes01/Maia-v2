@@ -1,8 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import {
-  AgentSelectorImpl,
-  type AgentSelectorDeps,
-} from '@/runtime/decision/agent-selector.ts';
+import { AgentSelectorImpl, type AgentSelectorDeps } from '@/runtime/decision/agent-selector.ts';
 import type { ChannelPoliciesReader } from '@/runtime/decision/types.js';
 import type { BaseContextPacket } from '@/runtime/context-packet/types.js';
 
@@ -35,10 +32,7 @@ describe('P9b — AgentSelector (no-op)', () => {
     const selector = new AgentSelectorImpl(deps);
     const r = await selector.select(mkBase());
     expect(r.agent_id).toBe('agent_default_1');
-    expect(deps.channelPolicies.getForChannel).toHaveBeenCalledWith(
-      'tn1',
-      'ch_123',
-    );
+    expect(deps.channelPolicies.getForChannel).toHaveBeenCalledWith('tn1', 'ch_123');
   });
 
   it('uses tenant_id and channel.id from base packet', async () => {
@@ -50,10 +44,7 @@ describe('P9b — AgentSelector (no-op)', () => {
         channel: { id: 'ch_other', kind: 'telegram', is_locked_down: false },
       }),
     );
-    expect(deps.channelPolicies.getForChannel).toHaveBeenCalledWith(
-      'tn_other',
-      'ch_other',
-    );
+    expect(deps.channelPolicies.getForChannel).toHaveBeenCalledWith('tn_other', 'ch_other');
   });
 
   it('does not consider intent / skill / actor (no-op behaviour)', async () => {
@@ -61,9 +52,7 @@ describe('P9b — AgentSelector (no-op)', () => {
     const selector = new AgentSelectorImpl(deps);
     // Multiple calls with different bases but same channel → same agent.
     const r1 = await selector.select(mkBase());
-    const r2 = await selector.select(
-      mkBase({ actor: { id: 'a_other', is_authenticated: false } }),
-    );
+    const r2 = await selector.select(mkBase({ actor: { id: 'a_other', is_authenticated: false } }));
     expect(r1.agent_id).toBe(r2.agent_id);
   });
 });

@@ -36,10 +36,7 @@ export async function revertCapability(args: {
     if (!args.proposal.delivery_artifact_ref) {
       const msg =
         'p9a.capability_revert.missing_artifact: capability_type=skill requires delivery_artifact_ref to rollback';
-      logger.error(
-        { proposal_id: args.proposal.id },
-        msg,
-      );
+      logger.error({ proposal_id: args.proposal.id }, msg);
       return { ok: false, revert_failed: true, reason: msg };
     }
     try {

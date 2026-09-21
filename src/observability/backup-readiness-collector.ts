@@ -85,9 +85,7 @@ async function refresh(deps: BackupReadinessCollectorDeps): Promise<void> {
     try {
       const profile = await deps.resolveProfile();
       const facts = await deps.readFacts();
-      snapshot = readinessGauges(
-        evaluateBackupReadiness({ now: deps.now(), profile, ...facts }),
-      );
+      snapshot = readinessGauges(evaluateBackupReadiness({ now: deps.now(), profile, ...facts }));
     } catch (err) {
       snapshot = null;
       // Redacted: a driver error can carry the connection URL with the password.

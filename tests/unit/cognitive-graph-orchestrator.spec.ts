@@ -5,7 +5,8 @@ import { CognitiveLayer } from '@/types/enums.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -15,21 +16,38 @@ vi.mock('@/db/repositories.js', async () => {
   };
 });
 
-const td = <TIn, TOut>(d: Partial<ModuleDescriptor<TIn, TOut>> & { name: string; run: (i: TIn) => Promise<TOut> }): ModuleDescriptor<TIn, TOut> => ({
-  layer: CognitiveLayer.SYNC_CONDITIONAL,
-  modelTier: 'fast',
-  timeoutMs: 1000,
-  version: 'v1',
-  ...d,
-}) as ModuleDescriptor<TIn, TOut>;
+const td = <TIn, TOut>(
+  d: Partial<ModuleDescriptor<TIn, TOut>> & { name: string; run: (i: TIn) => Promise<TOut> },
+): ModuleDescriptor<TIn, TOut> =>
+  ({
+    layer: CognitiveLayer.SYNC_CONDITIONAL,
+    modelTier: 'fast',
+    timeoutMs: 1000,
+    version: 'v1',
+    ...d,
+  }) as ModuleDescriptor<TIn, TOut>;
 
 describe('P7 — orchestrator runNodes', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('sync_required: executa serial, output indexado por name', async () => {
     const order: string[] = [];
-    const a = td({ name: 'a', layer: CognitiveLayer.SYNC_REQUIRED, run: async () => { order.push('a'); return 1; } });
-    const b = td({ name: 'b', layer: CognitiveLayer.SYNC_REQUIRED, run: async () => { order.push('b'); return 2; } });
+    const a = td({
+      name: 'a',
+      layer: CognitiveLayer.SYNC_REQUIRED,
+      run: async () => {
+        order.push('a');
+        return 1;
+      },
+    });
+    const b = td({
+      name: 'b',
+      layer: CognitiveLayer.SYNC_REQUIRED,
+      run: async () => {
+        order.push('b');
+        return 2;
+      },
+    });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const r = await runNodes([a, b], {});
       expect(order).toEqual(['a', 'b']);
@@ -40,10 +58,17 @@ describe('P7 — orchestrator runNodes', () => {
 
   it('sync_conditional + parallelizable: roda em paralelo', async () => {
     const starts: number[] = [];
-    const make = (name: string) => td({
-      name, layer: CognitiveLayer.SYNC_CONDITIONAL, parallelizable: true,
-      run: async () => { starts.push(Date.now()); await new Promise((r) => setTimeout(r, 80)); return name; },
-    });
+    const make = (name: string) =>
+      td({
+        name,
+        layer: CognitiveLayer.SYNC_CONDITIONAL,
+        parallelizable: true,
+        run: async () => {
+          starts.push(Date.now());
+          await new Promise((r) => setTimeout(r, 80));
+          return name;
+        },
+      });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const t0 = Date.now();
       const r = await runNodes([make('a'), make('b'), make('c')], {});
@@ -67,7 +92,13 @@ describe('P7 — orchestrator runNodes', () => {
 
   it('node lança erro: fallback aplicado, outros nodes prosseguem', async () => {
     const ok = td({ name: 'ok', run: async () => 'ok' });
-    const boom = td({ name: 'boom', fallback: 'fb', run: async () => { throw new Error('crash'); } });
+    const boom = td({
+      name: 'boom',
+      fallback: 'fb',
+      run: async () => {
+        throw new Error('crash');
+      },
+    });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const r = await runNodes([ok, boom], {});
       expect(r.nodes['ok']!.output).toBe('ok');
@@ -80,8 +111,13 @@ describe('P7 — orchestrator runNodes', () => {
   it('async layer: fire-and-forget, retorna imediato', async () => {
     let resolved = false;
     const asyncNode = td({
-      name: 'bg', layer: CognitiveLayer.ASYNC,
-      run: async () => { await new Promise((r) => setTimeout(r, 100)); resolved = true; return 'done'; },
+      name: 'bg',
+      layer: CognitiveLayer.ASYNC,
+      run: async () => {
+        await new Promise((r) => setTimeout(r, 100));
+        resolved = true;
+        return 'done';
+      },
     });
     await runWithTenantContext({ tenant_id: 'default', agent_id: 'default' }, async () => {
       const t0 = Date.now();

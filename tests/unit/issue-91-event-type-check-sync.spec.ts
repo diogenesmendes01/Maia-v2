@@ -98,7 +98,10 @@ describe('Issue #91 — procedure_execution_events.event_type CHECK ↔ code syn
       'utf-8',
     );
     const checkClause = extractCheckInClause(sql);
-    expect(checkClause, `migration 026 ADD CONSTRAINT ... CHECK (event_type IN (...)) clause missing`).toBeTruthy();
+    expect(
+      checkClause,
+      `migration 026 ADD CONSTRAINT ... CHECK (event_type IN (...)) clause missing`,
+    ).toBeTruthy();
     for (const t of ALLOWED_EVENT_TYPES) {
       expect(checkClause, `migration 026 CHECK missing event_type '${t}'`).toContain(`'${t}'`);
     }
@@ -146,10 +149,21 @@ describe('Issue #91 — procedure_execution_events.event_type CHECK ↔ code syn
     expect(checkClause).not.toContain(`'human_confirmation'`);
     // Sanity: down should still contain the original 15 values
     const original15 = [
-      'execution_started', 'step_started', 'input_received', 'decision_made',
-      'tool_called', 'tool_result', 'criterion_checked', 'step_completed',
-      'step_failed', 'branch_taken', 'state_updated', 'execution_completed',
-      'execution_aborted', 'execution_escalated', 'execution_abandoned',
+      'execution_started',
+      'step_started',
+      'input_received',
+      'decision_made',
+      'tool_called',
+      'tool_result',
+      'criterion_checked',
+      'step_completed',
+      'step_failed',
+      'branch_taken',
+      'state_updated',
+      'execution_completed',
+      'execution_aborted',
+      'execution_escalated',
+      'execution_abandoned',
     ];
     for (const t of original15) {
       expect(checkClause).toContain(`'${t}'`);

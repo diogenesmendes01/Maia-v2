@@ -33,10 +33,7 @@ export function redactValue(name: string, value: string | undefined): string | u
  * Short values (< 4 chars) are skipped — replacing them would mangle unrelated
  * text without protecting anything meaningful.
  */
-export function scrubSecrets(
-  text: string,
-  env: Record<string, string | undefined>,
-): string {
+export function scrubSecrets(text: string, env: Record<string, string | undefined>): string {
   let out = text;
   for (const name of SECRET_NAMES) {
     const value = env[name];

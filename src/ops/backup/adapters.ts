@@ -33,12 +33,7 @@ import { putWithDeadline } from './upload-deadline.js';
 import { sha256File } from './checksum.js';
 import { encryptFile, parseBackupKeyring } from './encryption.js';
 import { opaqueLocator } from './redaction.js';
-import type {
-  BackupPorts,
-  Provenance,
-  TombstoneWatermarkProbe,
-  UploadOutcome,
-} from './service.js';
+import type { BackupPorts, Provenance, TombstoneWatermarkProbe, UploadOutcome } from './service.js';
 import { backupEvidenceStore } from '@/db/repositories/ops-repos.js';
 
 const MIGRATIONS_DIR = join(process.cwd(), 'migrations');
@@ -96,8 +91,11 @@ export async function collectProvenance(): Promise<Provenance> {
   let appVersion = 'unknown';
   try {
     appVersion =
-      (JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as { version?: string })
-        .version ?? 'unknown';
+      (
+        JSON.parse(readFileSync(join(process.cwd(), 'package.json'), 'utf8')) as {
+          version?: string;
+        }
+      ).version ?? 'unknown';
   } catch {
     /* keep 'unknown' */
   }
@@ -160,9 +158,7 @@ export async function collectProvenance(): Promise<Provenance> {
  * mid-dump is replayed too, which is harmless because reconciliation is
  * idempotent — erring toward replay is the conservative direction.
  */
-export async function readTombstoneWatermark(
-  reference: Date,
-): Promise<TombstoneWatermarkProbe> {
+export async function readTombstoneWatermark(reference: Date): Promise<TombstoneWatermarkProbe> {
   try {
     const res = await db.execute<{ rows_present: boolean }>(
       sql`SELECT EXISTS (SELECT 1 FROM data_tombstones) AS rows_present`,
@@ -207,7 +203,12 @@ export function createBackupPorts(): BackupPorts {
     // structurally valid dump — a truncated file has a size too.
     readCatalog: async (path, timeoutMs) => {
       try {
-        const res = await runBounded('pg_restore', ['--list', path], timeoutMs, 'catalog_unreadable');
+        const res = await runBounded(
+          'pg_restore',
+          ['--list', path],
+          timeoutMs,
+          'catalog_unreadable',
+        );
         return res.ok;
       } catch {
         return false;

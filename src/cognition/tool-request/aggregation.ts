@@ -70,11 +70,7 @@ import {
   assinaturaDePedido,
   similaridadeDeAssinaturas,
 } from './similarity.js';
-import {
-  fundirRascunhos,
-  type EstadoDoContrato,
-  type MembroParaFusao,
-} from './draft-merge.js';
+import { fundirRascunhos, type EstadoDoContrato, type MembroParaFusao } from './draft-merge.js';
 import { ToolRequestSpecSchema, type ToolRequestSpec } from './types.js';
 
 export type ResultadoDaAgregacao =
@@ -124,17 +120,14 @@ export async function decidirAgregacao(args: {
 
   // 2 · Só agregados DESTE tenant+agent (o repositório não aceita escopo por
   //     parâmetro) e da MESMA versão de assinatura.
-  const candidatos = await toolRequestAggregatesRepo.candidatosParaFusao(
-    ASSINATURA_VERSION,
-  );
+  const candidatos = await toolRequestAggregatesRepo.candidatosParaFusao(ASSINATURA_VERSION);
 
   // O MAIOR score vence, e o empate é resolvido pela ordem em que o
   // repositório devolve — `last_member_at DESC`, isto é, o agregado mais
   // ativo. É determinístico (o `>` estrito nunca troca de campeão num empate)
   // e é a leitura certa: entre dois pedidos igualmente parecidos, somar ao que
   // está vivo é o que faz o contador significar demanda corrente.
-  let melhor: { aggregate_id: string; proposal_id: string; similaridade: number } | null =
-    null;
+  let melhor: { aggregate_id: string; proposal_id: string; similaridade: number } | null = null;
   for (const c of candidatos) {
     if (excluidos.has(c.id)) continue;
     const s = similaridadeDeAssinaturas(assinatura, c.assinatura);
@@ -301,9 +294,7 @@ export async function juntarAoAgregado(args: {
       member_count: estado.member_count,
       total_occurrences: estado.total_occurrences,
       contract_state: estado.contract_state,
-      conflitos: Array.isArray(estado.contract_conflicts)
-        ? estado.contract_conflicts.length
-        : 0,
+      conflitos: Array.isArray(estado.contract_conflicts) ? estado.contract_conflicts.length : 0,
     },
   });
 
@@ -357,10 +348,7 @@ export async function destacarDoAgregado(args: {
   const agregado = await toolRequestAggregatesRepo.findById(linha.aggregate_id);
   if (!agregado) return { ok: false, reason: 'nao_encontrado' };
 
-  const estado = await recomputarAgregado(
-    agregado.id,
-    agregado.representative_gap_id,
-  );
+  const estado = await recomputarAgregado(agregado.id, agregado.representative_gap_id);
   await toolRequestAggregatesRepo.atualizarAgregado({
     aggregate_id: agregado.id,
     member_count: estado.member_count,

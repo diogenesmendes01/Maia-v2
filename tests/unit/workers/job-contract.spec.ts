@@ -166,7 +166,13 @@ describe('contrato de concorrência dos schedulers (#513 §9)', () => {
     // deixasse de exercitar uma delas indicaria que a taxonomia virou
     // decoração.
     expect([...usadas].sort()).toEqual(
-      ['global singleton', 'idempotente', 'per-tenant singleton', 'read-only', 'row-claimed'].sort(),
+      [
+        'global singleton',
+        'idempotente',
+        'per-tenant singleton',
+        'read-only',
+        'row-claimed',
+      ].sort(),
     );
   });
 });
@@ -188,7 +194,10 @@ describe('grupos substituem phase sem mudar o que roda (#513 §5)', () => {
   it('todo grupo declarado tem spec e pelo menos um job', () => {
     const jobs = registro().JOBS as JobContract[];
     for (const g of JOB_GROUPS) {
-      expect(JOB_GROUP_SPECS.some((s) => s.group === g), `spec de ${g}`).toBe(true);
+      expect(
+        JOB_GROUP_SPECS.some((s) => s.group === g),
+        `spec de ${g}`,
+      ).toBe(true);
       expect(jobs.filter((j) => j.group === g).length, `jobs em ${g}`).toBeGreaterThan(0);
     }
   });
@@ -313,8 +322,18 @@ describe('validateJobRegistry — as regras, em isolamento', () => {
 
   it('reprova dois jobs no mesmo namespace de lock', () => {
     const v = validateJobRegistry([
-      { ...base, name: 'a', effect: 'side-effectful', guard: { kind: 'global-singleton', lock: 'L' } },
-      { ...base, name: 'b', effect: 'side-effectful', guard: { kind: 'global-singleton', lock: 'L' } },
+      {
+        ...base,
+        name: 'a',
+        effect: 'side-effectful',
+        guard: { kind: 'global-singleton', lock: 'L' },
+      },
+      {
+        ...base,
+        name: 'b',
+        effect: 'side-effectful',
+        guard: { kind: 'global-singleton', lock: 'L' },
+      },
     ]);
     expect(v.map((x) => x.rule)).toContain('lock-namespace-unique');
   });

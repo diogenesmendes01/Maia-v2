@@ -10,11 +10,7 @@
  * agente específico — glossário ARCHITECTURE.md §7).
  */
 import { logger } from '@/lib/logger.js';
-import {
-  mcpServersRepo,
-  mcpServerToolsRepo,
-  mcpSchemaHash,
-} from '@/db/repositories.js';
+import { mcpServersRepo, mcpServerToolsRepo, mcpSchemaHash } from '@/db/repositories.js';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { mcpListTools } from '@/lib/mcp-client.js';
 import { audit } from '@/governance/audit.js';

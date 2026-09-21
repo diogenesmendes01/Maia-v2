@@ -20,11 +20,7 @@ import { PageHeader } from '../../components/ui/page-header.js';
 import { Badge } from '../../components/ui/badge.js';
 import { Card, CardBody } from '../../components/ui/card.js';
 import { Field, Input, Select } from '../../components/ui/field.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../components/ui/states.js';
+import { LoadingState, ErrorState, EmptyState } from '../../components/ui/states.js';
 import { IconWrench } from '../../components/ui/icons.js';
 
 type SideEffect = 'read' | 'write' | 'communication' | 'none';
@@ -105,11 +101,10 @@ export default function ToolsCatalogPage() {
         title="Ferramentas"
         description={
           <>
-            Catálogo somente leitura de toda ferramenta que o agente pode chamar.
-            Ferramentas são definidas em código e globais (não escopadas por
-            tenant). Uma ferramenta controlada por feature flag desligada aparece
-            como <span className="font-medium">desabilitada</span>, com a flag que
-            a liga.
+            Catálogo somente leitura de toda ferramenta que o agente pode chamar. Ferramentas são
+            definidas em código e globais (não escopadas por tenant). Uma ferramenta controlada por
+            feature flag desligada aparece como <span className="font-medium">desabilitada</span>,
+            com a flag que a liga.
           </>
         }
       />
@@ -119,10 +114,7 @@ export default function ToolsCatalogPage() {
       ) : q.error ? (
         <ErrorState message={q.error.message} onRetry={() => void q.refetch()} />
       ) : tools.length === 0 ? (
-        <EmptyState
-          icon={<IconWrench size={36} />}
-          title="Nenhuma ferramenta registrada"
-        />
+        <EmptyState icon={<IconWrench size={36} />} title="Nenhuma ferramenta registrada" />
       ) : (
         <div className="space-y-6">
           <Card>
@@ -139,9 +131,7 @@ export default function ToolsCatalogPage() {
               <Field label="Efeito colateral" className="w-52">
                 <Select
                   value={sideEffectFilter}
-                  onChange={(e) =>
-                    setSideEffectFilter(e.target.value as 'all' | SideEffect)
-                  }
+                  onChange={(e) => setSideEffectFilter(e.target.value as 'all' | SideEffect)}
                 >
                   <option value="all">Todos</option>
                   {SIDE_EFFECT_ORDER.map((s) => (
@@ -210,17 +200,13 @@ function ToolCard({ tool }: { tool: CatalogTool }) {
     <Card>
       <CardBody className="space-y-2.5">
         <div className="flex flex-wrap items-center gap-2">
-          <code className="font-mono text-sm font-semibold text-zinc-900">
-            {tool.name}
-          </code>
+          <code className="font-mono text-sm font-semibold text-zinc-900">{tool.name}</code>
           <Badge tone="neutral">{tool.side_effect}</Badge>
           {tool.enabled ? (
             <Badge tone="success">habilitada</Badge>
           ) : (
             <Badge tone="neutral">
-              {tool.feature_flag
-                ? `desabilitada — ${tool.feature_flag}`
-                : 'desabilitada'}
+              {tool.feature_flag ? `desabilitada — ${tool.feature_flag}` : 'desabilitada'}
             </Badge>
           )}
           {tool.sensitive && <Badge tone="warning">sensível</Badge>}
@@ -233,16 +219,12 @@ function ToolCard({ tool }: { tool: CatalogTool }) {
             Entradas ({tool.inputs.length})
           </summary>
           {tool.inputs.length === 0 ? (
-            <p className="mt-2 pl-4 text-xs text-zinc-500">
-              Nenhum campo de entrada.
-            </p>
+            <p className="mt-2 pl-4 text-xs text-zinc-500">Nenhum campo de entrada.</p>
           ) : (
             <ul className="mt-2 space-y-1 border-l-2 border-zinc-200 pl-4">
               {tool.inputs.map((field) => (
                 <li key={field.name} className="text-xs">
-                  <code className="font-mono font-medium text-zinc-800">
-                    {field.name}
-                  </code>{' '}
+                  <code className="font-mono font-medium text-zinc-800">{field.name}</code>{' '}
                   <span className="text-zinc-500">· {field.type}</span>
                   {field.optional ? (
                     <span className="text-zinc-400"> · opcional</span>

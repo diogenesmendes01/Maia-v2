@@ -21,9 +21,8 @@ vi.mock('@/db/repositories/turn-repos.js', () => ({
   agentTurnsRepo: { snapshotLiveTurnStates },
 }));
 
-const { registerTurnStateGauges, _resetTurnStateCollectorForTests } = await import(
-  '@/observability/turn-state-collector.js'
-);
+const { registerTurnStateGauges, _resetTurnStateCollectorForTests } =
+  await import('@/observability/turn-state-collector.js');
 const { renderPrometheus, _resetForTests } = await import('@/lib/metrics.js');
 
 beforeEach(() => {
@@ -101,7 +100,9 @@ describe('gauges da máquina de estados do turno', () => {
     registerTurnStateGauges();
     registerTurnStateGauges();
     const out = await renderPrometheus();
-    const occurrences = out.split('\n').filter((l) => l.startsWith('maia_turns_current{status="running"}'));
+    const occurrences = out
+      .split('\n')
+      .filter((l) => l.startsWith('maia_turns_current{status="running"}'));
     expect(occurrences).toHaveLength(1);
   });
 });

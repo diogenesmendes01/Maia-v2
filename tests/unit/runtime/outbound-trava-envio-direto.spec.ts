@@ -280,12 +280,12 @@ describe('#634 — trava arquitetural do envio direto', () => {
     // O throw é SÍNCRONO de propósito: é erro de programação, não desfecho de
     // execução. Um `reject` faria a recusa depender de alguém dar `await` — e
     // um call site que esquecesse o `await` abriria a exceção assim mesmo.
-    expect(() =>
-      withDeclaredEgressException('workers.inventado', async () => undefined),
-    ).toThrow(/not declared in the outbound send-path inventory/);
-    expect(() =>
-      withDeclaredEgressExceptionSync('workers.inventado', () => undefined),
-    ).toThrow(/not declared in the outbound send-path inventory/);
+    expect(() => withDeclaredEgressException('workers.inventado', async () => undefined)).toThrow(
+      /not declared in the outbound send-path inventory/,
+    );
+    expect(() => withDeclaredEgressExceptionSync('workers.inventado', () => undefined)).toThrow(
+      /not declared in the outbound send-path inventory/,
+    );
   });
 
   it('a fronteira única RECUSA o envio quando ninguém abriu escopo — a trava está LIGADA', async () => {
@@ -305,9 +305,9 @@ describe('#634 — trava arquitetural do envio direto', () => {
         fileName: 'x.pdf',
       }),
     ).rejects.toBeInstanceOf(DirectSendViolationError);
-    await expect(
-      line.sendVoice('5511@s.whatsapp.net', Buffer.from('ogg')),
-    ).rejects.toBeInstanceOf(DirectSendViolationError);
+    await expect(line.sendVoice('5511@s.whatsapp.net', Buffer.from('ogg'))).rejects.toBeInstanceOf(
+      DirectSendViolationError,
+    );
     await expect(
       line.sendPoll('5511@s.whatsapp.net', 'q', [
         { key: 'a', label: 'A' },

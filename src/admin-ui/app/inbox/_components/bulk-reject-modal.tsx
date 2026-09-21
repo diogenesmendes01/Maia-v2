@@ -57,11 +57,7 @@ export default function BulkRejectModal({ open, tenantId, ids, onClose }: Props)
           <Button variant="secondary" onClick={onClose} disabled={mutation.isPending}>
             Cancelar
           </Button>
-          <Button
-            variant="danger"
-            onClick={() => void handleSubmit()}
-            loading={mutation.isPending}
-          >
+          <Button variant="danger" onClick={() => void handleSubmit()} loading={mutation.isPending}>
             Confirmar rejeição
           </Button>
         </>

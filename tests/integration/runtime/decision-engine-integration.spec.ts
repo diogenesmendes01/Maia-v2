@@ -9,10 +9,7 @@
  * lockdown reader, channel policies). No DB hits.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import {
-  createDecisionEngine,
-  TurnRiskScorerAdapter,
-} from '@/runtime/decision/index.ts';
+import { createDecisionEngine, TurnRiskScorerAdapter } from '@/runtime/decision/index.ts';
 import type {
   ChannelPoliciesReader,
   ContentResolver,
@@ -248,9 +245,7 @@ function buildFixture(): Fixture {
   };
 
   const haiku: HaikuClient = {
-    classify: vi
-      .fn()
-      .mockResolvedValue({ label: 'unknown', confidence: 0.4 }),
+    classify: vi.fn().mockResolvedValue({ label: 'unknown', confidence: 0.4 }),
   };
 
   const metrics: MetricsClient = {
@@ -316,10 +311,7 @@ function buildFixture(): Fixture {
   };
 }
 
-function mkBase(
-  fixture: Fixture,
-  overrides?: Partial<BaseContextPacket>,
-): BaseContextPacket {
+function mkBase(fixture: Fixture, overrides?: Partial<BaseContextPacket>): BaseContextPacket {
   return {
     trace_id: `trace_${Math.random().toString(36).slice(2)}`,
     tenant_id: fixture.tenant_id,
@@ -488,9 +480,9 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
 
     expect(r.packet.action_mode).toBe('escalate');
     expect(r.packet.rationale).toContain('owner_plus_compliance');
-    expect(r.packet.policy_decisions.some(
-      (d) => d.decision === 'require_dual_approval',
-    )).toBe(true);
+    expect(r.packet.policy_decisions.some((d) => d.decision === 'require_dual_approval')).toBe(
+      true,
+    );
   });
 
   it('Cenário 5: continue_workflow (active procedure execution matches intent domain)', async () => {
@@ -554,12 +546,8 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
     // Engine should still produce a packet — but transfer_money MUST NOT
     // appear in allowed_tools. Before the fix it leaked through because the
     // verdict was logged as a warning only.
-    expect(r.packet.tool_permissions.allowed_tools).not.toContain(
-      'transfer_money',
-    );
-    expect(r.packet.tool_permissions.blocked_tools).toContain(
-      'transfer_money',
-    );
+    expect(r.packet.tool_permissions.allowed_tools).not.toContain('transfer_money');
+    expect(r.packet.tool_permissions.blocked_tools).toContain('transfer_money');
     // Skill_transfer has ONLY transfer_money in allowed_tools — reducing it
     // empties the list, which must force ask_clarification (never a
     // call_tool packet with empty allowed_tools).
@@ -567,9 +555,7 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
     expect(r.packet.rationale).toContain('tool_set_reduced_to_empty');
 
     // Audit row recorded with policy_id and warn decision
-    const reduceRows = r.packet.policy_decisions.filter(
-      (d) => d.policy_id === 'p_mid_reduce',
-    );
+    const reduceRows = r.packet.policy_decisions.filter((d) => d.policy_id === 'p_mid_reduce');
     expect(reduceRows.length).toBeGreaterThan(0);
   });
 
@@ -598,9 +584,7 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
 
   it('Codex #103 — Cenário 10: hung resolver triggers deadline fallback (hot path bounded)', async () => {
     const hangResolver: PolicyDescriptorResolver = {
-      resolveDescriptors: vi
-        .fn()
-        .mockImplementation(() => new Promise<ResolvedPolicy[]>(() => {})),
+      resolveDescriptors: vi.fn().mockImplementation(() => new Promise<ResolvedPolicy[]>(() => {})),
     };
     const engine = createDecisionEngine({ ...fixture, resolver: hangResolver, budget_ms: 400 });
 
@@ -674,10 +658,7 @@ describe('P9b — Decision Engine integration (7 cenários, spec §10.2)', () =>
     // Merge late entries into the same packet (Guardrails layer responsibility)
     const merged = {
       ...r.packet,
-      policy_decisions: [
-        ...r.packet.policy_decisions,
-        ...lateResult.policy_decisions,
-      ],
+      policy_decisions: [...r.packet.policy_decisions, ...lateResult.policy_decisions],
     };
 
     const earlyDecisions = merged.policy_decisions.filter((d) => d.pep === 'early');

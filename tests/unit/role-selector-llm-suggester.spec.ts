@@ -27,9 +27,8 @@ vi.mock('@anthropic-ai/sdk', () => {
 });
 
 vi.mock('@/db/repositories.js', async () => {
-  const actual = await vi.importActual<typeof import('@/db/repositories.js')>(
-    '@/db/repositories.js',
-  );
+  const actual =
+    await vi.importActual<typeof import('@/db/repositories.js')>('@/db/repositories.js');
   return {
     ...actual,
     cognitiveModuleLogRepo: {
@@ -162,9 +161,7 @@ describe('llmSuggester', () => {
   it('mapping confidence → strength: 0.3=weak, 0.6=medium, 0.9=strong', async () => {
     // confidence 0.3 → weak
     anthropicCreateMock.mockResolvedValueOnce({
-      content: [
-        { type: 'text', text: '{"role_key":"suporte","confidence":0.3,"reason":"w"}' },
-      ],
+      content: [{ type: 'text', text: '{"role_key":"suporte","confidence":0.3,"reason":"w"}' }],
     });
     const weak = await llmSuggester.suggest(makeInput());
     expect(weak?.strength).toBe(RoleSelectorStrength.WEAK);
@@ -172,9 +169,7 @@ describe('llmSuggester', () => {
 
     // confidence 0.6 → medium
     anthropicCreateMock.mockResolvedValueOnce({
-      content: [
-        { type: 'text', text: '{"role_key":"suporte","confidence":0.6,"reason":"m"}' },
-      ],
+      content: [{ type: 'text', text: '{"role_key":"suporte","confidence":0.6,"reason":"m"}' }],
     });
     const medium = await llmSuggester.suggest(makeInput());
     expect(medium?.strength).toBe(RoleSelectorStrength.MEDIUM);
@@ -182,9 +177,7 @@ describe('llmSuggester', () => {
 
     // confidence 0.9 → strong
     anthropicCreateMock.mockResolvedValueOnce({
-      content: [
-        { type: 'text', text: '{"role_key":"suporte","confidence":0.9,"reason":"s"}' },
-      ],
+      content: [{ type: 'text', text: '{"role_key":"suporte","confidence":0.9,"reason":"s"}' }],
     });
     const strong = await llmSuggester.suggest(makeInput());
     expect(strong?.strength).toBe(RoleSelectorStrength.STRONG);
@@ -193,9 +186,7 @@ describe('llmSuggester', () => {
 
   it('JSON malformado (parse fail) → null sem crash', async () => {
     anthropicCreateMock.mockResolvedValueOnce({
-      content: [
-        { type: 'text', text: '{"role_key":"suporte","confidence":0.5,' /* trunc */ },
-      ],
+      content: [{ type: 'text', text: '{"role_key":"suporte","confidence":0.5,' /* trunc */ }],
     });
 
     const r = await llmSuggester.suggest(makeInput());

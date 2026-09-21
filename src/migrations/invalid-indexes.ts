@@ -131,9 +131,7 @@ export function describeInvalidIndex(index: InvalidIndex): string {
  * nenhuma (um `CREATE INDEX CONCURRENTLY` rodado à mão deixa exatamente esse
  * estado). O nome do índice vai no `detail`, que é o campo de texto livre.
  */
-export function invalidIndexBlockers(
-  indexes: readonly InvalidIndex[],
-): SchemaBlocker[] {
+export function invalidIndexBlockers(indexes: readonly InvalidIndex[]): SchemaBlocker[] {
   return indexes.map((index) => ({
     kind: 'invalid_index' as const,
     detail: describeInvalidIndex(index),

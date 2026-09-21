@@ -62,7 +62,11 @@ describe('canAct', () => {
   it('rejeita pessoa inativa', () => {
     const res = canAct({
       pessoa: { ...ativaPessoa, status: 'inativa' },
-      resolved: { permissao: ativaPermissao, profile: baseProfileContador, effective_limits: { valor_max: 0 } },
+      resolved: {
+        permissao: ativaPermissao,
+        profile: baseProfileContador,
+        effective_limits: { valor_max: 0 },
+      },
       action: 'read_balance',
     });
     expect(res.allowed).toBe(false);
@@ -106,7 +110,11 @@ describe('canAct', () => {
   it('rejeita valor acima do hard limit mesmo para owner', () => {
     const res = canAct({
       pessoa: { ...ativaPessoa, tipo: 'dono' },
-      resolved: { permissao: ativaPermissao, profile: ownerProfile, effective_limits: { valor_max: 999999 } },
+      resolved: {
+        permissao: ativaPermissao,
+        profile: ownerProfile,
+        effective_limits: { valor_max: 999999 },
+      },
       action: 'create_transaction',
       valor: 999999999,
     });

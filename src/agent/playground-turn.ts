@@ -126,9 +126,7 @@ export async function runPlaygroundTurn(args: {
   }
   const res = moduleResult.output;
   const reply =
-    res.content && res.content.trim().length > 0
-      ? res.content
-      : '(o modelo não retornou texto)';
+    res.content && res.content.trim().length > 0 ? res.content : '(o modelo não retornou texto)';
   const model = res.model;
   const inputTokens = res.usage.input_tokens ?? 0;
   const outputTokens = res.usage.output_tokens ?? 0;

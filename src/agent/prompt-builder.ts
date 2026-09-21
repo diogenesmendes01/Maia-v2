@@ -48,10 +48,7 @@ import {
   type TurnContextResult,
 } from './turn-context/metrics.js';
 import { SECTION_BUDGETS, SELF_AWARENESS_GAP_MAX_ITEMS } from './turn-context/types.js';
-import {
-  DOMAIN_KEYWORDS,
-  type ToolExecutionSummary,
-} from './tool-execution-summary.js';
+import { DOMAIN_KEYWORDS, type ToolExecutionSummary } from './tool-execution-summary.js';
 
 const LLM_BOUNDARIES = `
 Você é uma camada de interpretação. Você NÃO PODE:
@@ -210,7 +207,6 @@ export function wrapHint(text: string): string {
   return `<hint>${sanitizeBlock(text)}</hint>`;
 }
 
-
 export type PromptContext = {
   pessoa: Pessoa;
   conversa: Conversa;
@@ -263,10 +259,7 @@ function collectPriorAssistantTurns(messages: Mensagem[], inboundId: string): As
     .map((m) => ({ message: m, summaries: parseSummaries(m.ferramentas_chamadas) }));
 }
 
-function selectEventsForBlock(
-  turns: AssistantTurn[],
-  now: number,
-): ToolExecutionSummary[] {
+function selectEventsForBlock(turns: AssistantTurn[], now: number): ToolExecutionSummary[] {
   // Most recent first, side-effect priority (write/communication > read).
   const priorityRank = (s: ToolExecutionSummary): number => {
     if (s.side_effect === 'write' || s.side_effect === 'communication') return 0;
@@ -278,9 +271,7 @@ function selectEventsForBlock(
   // collectPriorAssistantTurns returns messages from recentInConversation which
   // lists newest-first, so turns[0] is the most recent.
   const firstTurn = turns[0];
-  const latestTurnCreatedAt = firstTurn
-    ? (firstTurn.message.created_at?.getTime() ?? 0)
-    : 0;
+  const latestTurnCreatedAt = firstTurn ? (firstTurn.message.created_at?.getTime() ?? 0) : 0;
 
   // Round-1 fix #1: pin ONLY write/communication successes from the latest turn.
   // Read successes from the latest turn fall into the global pool and compete
@@ -417,9 +408,7 @@ function resultKeysOverlap(
 
   if (identityKeys && identityKeys.length > 0) {
     // Tool-specific mode: find identity keys present in BOTH entries.
-    const matchableKeys = identityKeys.filter(
-      (k) => k in a && k in b,
-    );
+    const matchableKeys = identityKeys.filter((k) => k in a && k in b);
     // If no identity keys are shared by both entries, they can't be the same resource.
     if (matchableKeys.length === 0) return false;
     // ALL matchable identity keys must have the same value.
@@ -659,9 +648,7 @@ function buildGapMentionSection(gaps: readonly AgentCapabilityGap[]): string | n
  * NÃO cacheado, pela mesma razão que o bloco de limitações não é: um fato de
  * capacidade que muda tem de aparecer no turno seguinte, não depois de um TTL.
  */
-function buildCapacidadeAdquiridaSection(
-  gaps: readonly AgentCapabilityGap[],
-): string | null {
+function buildCapacidadeAdquiridaSection(gaps: readonly AgentCapabilityGap[]): string | null {
   const fechados = gaps
     .filter((g) => Boolean(g.resolved_at) && (g.resolved_tool_name ?? '').length > 0)
     // Mais recente primeiro: se o orçamento cortar, o que sobra é a notícia
@@ -727,11 +714,15 @@ function buildCapacidadeAdquiridaSection(
  * `item_count` é o número de mensagens renderizadas. Um NÚMERO — não pode
  * carregar conteúdo, e é limitado pela janela de histórico.
  */
-export async function buildPrompt(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
+export async function buildPrompt(
+  ctx: PromptContext,
+): Promise<{ system: string; messages: LLMMessage[] }> {
   return instrumentPromptRender(() => buildPromptInner(ctx));
 }
 
-async function buildPromptInner(ctx: PromptContext): Promise<{ system: string; messages: LLMMessage[] }> {
+async function buildPromptInner(
+  ctx: PromptContext,
+): Promise<{ system: string; messages: LLMMessage[] }> {
   const started_at = Date.now();
   return runWithQueryCounter(async (counter) => {
     let result: TurnContextResult = 'ok';
@@ -786,7 +777,13 @@ function renderMemorySection(ctx: PromptContext, memoryEntries: readonly MemoryE
   // not as instruction. Without this, a stored memory containing "ignore
   // previous rules…" would be interpolated raw into the system prompt.
   const lines = mentionableMemories.map((m) => `- ${wrapMemory(m.content)}`);
-  const budgeted = applyBudget('memories', lines, SECTION_BUDGETS.memories, utf8Bytes, truncateUtf8);
+  const budgeted = applyBudget(
+    'memories',
+    lines,
+    SECTION_BUDGETS.memories,
+    utf8Bytes,
+    truncateUtf8,
+  );
   return '\n## Memória relevante\n' + budgeted.items.join('\n');
 }
 
@@ -978,7 +975,9 @@ export function renderTurnPrompt(
   // `maia_turn_context_truncated_total`.
   const factsBlock = applyBudget(
     'facts',
-    snapshot.facts.value.map((f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`),
+    snapshot.facts.value.map(
+      (f) => `  - ${f.escopo}/${f.chave}: ${wrapFact(JSON.stringify(f.valor))}`,
+    ),
     SECTION_BUDGETS.facts,
     utf8Bytes,
     truncateUtf8,
@@ -1125,14 +1124,15 @@ export function renderTurnPrompt(
   // v3.1.1: growth_hints_block e episodic_summary_block foram removidos do
   // RenderedProfile. growth_backlog -> Evolution Pipeline (P5/P9 capability_proposals);
   // episodic_temp -> User Layer (P8c). Identity Layer nao carrega esse conteudo.
-  const system = systemSections.join('\n')
-    + memorySection
-    + hintsSection
-    + selfAwarenessSection
-    + roleSection
-    + procedureSection
-    + gapMentionSection
-    + capacidadeNovaSection;
+  const system =
+    systemSections.join('\n') +
+    memorySection +
+    hintsSection +
+    selfAwarenessSection +
+    roleSection +
+    procedureSection +
+    gapMentionSection +
+    capacidadeNovaSection;
 
   // Build conversation messages: oldest first.
   // History stays RAW — no inline tool-summary injection (auditability + the
@@ -1151,7 +1151,12 @@ export function renderTurnPrompt(
   const messages: LLMMessage[] = [];
   const pushCoalesced = (next: LLMMessage): void => {
     const last = messages[messages.length - 1];
-    if (last && last.role === next.role && typeof last.content === 'string' && typeof next.content === 'string') {
+    if (
+      last &&
+      last.role === next.role &&
+      typeof last.content === 'string' &&
+      typeof next.content === 'string'
+    ) {
       last.content = `${last.content}\n${next.content}`;
       return;
     }
@@ -1165,10 +1170,10 @@ export function renderTurnPrompt(
     // `ferramentas_chamadas` (reidrated by `collectPriorAssistantTurns`
     // above) but have no textual content for the LLM to read.
     const isEventOnly =
-      m.direcao === 'out' &&
-      (m.tipo === 'evento' || (m.conteudo ?? '').length === 0);
+      m.direcao === 'out' && (m.tipo === 'evento' || (m.conteudo ?? '').length === 0);
     if (isEventOnly) continue;
-    if (m.direcao === 'in') pushCoalesced({ role: 'user', content: wrapUserContent(m.conteudo ?? '') });
+    if (m.direcao === 'in')
+      pushCoalesced({ role: 'user', content: wrapUserContent(m.conteudo ?? '') });
     else pushCoalesced({ role: 'assistant', content: m.conteudo ?? '' });
   }
   pushCoalesced({ role: 'user', content: wrapUserContent(ctx.inbound.conteudo ?? '') });

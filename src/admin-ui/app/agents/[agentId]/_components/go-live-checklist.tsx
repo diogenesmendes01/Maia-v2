@@ -119,9 +119,7 @@ export default function GoLiveChecklist({
               <span
                 aria-hidden
                 className={`mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-xs font-semibold ${
-                  item.done
-                    ? 'bg-emerald-100 text-emerald-700'
-                    : 'bg-amber-100 text-amber-700'
+                  item.done ? 'bg-emerald-100 text-emerald-700' : 'bg-amber-100 text-amber-700'
                 }`}
               >
                 {item.done ? '✓' : '•'}
@@ -134,9 +132,7 @@ export default function GoLiveChecklist({
                 >
                   {item.label}
                 </span>
-                <span className="mt-0.5 block text-xs text-zinc-500">
-                  {item.detail}
-                </span>
+                <span className="mt-0.5 block text-xs text-zinc-500">{item.detail}</span>
               </span>
               {item.action}
             </li>

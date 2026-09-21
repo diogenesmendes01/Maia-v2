@@ -135,7 +135,10 @@ describe('regras cruzadas de shutdown', () => {
 
   it('os defaults do contrato são coerentes entre si', () => {
     const r = check('production');
-    expect(r.errors.filter((p) => p.rule.startsWith('lifecycle/')), formatHuman(r)).toEqual([]);
+    expect(
+      r.errors.filter((p) => p.rule.startsWith('lifecycle/')),
+      formatHuman(r),
+    ).toEqual([]);
     expect(r.warnings.filter((p) => p.rule.startsWith('lifecycle/'))).toEqual([]);
   });
 });
@@ -185,7 +188,10 @@ describe('regras cruzadas de readiness', () => {
       entries: [],
     });
     const boot = findings.filter(
-      (f) => f.rule === 'lifecycle/schema-check-disabled' && f.scope === 'boot' && f.severity === 'error',
+      (f) =>
+        f.rule === 'lifecycle/schema-check-disabled' &&
+        f.scope === 'boot' &&
+        f.severity === 'error',
     );
     expect(boot).toHaveLength(1);
   });

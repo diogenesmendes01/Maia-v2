@@ -120,11 +120,7 @@ function makeRepos(proposal: ProfileProposal, opts: { failTransition?: unknown }
   };
 }
 
-function callerFor(
-  role: string,
-  userId: string,
-  repos: ReturnType<typeof makeRepos>,
-) {
+function callerFor(role: string, userId: string, repos: ReturnType<typeof makeRepos>) {
   const ctx = {
     session: { user: { id: userId, role, tenant_id: 'tenant-A' } },
     userId,

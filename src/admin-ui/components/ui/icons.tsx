@@ -5,13 +5,7 @@ import * as React from 'react';
  * Kept local — no icon dependency, tree-shakes to exactly what's used.
  */
 function make(paths: React.ReactNode) {
-  return function Icon({
-    size = 16,
-    className,
-  }: {
-    size?: number;
-    className?: string;
-  }) {
+  return function Icon({ size = 16, className }: { size?: number; className?: string }) {
     return (
       <svg
         width={size}
@@ -132,9 +126,7 @@ export const IconBrain = make(
   </>,
 );
 
-export const IconMessage = make(
-  <path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />,
-);
+export const IconMessage = make(<path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z" />);
 
 export const IconUsers = make(
   <>

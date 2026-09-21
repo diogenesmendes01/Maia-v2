@@ -100,9 +100,9 @@ beforeEach(() => {
   outboxMarkDeadMock.mockReset().mockResolvedValue(undefined);
   outboxReturnToPendingMock.mockReset().mockResolvedValue(undefined);
   tasksSetStatusMock.mockReset().mockResolvedValue(undefined);
-  tasksByOccMock.mockReset().mockResolvedValue([
-    { id: 't1', kind: 'fire_reminder', status: 'in_progress' },
-  ]);
+  tasksByOccMock
+    .mockReset()
+    .mockResolvedValue([{ id: 't1', kind: 'fire_reminder', status: 'in_progress' }]);
   occByIdMock.mockReset();
   occSetStatusMock.mockReset().mockResolvedValue(undefined);
   sendOutboundTextMock.mockReset();
@@ -129,7 +129,9 @@ describe('runOutboxDrain — Requirement 1 (no message loss) + Requirement 7 (au
     // here → sole-active-channel resolution inside the boundary).
     expect(forCurrentAgentChannelMock).toHaveBeenCalledWith(null);
     expect(outboxMarkSentMock).toHaveBeenCalledWith('m1');
-    expect(auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'outbox_sent')).toBe(true);
+    expect(
+      auditMock.mock.calls.some((c) => (c[0] as { acao: string }).acao === 'outbox_sent'),
+    ).toBe(true);
     expect(
       auditMock.mock.calls.some(
         (c) =>
@@ -177,9 +179,9 @@ describe('runOutboxDrain — Requirement 1 (no message loss) + Requirement 7 (au
 
     expect(outboxMarkSentMock).not.toHaveBeenCalled();
     expect(outboxMarkFailedRetryableMock).toHaveBeenCalledTimes(1);
-    expect(
-      (outboxMarkFailedRetryableMock.mock.calls[0]![1] as string),
-    ).toContain('whatsapp_send_returned_null');
+    expect(outboxMarkFailedRetryableMock.mock.calls[0]![1] as string).toContain(
+      'whatsapp_send_returned_null',
+    );
     // O slot de pacing adquirido é devolvido na falha.
     expect(releasePaceMock).toHaveBeenCalledWith('mariana@s.whatsapp.net');
   });
@@ -208,11 +210,7 @@ describe('runOutboxDrain — Requirement 1 (no message loss) + Requirement 7 (au
     const { runOutboxDrain } = await import('../../src/scheduling/outbox-drain.js');
     const r = await runOutboxDrain();
     expect(sendOutboundTextMock).not.toHaveBeenCalled();
-    expect(outboxMarkFailedRetryableMock).toHaveBeenCalledWith(
-      'm4',
-      'rate_limit:per_second',
-      1,
-    );
+    expect(outboxMarkFailedRetryableMock).toHaveBeenCalledWith('m4', 'rate_limit:per_second', 1);
     expect(r.rate_limited).toBe(1);
   });
 

@@ -37,7 +37,7 @@ import type {
 const TOPIC_RISK: Record<TopicSignal, RiskLevel | null> = {
   casual: null,
   operational_simple: null,
-  unknown: null,             // unknown não soma piso, mas marca ambíguo
+  unknown: null, // unknown não soma piso, mas marca ambíguo
   financial: RiskLevel.MEDIUM,
   legal: RiskLevel.HIGH,
   health: RiskLevel.HIGH,
@@ -65,7 +65,11 @@ const TOOL_RISK: Record<ToolKind, RiskLevel | null> = {
 const VALID_TOPICS = new Set<string>(Object.keys(TOPIC_RISK));
 const VALID_TOOL_KINDS = new Set<string>(Object.keys(TOOL_RISK));
 const VALID_KNOWLEDGE_TYPES = new Set<string>([
-  'fato', 'regra', 'procedimento', 'lacuna', 'tool_request',
+  'fato',
+  'regra',
+  'procedimento',
+  'lacuna',
+  'tool_request',
 ]);
 
 /**
@@ -126,10 +130,7 @@ function pushTrigger(
   triggers.push({ signal, contributes_to, weight });
 }
 
-function levelFromTriggers(
-  baseline: RiskLevel,
-  triggers: ReadonlyArray<RiskTrigger>,
-): RiskLevel {
+function levelFromTriggers(baseline: RiskLevel, triggers: ReadonlyArray<RiskTrigger>): RiskLevel {
   let current = baseline;
   for (const t of triggers) {
     current = maxRiskLevel(current, t.contributes_to);
@@ -215,9 +216,7 @@ export function scoreTurnHeuristic(sig: TurnRiskSignals): HeuristicResult {
   let baseline: RiskLevel = RiskLevel.LOW;
   if (
     topic === 'critical_decision' &&
-    toolKinds.some(
-      (k) => k === 'irreversible' || k === 'transfer' || k === 'write_external',
-    )
+    toolKinds.some((k) => k === 'irreversible' || k === 'transfer' || k === 'write_external')
   ) {
     baseline = RiskLevel.CRITICAL;
     pushTrigger(triggers, 'composite:critical_decision+sensitive_tool', RiskLevel.CRITICAL, 1);
@@ -323,11 +322,7 @@ export function scoreKnowledgeHeuristic(sig: KnowledgeRiskSignals): HeuristicRes
     knowledgeType === 'tool_request';
   const hasSensitiveTool = toolKinds.some(isSensitiveTool);
   const hasIrreversibleAction = hasSensitiveTool || sig.touches_irreversible === true;
-  if (
-    isActionable &&
-    topic === 'critical_decision' &&
-    hasIrreversibleAction
-  ) {
+  if (isActionable && topic === 'critical_decision' && hasIrreversibleAction) {
     baseline = RiskLevel.CRITICAL;
     pushTrigger(
       triggers,

@@ -7,19 +7,8 @@ import { PageHeader } from '../../components/ui/page-header.js';
 import { Field, Select } from '../../components/ui/field.js';
 import { Tabs } from '../../components/ui/tabs.js';
 import { StatusBadge } from '../../components/ui/badge.js';
-import {
-  TableShell,
-  Table,
-  THead,
-  Th,
-  Tr,
-  Td,
-} from '../../components/ui/table.js';
-import {
-  LoadingState,
-  ErrorState,
-  EmptyState,
-} from '../../components/ui/states.js';
+import { TableShell, Table, THead, Th, Tr, Td } from '../../components/ui/table.js';
+import { LoadingState, ErrorState, EmptyState } from '../../components/ui/states.js';
 import { IconLayers } from '../../components/ui/icons.js';
 import ToolRequests from './_components/tool-requests.js';
 
@@ -32,10 +21,7 @@ export default function CapabilitiesPage() {
   const [agentId, setAgentId] = React.useState('');
   const [tab, setTab] = React.useState<Tab>('proposals');
 
-  const agentsQuery = trpc.agents.list.useQuery(
-    { tenantId },
-    { enabled: tenantId !== '' },
-  );
+  const agentsQuery = trpc.agents.list.useQuery({ tenantId }, { enabled: tenantId !== '' });
 
   const domainsQuery = trpc.capabilities.listDomains.useQuery(
     { tenantId, agentId },
@@ -182,9 +168,7 @@ function DataTable({
 }) {
   if (query.isLoading) return <LoadingState />;
   if (query.error) {
-    return (
-      <ErrorState message={query.error.message} onRetry={() => void query.refetch()} />
-    );
+    return <ErrorState message={query.error.message} onRetry={() => void query.refetch()} />;
   }
   const items = (query.data?.items ?? []) as Array<Record<string, unknown>>;
   if (items.length === 0) {

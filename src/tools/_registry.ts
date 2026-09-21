@@ -88,10 +88,7 @@ import { conversationStateUpdateTool } from './conversation-state-update.js';
 // Issue #507 — classificação de efeito. O vocabulário e o validador que RECUSA
 // uma definição incompleta vivem num módulo folha (sem imports), porque é este
 // arquivo que o chama.
-import {
-  assertToolDefinitionsComplete,
-  type ToolEffectClass,
-} from './effect-class.js';
+import { assertToolDefinitionsComplete, type ToolEffectClass } from './effect-class.js';
 
 /**
  * Issue #504 §Fencing — a TENTATIVA do turno, entregue ao handler.
@@ -154,7 +151,14 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
    */
   compensated_by?: string;
   redis_required: boolean;
-  operation_type: 'create' | 'correct' | 'cancel' | 'update_meta' | 'parse_only' | 'read' | 'communicate';
+  operation_type:
+    | 'create'
+    | 'correct'
+    | 'cancel'
+    | 'update_meta'
+    | 'parse_only'
+    | 'read'
+    | 'communicate';
   audit_action: AuditAction;
   handler: (input: z.infer<I>, ctx: ToolHandlerCtx) => Promise<z.infer<O>>;
   // Optional: extract the resource id (e.g. transacao_id) from the tool's
@@ -177,9 +181,9 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
    * When set AND returning non-null, the dispatcher routes through the atomic
    * markCompleted+enqueue path instead of plain markCompleted.
    */
-  extractEffect?: (result: z.infer<O>) => import(
-    '@/governance/idempotency-effects.js'
-  ).PlannedEffect | null;
+  extractEffect?: (
+    result: z.infer<O>,
+  ) => import('@/governance/idempotency-effects.js').PlannedEffect | null;
   /**
    * When true, any turn that dispatches this tool flips the outbound text
    * reply into view-once (B3a). OR-logic across all tools in the turn.
@@ -371,10 +375,7 @@ const ALL_DEFINED_TOOLS: readonly AnyTool[] = [
   ...CONFIG_GATED_TOOLS.map((e) => e.tool),
 ];
 
-assertToolDefinitionsComplete(
-  ALL_DEFINED_TOOLS,
-  new Set(ALL_DEFINED_TOOLS.map((t) => t.name)),
-);
+assertToolDefinitionsComplete(ALL_DEFINED_TOOLS, new Set(ALL_DEFINED_TOOLS.map((t) => t.name)));
 
 /**
  * Runtime-flag check used by both the schema exposure path
@@ -406,9 +407,7 @@ export function getToolSchemas(byEntity: Map<string, ResolvedPermission>) {
   // exposto ao LLM sincronizado com o gate do dispatcher.
   const tools = Object.values(REGISTRY).filter((t) => isToolEnabled(t.name));
   if (isOwner) return tools.flatMap(toolToSchema);
-  return tools
-    .filter((t) => t.required_actions.every((a) => allowed.has(a)))
-    .flatMap(toolToSchema);
+  return tools.filter((t) => t.required_actions.every((a) => allowed.has(a))).flatMap(toolToSchema);
 }
 
 /**
@@ -453,13 +452,9 @@ export function getAgentToolSchemas(
     for (const a of rp.profile.acoes) allowed.add(a);
   }
 
-  const tools = Object.values(REGISTRY).filter(
-    (t) => visible.has(t.name) && isToolEnabled(t.name),
-  );
+  const tools = Object.values(REGISTRY).filter((t) => visible.has(t.name) && isToolEnabled(t.name));
   if (isOwner) return tools.flatMap(toolToSchema);
-  return tools
-    .filter((t) => t.required_actions.every((a) => allowed.has(a)))
-    .flatMap(toolToSchema);
+  return tools.filter((t) => t.required_actions.every((a) => allowed.has(a))).flatMap(toolToSchema);
 }
 
 /**
@@ -495,7 +490,9 @@ const LEGACY_GENERIC_INPUT_SCHEMA = { type: 'object' as const, additionalPropert
  */
 function toolToSchema(t: AnyTool): ExposedToolSchema[] {
   if (!config.FEATURE_STRICT_TOOL_SCHEMAS) {
-    return [{ name: t.name, description: t.description, input_schema: LEGACY_GENERIC_INPUT_SCHEMA }];
+    return [
+      { name: t.name, description: t.description, input_schema: LEGACY_GENERIC_INPUT_SCHEMA },
+    ];
   }
   const built = buildToolSchema(t);
   if (!built) return [];
@@ -608,9 +605,7 @@ export function buildToolCatalog(): CatalogEntry[] {
     }
   }
 
-  return Array.from(byName.values()).sort((a, b) =>
-    a.tool.name.localeCompare(b.tool.name),
-  );
+  return Array.from(byName.values()).sort((a, b) => a.tool.name.localeCompare(b.tool.name));
 }
 
 /**

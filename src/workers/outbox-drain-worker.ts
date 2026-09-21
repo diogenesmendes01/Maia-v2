@@ -65,9 +65,7 @@ export async function runOutboxDrainWorker(): Promise<void> {
 
   for (const { tenant_id, agent_id } of tenants) {
     try {
-      await runWithTenantContext({ tenant_id, agent_id }, () =>
-        drainTenant(maxPasses, sleepMs),
-      );
+      await runWithTenantContext({ tenant_id, agent_id }, () => drainTenant(maxPasses, sleepMs));
       tenantsProcessed++;
     } catch (err) {
       tenantsFailed++;

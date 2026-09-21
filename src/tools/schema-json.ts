@@ -227,9 +227,7 @@ export function canonicalStringify(value: unknown): string {
   const entries = Object.entries(value as JsonObject)
     .filter(([, v]) => v !== undefined)
     .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
-  return `{${entries
-    .map(([k, v]) => `${JSON.stringify(k)}:${canonicalStringify(v)}`)
-    .join(',')}}`;
+  return `{${entries.map(([k, v]) => `${JSON.stringify(k)}:${canonicalStringify(v)}`).join(',')}}`;
 }
 
 /** 16 hex chars of sha256 over `canonicalStringify(value)`. */
@@ -399,10 +397,7 @@ function jsonTypeOf(value: unknown, path: string): string {
     case 'boolean':
       return 'boolean';
     default:
-      throw new ToolSchemaConversionError(
-        `literal of unsupported type '${typeof value}'`,
-        path,
-      );
+      throw new ToolSchemaConversionError(`literal of unsupported type '${typeof value}'`, path);
   }
 }
 
@@ -470,12 +465,7 @@ function convertNode(schema: ZodLike | undefined, path: string, depth: number): 
   return orderKeys(node);
 }
 
-function convertByType(
-  schema: ZodLike,
-  def: ZodDefLike,
-  path: string,
-  depth: number,
-): JsonObject {
+function convertByType(schema: ZodLike, def: ZodDefLike, path: string, depth: number): JsonObject {
   switch (def.typeName) {
     // ---- wrappers -------------------------------------------------------
     case 'ZodOptional':
@@ -749,10 +739,7 @@ export function buildToolSchema(tool: AnyTool): CanonicalToolSchema | null {
   } catch (err) {
     incCounter('maia_tool_schema_build_total', { result: 'error' });
     observeHistogram('maia_tool_schema_build_duration_ms', Date.now() - started);
-    logger.error(
-      { tool: tool.name, err: (err as Error).message },
-      'tools.schema_build_failed',
-    );
+    logger.error({ tool: tool.name, err: (err as Error).message }, 'tools.schema_build_failed');
     return null;
   }
 }

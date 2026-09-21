@@ -63,9 +63,7 @@ describe('promptOnlyMode', () => {
       input: { msg: 'hi' },
       resolvedPolicies: [],
     });
-    expect(callLLM).toHaveBeenCalledWith(
-      expect.objectContaining({ max_tokens: 500 }),
-    );
+    expect(callLLM).toHaveBeenCalledWith(expect.objectContaining({ max_tokens: 500 }));
   });
 
   it('defaults max_tokens to 1024 when no hint', async () => {

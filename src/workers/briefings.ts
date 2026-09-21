@@ -71,7 +71,9 @@ async function buildEveningBriefing(): Promise<string> {
     const d = sumDecimal(txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor));
     lines.push(`• ${e.nome}: +${fmtBRL(r)} / -${fmtBRL(d)}`);
   }
-  return [`Fechamento do dia — ${fmtBR(new Date())}`, '', 'Movimento de hoje:', ...lines].join('\n');
+  return [`Fechamento do dia — ${fmtBR(new Date())}`, '', 'Movimento de hoje:', ...lines].join(
+    '\n',
+  );
 }
 
 async function buildWeeklyBriefing(): Promise<string> {
@@ -82,12 +84,18 @@ async function buildWeeklyBriefing(): Promise<string> {
   for (const e of ents.slice(0, 5)) {
     const txns = await transacoesRepo.byScope(
       { pessoa_id: 'system', entidades: [e.id] },
-      { date_from: from.toISOString().slice(0, 10), date_to: to.toISOString().slice(0, 10), limit: 1000 },
+      {
+        date_from: from.toISOString().slice(0, 10),
+        date_to: to.toISOString().slice(0, 10),
+        limit: 1000,
+      },
     );
     const r = sumDecimal(txns.filter((t) => t.natureza === 'receita').map((t) => t.valor));
     const d = sumDecimal(txns.filter((t) => t.natureza === 'despesa').map((t) => t.valor));
     // lucro = r - d em Decimal; só formata pra string no output.
-    lines.push(`• ${e.nome}: receita ${fmtBRL(r)}, despesa ${fmtBRL(d)}, lucro ${fmtBRL(r.minus(d))}`);
+    lines.push(
+      `• ${e.nome}: receita ${fmtBRL(r)}, despesa ${fmtBRL(d)}, lucro ${fmtBRL(r.minus(d))}`,
+    );
   }
   return [`Resumo semanal — ${fmtBR(new Date())}`, '', 'Últimos 7 dias:', ...lines].join('\n');
 }
@@ -147,10 +155,7 @@ function fmtISODate(d: Date): string {
  * reads scoped to ALS) and sends it to that tuple's owners. Fail-isolated per
  * tuple; the `period` label keys the per-period idle/done logs.
  */
-async function dispatchBriefing(
-  period: BriefingPeriod,
-  inner: () => Promise<void>,
-): Promise<void> {
+async function dispatchBriefing(period: BriefingPeriod, inner: () => Promise<void>): Promise<void> {
   const tuples: Pair[] = await pessoasRepo.listTenantAgentPairsWithActiveOwner();
 
   if (tuples.length === 0) {

@@ -1,16 +1,9 @@
-import {
-  pessoasRepo,
-  conversasRepo,
-  agentAudienceProfilesRepo,
-} from '@/db/repositories.js';
+import { pessoasRepo, conversasRepo, agentAudienceProfilesRepo } from '@/db/repositories.js';
 import { resolveScope, type ResolvedPermission } from '@/governance/permissions.js';
 import type { Pessoa, Conversa } from '@/db/schema.js';
 import { audit } from '@/governance/audit.js';
 import { logger } from '@/lib/logger.js';
-import {
-  buildAudienceContext,
-  type AudienceContext,
-} from '@/identity/audience-context.js';
+import { buildAudienceContext, type AudienceContext } from '@/identity/audience-context.js';
 import { instrumentIdentityResolve } from '@/observability/instrumentation.js';
 
 export type ResolvedIdentity = {
@@ -67,7 +60,10 @@ async function resolveIdentityInner(input: {
 }): Promise<ResolveResult> {
   const pessoa = await pessoasRepo.findByPhone(input.telefone_whatsapp);
   if (!pessoa) {
-    await audit({ acao: 'unknown_number_message_received', metadata: { telefone: input.telefone_whatsapp } });
+    await audit({
+      acao: 'unknown_number_message_received',
+      metadata: { telefone: input.telefone_whatsapp },
+    });
     return { kind: 'unknown', telefone: input.telefone_whatsapp };
   }
   if (pessoa.status === 'inativa' || pessoa.status === 'bloqueada') {
@@ -189,10 +185,7 @@ async function resolveIdentityInner(input: {
             escopo_entidades: scope.entidades,
             channel_id: input.channel_id,
           });
-          logger.info(
-            { pessoa_id: pessoa.id, conversa_id: conversa.id },
-            'conversa.created',
-          );
+          logger.info({ pessoa_id: pessoa.id, conversa_id: conversa.id }, 'conversa.created');
         }
       }
     }

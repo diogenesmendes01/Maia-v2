@@ -46,6 +46,8 @@ d('cognitive_module_log smoke', () => {
     expect(rows.length).toBeGreaterThanOrEqual(1);
 
     // cleanup
-    await db.delete(cognitive_module_log).where(eq(cognitive_module_log.module_name, 'reflection.test'));
+    await db
+      .delete(cognitive_module_log)
+      .where(eq(cognitive_module_log.module_name, 'reflection.test'));
   });
 });

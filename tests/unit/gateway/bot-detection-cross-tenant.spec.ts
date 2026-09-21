@@ -47,10 +47,7 @@
  *     omits the wrapper to assert the loud-failure path.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import {
-  runWithTenantContext,
-  MissingTenantContextError,
-} from '@/db/tenant-context.js';
+import { runWithTenantContext, MissingTenantContextError } from '@/db/tenant-context.js';
 import { buildCacheKey } from '@/lib/cache-key.js';
 
 // ---------------------------------------------------------------------------
@@ -150,12 +147,9 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
   // -------------------------------------------------------------------------
   describe('checkBotAndMaybeBlock — key shape', () => {
     it('emits a key prefixed with encoded tenant_id and agent_id segments', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
 
       // First call also fires `expire` (count === 1 branch). Both ops target
       // the SAME key string. The UUIDs and `+E164` phone are URI-safe so
@@ -185,18 +179,12 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       const PAIR_B_TENANT = 'acme';
       const PAIR_B_AGENT = 'dev:router';
 
-      await runWithTenantContext(
-        { tenant_id: PAIR_A_TENANT, agent_id: PAIR_A_AGENT },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: PAIR_B_TENANT, agent_id: PAIR_B_AGENT },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: PAIR_A_TENANT, agent_id: PAIR_A_AGENT }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
+      await runWithTenantContext({ tenant_id: PAIR_B_TENANT, agent_id: PAIR_B_AGENT }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
 
       const incrKeys = keysOf('incr');
       expect(incrKeys).toHaveLength(2);
@@ -229,18 +217,13 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
     it('issue #287: key equals the buildCacheKey composition and neutralizes glob metachars', async () => {
       const GLOB_TENANT = 'acme*dev';
       const GLOB_AGENT = 'router!';
-      await runWithTenantContext(
-        { tenant_id: GLOB_TENANT, agent_id: GLOB_AGENT },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: GLOB_TENANT, agent_id: GLOB_AGENT }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
       const key = keysOf('incr')[0]!;
       // Parity with the central helper — proves the call site routes through
       // buildCacheKey rather than reimplementing the encoding locally.
-      expect(key).toBe(
-        buildCacheKey('maia:botdet:', GLOB_TENANT, GLOB_AGENT, PHONE_SHARED),
-      );
+      expect(key).toBe(buildCacheKey('maia:botdet:', GLOB_TENANT, GLOB_AGENT, PHONE_SHARED));
       // Glob metachars are percent-encoded (encodeURIComponent alone leaves
       // `*` and `!` raw — this is the #287 upgrade).
       expect(key).toContain('acme%2Adev');
@@ -268,18 +251,12 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
   // -------------------------------------------------------------------------
   describe('checkBotAndMaybeBlock — cross-tenant independence', () => {
     it('same phone under different tenants produces DIFFERENT keys (independent counters)', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
 
       const incrKeys = keysOf('incr');
       expect(incrKeys).toHaveLength(2);
@@ -306,18 +283,12 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       // Defense-in-depth: agents within the same tenant must also be
       // isolated. Catches a regression where someone strips agent_id from
       // the prefix thinking tenant_id is enough.
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_B },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_B }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
 
       const incrKeys = keysOf('incr');
       expect(incrKeys).toHaveLength(2);
@@ -333,22 +304,16 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
     it('SYMMETRY: B→A is also isolated', async () => {
       // Inverse of the previous test — proves the property is symmetric
       // and we didn't just hard-code tenant-A as a "primary" path.
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
       const tenantBKey = calls.find((c) => c.op === 'incr')?.key;
 
       calls.length = 0;
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
       const tenantAKey = calls.find((c) => c.op === 'incr')?.key;
 
       expect(tenantBKey).toBe(
@@ -383,14 +348,11 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       // without touching `updateStatus`. That's fine — the load-bearing
       // assertion is that tenant-B's counter does NOT inherit the count.
       const TENANT_A_FLOOD = 60; // > THRESHOLD (50)
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          for (let i = 0; i < TENANT_A_FLOOD; i++) {
-            await checkBotAndMaybeBlock(PHONE_SHARED);
-          }
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        for (let i = 0; i < TENANT_A_FLOOD; i++) {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        }
+      });
 
       const tenantAKey = `maia:botdet:${encodeURIComponent(TENANT_A)}:${encodeURIComponent(AGENT_A)}:${encodeURIComponent(PHONE_SHARED)}`;
       expect(counters.get(tenantAKey)).toBe(TENANT_A_FLOOD);
@@ -407,12 +369,9 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
 
       // Tenant-B hits with the SAME phone, EXACTLY ONCE.
       let tenantBReturn: boolean | undefined;
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          tenantBReturn = await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        tenantBReturn = await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
 
       // Tenant-B used its OWN key, not tenant-A's.
       const tenantBKey = `maia:botdet:${encodeURIComponent(TENANT_B)}:${encodeURIComponent(AGENT_B)}:${encodeURIComponent(PHONE_SHARED)}`;
@@ -427,9 +386,7 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
 
       // And critically: no extra findByPhone call fired for tenant-B,
       // because tenant-B never crossed THRESHOLD on its own counter.
-      expect(findByPhoneMock.mock.calls.length).toBe(
-        findByPhoneCallsAfterTenantA,
-      );
+      expect(findByPhoneMock.mock.calls.length).toBe(findByPhoneCallsAfterTenantA);
       // No status flip either.
       expect(updateStatusMock).not.toHaveBeenCalled();
     });
@@ -447,12 +404,9 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
   // -------------------------------------------------------------------------
   describe('checkBotAndMaybeBlock — TTL contract', () => {
     it('sets a 60-second TTL on the FIRST hit (count === 1 branch)', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
       // Exactly one expire call, with TTL=60s (WINDOW_SECONDS in the
       // production module). Asserting the second argument is what catches
       // a refactor that drops it to e.g. 600s or leaves the TTL unset.
@@ -462,14 +416,11 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
     });
 
     it('does NOT re-arm the TTL on subsequent hits within the same window', async () => {
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
       // expire fires once, on the first hit only. The TTL set there
       // governs the entire 60s window — re-arming on every hit would let
       // a slow flooder keep the counter alive indefinitely.
@@ -500,14 +451,11 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       // the auto-block branch. We do 51 calls total: 50 below-threshold
       // (returning false), then one crossing call.
       let lastReturn: boolean | undefined;
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          for (let i = 0; i < 51; i++) {
-            lastReturn = await checkBotAndMaybeBlock(PHONE_SHARED);
-          }
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        for (let i = 0; i < 51; i++) {
+          lastReturn = await checkBotAndMaybeBlock(PHONE_SHARED);
+        }
+      });
 
       // The 51st call (count === 51 > 50) should:
       //   1. Return true (caller must drop the message)
@@ -541,14 +489,11 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       } as unknown as null);
 
       let lastReturn: boolean | undefined;
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          for (let i = 0; i < 51; i++) {
-            lastReturn = await checkBotAndMaybeBlock(PHONE_SHARED);
-          }
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        for (let i = 0; i < 51; i++) {
+          lastReturn = await checkBotAndMaybeBlock(PHONE_SHARED);
+        }
+      });
 
       // Owner path: return FALSE (don't drop), no status change, no audit.
       expect(lastReturn).toBe(false);
@@ -577,12 +522,9 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
       // Force the redis incr to throw so we hit the catch branch.
       redisStub.incr.mockRejectedValueOnce(new Error('CONN_RESET'));
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_A },
-        async () => {
-          await checkBotAndMaybeBlock(PHONE_SHARED);
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_A }, async () => {
+        await checkBotAndMaybeBlock(PHONE_SHARED);
+      });
 
       const redisFailedCall = loggerWarnMock.mock.calls.find(
         (call) => call[1] === 'bot_detection.redis_failed',
@@ -607,14 +549,11 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
         telefone_whatsapp: PHONE_SHARED,
       } as unknown as null);
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_B, agent_id: AGENT_B },
-        async () => {
-          for (let i = 0; i < 51; i++) {
-            await checkBotAndMaybeBlock(PHONE_SHARED);
-          }
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_B, agent_id: AGENT_B }, async () => {
+        for (let i = 0; i < 51; i++) {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        }
+      });
 
       const autoBlockedCall = loggerWarnMock.mock.calls.find(
         (call) => call[1] === 'bot_detection.auto_blocked',
@@ -639,14 +578,11 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
         telefone_whatsapp: PHONE_SHARED,
       } as unknown as null);
 
-      await runWithTenantContext(
-        { tenant_id: TENANT_A, agent_id: AGENT_B },
-        async () => {
-          for (let i = 0; i < 51; i++) {
-            await checkBotAndMaybeBlock(PHONE_SHARED);
-          }
-        },
-      );
+      await runWithTenantContext({ tenant_id: TENANT_A, agent_id: AGENT_B }, async () => {
+        for (let i = 0; i < 51; i++) {
+          await checkBotAndMaybeBlock(PHONE_SHARED);
+        }
+      });
 
       const ownerCall = loggerWarnMock.mock.calls.find(
         (call) => call[1] === 'bot_detection.owner_threshold_exceeded',
@@ -668,9 +604,7 @@ describe('issue #246 — bot-detection Redis key is tenant+agent scoped', () => 
   // -------------------------------------------------------------------------
   describe('checkBotAndMaybeBlock — missing tenant context', () => {
     it('throws MissingTenantContextError when called without tenant context', async () => {
-      await expect(checkBotAndMaybeBlock(PHONE_SHARED)).rejects.toThrow(
-        MissingTenantContextError,
-      );
+      await expect(checkBotAndMaybeBlock(PHONE_SHARED)).rejects.toThrow(MissingTenantContextError);
       // Nothing should have been written to Redis.
       expect(redisStub.incr).not.toHaveBeenCalled();
       expect(redisStub.expire).not.toHaveBeenCalled();

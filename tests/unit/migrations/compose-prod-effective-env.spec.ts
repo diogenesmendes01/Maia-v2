@@ -271,9 +271,7 @@ function service(name: string): Record<string, ComposeNode> {
  * `env_file` — o `migrate` — devolve lista vazia, que é o ponto dele.
  */
 function exampleFilesOf(composeName: string): string[] {
-  return envFileNamesOf(compose(), composeName).map((f) =>
-    resolve(REPO_ROOT, `${f}.prod.example`),
-  );
+  return envFileNamesOf(compose(), composeName).map((f) => resolve(REPO_ROOT, `${f}.prod.example`));
 }
 
 /**
@@ -389,15 +387,15 @@ describe('compose.prod.yml — MAIA_ENV chega aos TRÊS serviços, de uma fonte 
     'um .env.infra sem MAIA_ENV aborta a interpolação de $compose antes de qualquer container',
     ({ compose: name }) => {
       const { MAIA_ENV: _dropped, ...withoutMaiaEnv } = INFRA;
-      expect(() => environmentOf(compose(), name, withoutMaiaEnv)).toThrow(
-        /MAIA_ENV is required/,
-      );
+      expect(() => environmentOf(compose(), name, withoutMaiaEnv)).toThrow(/MAIA_ENV is required/);
     },
   );
 
   it('um MAIA_ENV=staging no .env.infra chega igual nos três', () => {
     const staging = { ...INFRA, MAIA_ENV: 'staging' };
-    const got = SERVICES.map(({ compose: name }) => environmentOf(compose(), name, staging).MAIA_ENV);
+    const got = SERVICES.map(
+      ({ compose: name }) => environmentOf(compose(), name, staging).MAIA_ENV,
+    );
     expect(got).toEqual(SERVICES.map(() => 'staging'));
   });
 
@@ -416,7 +414,9 @@ describe('compose.prod.yml — MAIA_ENV chega aos TRÊS serviços, de uma fonte 
     }
     expect({
       faltando: [...blanks].filter((k) => !(k in OPERATOR_FILLS)).sort(),
-      sobrando: Object.keys(OPERATOR_FILLS).filter((k) => !blanks.has(k)).sort(),
+      sobrando: Object.keys(OPERATOR_FILLS)
+        .filter((k) => !blanks.has(k))
+        .sort(),
     }).toEqual({ faltando: [], sobrando: [] });
   });
 });
@@ -427,7 +427,12 @@ describe('o ambiente do runbook satisfaz o loader de TODOS os serviços (issue #
     // este arquivo continuaria verde medindo três dos quatro consumidores.
     expect(
       preflightTargets(compose()).map((t) => ({ compose: t.compose, contracts: [...t.contracts] })),
-    ).toEqual(SERVICES.map(({ compose: name, contracts }) => ({ compose: name, contracts: [...contracts] })));
+    ).toEqual(
+      SERVICES.map(({ compose: name, contracts }) => ({
+        compose: name,
+        contracts: [...contracts],
+      })),
+    );
     expect(COMPOSE_SERVICE_CONTRACT).toEqual(
       Object.fromEntries(SERVICES.map(({ compose: name, contracts }) => [name, contracts])),
     );
@@ -441,7 +446,10 @@ describe('o ambiente do runbook satisfaz o loader de TODOS os serviços (issue #
     // reprovava com BACKUP_ENCRYPTION_MODE/BACKUP_S3_BUCKET (e outras quatro
     // na segunda rodada) e `admin-ui` com as quatro OIDC_*.
     const reprovas = Object.fromEntries(
-      SERVICES.map(({ compose: name, contracts }) => [name, reprovadas(contracts, effectiveEnv(name))]),
+      SERVICES.map(({ compose: name, contracts }) => [
+        name,
+        reprovadas(contracts, effectiveEnv(name)),
+      ]),
     );
     expect(
       reprovas,
@@ -498,7 +506,10 @@ describe('o ambiente do runbook satisfaz o loader de TODOS os serviços (issue #
     expect(comDefault).toContain('OIDC_TENANT_SLUGS');
     // E não é só o literal sozinho: numa lista, também.
     expect(
-      reprovadas(['admin-ui'], effectiveEnv('admin-ui', { add: { OIDC_TENANT_SLUGS: 'primary,default' } })),
+      reprovadas(
+        ['admin-ui'],
+        effectiveEnv('admin-ui', { add: { OIDC_TENANT_SLUGS: 'primary,default' } }),
+      ),
     ).toContain('OIDC_TENANT_SLUGS');
   });
 });

@@ -1,8 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import {
-  resolveBackupProfile,
-  type BackupConfigInput,
-} from '../../../src/ops/backup/profile.js';
+import { resolveBackupProfile, type BackupConfigInput } from '../../../src/ops/backup/profile.js';
 
 /**
  * Issue #520 §1 — RESOLUTION only.
@@ -62,9 +59,9 @@ describe('resolveBackupProfile — the profile comes from MAIA_ENV', () => {
   });
 
   it('lets an operator opt IN to off-site outside production', () => {
-    expect(
-      resolveBackupProfile(input({ BACKUP_OFFSITE_REQUIRED: true })).offsite.required,
-    ).toBe(true);
+    expect(resolveBackupProfile(input({ BACKUP_OFFSITE_REQUIRED: true })).offsite.required).toBe(
+      true,
+    );
   });
 
   it('treats an absent BACKUP_OFFSITE_REQUIRED as "the profile decides"', () => {
@@ -72,9 +69,9 @@ describe('resolveBackupProfile — the profile comes from MAIA_ENV', () => {
     expect(
       resolveBackupProfile(prod({ BACKUP_OFFSITE_REQUIRED: undefined })).offsite.required,
     ).toBe(true);
-    expect(
-      resolveBackupProfile(prod({ BACKUP_OFFSITE_REQUIRED: false })).offsite.required,
-    ).toBe(false);
+    expect(resolveBackupProfile(prod({ BACKUP_OFFSITE_REQUIRED: false })).offsite.required).toBe(
+      false,
+    );
   });
 
   it('reports a destination as configured only when a bucket is set', () => {
@@ -98,16 +95,14 @@ describe('resolveBackupProfile — the profile comes from MAIA_ENV', () => {
         .keyConfigured,
     ).toBe(false);
     expect(
-      resolveBackupProfile(prod({ BACKUP_ENCRYPTION_KEYRING: undefined })).encryption
-        .keyConfigured,
+      resolveBackupProfile(prod({ BACKUP_ENCRYPTION_KEYRING: undefined })).encryption.keyConfigured,
     ).toBe(false);
   });
 
   it('flags partial S3 credentials (both or neither)', () => {
     expect(resolveBackupProfile(prod()).offsite.credentialsComplete).toBe(true);
     expect(
-      resolveBackupProfile(prod({ BACKUP_S3_SECRET_KEY: undefined })).offsite
-        .credentialsComplete,
+      resolveBackupProfile(prod({ BACKUP_S3_SECRET_KEY: undefined })).offsite.credentialsComplete,
     ).toBe(false);
     // Neither = an instance role, which is legitimate.
     expect(

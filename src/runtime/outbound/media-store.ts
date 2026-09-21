@@ -250,7 +250,10 @@ export async function resolveOutboundMediaPath(ref: MediaRef): Promise<string> {
     [pessoa_id, 'pessoa_id'],
   ] as const) {
     if (!SAFE_SEGMENT.test(value)) {
-      throw new OutboundMediaError('malformed_key', `storage object key segment ${label} is unsafe`);
+      throw new OutboundMediaError(
+        'malformed_key',
+        `storage object key segment ${label} is unsafe`,
+      );
     }
   }
   if (!/^[0-9a-f]{64}\.[a-z0-9]{1,8}$/.test(file)) {
@@ -331,7 +334,10 @@ export async function discardOutboundMedia(ref: MediaRef): Promise<boolean> {
  * `SAFE_EXT` vira o fallback, e o fallback é sempre um literal do chamador —
  * nunca uma string derivada de dado do usuário.
  */
-export function safeOutboundExtension(candidate: string | null | undefined, fallback: string): string {
+export function safeOutboundExtension(
+  candidate: string | null | undefined,
+  fallback: string,
+): string {
   const tail = (candidate ?? '').split('.').pop()?.toLowerCase() ?? '';
   return SAFE_EXT.test(tail) ? tail : fallback;
 }

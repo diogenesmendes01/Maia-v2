@@ -73,9 +73,7 @@ vi.mock('@/db/repositories.js', async () => {
       recordTx: vi.fn(async (_tx: unknown, input: any) => {
         events.push(input);
       }),
-      listByExecution: vi.fn(async (id: string) =>
-        events.filter((e) => e.execution_id === id),
-      ),
+      listByExecution: vi.fn(async (id: string) => events.filter((e) => e.execution_id === id)),
     },
     procedureSelectorDecisionsRepo: {
       record: vi.fn(async (input: any) => {

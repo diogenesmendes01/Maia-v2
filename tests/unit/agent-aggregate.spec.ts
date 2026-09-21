@@ -129,10 +129,27 @@ describe('aggregateUnprocessedTexts', () => {
     // the agent. Earlier chunks are still NULL — the aggregator MUST find
     // them. This is the regression test for the original bug.
     h.listUnprocessedByTelefone.mockResolvedValue([
-      mkInbound({ id: 's1', conversa_id: null, conteudo: 'Oi, como esta', tipo: 'texto', created_at: T_MINUS_2 }),
-      mkInbound({ id: 's2', conversa_id: null, conteudo: 'as finanças', tipo: 'texto', created_at: T_MINUS_1 }),
+      mkInbound({
+        id: 's1',
+        conversa_id: null,
+        conteudo: 'Oi, como esta',
+        tipo: 'texto',
+        created_at: T_MINUS_2,
+      }),
+      mkInbound({
+        id: 's2',
+        conversa_id: null,
+        conteudo: 'as finanças',
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
     ]);
-    const target = mkInbound({ id: 'target-id', conversa_id: 'conv-1', conteudo: 'da empresa X?', created_at: T0 });
+    const target = mkInbound({
+      id: 'target-id',
+      conversa_id: 'conv-1',
+      conteudo: 'da empresa X?',
+      created_at: T0,
+    });
 
     const result = await _internal.aggregateUnprocessedTexts(target as never);
 
@@ -142,9 +159,20 @@ describe('aggregateUnprocessedTexts', () => {
 
   it('aggregates already-attached siblings whose conversa_id matches the target', async () => {
     h.listUnprocessedByTelefone.mockResolvedValue([
-      mkInbound({ id: 's1', conversa_id: 'conv-1', conteudo: 'attached early', tipo: 'texto', created_at: T_MINUS_1 }),
+      mkInbound({
+        id: 's1',
+        conversa_id: 'conv-1',
+        conteudo: 'attached early',
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
     ]);
-    const target = mkInbound({ id: 'target-id', conversa_id: 'conv-1', conteudo: 'tail', created_at: T0 });
+    const target = mkInbound({
+      id: 'target-id',
+      conversa_id: 'conv-1',
+      conteudo: 'tail',
+      created_at: T0,
+    });
 
     const result = await _internal.aggregateUnprocessedTexts(target as never);
 
@@ -154,10 +182,27 @@ describe('aggregateUnprocessedTexts', () => {
 
   it('rejects siblings already attached to a DIFFERENT conversa (cross-conversation guard)', async () => {
     h.listUnprocessedByTelefone.mockResolvedValue([
-      mkInbound({ id: 's1', conversa_id: 'conv-2', conteudo: 'foreign', tipo: 'texto', created_at: T_MINUS_1 }),
-      mkInbound({ id: 's2', conversa_id: null, conteudo: 'orphan ours', tipo: 'texto', created_at: T_MINUS_1 }),
+      mkInbound({
+        id: 's1',
+        conversa_id: 'conv-2',
+        conteudo: 'foreign',
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
+      mkInbound({
+        id: 's2',
+        conversa_id: null,
+        conteudo: 'orphan ours',
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
     ]);
-    const target = mkInbound({ id: 'target-id', conversa_id: 'conv-1', conteudo: 'tail', created_at: T0 });
+    const target = mkInbound({
+      id: 'target-id',
+      conversa_id: 'conv-1',
+      conteudo: 'tail',
+      created_at: T0,
+    });
 
     const result = await _internal.aggregateUnprocessedTexts(target as never);
 
@@ -167,9 +212,27 @@ describe('aggregateUnprocessedTexts', () => {
 
   it('skips siblings with empty/null content', async () => {
     h.listUnprocessedByTelefone.mockResolvedValue([
-      mkInbound({ id: 's1', conversa_id: null, conteudo: 'real', tipo: 'texto', created_at: T_MINUS_1 }),
-      mkInbound({ id: 's2', conversa_id: null, conteudo: null, tipo: 'texto', created_at: T_MINUS_1 }),
-      mkInbound({ id: 's3', conversa_id: null, conteudo: '', tipo: 'texto', created_at: T_MINUS_1 }),
+      mkInbound({
+        id: 's1',
+        conversa_id: null,
+        conteudo: 'real',
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
+      mkInbound({
+        id: 's2',
+        conversa_id: null,
+        conteudo: null,
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
+      mkInbound({
+        id: 's3',
+        conversa_id: null,
+        conteudo: '',
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
     ]);
     const target = mkInbound({ conteudo: 'tail', created_at: T0 });
 
@@ -181,10 +244,34 @@ describe('aggregateUnprocessedTexts', () => {
 
   it('does NOT aggregate audio/imagem/documento siblings — only texto', async () => {
     h.listUnprocessedByTelefone.mockResolvedValue([
-      mkInbound({ id: 'a1', conversa_id: null, conteudo: 'caption', tipo: 'audio', created_at: T_MINUS_1 }),
-      mkInbound({ id: 'i1', conversa_id: null, conteudo: 'caption', tipo: 'imagem', created_at: T_MINUS_1 }),
-      mkInbound({ id: 'd1', conversa_id: null, conteudo: 'caption', tipo: 'documento', created_at: T_MINUS_1 }),
-      mkInbound({ id: 't1', conversa_id: null, conteudo: 'real text', tipo: 'texto', created_at: T_MINUS_1 }),
+      mkInbound({
+        id: 'a1',
+        conversa_id: null,
+        conteudo: 'caption',
+        tipo: 'audio',
+        created_at: T_MINUS_1,
+      }),
+      mkInbound({
+        id: 'i1',
+        conversa_id: null,
+        conteudo: 'caption',
+        tipo: 'imagem',
+        created_at: T_MINUS_1,
+      }),
+      mkInbound({
+        id: 'd1',
+        conversa_id: null,
+        conteudo: 'caption',
+        tipo: 'documento',
+        created_at: T_MINUS_1,
+      }),
+      mkInbound({
+        id: 't1',
+        conversa_id: null,
+        conteudo: 'real text',
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
     ]);
     const target = mkInbound({ conteudo: 'tail', created_at: T0 });
 
@@ -217,8 +304,20 @@ describe('aggregateUnprocessedTexts', () => {
       // returns the (future) M2 → would yield "M2\nM1" + premature mark-processed.
       // Even with debounce on, message-recovery requeueing an old stuck job
       // could trigger this — gate 2 protects both paths.
-      mkInbound({ id: 'future-1', conversa_id: null, conteudo: 'arrived after target', tipo: 'texto', created_at: T_PLUS_1 }),
-      mkInbound({ id: 'past-1', conversa_id: null, conteudo: 'arrived before target', tipo: 'texto', created_at: T_MINUS_1 }),
+      mkInbound({
+        id: 'future-1',
+        conversa_id: null,
+        conteudo: 'arrived after target',
+        tipo: 'texto',
+        created_at: T_PLUS_1,
+      }),
+      mkInbound({
+        id: 'past-1',
+        conversa_id: null,
+        conteudo: 'arrived before target',
+        tipo: 'texto',
+        created_at: T_MINUS_1,
+      }),
     ]);
     const target = mkInbound({ conteudo: 'target', created_at: T0 });
 

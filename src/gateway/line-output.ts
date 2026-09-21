@@ -61,11 +61,7 @@ export interface LineOutput {
     path: string,
     opts: { mimetype: string; fileName: string; caption?: string; quoted?: WAQuotedContext },
   ): Promise<string | null>;
-  sendVoice(
-    jid: string,
-    buf: Buffer,
-    opts?: { quoted?: WAQuotedContext },
-  ): Promise<string | null>;
+  sendVoice(jid: string, buf: Buffer, opts?: { quoted?: WAQuotedContext }): Promise<string | null>;
   sendPoll(
     jid: string,
     question: string,
@@ -256,7 +252,8 @@ function buildOutput(scope: ChannelScope): LineOutput {
       return sendOutboundVoice(jid, buf, opts);
     },
     sendPoll(jid, question, options) {
-      if (viaManager) return manager.transportFor(scope.channel_id).sendPoll(jid, question, options);
+      if (viaManager)
+        return manager.transportFor(scope.channel_id).sendPoll(jid, question, options);
       return presenceSendPoll(jid, question, options);
     },
     sendReaction(jid, whatsappId, emoji) {

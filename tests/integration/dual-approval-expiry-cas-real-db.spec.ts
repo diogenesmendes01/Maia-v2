@@ -151,7 +151,9 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
     // do ledger. Um aviso por workflow.
     for (const id of ids) {
       const avisos = await avisosNoLedger(id);
-      expect(avisos, `o solicitante teria recebido ${avisos} avisos de DA-${id.slice(0, 8)}`).toBe(1);
+      expect(avisos, `o solicitante teria recebido ${avisos} avisos de DA-${id.slice(0, 8)}`).toBe(
+        1,
+      );
     }
 
     const st = await pool.query<{ n: string }>(
@@ -184,10 +186,9 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
     await rodarDoisTicks();
 
     expect(await avisosNoLedger(w.rows[0]!.id)).toBe(0);
-    const st = await pool.query<{ status: string }>(
-      'SELECT status FROM workflows WHERE id = $1',
-      [w.rows[0]!.id],
-    );
+    const st = await pool.query<{ status: string }>('SELECT status FROM workflows WHERE id = $1', [
+      w.rows[0]!.id,
+    ]);
     expect(st.rows[0]!.status, 'um workflow no prazo foi cancelado').toBe('aguardando_terceiro');
   });
 
@@ -202,12 +203,8 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
 
     // (a) `status IN (abertos)` — segunda chamada na MESMA row perde.
     const vencido = await semearVencido();
-    const primeira = await runWithTenantContext(escopo, () =>
-      workflowsRepo.expireIfDue(vencido),
-    );
-    const segunda = await runWithTenantContext(escopo, () =>
-      workflowsRepo.expireIfDue(vencido),
-    );
+    const primeira = await runWithTenantContext(escopo, () => workflowsRepo.expireIfDue(vencido));
+    const segunda = await runWithTenantContext(escopo, () => workflowsRepo.expireIfDue(vencido));
     expect(primeira, 'a primeira chamada devia ter vencido a row').toBe(true);
     expect(segunda, 'a segunda chamada cancelou de novo o que já estava cancelado').toBe(false);
 
@@ -238,9 +235,7 @@ d('expiração de dual approval — o efeito externo acontece UMA vez', () => {
     // `aguardando_terceiro`. O conjunto aqui é o mesmo `WORKFLOW_OPEN_STATUSES`
     // que `listPending` usa para trazer a row até o laço.
     const { runWithTenantContext } = await import('../../src/db/tenant-context.js');
-    const { workflowsRepo, WORKFLOW_OPEN_STATUSES } = await import(
-      '../../src/db/repositories.js'
-    );
+    const { workflowsRepo, WORKFLOW_OPEN_STATUSES } = await import('../../src/db/repositories.js');
     const escopo = { tenant_id: T, agent_id: A };
 
     for (const status of WORKFLOW_OPEN_STATUSES) {

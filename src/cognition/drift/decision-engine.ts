@@ -29,15 +29,8 @@
  * já governou os detectores. Este engine é a borda determinística que
  * traduz evidência em ação operacional + audit.
  */
-import {
-  DriftSeverity,
-  DriftDecision,
-  DriftType,
-} from '@/types/enums.js';
-import {
-  operationalProfileVersionsRepo,
-  driftAlertsRepo,
-} from '@/db/repositories.js';
+import { DriftSeverity, DriftDecision, DriftType } from '@/types/enums.js';
+import { operationalProfileVersionsRepo, driftAlertsRepo } from '@/db/repositories.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { logger } from '@/lib/logger.js';
 import type { DriftEvidence } from './types.js';
@@ -225,9 +218,7 @@ export function classifySeverity(ev: DriftEvidence): DriftSeverity {
         typeof declared === 'string' &&
         SLUG_RE.test(observed.trim()) &&
         SLUG_RE.test(declared.trim()) &&
-        !observed.toLowerCase().includes(
-          (declared.toLowerCase().split('_')[0] ?? ''),
-        );
+        !observed.toLowerCase().includes(declared.toLowerCase().split('_')[0] ?? '');
 
       if (offRole.length >= 5 || (rolesDiverge && offRole.length >= 3))
         return DriftSeverity.CRITICO;
@@ -371,8 +362,7 @@ export async function decideAndApply(args: {
     const { severity, decision } = classifyAndDecide(ev);
     const mutatesProfile =
       ev.drift_type !== DriftType.SOUL_DRIFT &&
-      (decision === DriftDecision.FROZEN ||
-        decision === DriftDecision.ROLLBACK);
+      (decision === DriftDecision.FROZEN || decision === DriftDecision.ROLLBACK);
     return { ev, index, severity, decision, mutatesProfile };
   });
 
@@ -461,8 +451,7 @@ export async function decideAndApply(args: {
     if (persisted.length === 0) continue;
     let winner = persisted[0]!;
     for (const item of persisted) {
-      const stronger =
-        SEVERITY_RANK[item.severity] > SEVERITY_RANK[winner.severity];
+      const stronger = SEVERITY_RANK[item.severity] > SEVERITY_RANK[winner.severity];
       if (stronger) winner = item;
     }
     realWinnerIndexByProfile.set(profileId, winner.index);
@@ -476,8 +465,7 @@ export async function decideAndApply(args: {
   for (const [profileId, items] of mutatorsByProfile) {
     let intendedWinner = items[0]!;
     for (const item of items) {
-      const stronger =
-        SEVERITY_RANK[item.severity] > SEVERITY_RANK[intendedWinner.severity];
+      const stronger = SEVERITY_RANK[item.severity] > SEVERITY_RANK[intendedWinner.severity];
       if (stronger) intendedWinner = item;
     }
     const realWinnerIdx = realWinnerIndexByProfile.get(profileId);
@@ -528,10 +516,7 @@ export async function decideAndApply(args: {
   //     The applied-only-if-alert-persisted invariant still holds: the
   //     winner selection step above ALREADY filtered out unpersisted
   //     mutators, so the winner here always has an alert_id.
-  const applyResult = new Map<
-    number,
-    { applied: boolean; applied_error?: string }
-  >();
+  const applyResult = new Map<number, { applied: boolean; applied_error?: string }>();
   for (const [profileId, winnerIndex] of realWinnerIndexByProfile) {
     const winner = classified[winnerIndex]!;
     const winnerAlertId = perItem[winnerIndex]!.alert_id;
@@ -570,9 +555,7 @@ export async function decideAndApply(args: {
         expected_from: 'active',
         approved_by: `auto:drift_${winner.severity}`,
         rollback_reason:
-          winner.decision === DriftDecision.ROLLBACK
-            ? winner.ev.evidence_summary
-            : undefined,
+          winner.decision === DriftDecision.ROLLBACK ? winner.ev.evidence_summary : undefined,
       });
       if (r.ok) {
         applyResult.set(winnerIndex, { applied: true });
@@ -744,10 +727,10 @@ export async function decideAndApply(args: {
       } else {
         const applied_error =
           r.reason === 'stale'
-            // Encode the observed-state in the error string so postmortems
-            // can see WHY the rollback was skipped (active row was already
-            // frozen/rolled_back/replaced by a concurrent writer).
-            ? `stale:expected=${r.expected_from},actual=${r.actual}`
+            ? // Encode the observed-state in the error string so postmortems
+              // can see WHY the rollback was skipped (active row was already
+              // frozen/rolled_back/replaced by a concurrent writer).
+              `stale:expected=${r.expected_from},actual=${r.actual}`
             : r.reason;
         applyResult.set(winnerIndex, { applied: false, applied_error });
       }

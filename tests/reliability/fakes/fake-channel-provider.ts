@@ -58,12 +58,14 @@ export type EntradaDeLedger = z.infer<typeof entradaDeLedgerSchema>;
 export const ledgerSchema = z.object({
   entries: z.array(entradaDeLedgerSchema),
   calls: z.array(
-    z.object({
-      idempotency_key: z.string(),
-      payload_hash: z.string(),
-      at: z.number(),
-      kind: z.string(),
-    }).passthrough(),
+    z
+      .object({
+        idempotency_key: z.string(),
+        payload_hash: z.string(),
+        at: z.number(),
+        kind: z.string(),
+      })
+      .passthrough(),
   ),
   physical_call_total: z.number().int().min(0),
   logical_effect_total: z.number().int().min(0),

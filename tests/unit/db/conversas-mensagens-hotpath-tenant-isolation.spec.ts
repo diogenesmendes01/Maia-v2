@@ -69,9 +69,27 @@ describe('Flip-readiness (#323) — conversas hot-path mutations are tenant+agen
     const OLD = new Date('2020-01-01T00:00:00.000Z');
     beforeEach(() => {
       store.reset([
-        { id: 'shared', tenant_id: A.tenant_id, agent_id: A.agent_id, status: 'ativa', ultima_atividade_em: OLD },
-        { id: 'shared', tenant_id: B.tenant_id, agent_id: B.agent_id, status: 'ativa', ultima_atividade_em: OLD },
-        { id: 'shared', tenant_id: A_OTHER_AGENT.tenant_id, agent_id: A_OTHER_AGENT.agent_id, status: 'ativa', ultima_atividade_em: OLD },
+        {
+          id: 'shared',
+          tenant_id: A.tenant_id,
+          agent_id: A.agent_id,
+          status: 'ativa',
+          ultima_atividade_em: OLD,
+        },
+        {
+          id: 'shared',
+          tenant_id: B.tenant_id,
+          agent_id: B.agent_id,
+          status: 'ativa',
+          ultima_atividade_em: OLD,
+        },
+        {
+          id: 'shared',
+          tenant_id: A_OTHER_AGENT.tenant_id,
+          agent_id: A_OTHER_AGENT.agent_id,
+          status: 'ativa',
+          ultima_atividade_em: OLD,
+        },
       ]);
     });
 
@@ -91,8 +109,20 @@ describe('Flip-readiness (#323) — conversas hot-path mutations are tenant+agen
   describe('conversasRepo.updateMetadata (predicate-only)', () => {
     beforeEach(() => {
       store.reset([
-        { id: 'shared', tenant_id: A.tenant_id, agent_id: A.agent_id, status: 'ativa', metadata: { who: 'A' } },
-        { id: 'shared', tenant_id: B.tenant_id, agent_id: B.agent_id, status: 'ativa', metadata: { who: 'B' } },
+        {
+          id: 'shared',
+          tenant_id: A.tenant_id,
+          agent_id: A.agent_id,
+          status: 'ativa',
+          metadata: { who: 'A' },
+        },
+        {
+          id: 'shared',
+          tenant_id: B.tenant_id,
+          agent_id: B.agent_id,
+          status: 'ativa',
+          metadata: { who: 'B' },
+        },
       ]);
     });
 
@@ -110,8 +140,20 @@ describe('Flip-readiness (#323) — conversas hot-path mutations are tenant+agen
   describe('conversasRepo.mergeMetadata (predicate-only)', () => {
     beforeEach(() => {
       store.reset([
-        { id: 'shared', tenant_id: A.tenant_id, agent_id: A.agent_id, status: 'ativa', metadata: { who: 'A' } },
-        { id: 'shared', tenant_id: B.tenant_id, agent_id: B.agent_id, status: 'ativa', metadata: { who: 'B' } },
+        {
+          id: 'shared',
+          tenant_id: A.tenant_id,
+          agent_id: A.agent_id,
+          status: 'ativa',
+          metadata: { who: 'A' },
+        },
+        {
+          id: 'shared',
+          tenant_id: B.tenant_id,
+          agent_id: B.agent_id,
+          status: 'ativa',
+          metadata: { who: 'B' },
+        },
       ]);
     });
 
@@ -130,13 +172,27 @@ describe('Flip-readiness (#323) — conversas hot-path mutations are tenant+agen
   describe('conversasRepo.unsetMetadataKey (predicate-only)', () => {
     beforeEach(() => {
       store.reset([
-        { id: 'shared', tenant_id: A.tenant_id, agent_id: A.agent_id, status: 'ativa', metadata: { pending_question: { id: 'A' } } },
-        { id: 'shared', tenant_id: B.tenant_id, agent_id: B.agent_id, status: 'ativa', metadata: { pending_question: { id: 'B' } } },
+        {
+          id: 'shared',
+          tenant_id: A.tenant_id,
+          agent_id: A.agent_id,
+          status: 'ativa',
+          metadata: { pending_question: { id: 'A' } },
+        },
+        {
+          id: 'shared',
+          tenant_id: B.tenant_id,
+          agent_id: B.agent_id,
+          status: 'ativa',
+          metadata: { pending_question: { id: 'B' } },
+        },
       ]);
     });
 
     it('targets ONLY tenant-A; tenant-B metadata untouched', async () => {
-      await runWithTenantContext(A, () => conversasRepo.unsetMetadataKey('shared', 'pending_question'));
+      await runWithTenantContext(A, () =>
+        conversasRepo.unsetMetadataKey('shared', 'pending_question'),
+      );
 
       const b = store.rows.find((r) => r.tenant_id === B.tenant_id)!;
       expect(b.metadata).toEqual({ pending_question: { id: 'B' } });
@@ -148,9 +204,30 @@ describe('Flip-readiness (#323) — conversas hot-path mutations are tenant+agen
     const SHARED_PESSOA = 'pessoa-shared';
     beforeEach(() => {
       store.reset([
-        { id: 'cA', tenant_id: A.tenant_id, agent_id: A.agent_id, status: 'ativa', pessoa_id: SHARED_PESSOA, escopo_entidades: ['e1'] },
-        { id: 'cB', tenant_id: B.tenant_id, agent_id: B.agent_id, status: 'ativa', pessoa_id: SHARED_PESSOA, escopo_entidades: ['e2'] },
-        { id: 'cAZ', tenant_id: A_OTHER_AGENT.tenant_id, agent_id: A_OTHER_AGENT.agent_id, status: 'ativa', pessoa_id: SHARED_PESSOA, escopo_entidades: ['e3'] },
+        {
+          id: 'cA',
+          tenant_id: A.tenant_id,
+          agent_id: A.agent_id,
+          status: 'ativa',
+          pessoa_id: SHARED_PESSOA,
+          escopo_entidades: ['e1'],
+        },
+        {
+          id: 'cB',
+          tenant_id: B.tenant_id,
+          agent_id: B.agent_id,
+          status: 'ativa',
+          pessoa_id: SHARED_PESSOA,
+          escopo_entidades: ['e2'],
+        },
+        {
+          id: 'cAZ',
+          tenant_id: A_OTHER_AGENT.tenant_id,
+          agent_id: A_OTHER_AGENT.agent_id,
+          status: 'ativa',
+          pessoa_id: SHARED_PESSOA,
+          escopo_entidades: ['e3'],
+        },
       ]);
     });
 
@@ -173,8 +250,20 @@ describe('Flip-readiness (#323) — mensagens hot-path mutations are tenant+agen
   describe('mensagensRepo.setConversaId (fail-loud)', () => {
     beforeEach(() => {
       store.reset([
-        { id: 'shared', tenant_id: A.tenant_id, agent_id: A.agent_id, status: '', conversa_id: null },
-        { id: 'shared', tenant_id: B.tenant_id, agent_id: B.agent_id, status: '', conversa_id: 'B-conv' },
+        {
+          id: 'shared',
+          tenant_id: A.tenant_id,
+          agent_id: A.agent_id,
+          status: '',
+          conversa_id: null,
+        },
+        {
+          id: 'shared',
+          tenant_id: B.tenant_id,
+          agent_id: B.agent_id,
+          status: '',
+          conversa_id: 'B-conv',
+        },
       ]);
     });
 
@@ -222,7 +311,9 @@ describe('Flip-readiness (#323) — mensagens hot-path mutations are tenant+agen
     });
 
     it('empty id list short-circuits (no UPDATE issued)', async () => {
-      store.reset([{ id: 'm1', tenant_id: A.tenant_id, agent_id: A.agent_id, status: '', conversa_id: null }]);
+      store.reset([
+        { id: 'm1', tenant_id: A.tenant_id, agent_id: A.agent_id, status: '', conversa_id: null },
+      ]);
       await runWithTenantContext(A, () => mensagensRepo.setConversaIdMany([], 'A-conv'));
       expect(store.lastPredicate()).toBeUndefined(); // never reached `.where`
     });
@@ -231,8 +322,22 @@ describe('Flip-readiness (#323) — mensagens hot-path mutations are tenant+agen
   describe('mensagensRepo.markProcessed (fail-loud)', () => {
     beforeEach(() => {
       store.reset([
-        { id: 'shared', tenant_id: A.tenant_id, agent_id: A.agent_id, status: '', processada_em: null, tokens_usados: null },
-        { id: 'shared', tenant_id: B.tenant_id, agent_id: B.agent_id, status: '', processada_em: null, tokens_usados: 999 },
+        {
+          id: 'shared',
+          tenant_id: A.tenant_id,
+          agent_id: A.agent_id,
+          status: '',
+          processada_em: null,
+          tokens_usados: null,
+        },
+        {
+          id: 'shared',
+          tenant_id: B.tenant_id,
+          agent_id: B.agent_id,
+          status: '',
+          processada_em: null,
+          tokens_usados: 999,
+        },
       ]);
     });
 

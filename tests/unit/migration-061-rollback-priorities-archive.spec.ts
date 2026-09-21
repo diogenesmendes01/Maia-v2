@@ -111,9 +111,7 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
       // is unresolvable when the archive UPDATE executes.
       const archiveIdx = downCode.indexOf(`SET ${SIDECAR_COL}`);
       // Fall back to a tolerant search to tolerate whitespace variation.
-      const tolerantArchiveIdx = downCode.search(
-        new RegExp(`SET\\s+${SIDECAR_COL}\\s*=`, 'i'),
-      );
+      const tolerantArchiveIdx = downCode.search(new RegExp(`SET\\s+${SIDECAR_COL}\\s*=`, 'i'));
       const dropIdx = downCode.search(/DROP\s+COLUMN\s+IF\s+EXISTS\s+profile_body/i);
       const finalArchiveIdx = archiveIdx >= 0 ? archiveIdx : tolerantArchiveIdx;
       expect(finalArchiveIdx, 'archive UPDATE must exist').toBeGreaterThanOrEqual(0);
@@ -125,10 +123,7 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
       // #194 closed the priorities → principles fallback. The new sidecar
       // must NEVER feed core_immutable.principles either — otherwise we'd
       // reintroduce the VALORES audit contamination through a side door.
-      const contamRe = new RegExp(
-        `'principles'[\\s\\S]{0,200}${SIDECAR_COL}`,
-        'i',
-      );
+      const contamRe = new RegExp(`'principles'[\\s\\S]{0,200}${SIDECAR_COL}`, 'i');
       expect(downCode).not.toMatch(contamRe);
     });
 
@@ -162,10 +157,7 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
       // The up must detect the sidecar column at migration time (introspect
       // information_schema, same pattern as the existing legacy check) and
       // restore from it when present.
-      const introspectRe = new RegExp(
-        `information_schema\\.columns[\\s\\S]*${SIDECAR_COL}`,
-        'i',
-      );
+      const introspectRe = new RegExp(`information_schema\\.columns[\\s\\S]*${SIDECAR_COL}`, 'i');
       expect(upCode).toMatch(introspectRe);
     });
 
@@ -184,10 +176,7 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
       // After restore, the sidecar must be reset to '{}'::jsonb so a second
       // up doesn't redundantly overwrite identity.priorities — and so a
       // subsequent down captures a fresh snapshot.
-      const clearRe = new RegExp(
-        `SET\\s+[\\s\\S]*${SIDECAR_COL}\\s*=\\s*'\\{\\}'::jsonb`,
-        'i',
-      );
+      const clearRe = new RegExp(`SET\\s+[\\s\\S]*${SIDECAR_COL}\\s*=\\s*'\\{\\}'::jsonb`, 'i');
       expect(upCode).toMatch(clearRe);
     });
 
@@ -217,14 +206,8 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
       // breaks.
       const sidecarInDown = downCode.includes(SIDECAR_COL);
       const sidecarInUp = upCode.includes(SIDECAR_COL);
-      expect(
-        sidecarInDown,
-        'down migration must reference the sidecar column',
-      ).toBe(true);
-      expect(
-        sidecarInUp,
-        'up migration must reference the sidecar column for restore',
-      ).toBe(true);
+      expect(sidecarInDown, 'down migration must reference the sidecar column').toBe(true);
+      expect(sidecarInUp, 'up migration must reference the sidecar column for restore').toBe(true);
     });
 
     it('tenant isolation: archive UPDATE has no cross-tenant join or subquery', () => {
@@ -238,10 +221,7 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
           'i',
         ),
       );
-      expect(
-        archiveBlockMatch,
-        'archive UPDATE block must be present',
-      ).not.toBeNull();
+      expect(archiveBlockMatch, 'archive UPDATE block must be present').not.toBeNull();
       const archiveBlock = archiveBlockMatch![0];
       expect(archiveBlock).not.toMatch(/\bJOIN\b/i);
       // Also: no subquery that could leak across rows (the only valid
@@ -274,8 +254,7 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
         'i',
       );
       const seedsIdentity =
-        seedJsonbBuildObjectRe.test(upCode) ||
-        nestedJsonbSetIdentityRe.test(upCode);
+        seedJsonbBuildObjectRe.test(upCode) || nestedJsonbSetIdentityRe.test(upCode);
       expect(
         seedsIdentity,
         'expected the restore SET to seed profile_body.identity (jsonb_build_object or nested jsonb_set) before writing identity.priorities, otherwise canonical-only re-up loses archived priorities',
@@ -307,9 +286,7 @@ describe('migration 061 — issue #203 rollback priorities sidecar archive', () 
       const block = restoreBlockMatch![0];
       // Same statement must touch BOTH the sidecar clear AND the
       // identity.priorities write.
-      expect(block).toMatch(
-        new RegExp(`${SIDECAR_COL}\\s*=\\s*'\\{\\}'::jsonb`, 'i'),
-      );
+      expect(block).toMatch(new RegExp(`${SIDECAR_COL}\\s*=\\s*'\\{\\}'::jsonb`, 'i'));
       expect(block).toMatch(/identity[\s\S]*priorities/i);
     });
   });
