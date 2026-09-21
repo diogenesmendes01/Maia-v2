@@ -42,7 +42,7 @@ export type AdmissionGuarantee = typeof ADMISSION_GUARANTEE;
 
 /**
  * `engine_budget_accounts` (§9.2), na forma que a decisão precisa: conta por
- * `(tenant_id, agent_id, period_start_utc, currency)` já resolvida e travada.
+ * `(tenant_id, agent_id, period_start_utc)` já resolvida e travada.
  *
  * Não há `tenant_id` aqui: quem resolveu a conta foi o repositório, sob ALS. A
  * política não escolhe conta — escolher conta a partir de um parâmetro é como se
@@ -67,31 +67,28 @@ export interface AdmissionRequestV1 {
 }
 
 /**
- * O que fazer quando não há preço verificável.
- *
- * §9.2: "sem preço/limite superior verificável, modo de hard cap fica
- * desabilitado **ou** a admissão é negada conforme policy". A spec deixa os dois
- * caminhos abertos, então a escolha entra por PARÂMETRO — exatamente como
- * `blockCategories` em `poison-policy`. Fixá-la aqui dentro seria política
- * minha disfarçada de leitura da spec.
+ * Sem preço verificável, NÃO admite (decisão do dono para produção). O §9.2
+ * deixa "hard cap desabilitado ou admissão negada conforme policy"; a variante
+ * que admitia sem preço existia só por parâmetro e saiu: `estimate_microusd`
+ * `null` fica como sinal de diagnóstico (motivo `unknown_price`), nunca como
+ * reserva zero nem como exposição sem teto.
  */
-export interface AdmissionPolicyV1 {
-  on_unpriced: 'deny' | 'admit_unpriced';
-}
-
 export type AdmissionDecisionV1 =
   | {
       kind: 'admit';
       guarantee: AdmissionGuarantee;
-      /** `null` = admitida SEM preço. Nunca `'0'`: zero seria exposição falsa. */
-      reserve_microusd: string | null;
-      /** Falso quando não há tarifa: o teto não pode ser imposto sem preço. */
-      hard_cap_enabled: boolean;
+      /** Exposição reservada, em microusd. Sempre com preço: nunca `null`, nunca `'0'` inventado. */
+      reserve_microusd: string;
     }
   | {
       kind: 'refuse';
       guarantee: AdmissionGuarantee;
-      code: 'budget_exhausted' | 'inference_limit_exceeded' | 'admission_unavailable';
+      code:
+        | 'budget_exhausted'
+        | 'inference_limit_exceeded'
+        | 'admission_unavailable'
+        /** Tarifa desconhecida (`estimate_microusd` null): sem preço não há reserva. */
+        | 'unknown_price';
     };
 
 const DECIMAL_UINT_RE = /^(0|[1-9][0-9]*)$/;
@@ -124,7 +121,6 @@ function uint(valor: string, campo: string): bigint {
 export function decideAdmission(
   account: BudgetAccountV1 | null,
   request: AdmissionRequestV1,
-  policy: AdmissionPolicyV1,
 ): AdmissionDecisionV1 {
   if (account === null) {
     return { kind: 'refuse', guarantee: ADMISSION_GUARANTEE, code: 'admission_unavailable' };
@@ -135,18 +131,7 @@ export function decideAdmission(
   }
 
   if (request.estimate_microusd === null) {
-    if (policy.on_unpriced === 'deny') {
-      return { kind: 'refuse', guarantee: ADMISSION_GUARANTEE, code: 'budget_exhausted' };
-    }
-    // Admitida sem preço: a reserva é `null` (não zero) para que a ausência de
-    // tarifa fique VISÍVEL na conta, e o hard cap é declarado desligado —
-    // impor teto sem preço seria afirmar um controle que não existe.
-    return {
-      kind: 'admit',
-      guarantee: ADMISSION_GUARANTEE,
-      reserve_microusd: null,
-      hard_cap_enabled: false,
-    };
+    return { kind: 'refuse', guarantee: ADMISSION_GUARANTEE, code: 'unknown_price' };
   }
 
   const estimativa = uint(request.estimate_microusd, 'estimate_microusd');
@@ -164,16 +149,14 @@ export function decideAdmission(
     kind: 'admit',
     guarantee: ADMISSION_GUARANTEE,
     reserve_microusd: estimativa.toString(),
-    hard_cap_enabled: true,
   };
 }
 
 /**
  * Aplica uma admissão à conta — a metade "soma reserva" da transação do §9.2.
  *
- * `row_version` avança em TODA admissão, inclusive na não precificada: a
- * tentativa existe, e uma versão que não anda deixaria um CAS concorrente
- * acreditar que nada aconteceu. A exposição, essa sim, só anda quando há preço.
+ * `row_version` avança em TODA admissão: a tentativa existe, e uma versão que
+ * não anda deixaria um CAS concorrente acreditar que nada aconteceu.
  */
 export function applyAdmission(
   account: BudgetAccountV1,
@@ -181,10 +164,7 @@ export function applyAdmission(
 ): BudgetAccountV1 {
   if (decision.kind !== 'admit') return account;
   const reservado = uint(account.reserved_microusd, 'reserved_microusd');
-  const acrescimo =
-    decision.reserve_microusd === null
-      ? 0n
-      : uint(decision.reserve_microusd, 'reserve_microusd');
+  const acrescimo = uint(decision.reserve_microusd, 'reserve_microusd');
   return {
     ...account,
     reserved_microusd: (reservado + acrescimo).toString(),
