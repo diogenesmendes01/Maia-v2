@@ -264,7 +264,8 @@ export type ReActExitReason =
   | 'reasoner_failed'
   | 'outbound_failure'
   | 'empty_final_text'
-  | 'iteration_cap';
+  | 'iteration_cap'
+  | 'claim_divergence_blocked';
 
 /**
  * Runs the ReAct iteration loop. Keeps the LLM call → tool execution cycle

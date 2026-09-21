@@ -57,6 +57,16 @@ export function decideTurnAction(delivery: ReActDelivery): TurnAction {
       : { kind: 'retry', code: delivery.exitReason };
   }
 
+  // 2b. [P2] Bloqueio de reconciliação — divergência com efeito.
+  //     O motor alegou ter chamado ferramentas sem receipt: um efeito ocorreu,
+  //     mas não sabemos qual subset da alegação corresponde ao que foi realmente
+  //     executado. Bloquear e exigir investigação/reconciliação é mandatório.
+  //     Sem este reconhecimento explícito, divergência com efeito fica
+  //     indistinguível de um turno que simplesmente não produziu resposta.
+  if (delivery.exitReason === 'claim_divergence_blocked' && delivery.sideEffectsCommitted) {
+    return { kind: 'dead_letter', code: delivery.exitReason, outcome: 'unsafe_to_retry' };
+  }
+
   // 3. O turno correu até o fim sem produzir resposta.
   return { kind: 'complete', outcome: 'no_reply_produced' };
 }

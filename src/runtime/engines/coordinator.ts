@@ -134,9 +134,14 @@ export async function coordinateOutput(
       },
       'engine.coordinator.claim_divergence_blocked_delivery',
     );
-    // Efeito pode ter ocorrido nas chamadas que ESTÃO no journal, então o
-    // motivo não pode ser retryable por conta própria: quem decide retry é
-    // `decideTurnAction`, lendo `sideEffectsCommitted`.
+    // [P2] Preservar divergência explicitamente até decideTurnAction.
+    // O motivo 'claim_divergence_blocked' não é retryable (não está em
+    // RETRYABLE_EXITS de turn-outcome.ts), mas se sideEffectsCommitted=true,
+    // indicará dead_letter/unsafe_to_retry — bloqueio de reconciliação, não
+    // turno vazio. Sem este motivo explícito, uma divergência com efeito fica
+    // indistinguível de um turno que simplesmente não produziu resposta.
+    exitReason = 'claim_divergence_blocked';
+
     if (assembled.toolSummaries.length > 0) {
       await deps.flushUnconfirmedToolSummaries(
         conversa.id,
@@ -210,7 +215,23 @@ export async function coordinateOutput(
       // Lacuna interna só depois de algo CHEGAR ao usuário — nunca depois de
       // uma falha pre-send. Texto cru, sem o prefixo de role, para o anúncio
       // da Maia não disparar lacuna por frase nossa.
-      deps.onDelivered?.(candidato.rawText);
+      //
+      // [P2] Proteger throws síncronos E rejeições assíncronas da hook. O contrato
+      // declara "fire-and-forget, NUNCA bloqueia a resposta" (§5.9.2.9), então o
+      // `dispatch` já confirmou a entrega e `dispatched = true`. Uma falha auxiliar
+      // não pode apagar esse veredito que o caller precisa preservar.
+      void Promise.resolve()
+        .then(() => deps.onDelivered?.(candidato.rawText))
+        .catch((err) => {
+          logger.warn(
+            {
+              conversa_id: conversa.id,
+              mensagem_id: inbound.id,
+              err,
+            },
+            'engine.coordinator.onDelivered_hook_failed',
+          );
+        });
     }
   }
 
