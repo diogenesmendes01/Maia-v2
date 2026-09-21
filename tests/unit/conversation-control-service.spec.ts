@@ -143,3 +143,48 @@ describe('resumeConversation — future_only não é escolha do caller', () => {
     expect(r.kind === 'resumed' && r.resume_after_ingress_seq).toBe('1234');
   });
 });
+
+describe('identidade do desfecho — comando e chave de idempotência não se misturam', () => {
+  it('pausa devolve identidade de COMANDO, com o id emitido pelo repositório', async () => {
+    pauseConversationTx.mockResolvedValue({ ...PAUSA_OK, drain_status: 'complete' });
+    const r = await pauseConversation(CMD);
+    expect(r.kind === 'acquired' && r.identity).toEqual({
+      kind: 'command',
+      command_id: 'cmd-1',
+    });
+  });
+
+  it('reconciliação avulsa NÃO fabrica um command_id', async () => {
+    // `reconcilePauseTx` não emite comando — ele reconcilia um que já existe.
+    // A versão anterior devolvia a `idempotency_key` no campo `command_id`, e
+    // um consumidor que correlacionasse os dois resultados receberia
+    // identificadores que não são comparáveis entre si.
+    const { reconcilePause } = await import('@/runtime/conversation-control/service.js');
+    reconcilePauseTx.mockResolvedValue({
+      ok: true,
+      idempotent: false,
+      control_id: 'ctl-1',
+      mode: 'human',
+      epoch: '8',
+      drain_status: 'complete',
+      inflight_effects: 0,
+      unknown_deliveries: 0,
+      drain_scope: 'engine_originated_only',
+      updated_at: new Date(),
+    });
+
+    const r = await reconcilePause({
+      control_id: 'ctl-1',
+      expected_epoch: '8',
+      idempotency_key: 'idem-9',
+      requested_by_app_user_id: 'op-1',
+    });
+
+    expect(r.kind === 'acquired' && r.identity).toEqual({
+      kind: 'standalone_reconciliation',
+      idempotency_key: 'idem-9',
+    });
+    // E o discriminante impede ler um como o outro por engano.
+    expect(JSON.stringify(r)).not.toContain('"command_id"');
+  });
+});

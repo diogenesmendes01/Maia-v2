@@ -80,19 +80,39 @@ export type ResumeCommandV1 = {
  * console mostra isso como estado, não como erro, e o §8.2.4 é explícito em
  * que entrega em voo conserva `delivery_unknown` sem reenvio cego.
  */
+/**
+ * De onde vem a identidade do desfecho.
+ *
+ * Existe porque `command_id` e chave de idempotência são coisas de naturezas
+ * diferentes, e o tipo anterior deixava as duas ocuparem o mesmo campo:
+ * `pauseConversation` devolvia o id REAL emitido pelo repositório, e
+ * `reconcilePause` devolvia a `idempotency_key` que o chamador tinha passado.
+ * Um consumidor que correlacionasse os dois resultados receberia
+ * identificadores que não são comparáveis entre si.
+ *
+ * `reconcilePauseTx` simplesmente NÃO emite comando — ele reconcilia um que já
+ * existe. Fabricar um id ali seria inventar a identidade que falta. A união
+ * torna isso impossível de ler por engano.
+ */
+export type ControlIdentityV1 =
+  /** Um comando foi emitido e o repositório devolveu o id dele. */
+  | { kind: 'command'; command_id: string }
+  /** Reconciliação avulsa: não há comando, só a chave que a deduplica. */
+  | { kind: 'standalone_reconciliation'; idempotency_key: string };
+
 export type PauseOutcomeV1 =
   | {
       kind: 'acquired';
       control_id: string;
       epoch: string;
       idempotent: boolean;
-      command_id: string;
+      identity: ControlIdentityV1;
     }
   | {
       kind: 'reconciliation_required';
       control_id: string;
       epoch: string;
-      command_id: string;
+      identity: ControlIdentityV1;
       inflight_effects: number;
       unknown_deliveries: number;
       /** O dreno mede SÓ egresso de origem engine — ver `ReconcilePauseResult`. */
@@ -155,7 +175,7 @@ export async function pauseConversation(cmd: PauseCommandV1): Promise<PauseOutco
       control_id: pausa.control_id,
       epoch: pausa.epoch,
       idempotent: pausa.idempotent,
-      command_id: pausa.command_id,
+      identity: { kind: 'command', command_id: pausa.command_id },
     };
   }
 
@@ -185,7 +205,7 @@ export async function pauseConversation(cmd: PauseCommandV1): Promise<PauseOutco
       kind: 'reconciliation_required',
       control_id: pausa.control_id,
       epoch: pausa.epoch,
-      command_id: pausa.command_id,
+      identity: { kind: 'command', command_id: pausa.command_id },
       inflight_effects: pausa.inflight_effects,
       unknown_deliveries: pausa.unknown_deliveries,
       drain_scope: 'engine_originated_only',
@@ -198,7 +218,7 @@ export async function pauseConversation(cmd: PauseCommandV1): Promise<PauseOutco
       control_id: pausa.control_id,
       epoch: reconciliacao.epoch,
       idempotent: pausa.idempotent,
-      command_id: pausa.command_id,
+      identity: { kind: 'command', command_id: pausa.command_id },
     };
   }
 
@@ -206,7 +226,7 @@ export async function pauseConversation(cmd: PauseCommandV1): Promise<PauseOutco
     kind: 'reconciliation_required',
     control_id: pausa.control_id,
     epoch: reconciliacao.epoch,
-    command_id: pausa.command_id,
+    identity: { kind: 'command', command_id: pausa.command_id },
     inflight_effects: reconciliacao.inflight_effects,
     unknown_deliveries: reconciliacao.unknown_deliveries,
     drain_scope: reconciliacao.drain_scope,
@@ -240,14 +260,14 @@ export async function reconcilePause(cmd: {
       control_id: r.control_id,
       epoch: r.epoch,
       idempotent: r.idempotent,
-      command_id: cmd.idempotency_key,
+      identity: { kind: 'standalone_reconciliation', idempotency_key: cmd.idempotency_key },
     };
   }
   return {
     kind: 'reconciliation_required',
     control_id: r.control_id,
     epoch: r.epoch,
-    command_id: cmd.idempotency_key,
+    identity: { kind: 'standalone_reconciliation', idempotency_key: cmd.idempotency_key },
     inflight_effects: r.inflight_effects,
     unknown_deliveries: r.unknown_deliveries,
     drain_scope: r.drain_scope,
