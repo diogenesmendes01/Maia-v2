@@ -4943,11 +4943,7 @@ export const engine_usage_events = pgTable(
   },
   (t) => ({
     keyUq: unique('engine_usage_events_key_uq').on(t.tenant_id, t.agent_id, t.event_key),
-    attemptIdx: index('engine_usage_events_attempt_idx').on(
-      t.tenant_id,
-      t.agent_id,
-      t.attempt_id,
-    ),
+    attemptIdx: index('engine_usage_events_attempt_idx').on(t.tenant_id, t.agent_id, t.attempt_id),
   }),
 );
 
@@ -4959,3 +4955,40 @@ export type EngineInferenceAttemptRow = typeof engine_inference_attempts.$inferS
 export type NewEngineInferenceAttemptRow = typeof engine_inference_attempts.$inferInsert;
 export type EngineUsageEventRow = typeof engine_usage_events.$inferSelect;
 export type NewEngineUsageEventRow = typeof engine_usage_events.$inferInsert;
+
+/* ───────────────────────────────────────────────────────────────────────────
+ * POLÍTICA DE ENGINE POR ESCOPO (migration 145, spec §4.1, K-15)
+ *
+ * Espelho, não a autoridade: a FK composta para `channels (tenant_id,
+ * agent_id, id)` e os CHECKs de engine, versão, ator e literal `default` moram
+ * na migration.
+ * ─────────────────────────────────────────────────────────────────────────── */
+
+/**
+ * Motor de turno NOVO por (tenant, agente, canal). Linha ausente = `maia_react`;
+ * nenhuma flag global liga o Hermes. Escrita por CAS em `row_version`.
+ */
+export const agent_engine_policies = pgTable(
+  'agent_engine_policies',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    channel_id: uuid('channel_id').notNull(),
+    /** `maia_react` | `hermes`. */
+    engine: text('engine').notNull(),
+    row_version: bigint('row_version', { mode: 'number' }).notNull().default(1),
+    /** Ator da última escrita. `app_users.id` é text; referência SOFT. */
+    updated_by: text('updated_by').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      name: 'agent_engine_policies_pk',
+      columns: [t.tenant_id, t.agent_id, t.channel_id],
+    }),
+  }),
+);
+
+export type AgentEnginePolicyRow = typeof agent_engine_policies.$inferSelect;
+export type NewAgentEnginePolicyRow = typeof agent_engine_policies.$inferInsert;

@@ -49,6 +49,18 @@ const boolFlag = (def: 'true' | 'false') =>
     .default(def)
     .transform((s) => s === 'true' || s === '1');
 
+/**
+ * Kill switch: o lado seguro é ACIONADO. `boolFlag` lê `TRUE`, `yes` ou `on`
+ * como `false`, o que para uma flag que LIGA é fechado e para uma que DESLIGA é
+ * aberto. Aqui só `false`/`0` explícitos (sem caixa, sem espaço) deixam o kill
+ * switch solto; qualquer outro valor, inclusive erro de digitação, o aciona.
+ */
+const killSwitchFlag = () =>
+  z
+    .string()
+    .default('false')
+    .transform((s) => !['false', '0'].includes(s.trim().toLowerCase()));
+
 const posInt = (def: number) => z.coerce.number().int().positive().default(def);
 
 // ---------------------------------------------------------------------------
@@ -1927,6 +1939,22 @@ export const ENV_CONTRACT = {
     schema: boolFlag('true'),
     example: 'true',
     fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_HERMES_KILL_SWITCH: {
+    name: 'MAIA_HERMES_KILL_SWITCH',
+    description:
+      'Kill switch do Hermes (K-15): true força maia_react em todo turno novo, por cima de ' +
+      'agent_engine_policies. Só desliga; nunca liga o Hermes — ligar é linha por ' +
+      '(tenant, agente, canal). Não muda turno já pinado. Só false/0 explícitos o ' +
+      'deixam solto: qualquer outro valor aciona.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: killSwitchFlag(),
+    example: 'false',
+    fixture: 'false',
     restartRequired: true,
     commentedInExample: true,
   },
