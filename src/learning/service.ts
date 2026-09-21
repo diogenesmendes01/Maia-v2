@@ -178,6 +178,13 @@ export async function proposeFromWorker(
     // inferido por um modelo em algum ponto da cadeia, e `worker` não muda
     // isso — é o que "`source='worker'` não é selo de confiança" quer dizer.
     origin: 'llm_inference',
+    // §7.4.1 — a exigência de revisão é declarada ao KSM, que decide na
+    // PRIMEIRA transição. Antes eu checava DEPOIS e só logava: o item já
+    // estava gravado visível, e um log não desfaz gravação. As duas saídas
+    // alternativas são proibidas pela spec — falsificar o risco estraga a
+    // leitura dele, e um UPDATE de ephemeral para pending_review inventaria
+    // uma aresta que a máquina não tem.
+    require_human_review: alwaysRequiresHumanReview(proposta.kind),
     source: `learning:${proposta.source}`,
     native: {
       ...(proposta.native ?? {}),
@@ -192,27 +199,6 @@ export async function proposeFromWorker(
       rule_exemplo_origem_id: proposta.primary_example_id ?? proposta.source_example_ids[0] ?? null,
     } as never,
   });
-
-  /**
-   * O KSM pode devolver `ephemeral` quando o risco é baixo. Para tudo que
-   * exige revisão por SEMÂNTICA — regra, memória pessoal, os compartilhados —
-   * isso não basta, e a checagem fica aqui em vez de no scorer porque não é
-   * uma questão de risco: uma regra inofensiva continua sendo uma regra.
-   *
-   * Isto é um fence, não uma expectativa: se o KSM mudar e passar a devolver
-   * `ephemeral` para regra, o log grita em vez de o item ficar visível.
-   */
-  if (alwaysRequiresHumanReview(proposta.kind) && resultado.visible_to_llm) {
-    logger.error(
-      {
-        proposal_id: resultado.proposal_id,
-        learning_kind: proposta.kind,
-        initial_status: resultado.initial_status,
-        ops_alert: true,
-      },
-      'learning.proposal_visible_despite_mandatory_review',
-    );
-  }
 
   const risk = riscoDoResultado(resultado.reason);
 

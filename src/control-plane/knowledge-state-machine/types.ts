@@ -131,6 +131,18 @@ export interface KnowledgeProposalInput {
   origin: KnowledgeOrigin;
   source: string;
   sensitivity_hint?: KnowledgeSensitivity;
+  /**
+   * §7.4.1 — exige revisão humana por SEMÂNTICA do que está sendo proposto.
+   *
+   * Contrato de ingestão CONFIÁVEL: o campo é do backend, nunca do JSON de uma
+   * tool. A spec é explícita em "não aceitar esse campo no JSON da tool" —
+   * aceitá-lo daria ao modelo o poder de declarar que a própria proposta
+   * dispensa revisão.
+   *
+   * Default do serviço de atendimento é `true`. Só o §7.5, depois de todos os
+   * gates, pode fornecer `false`.
+   */
+  require_human_review?: boolean;
   ttl_days?: number;
   /**
    * Codex round-2 finding 2: table-native column values the legacy
