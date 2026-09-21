@@ -126,6 +126,23 @@ export type ToolGatewayDepsV1 = {
    * tem desfecho. Ver a nota sobre `defer` mais abaixo.
    */
   retryAfterMs?: number;
+  /**
+   * A auditoria da recusa (T19).
+   *
+   * Injetada como as demais dependências, e por um motivo que não é só
+   * testabilidade: `@/governance/audit.js` resolve tenant e agent pelo ALS, e
+   * amarrá-lo estaticamente aqui tornaria este módulo — que é puro fora das
+   * deps — dependente de contexto de execução para ser importado.
+   *
+   * Opcional para que um caller que já audita noutro ponto não duplique a
+   * linha. Ausente, a recusa continua acontecendo: o que se perde é a trilha,
+   * e o caller assume essa escolha explicitamente ao não passar a dependência.
+   */
+  audit?: (input: {
+    acao: 'unauthorized_access_attempt';
+    alvo_id: string;
+    metadata: Record<string, unknown>;
+  }) => Promise<void>;
 };
 
 const RETRY_PADRAO_MS = 30_000;
@@ -182,6 +199,41 @@ export function createEngineToolGateway(
         { run_id: identity.run_id, call_id: call.call_id, reason: estatica.reason },
         'engine.tool_gateway.refused_static',
       );
+
+      /**
+       * T19 — a recusa de binding cruzado exige "recusa **E** auditoria".
+       *
+       * Um log não cumpre isso. Log é diagnóstico: rotaciona, é amostrado, e
+       * ninguém responde a uma pergunta de governança lendo log. Uma tentativa
+       * de um run agir sobre o binding de OUTRO é evento de autorização, e
+       * evento de autorização precisa de linha durável.
+       *
+       * A ação é `unauthorized_access_attempt`, que já existe e já é usada pelo
+       * dispatcher para exatamente esta classe de fato (INV-12: auditoria não
+       * se inventa). Cunhar uma ação nova para o mesmo fato partiria as
+       * consultas de governança em duas.
+       *
+       * `await` de propósito: se a auditoria não gravar, a recusa não é
+       * silenciosa — o erro sobe. Uma recusa auditada que não auditou é pior
+       * que uma recusa ruidosa.
+       */
+      if (deps.audit !== undefined) {
+        await deps.audit({
+          acao: 'unauthorized_access_attempt',
+          alvo_id: identity.run_id,
+          metadata: {
+            source: 'engine_tool_gateway',
+            call_id: call.call_id,
+            tool: call.name,
+            reason: estatica.reason,
+            wire_code: estatica.wire,
+            // `detail` fica FORA: ele é texto livre do broker e pode carregar
+            // material do frame. A linha de auditoria diz o QUE foi recusado e
+            // por qual regra, não o conteúdo da tentativa.
+          },
+        });
+      }
+
       return { kind: 'refused', call_id: call.call_id, code: estatica.wire };
     }
 

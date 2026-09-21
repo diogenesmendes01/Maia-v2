@@ -297,3 +297,69 @@ describe('EngineToolGateway — efeito incerto nunca vira retry seguro', () => {
     expect(d.dispatch).not.toHaveBeenCalled();
   });
 });
+
+describe('T19 — recusa de binding cruzado exige recusa E auditoria', () => {
+  it('a recusa estática grava linha de auditoria com o run e a regra', async () => {
+    const audit = vi.fn(async () => undefined);
+    const d = deps({
+      decide: vi.fn(() => ({
+        kind: 'refuse' as const,
+        reason: 'binding_mismatch' as never,
+        wire: 'run_not_authorized' as const,
+        detail: 'correlação divergente em run_id',
+      })),
+      audit,
+    });
+
+    const r = await createEngineToolGateway(IDENT, d)(CHAMADA);
+
+    expect(r).toMatchObject({ kind: 'refused', code: 'run_not_authorized' });
+    expect(audit).toHaveBeenCalledWith(
+      expect.objectContaining({
+        acao: 'unauthorized_access_attempt',
+        alvo_id: 'run-1',
+        metadata: expect.objectContaining({
+          source: 'engine_tool_gateway',
+          reason: 'binding_mismatch',
+          tool: 'consultar_saldo',
+        }),
+      }),
+    );
+  });
+
+  it('o `detail` do broker NÃO vai para a auditoria', async () => {
+    // Ele é texto livre e pode carregar material do frame. A linha diz o QUE
+    // foi recusado e por qual regra, não o conteúdo da tentativa.
+    const audit = vi.fn(async () => undefined);
+    await createEngineToolGateway(
+      IDENT,
+      deps({
+        decide: vi.fn(() => ({
+          kind: 'refuse' as const,
+          reason: 'binding_mismatch' as never,
+          wire: 'run_not_authorized' as const,
+          detail: 'segredo-do-frame',
+        })),
+        audit,
+      }),
+    )(CHAMADA);
+
+    expect(JSON.stringify(audit.mock.calls)).not.toContain('segredo-do-frame');
+  });
+
+  it('falha ao auditar NÃO deixa a recusa passar em silêncio', async () => {
+    // Uma recusa auditada que não auditou é pior que uma recusa ruidosa.
+    const d = deps({
+      decide: vi.fn(() => ({
+        kind: 'refuse' as const,
+        reason: 'binding_mismatch' as never,
+        wire: 'run_not_authorized' as const,
+        detail: '',
+      })),
+      audit: vi.fn(async () => {
+        throw new Error('audit indisponível');
+      }),
+    });
+    await expect(createEngineToolGateway(IDENT, d)(CHAMADA)).rejects.toThrow('audit indisponível');
+  });
+});
