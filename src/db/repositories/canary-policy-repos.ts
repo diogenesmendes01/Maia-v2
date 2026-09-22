@@ -178,6 +178,18 @@ export const canaryPolicyRepo = {
  * capacidade, nunca concedê-la. O inverso seria um canário que se habilita
  * sozinho quando o Postgres oscila.
  */
+/**
+ * A ligação de produção do seletor de motor (`lookupEngineForNewTurn`).
+ *
+ * Existe para que o nome da capacidade não seja uma string escrita no call
+ * site. É a mesma armadilha que já apareceu nesta épica com o `escopo` do
+ * `recall`: quando a autorização é um argumento que o chamador digita, um
+ * chamador novo digita outro — e o degrau consultado passa a não ser o degrau
+ * que governa o que ele está fazendo.
+ */
+export const canaryAllowsHermesLiveTurn = (): Promise<boolean> =>
+  canaryCapabilityAllowed('hermes_live_turn');
+
 export async function canaryCapabilityAllowed(capability: CanaryCapability): Promise<boolean> {
   let policy: AgentCanaryPolicyV1 | null;
   try {
