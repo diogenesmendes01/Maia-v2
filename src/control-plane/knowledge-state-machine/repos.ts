@@ -306,7 +306,20 @@ export const knowledgeRepos = {
     kind: KnowledgeKind,
     id: string,
     exec: Executor = db,
+    /**
+     * PR #775 finding 3 — `forUpdate` locks the row (`SELECT … FOR UPDATE`)
+     * so a caller can validate-then-act atomically inside its own `tx`
+     * without a second writer racing between the read and the write.
+     * Mirrors the `capability_proposal` branch of
+     * `admin-repos.ts#decideAtomically`, which already does this via its
+     * own inline `.for('update')` — the pattern this parameter generalises
+     * for the `knowledge_proposal` branch (see `applyKnowledgeDecisionTx`
+     * callers). Defaults to false so every existing (unlocked) caller is
+     * unaffected.
+     */
+    opts: { forUpdate?: boolean } = {},
   ): Promise<KnowledgeRow | null> {
+    const forUpdate = opts.forUpdate ?? false;
     switch (kind) {
       case 'fact': {
         // Issue #254 — cross-tenant guard. `agent_facts` reads via the
@@ -320,17 +333,14 @@ export const knowledgeRepos = {
         // tenant_id+agent_id (extended for all 4 kinds by PR #243).
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        const rows = await exec
-          .select()
-          .from(agent_facts)
-          .where(
-            and(
-              eq(agent_facts.id, id),
-              eq(agent_facts.tenant_id, tenant_id),
-              eq(agent_facts.agent_id, agent_id),
-            ),
-          )
-          .limit(1);
+        const where = and(
+          eq(agent_facts.id, id),
+          eq(agent_facts.tenant_id, tenant_id),
+          eq(agent_facts.agent_id, agent_id),
+        );
+        const rows = forUpdate
+          ? await exec.select().from(agent_facts).where(where).for('update').limit(1)
+          : await exec.select().from(agent_facts).where(where).limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
@@ -346,17 +356,14 @@ export const knowledgeRepos = {
         // row's persisted tenant_id+agent_id (workers/knowledge-state-promoter.ts).
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        const rows = await exec
-          .select()
-          .from(learned_rules)
-          .where(
-            and(
-              eq(learned_rules.id, id),
-              eq(learned_rules.tenant_id, tenant_id),
-              eq(learned_rules.agent_id, agent_id),
-            ),
-          )
-          .limit(1);
+        const where = and(
+          eq(learned_rules.id, id),
+          eq(learned_rules.tenant_id, tenant_id),
+          eq(learned_rules.agent_id, agent_id),
+        );
+        const rows = forUpdate
+          ? await exec.select().from(learned_rules).where(where).for('update').limit(1)
+          : await exec.select().from(learned_rules).where(where).limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
@@ -366,17 +373,14 @@ export const knowledgeRepos = {
         // leak across tenants via the KSM facade.
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        const rows = await exec
-          .select()
-          .from(memory_entry)
-          .where(
-            and(
-              eq(memory_entry.id, id),
-              eq(memory_entry.tenant_id, tenant_id),
-              eq(memory_entry.agent_id, agent_id),
-            ),
-          )
-          .limit(1);
+        const where = and(
+          eq(memory_entry.id, id),
+          eq(memory_entry.tenant_id, tenant_id),
+          eq(memory_entry.agent_id, agent_id),
+        );
+        const rows = forUpdate
+          ? await exec.select().from(memory_entry).where(where).for('update').limit(1)
+          : await exec.select().from(memory_entry).where(where).limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
@@ -402,17 +406,14 @@ export const knowledgeRepos = {
         // discrimination is needed.
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        const rows = await exec
-          .select()
-          .from(behavioral_hint)
-          .where(
-            and(
-              eq(behavioral_hint.id, id),
-              eq(behavioral_hint.tenant_id, tenant_id),
-              eq(behavioral_hint.agent_id, agent_id),
-            ),
-          )
-          .limit(1);
+        const where = and(
+          eq(behavioral_hint.id, id),
+          eq(behavioral_hint.tenant_id, tenant_id),
+          eq(behavioral_hint.agent_id, agent_id),
+        );
+        const rows = forUpdate
+          ? await exec.select().from(behavioral_hint).where(where).for('update').limit(1)
+          : await exec.select().from(behavioral_hint).where(where).limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }

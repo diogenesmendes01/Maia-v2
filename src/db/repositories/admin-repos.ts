@@ -1,6 +1,7 @@
 import { eq, and, desc, isNull, sql, gt } from 'drizzle-orm';
 import { db, withTx } from '../client.js';
 import { applyKnowledgeDecisionTx } from '@/learning/approval-adapter.js';
+import { knowledgeRepos } from '@/control-plane/knowledge-state-machine/repos.js';
 import {
   capability_proposals,
   agent_operational_profile_versions,
@@ -283,8 +284,30 @@ export const proposalsUnifiedRepo = {
           { nome: 'learned_rules', kind: 'rule', descritor: 'contexto' },
           { nome: 'behavioral_hint', kind: 'behavioral_hint', descritor: 'content' },
         ];
+        // PR #775 finding 4 — o predicado de cursor faltava aqui. As outras
+        // fontes (capability_proposals, agent_operational_profile_versions,
+        // abaixo) recebem `(created_at, id) < (cursor.ts, cursor.id)`; este
+        // bloco só tinha ORDER BY + LIMIT, então cada página repetia os
+        // MESMOS `limit` itens mais recentes das quatro tabelas do KSM —
+        // "próxima página" nunca avançava.
+        const cursorFilter = cursor
+          ? sql`AND (created_at, id) < (${cursor.ts}, ${cursor.id}::uuid)`
+          : sql``;
+        // PR #775 finding 4 (achado relacionado, descoberto ao corrigi-lo) —
+        // NENHUMA das quatro tabelas do KSM está em `EXPECTED_TABLES` /
+        // `_availableTables()` (aquele probe só verifica
+        // policy_rules/soul_biases/skills/capability_proposals/
+        // knowledge_pending_review — tabelas FUTURAS que podem não existir
+        // ainda). `available.includes(t.nome)` para 'agent_facts',
+        // 'memory_entry', 'learned_rules' ou 'behavioral_hint' é SEMPRE
+        // false, então o `continue` disparava incondicionalmente e este
+        // bloco nunca executava a query — o SELECT abaixo era morto.
+        // Resultado real: nenhum `knowledge_proposal` jamais aparecia na
+        // fila, corrigir só o cursor ou só o countersByType não teria efeito
+        // observável sem isto. As quatro são tabelas NÚCLEO (existem desde
+        // P1/P2, usadas em todo `src/`), então — diferente das tabelas
+        // FUTURAS do array acima — não precisam de probe: sempre existem.
         for (const t of tabelas) {
-          if (!available.includes(t.nome)) continue;
           const rows = await db.execute<{
             id: string;
             descriptor: string;
@@ -298,6 +321,7 @@ export const proposalsUnifiedRepo = {
               FROM ${sql.raw(t.nome)}
              WHERE tenant_id = ${input.tenantId}
                AND lifecycle_status = ${alvo}
+               ${cursorFilter}
              ORDER BY created_at DESC, id DESC
              LIMIT ${input.limit + 1}
           `);
@@ -418,6 +442,25 @@ export const proposalsUnifiedRepo = {
       `);
       const raw = result.rows[0]?.count ?? 0;
       counts.capability_proposal = typeof raw === 'string' ? Number(raw) : raw;
+    }
+    // PR #775 finding 4 — `knowledge_proposal` ficava com zero fixo mesmo
+    // depois do P10 (c2156b29) ter dado à fonte um `list()` funcional: soma
+    // pending_review das quatro tabelas do KSM, mesma régua de
+    // `ksmStatusMap.pending_review` em `list()` acima. Núcleo, não probed
+    // (ver o comentário equivalente em `list()`).
+    {
+      let total = 0;
+      for (const nome of ['agent_facts', 'memory_entry', 'learned_rules', 'behavioral_hint']) {
+        const result = await db.execute<{ count: number | string }>(sql`
+          SELECT COUNT(*)::int AS count
+            FROM ${sql.raw(nome)}
+           WHERE tenant_id = ${tenantId}
+             AND lifecycle_status = 'pending_review'
+        `);
+        const raw = result.rows[0]?.count ?? 0;
+        total += typeof raw === 'string' ? Number(raw) : raw;
+      }
+      counts.knowledge_proposal = total;
     }
     // Spec perfil-inbox v4 (fase C) — contadores nativos; o card bespoke
     // `pendingProfileApprovals` (#492) foi removido junto com a flag.
@@ -726,6 +769,40 @@ export const proposalsUnifiedRepo = {
           return { ok: false, reason: 'source_not_supported' as const };
         }
 
+        /**
+         * PR #775 finding 3 — validar sob LOCK antes de inserir a aprovação.
+         *
+         * Antes, `not_found`/`invalid_source_status` só eram descobertos
+         * DEPOIS de inserir `proposal_approvals` + `admin_audit_log`, via
+         * `applyKnowledgeDecisionTx` (abaixo). Um `return { ok: false, ... }`
+         * de DENTRO do `withTx` não faz rollback — só uma exceção faz (ver
+         * `withTx` em src/db/client.ts) — então a aprovação ficava gravada
+         * sem a transição correspondente: uma aprovação registrada para uma
+         * decisão que não aconteceu.
+         *
+         * A correção espelha o ramo `capability_proposal` logo abaixo (o
+         * padrão da casa): lê e TRAVA a linha de origem
+         * (`SELECT … FOR UPDATE`, via `knowledgeRepos.findById(..., {
+         * forUpdate: true })`) e valida existência + status ANTES de
+         * qualquer INSERT. Sem escrita alguma ainda, `return` aqui não tem
+         * nada para desfazer — não é preciso rollback porque não há efeito
+         * colateral para reverter.
+         *
+         * O lock também fecha uma corrida que o CAS de
+         * `applyKnowledgeDecisionTx` só fechava depois do fato: duas
+         * decisões concorrentes na MESMA proposta agora serializam aqui — a
+         * segunda só prossegue depois que a primeira commita, e então vê o
+         * novo `lifecycle_status` (não mais `pending_review`) e devolve
+         * `invalid_source_status` sem inserir nada.
+         */
+        const precheck = await knowledgeRepos.findById(kind, input.proposalId, tx, {
+          forUpdate: true,
+        });
+        if (precheck === null) return { ok: false, reason: 'not_found' as const };
+        if (precheck.lifecycle_status !== 'pending_review') {
+          return { ok: false, reason: 'invalid_source_status' as const };
+        }
+
         const inseridas = await tx
           .insert(proposal_approvals)
           .values({
@@ -767,11 +844,21 @@ export const proposalsUnifiedRepo = {
           reason: input.comment,
         });
         if (!r.ok) {
-          if (r.reason === 'not_found') return { ok: false, reason: 'not_found' as const };
-          if (r.reason === 'invalid_source_status') {
-            return { ok: false, reason: 'invalid_source_status' as const };
-          }
-          return { ok: false, reason: 'transition_failed' as const };
+          // Defesa em profundidade, não o caminho esperado: o pré-check
+          // acima já travou a linha (FOR UPDATE) e validou
+          // `pending_review` NA MESMA transação, então nada podia ter
+          // mudado o status entre o pré-check e aqui. Se `r.ok` ainda
+          // assim vier falso, a máquina de transições divergiu do
+          // pré-check — uma violação de invariante, não uma corrida
+          // legítima. A aprovação e a auditoria que acabamos de inserir
+          // não podem sobreviver a uma decisão que não aconteceu, então
+          // esta é a exceção que causa ROLLBACK TOTAL — mesmo contrato do
+          // `_decideProfileAtomically` logo abaixo (ver o comentário lá:
+          // "invariante 1b: nenhum estado parcial").
+          throw new TypedError(
+            `knowledge_decision_${r.reason}`,
+            `applyKnowledgeDecisionTx failed after the pre-check validated pending_review under lock: ${r.reason}`,
+          );
         }
 
         return {
