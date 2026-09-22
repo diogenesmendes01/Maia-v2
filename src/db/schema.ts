@@ -592,6 +592,18 @@ export const agent_memories = pgTable('agent_memories', {
     .default(sql`'{}'::jsonb`),
   ref_tabela: text('ref_tabela'),
   ref_id: uuid('ref_id'),
+  // Migration 146 (G2, spec §7.6.3) — vínculo com o item CANÔNICO em
+  // `memory_entry`. Nullable: linhas pré-146 não têm como ser ligadas
+  // retroativamente (ver o cabeçalho da 146). `recallAuthorized` exige
+  // este vínculo via JOIN — vetor sem `memory_entry_id` não é elegível.
+  // Composição (tenant_id, agent_id, memory_entry_id) referencia
+  // memory_entry(tenant_id, agent_id, id); a FK composta vive só na
+  // migration, seguindo o padrão já usado para colunas de associação
+  // tenant-scoped neste arquivo (ex.: behavioral_hint.derived_from_memory_id).
+  memory_entry_id: uuid('memory_entry_id'),
+  // Digest do conteúdo canônico NO MOMENTO da indexação, para o projetor
+  // detectar item canônico editado depois da última reindexação.
+  content_digest: text('content_digest'),
   created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
 });
 
