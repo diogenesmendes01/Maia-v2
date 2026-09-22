@@ -54,6 +54,9 @@ import {
   routeExistingEngineRun,
   decideRouteTurnAction,
 } from '@/runtime/engines/route-existing-run.js';
+// K-15 — qual motor atende este turno. Ver `integration.ts` para por que a
+// pergunta é feita junto do seam de rota e não na altura do reasoner.
+import { decideTurnEngine } from '@/runtime/engines/integration.js';
 // Issue #503 — máquina de estados durável do turno inbound. `core.ts` declara o
 // OUTCOME de negócio; a fachada escolhe o estado terminal e faz o CAS.
 import {
@@ -724,13 +727,23 @@ async function runAgentForMensagemInner(
    * na linha do motor já reexecutou pendências, procedures e skills — e parte
    * disso commita efeito. Depois não adianta saber.
    *
-   * Hoje isto é um no-op observável: nada chama `pinEngineAndPrepareRun` ainda,
-   * então todo turno responde `no_binding` e segue o caminho de sempre. O seam
-   * existe para que, quando o pin passar a ser escrito, o recovery não precise
-   * ser reescrito junto — que é o que torna a mudança seguinte pequena em vez
-   * de arriscada.
+   * Nenhum turno chega a ter binding HOJE — `pinEngineAndPrepareRun` continua
+   * sem call site de produção, pelos dois motivos verificáveis registrados no
+   * cabeçalho de `@/runtime/engines/integration.ts` (não há produtor de linha
+   * em `conversation_controls`, nem compilador de `RuntimeManifestV1`). Então
+   * a rota responde `no_binding` em todo turno e o pipeline roda como sempre.
+   * O seam existe para que, quando o pin passar a ser escrito, o recovery não
+   * precise ser reescrito junto — que é o que torna a mudança seguinte pequena
+   * em vez de arriscada.
+   *
+   * O que DEIXOU de ser no-op aqui é a ESCOLHA do motor: o estado lido por
+   * este seam alimenta `decideTurnEngine` logo abaixo.
    */
   const comRotaDeMotor = async (): Promise<void> => {
+    // Sem handle de turno (caminho legado, máquina de estados desligada) não há
+    // nem rota nem escolha de motor a fazer: o pin e o run são endereçados por
+    // `turn_id`, e sem ele não existe onde gravar nem o que reconciliar. O
+    // comportamento aqui é o de #503, idêntico ao de antes desta fiação.
     if (turn === null) {
       return runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
     }
@@ -740,10 +753,66 @@ async function runAgentForMensagemInner(
     // (`routeExistingEngineRun`) é puro e continua no import de cima — o que
     // chega tarde é só o acesso ao banco, que só o turno com handle usa.
     const { engineRunsRepo } = await import('@/db/repositories/engine-repos.js');
-    const rota = routeExistingEngineRun(
-      await engineRunsRepo.findTurnEngineState({ turn_id: turn.turn_id }),
-    );
+    const estadoDoMotor = await engineRunsRepo.findTurnEngineState({ turn_id: turn.turn_id });
+    const rota = routeExistingEngineRun(estadoDoMotor);
     if (rota.kind === 'run_pipeline') {
+      /**
+       * K-15 · P12 — A ESCOLHA DO MOTOR, no único ponto onde ela cabe.
+       *
+       * É feita AQUI, e não na altura do reasoner, pelo motivo que o seam
+       * acima já carrega: quando o pipeline chega no motor, pendências,
+       * procedures e skills já rodaram — e parte delas commita efeito. Uma
+       * escolha de motor tomada depois disso não consegue mais mudar quem
+       * executou o turno, só quem produz a última frase.
+       *
+       * `estadoDoMotor` é reusado de propósito: a rota e a escolha olham o
+       * MESMO instante do banco. Duas leituras poderiam discordar, e a
+       * discordância só apareceria sob recovery concorrente.
+       *
+       * O canal vem do resolver e cai para o da mensagem — é o mesmo par que
+       * `effectiveChannelId` usa lá embaixo, menos o da conversa, que ainda
+       * não foi carregada neste ponto. Sem canal, `decideTurnEngine` devolve
+       * `maia_react` por ausência de linha possível, nunca por um `'default'`
+       * inventado.
+       */
+      const motor = await decideTurnEngine({
+        state: estadoDoMotor,
+        scope: {
+          tenant_id: getCurrentTenant(),
+          agent_id: getCurrentAgent(),
+          channel_id: channel_id ?? inbound.channel_id ?? null,
+        },
+      });
+
+      /**
+       * Duas saídas que NÃO reexecutam o pipeline, e nenhuma delas troca de
+       * motor para "cobrir" o problema — trocar é o cenário que o §5.8.2
+       * proíbe.
+       *
+       * `refused`: o turno tem pin e este processo não consegue honrá-lo
+       * (motor ausente, revisão divergente, motor desconhecido). Retry com
+       * backoff é o desfecho certo porque o conserto é uma IMPLANTAÇÃO — a
+       * volta do processo que sabe rodar aquele pin —, e o esgotamento das
+       * tentativas leva o turno para dead letter na frente de uma pessoa.
+       *
+       * `remote`: existe instância do motor remoto, mas preparar o run dela
+       * (`pinEngineAndPrepareRun`) ainda é impossível nesta árvore. Atender
+       * localmente seria responder com um motor diferente do que a política e
+       * o degrau escolheram, sem registro nenhum de que isso aconteceu. Hoje
+       * é inalcançável (a porta `hermesEngine()` devolve `null`, e o `null`
+       * já degrada para local com motivo próprio); o ramo existe para que o
+       * dia em que ela devolver uma instância seja BARULHENTO e não silencioso.
+       */
+      if (motor.kind !== 'local') {
+        const code =
+          motor.kind === 'refused' ? `engine_${motor.reason}` : 'engine_remote_turn_not_wired';
+        logger.error(
+          { mensagem_id, turn_id: turn.turn_id, error_code: code, ops_alert: true },
+          'agent.turn_engine_not_runnable',
+        );
+        await failTurnRetryable(turn, { code, mensagem_id });
+        return;
+      }
       return runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
     }
     // Não reexecuta. O run está no journal e quem o retoma é o caminho de
