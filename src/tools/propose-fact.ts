@@ -10,6 +10,7 @@ import { z } from 'zod';
 import type { Tool } from './_registry.js';
 import { KnowledgeStateMachine } from '@/control-plane/knowledge-state-machine/index.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { logger } from '@/lib/logger.js';
 import type {
   KnowledgeOrigin,
   KnowledgeScope,
@@ -50,10 +51,40 @@ function mapEscopoToScope(escopo: string): {
   return { scope: 'agent' };
 }
 
-function fonteToOrigin(fonte: 'configurado' | 'aprendido' | 'inferido'): KnowledgeOrigin {
-  if (fonte === 'configurado') return 'human_approved';
-  if (fonte === 'inferido') return 'tool_callback';
-  return 'llm_inference';
+/**
+ * G3 (spec §7.6.2) — A PROVENIÊNCIA DEIXA DE SER ESCOLHA DO MODELO.
+ *
+ * `fonteToOrigin` mapeava `fonte='configurado'` para `origin='human_approved'`.
+ * Como `fonte` é campo do schema de entrada, quem escolhia era o MODELO — e o
+ * efeito não parava no rótulo:
+ *
+ *   modelo manda `fonte='configurado'`
+ *     → `origin='human_approved'`
+ *     → o scorer elevava a confiança para 0.8 ("bônus humano")
+ *     → o risco caía
+ *     → o item podia nascer `ephemeral`, visível ao LLM, sem revisão humana.
+ *
+ * Uma tool chamada pelo modelo tem exatamente uma proveniência possível, e ela
+ * não depende do que o modelo diz: `llm_inference`. É o que esta constante
+ * fixa. Nada no payload a altera.
+ *
+ * `configurado` passa a ser RECUSADO em vez de silenciosamente rebaixado: o
+ * chamador pediu autoridade humana, e uma recusa nomeada é o que faz esse
+ * pedido aparecer. `aprendido`/`inferido` continuam aceitos por compatibilidade
+ * e não valem como autoridade — geram telemetria de depreciação.
+ */
+const ORIGEM_DE_TOOL_DO_MODELO: KnowledgeOrigin = 'llm_inference';
+
+/** Recusa nomeada, para o modelo não confundir com erro de validação. */
+export class InvalidProvenanceError extends Error {
+  readonly code = 'invalid_provenance';
+  constructor() {
+    super(
+      'invalid_provenance: `fonte=configurado` afirma aprovação humana e não pode ser declarada por uma chamada de ferramenta. ' +
+        'Proponha o fato e deixe a revisão humana decidir.',
+    );
+    this.name = 'InvalidProvenanceError';
+  }
 }
 
 export const proposeFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
@@ -83,6 +114,18 @@ export const proposeFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
       }
     }
 
+    // G3 — a proveniência é recusada, não rebaixada em silêncio.
+    if (args.fonte === 'configurado') throw new InvalidProvenanceError();
+    if (args.fonte === 'inferido') {
+      // `inferido` mapeava para `tool_callback`, que também é uma afirmação
+      // sobre a origem que o modelo não pode fazer. Não quebra o chamador, mas
+      // deixa de valer como autoridade e fica visível para quem for depreciar.
+      logger.warn(
+        { tool: 'propose_fact', fonte: args.fonte, request_id: ctx.request_id },
+        'tool.deprecated_provenance_field',
+      );
+    }
+
     const { scope, scope_value } = mapEscopoToScope(args.escopo);
     const result = await KnowledgeStateMachine.propose({
       trace_id: ctx.request_id,
@@ -95,7 +138,9 @@ export const proposeFactTool: Tool<typeof inputSchema, typeof outputSchema> = {
       content: args.valor,
       content_text: args.texto,
       confidence: args.confianca,
-      origin: fonteToOrigin(args.fonte),
+      // Fixo. Ver `ORIGEM_DE_TOOL_DO_MODELO`: chamada de tool pelo modelo tem
+      // uma proveniência possível, e não é o modelo que a escolhe.
+      origin: ORIGEM_DE_TOOL_DO_MODELO,
       source: 'tool:propose_fact',
       ...(args.sensibilidade !== undefined ? { sensitivity_hint: args.sensibilidade } : {}),
       // Codex round-2 finding 2: persist the legacy escopo/chave verbatim
