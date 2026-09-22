@@ -141,25 +141,40 @@ export function createReplayToolIO(
   /** Chaves da gravação que o motor em shadow NÃO pediu. */
   naoUsadas: () => RecordedToolCallV1[];
 } {
-  // Usar fila (array) por chave para suportar múltiplas chamadas com os mesmos argumentos.
+  /**
+   * FILA por chave, e não um valor só.
+   *
+   * O par (nome, digest dos argumentos) não identifica uma chamada: identifica
+   * uma FORMA de chamada. Um turno que consulta o saldo duas vezes grava duas
+   * entradas idênticas, e um mapa de valor único devolveria a primeira nas
+   * duas vezes — o replay mediria o motor contra uma gravação que ele mesmo
+   * encurtou. A fila preserva ordem e cardinalidade do turno original.
+   */
   const porChave = new Map<string, RecordedToolCallV1[]>();
   for (const c of snapshot.recorded_calls) {
     const chave = `${c.name}\u0000${c.args_digest}`;
-    if (!porChave.has(chave)) {
-      porChave.set(chave, []);
-    }
-    porChave.get(chave)!.push(c);
+    const fila = porChave.get(chave);
+    if (fila === undefined) porChave.set(chave, [c]);
+    else fila.push(c);
   }
-  // Rastrear quantas chamadas foram consumidas por chave para reportar corretamente as não usadas.
+  /** Quantas da fila de cada chave já foram devolvidas. */
   const consumidos = new Map<string, number>();
 
   return {
     invokeTool: async (call: EngineToolCallV1): Promise<EngineToolReplyV1> => {
       const chave = `${call.name}\u0000${digestArgs(call.args)}`;
-      const fila = porChave.get(chave);
       const numConsumidos = consumidos.get(chave) ?? 0;
+      /**
+       * Um acesso só cobre as DUAS formas de não haver gravação: chave que o
+       * turno original nunca produziu, e chave cuja fila já se esgotou (o
+       * motor em shadow pediu mais vezes do que a produção pediu). Checar
+       * `fila.length` à parte diria a mesma coisa em dois lugares — e deixava
+       * a leitura do índice sem prova para o compilador, que é como este
+       * arquivo chegou vermelho no CI.
+       */
+      const gravada = porChave.get(chave)?.[numConsumidos];
 
-      if (!fila || numConsumidos >= fila.length) {
+      if (gravada === undefined) {
         naoGravadas.push({
           kind: 'tool_not_recorded',
           call_id: call.call_id,
@@ -172,7 +187,6 @@ export function createReplayToolIO(
         };
       }
 
-      const gravada = fila[numConsumidos];
       consumidos.set(chave, numConsumidos + 1);
 
       return {
