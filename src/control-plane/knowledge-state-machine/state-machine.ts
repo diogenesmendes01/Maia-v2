@@ -52,7 +52,28 @@ export function decideInitialStatus(args: {
   risk_level: KnowledgeRiskLevel;
   sensitivity: KnowledgeSensitivity;
   confidence: number;
+  /**
+   * §7.4.1 (extensão NOVA do KSM) — a revisão humana é exigida por SEMÂNTICA,
+   * independentemente do que o scorer achou do conteúdo.
+   *
+   * Existe porque havia duas saídas erradas para o mesmo problema, e a spec
+   * proíbe as duas nominalmente:
+   *
+   *  - **falsificar `risk=high`** para forçar revisão. O risco é lido por
+   *    outras coisas, e mentir nele estraga todas elas;
+   *  - **`UPDATE` posterior de `ephemeral` para `pending_review`**. Essa
+   *    transição não existe na máquina, e forçá-la seria inventar uma aresta.
+   *
+   * Com o campo, quem decide continua sendo o KSM, na PRIMEIRA decisão, e o
+   * resultado real do scorer é preservado intacto ao lado.
+   *
+   * `false` não força nada: ele apenas permite que o algoritmo conservador
+   * existente siga. Risco alto ou falha de scorer continuam mandando para
+   * revisão.
+   */
+  require_human_review?: boolean;
 }): KnowledgeLifecycleStatus {
+  if (args.require_human_review === true) return 'pending_review';
   if (args.kind === 'rule') return 'pending_review';
   if (args.risk_level === 'high' || args.risk_level === 'critical') {
     return 'pending_review';
@@ -131,6 +152,9 @@ export class KnowledgeStateMachine {
       risk_level: risk.level,
       sensitivity: risk.sensitivity,
       confidence: input.confidence,
+      ...(input.require_human_review !== undefined
+        ? { require_human_review: input.require_human_review }
+        : {}),
     });
 
     const transition: KnowledgeTransitionRecord = {

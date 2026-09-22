@@ -86,6 +86,19 @@ export interface KnowledgeProposalNativeFields {
   rule_acao?: string;
   rule_contexto_jsonb?: Record<string, unknown>;
   rule_acoes_jsonb?: Record<string, unknown>;
+  /**
+   * Exemplo que ORIGINOU a regra — `transacoes.id`, na coluna
+   * `learned_rules.exemplo_origem_id`.
+   *
+   * Existe porque o caminho que o `LearningService` substituiu já persistia
+   * essa referência (`rulesRepo.create({ exemplo_origem_id })`), e sem ela a
+   * revisão humana perde o vínculo com o caso concreto que motivou a
+   * proposta — justamente a evidência que o revisor precisa para decidir.
+   *
+   * É `transacoes.id`, NÃO `audit_log.id`: quem preencher deve preservar essa
+   * semântica em vez de apresentar um id de evento de auditoria aqui.
+   */
+  rule_exemplo_origem_id?: string | null;
 
   // memory
   memory_type?: string;
@@ -118,6 +131,18 @@ export interface KnowledgeProposalInput {
   origin: KnowledgeOrigin;
   source: string;
   sensitivity_hint?: KnowledgeSensitivity;
+  /**
+   * §7.4.1 — exige revisão humana por SEMÂNTICA do que está sendo proposto.
+   *
+   * Contrato de ingestão CONFIÁVEL: o campo é do backend, nunca do JSON de uma
+   * tool. A spec é explícita em "não aceitar esse campo no JSON da tool" —
+   * aceitá-lo daria ao modelo o poder de declarar que a própria proposta
+   * dispensa revisão.
+   *
+   * Default do serviço de atendimento é `true`. Só o §7.5, depois de todos os
+   * gates, pode fornecer `false`.
+   */
+  require_human_review?: boolean;
   ttl_days?: number;
   /**
    * Codex round-2 finding 2: table-native column values the legacy

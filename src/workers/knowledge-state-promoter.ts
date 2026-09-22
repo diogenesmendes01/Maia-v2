@@ -86,8 +86,33 @@ async function promote(args: {
   stats: PromoteStats;
   counterKey: keyof PromoteStats;
 }): Promise<void> {
-  const filterFor = (kind: KnowledgeKind) =>
-    typeof args.filter === 'function' ? args.filter(kind) : args.filter;
+  /**
+   * §7.4.1 — REVISÃO PENDENTE NÃO PROMOVE.
+   *
+   * A spec pede impedir promoção de item quarantined/restricted e de
+   * conhecimento compartilhado sem decisão humana vinculada à revisão. Do que
+   * ela enumera, só um pedaço é exprimível hoje, e é honesto dizer qual:
+   *
+   *  - a coluna `needs_review` existe em `memory_entry` e é aplicada aqui. Um
+   *    item marcado para revisão subindo de `ephemeral` para `observed`
+   *    sozinho ganharia peso de visibilidade sem ninguém ter decidido nada — e
+   *    o peso é o que faz o prompt-builder confiar mais nele.
+   *  - **quarantined/restricted** são estados NOVOS do §7.4.2, que não
+   *    existem no enum. Não dá para filtrar por um estado que não é
+   *    persistido, e inventar um valor aqui criaria uma segunda máquina.
+   *  - **publicação compartilhada** depende do publicador do P09.
+   *
+   * As outras tabelas não têm a coluna. Acrescentá-la é migration própria;
+   * aplicar o predicado só onde ele existe é o que dá para fazer sem fingir
+   * cobertura que não há.
+   */
+  const guardDeRevisao = (kind: KnowledgeKind) =>
+    kind === 'memory' ? sql` AND needs_review = false` : sql``;
+
+  const filterFor = (kind: KnowledgeKind) => {
+    const base = typeof args.filter === 'function' ? args.filter(kind) : args.filter;
+    return sql`${base}${guardDeRevisao(kind)}`;
+  };
 
   for (const kind of KINDS) {
     let rows: Array<{ id: string; tenant_id: string; agent_id: string }>;
