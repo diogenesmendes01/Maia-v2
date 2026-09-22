@@ -129,6 +129,13 @@ export class KnowledgeStateMachine {
           kind: input.kind,
           scope: input.scope,
           content_text: input.content_text,
+          // G3 (§7.6.2) — o PAYLOAD canônico, não só a descrição textual.
+          //
+          // `content_text` é livre e pode descrever o item sem conter o que ele
+          // carrega; `content` é o que de fato persiste. Passar os dois deixa a
+          // varredura do scorer cobrir o DADO, e não a descrição dele — que era
+          // a diferença entre varrer e parecer que varre.
+          content_payload: input.content,
           confidence: input.confidence,
           origin: input.origin,
           proposer_sensitivity_hint: input.sensitivity_hint,
