@@ -38,9 +38,11 @@ import { describe, it, expect } from "vitest";
 import { PgDialect } from "drizzle-orm/pg-core";
 import { sql as raw } from "drizzle-orm";
 import {
+  controlProvenanceForStreamSql,
   heldBacklogForCancellationSql,
   lockControlByIdSql,
   lockControlByRunSql,
+  outboundEgressAuthorizedSql,
   turnWithoutPendingEffectSql,
 } from "@/db/repositories/conversation-control-sql.js";
 
@@ -299,5 +301,88 @@ describe("P04.5b.2a — evidência de efeito POR TURNO", () => {
     // O núcleo do predicado tem de aparecer LITERALMENTE dentro da seleção.
     const nucleo = predicado.slice(predicado.indexOf("NOT EXISTS"));
     expect(selecao).toContain(nucleo.slice(0, 60));
+  });
+});
+
+// ─── P04.7b — o FENCE DE EGRESSO depois do commit (§8.2.4, C43) ─────────────
+
+describe("P04.7b — outboundEgressAuthorizedSql", () => {
+  const p = () =>
+    compilar(
+      outboundEgressAuthorizedSql({
+        tenant: raw`${ESCOPO.tenant_id}`,
+        agent: raw`${ESCOPO.agent_id}`,
+        alvo: raw`om`,
+      }),
+    );
+
+  it("16. a fala do OPERADOR passa sempre — senão o remédio vira a doença", () => {
+    // Sem esta cláusula, o fence reteria exatamente quem tem o controle: o
+    // atendente escreve pelo console, a mensagem entra no mesmo
+    // `outbound_messages`, e o console fica mudo.
+    expect(p().sql).toMatch(/om\.origin\s*=\s*'operator'/);
+  });
+
+  it("17. `system` NÃO tem escape — lembrete durante atendimento é a plataforma falando por cima", () => {
+    // A ausência é a asserção: a ÚNICA comparação com `origin` é contra
+    // `operator`. (`bot` aparece no SQL, mas em `controle.mode`, que é outra
+    // coluna e outra pergunta.)
+    const { sql } = p();
+    const comparacoesDeOrigin = sql.match(/om\.origin\s*[<>=!]+\s*'[a-z]+'/g) ?? [];
+    expect(comparacoesDeOrigin).toEqual(["om.origin = 'operator'"]);
+    expect(sql).not.toContain("'system'");
+  });
+
+  it("18. retém pelo controle VIVO da stream do TURNO, que alcança linha legada", () => {
+    // É a metade que não depende de coluna nova: uma saída commitada antes da
+    // 148 não tem proveniência, mas o turno dela tem `stream_key`.
+    const { sql } = p();
+    expect(sql).toMatch(/turno\.id\s*=\s*om\.turn_id/);
+    expect(sql).toMatch(/controle\.stream_key\s*=\s*turno\.stream_key/);
+    expect(sql).toMatch(/controle\.mode\s*<>\s*'bot'/);
+  });
+
+  it("19. e também pelo EPOCH, que é o que pega pausa seguida de retomada", () => {
+    // Ao voltar para `bot`, a primeira metade liberaria de novo — e liberaria
+    // uma resposta escrita para um estado da conversa que já não existe.
+    const { sql } = p();
+    expect(sql).toMatch(/controle\.control_epoch\s*<>\s*om\.control_epoch/);
+    expect(sql).toMatch(/om\.control_epoch IS NOT NULL/);
+  });
+
+  it("20. turno SEM stream não é retido — não existe controle que o alcance", () => {
+    expect(p().sql).toMatch(/turno\.stream_key IS NOT NULL/);
+  });
+
+  it("21. o escopo entra nos DOIS lados do join, nunca só o id", () => {
+    // Dois escopos com o mesmo uuid cruzariam tenants se o pertencimento não
+    // fosse predicado — a mesma régua de `lockControlByRunSql`.
+    const { sql, params } = p();
+    expect(sql).toMatch(/turno\.tenant_id\s*=\s*\$1/);
+    expect(sql).toMatch(/turno\.agent_id\s*=\s*\$2/);
+    expect(sql).toMatch(/controle\.tenant_id\s*=\s*turno\.tenant_id/);
+    expect(sql).toMatch(/controle\.agent_id\s*=\s*turno\.agent_id/);
+    expect(params).toEqual([ESCOPO.tenant_id, ESCOPO.agent_id]);
+  });
+});
+
+describe("P04.7b — controlProvenanceForStreamSql", () => {
+  it("22. com stream, as duas colunas saem do MESMO controle", () => {
+    const prov = controlProvenanceForStreamSql({ ...ESCOPO, stream_key: "wa:5511:abc" });
+    const a = compilar(prov.control_id);
+    const b = compilar(prov.control_epoch);
+    expect(a.sql).toMatch(/SELECT c\.id FROM/);
+    expect(b.sql).toMatch(/SELECT c\.control_epoch FROM/);
+    // Mesmo escopo e mesma stream nos dois: réguas diferentes tornariam o
+    // epoch incomparável no envio.
+    expect(a.params).toEqual([ESCOPO.tenant_id, ESCOPO.agent_id, "wa:5511:abc"]);
+    expect(b.params).toEqual(a.params);
+  });
+
+  it("23. sem stream as duas saem NULL JUNTAS — o CHECK da 148 exige isso", () => {
+    // Um epoch sem o controle a que pertence é um número sem régua.
+    const prov = controlProvenanceForStreamSql({ ...ESCOPO, stream_key: null });
+    expect(compilar(prov.control_id).sql).toBe("NULL");
+    expect(compilar(prov.control_epoch).sql).toBe("NULL");
   });
 });

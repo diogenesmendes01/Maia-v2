@@ -34,6 +34,7 @@ import { mensagens, outbound_messages } from '../schema.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
 import { auditTx } from '@/governance/audit.js';
 import { statusList } from './turn-fence-sql.js';
+import { outboundEgressAuthorizedSql } from './conversation-control-sql.js';
 import type { OutboundDeliveryOutcome } from '@/runtime/outbound/contract.js';
 import {
   DELIVERY_CLAIMABLE_STATUSES,
@@ -198,6 +199,32 @@ export const outboundDeliveryRepo = {
                    AND lease_expires_at IS NOT NULL
                    AND lease_expires_at <= now())
            )
+           -- ── P04.7b — O FENCE DE EGRESSO (§8.2.4, C43). ─────────────────
+           --
+           -- Aqui, e não em cada worker. Este UPDATE é o ponto ÚNICO por onde
+           -- toda entrega do outbox durável passa — drain, recovery e takeover
+           -- de lease chamam todos o tryClaimDelivery, e nenhum envia sem a
+           -- posse que ele concede. Um fence por worker seriam três cópias,
+           -- e a que envelhecesse seria a que deixa passar.
+           --
+           -- Como PREDICADO DO CLAIM, e não checagem antes dele: a posse e a
+           -- autorização são decididas na mesma linha do mesmo UPDATE, sob o
+           -- mesmo lock. Não existe estado em que o worker tenha posse e não
+           -- tenha autorização — que é o estado de onde sai o envio por cima
+           -- do atendente.
+           --
+           -- Efeito de não adquirir: a linha fica como está, com o
+           -- next_attempt_at intacto, e o tick seguinte tenta de novo. É o
+           -- HOLD que o §8.2.5 descreve — "podem permanecer em estado
+           -- operacional não terminal sob hold de controle" —, não um
+           -- descarte. Quando o humano devolve a conversa, quem decide o
+           -- destino do backlog é a retomada (future_only descarta), não
+           -- este predicado.
+           AND ${outboundEgressAuthorizedSql({
+             tenant: sql`${tenant_id}`,
+             agent: sql`${agent_id}`,
+             alvo: sql`${outbound_messages}`,
+           })}
         -- O status devolvido aqui e o valor NOVO, e e justamente ele que carrega
         -- a disposicao: claimed = ninguem tocou o adaptador, pode enviar;
         -- sending = a chamada anterior ficou em voo, NAO pode.
@@ -237,7 +264,19 @@ export const outboundDeliveryRepo = {
       // três pedem triagem oposta (bug de roteamento, operação normal, job
       // duplicado).
       const [current] = await db
-        .select({ status: outbound_messages.status })
+        .select({
+          status: outbound_messages.status,
+          // P04.7b — a MESMA expressão do predicado do claim, avaliada de novo
+          // na leitura de diagnóstico. Reescrevê-la em TypeScript a partir de
+          // colunas lidas seria a segunda cópia que este par de módulos existe
+          // para não ter: ela divergiria, e o lado que divergisse seria o que
+          // rotula errado.
+          egresso_autorizado: sql<boolean>`${outboundEgressAuthorizedSql({
+            tenant: sql`${tenant_id}`,
+            agent: sql`${agent_id}`,
+            alvo: sql`${outbound_messages}`,
+          })}`,
+        })
         .from(outbound_messages)
         .where(
           and(
@@ -247,11 +286,16 @@ export const outboundDeliveryRepo = {
           ),
         )
         .limit(1);
+      // Ordem: `terminal` ANTES de `human_control`. Uma linha já terminal não
+      // vai sair de novo, com ou sem atendente na conversa, e dizer
+      // `human_control` ali sugeriria que a retomada a libera — não libera.
       const reason: DeliveryClaimRejection = !current
         ? 'not_found'
         : (DELIVERY_TERMINAL_STATUSES as readonly string[]).includes(current.status)
           ? 'terminal'
-          : 'not_eligible';
+          : current.egresso_autorizado === false
+            ? 'human_control'
+            : 'not_eligible';
       return { ok: false, reason };
     }
     return {

@@ -213,7 +213,18 @@ export type ReActExitReason =
   | 'reasoner_failed'
   | 'outbound_failure'
   | 'empty_final_text'
-  | 'iteration_cap';
+  | 'iteration_cap'
+  /**
+   * U-P04.7a — o commit de outbound foi recusado porque um humano assumiu a
+   * conversa.
+   *
+   * Separado de `outbound_failure` porque as duas pedem reações opostas.
+   * `outbound_failure` é retentável: nada chegou ao usuário e o envio pode dar
+   * certo na próxima. Aqui o envio NÃO vai dar certo na próxima — a conversa
+   * está com um atendente, e o fence continuará recusando. Retentar é a
+   * automação insistindo para voltar ao canal de onde foi tirada.
+   */
+  | 'human_control_blocked';
 
 /**
  * Runs the ReAct iteration loop. Keeps the LLM call → tool execution cycle
@@ -650,11 +661,21 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       sensitiveTools,
     });
     if (outcome.status === 'not_sent') {
+      // O motivo TIPADO sobrevive até aqui (ver `DispatchOutcome.rejection`),
+      // em vez de a decisão de retry ter de parsear a string de erro.
+      const porControleHumano = outcome.rejection === 'human_control';
       logger.warn(
-        { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error },
-        'react_loop.outbound_not_delivered',
+        {
+          conversa_id: c.id,
+          mensagem_id: inbound.id,
+          err: outcome.error,
+          rejection: outcome.rejection ?? null,
+        },
+        porControleHumano
+          ? 'react_loop.outbound_blocked_human_control'
+          : 'react_loop.outbound_not_delivered',
       );
-      exitReason = 'outbound_failure';
+      exitReason = porControleHumano ? 'human_control_blocked' : 'outbound_failure';
     } else {
       if (outcome.status === 'sent_no_persist') {
         // Sent but persist failed (or ambiguous) — user has it; do NOT re-send.
