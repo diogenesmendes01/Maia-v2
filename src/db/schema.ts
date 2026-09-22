@@ -5020,3 +5020,44 @@ export const agent_engine_policies = pgTable(
 
 export type AgentEnginePolicyRow = typeof agent_engine_policies.$inferSelect;
 export type NewAgentEnginePolicyRow = typeof agent_engine_policies.$inferInsert;
+
+/**
+ * P12 (spec §10.1) — o DEGRAU da escada de canário por (tenant, agente).
+ *
+ * Migration 147. A escada em si é código
+ * (`src/runtime/engines/canary-policy.ts`), que responde "o que este degrau
+ * permite?". Esta tabela responde a outra metade — "em que degrau este agente
+ * está?" —, que muda por agente e por decisão humana e precisa sobreviver a
+ * deploy. Linha ausente vale `off`.
+ *
+ * Escopo (tenant, agente) e não (tenant, agente, canal): o canal escolhe MOTOR
+ * (`agent_engine_policies`, 145); o degrau escolhe o que qualquer motor pode
+ * fazer.
+ */
+export const agent_canary_policy = pgTable(
+  'agent_canary_policy',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    /** Um de `CANARY_STAGES`, na ordem do §10.1. */
+    stage: text('stage').notNull().default('off'),
+    /** Cadastro da coorte autorizada. Exigido a partir de `live_informational`. */
+    cohort_ref: text('cohort_ref'),
+    /** Quem aceitou o degrau, e contra o quê. Exigido a partir de `shadow_offline`. */
+    acceptance_evidence_ref: text('acceptance_evidence_ref'),
+    row_version: bigint('row_version', { mode: 'number' }).notNull().default(1),
+    /** Ator da última escrita. `app_users.id` é text; referência SOFT. */
+    updated_by: text('updated_by').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+    updated_at: timestamp('updated_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({
+      name: 'agent_canary_policy_pk',
+      columns: [t.tenant_id, t.agent_id],
+    }),
+  }),
+);
+
+export type AgentCanaryPolicyRow = typeof agent_canary_policy.$inferSelect;
+export type NewAgentCanaryPolicyRow = typeof agent_canary_policy.$inferInsert;

@@ -23,6 +23,10 @@ import {
   readEnginePolicyForScope,
 } from '@/db/repositories/engine-policy-repos.js';
 import { lookupEngineForNewTurn } from '@/runtime/engines/selector.js';
+import {
+  canaryAllowsHermesLiveTurn,
+  canaryPolicyRepo,
+} from '@/db/repositories/canary-policy-repos.js';
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
@@ -62,6 +66,9 @@ function motorDoTurnoNovo(
       scope: { tenant_id, agent_id, channel_id },
       kill_switch,
       readPolicy: readEnginePolicyForScope,
+      // Degrau já liberado de propósito: o assunto DESTE arquivo é a LINHA
+      // (K-15). A composição dos dois gates tem bloco proprio no fim.
+      canaryAllowsHermes: async () => true,
     }),
   );
 }
@@ -98,6 +105,9 @@ d('agent_engine_policies + seletor de turno novo contra Postgres real (K-15)', (
   afterAll(async () => {
     if (!pool) return;
     await pool.query(`DELETE FROM agent_engine_policies WHERE tenant_id = ANY($1)`, [
+      [TENANT_A, TENANT_B],
+    ]);
+    await pool.query(`DELETE FROM agent_canary_policy WHERE tenant_id = ANY($1)`, [
       [TENANT_A, TENANT_B],
     ]);
     await pool.query(`DELETE FROM channels WHERE tenant_id = ANY($1)`, [[TENANT_A, TENANT_B]]);
@@ -350,8 +360,122 @@ d('agent_engine_policies + seletor de turno novo contra Postgres real (K-15)', (
           scope: { tenant_id: TENANT_A, agent_id: AGENT_A1, channel_id: canalA1 },
           kill_switch: false,
           readPolicy: readEnginePolicyForScope,
+          canaryAllowsHermes: async () => true,
         }),
       ),
     ).toEqual({ kind: 'refused', reason: 'policy_lookup_failed' });
+  });
+});
+
+/**
+ * P12 (spec §10.1) — a LINHA e o DEGRAU compondo contra Postgres real.
+ *
+ * O arquivo acima prova a linha de `agent_engine_policies` (K-15). Estes casos
+ * provam o que ela NÃO basta para fazer sozinha: ligar o Hermes. A escada do
+ * §10.1 põe `hermes_live_turn` em `live_informational`, e até esta fatia ela
+ * era dado e regra sem leitor nenhum — uma linha de tabela bastava para ligar
+ * o motor remoto, sem coorte cadastrada e sem evidência de aceite.
+ *
+ * Aqui os dois gates rodam com as portas de PRODUÇÃO — `readEnginePolicyForScope`
+ * e `canaryAllowsHermesLiveTurn` —, contra as duas tabelas de verdade (145 e
+ * 147). Um teste que injetasse a escada como booleano provaria a conjunção em
+ * TypeScript e não provaria que a leitura do degrau funciona.
+ */
+d('P12 — a escada do canário decide junto com a linha (Postgres real)', () => {
+  let canal: string;
+
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 4 });
+    await pool.query('INSERT INTO tenants(id, nome) VALUES ($1,$1) ON CONFLICT (id) DO NOTHING', [
+      TENANT_A,
+    ]);
+    await pool.query(
+      'INSERT INTO agents(id, tenant_id, nome) VALUES ($1,$2,$1) ON CONFLICT (id) DO NOTHING',
+      [AGENT_A1, TENANT_A],
+    );
+    canal = await mkCanal(TENANT_A, AGENT_A1);
+    await noEscopo(TENANT_A, AGENT_A1, () =>
+      enginePoliciesRepo.write({
+        channel_id: canal,
+        engine: 'hermes',
+        expected_row_version: null,
+        updated_by: OPERADOR,
+      }),
+    );
+  });
+
+  afterAll(async () => {
+    if (!pool) return;
+    await pool.query(`DELETE FROM agent_canary_policy WHERE tenant_id = $1`, [TENANT_A]);
+    await pool.query(`DELETE FROM agent_engine_policies WHERE tenant_id = $1`, [TENANT_A]);
+    await pool.query(`DELETE FROM channels WHERE tenant_id = $1`, [TENANT_A]);
+    await pool.end();
+  });
+
+  /** O seletor com as DUAS portas de produção. */
+  function motor() {
+    return noEscopo(TENANT_A, AGENT_A1, () =>
+      lookupEngineForNewTurn({
+        scope: { tenant_id: TENANT_A, agent_id: AGENT_A1, channel_id: canal },
+        kill_switch: false,
+        readPolicy: readEnginePolicyForScope,
+        canaryAllowsHermes: canaryAllowsHermesLiveTurn,
+      }),
+    );
+  }
+
+  async function degrau(input: {
+    stage: 'off' | 'synthetic' | 'shadow_offline' | 'live_informational';
+    cohort_ref?: string | null;
+    acceptance_evidence_ref?: string | null;
+  }) {
+    await pool.query(`DELETE FROM agent_canary_policy WHERE tenant_id = $1`, [TENANT_A]);
+    return noEscopo(TENANT_A, AGENT_A1, () =>
+      canaryPolicyRepo.write({
+        stage: input.stage,
+        cohort_ref: input.cohort_ref ?? null,
+        acceptance_evidence_ref: input.acceptance_evidence_ref ?? null,
+        expected_row_version: null,
+        updated_by: OPERADOR,
+      }),
+    );
+  }
+
+  it('1. linha hermes SEM degrau cadastrado: fica no incumbente', async () => {
+    // Ausência de linha de canário vale `off`. Era exatamente este o buraco:
+    // a linha de `agent_engine_policies` sozinha ligava o motor remoto.
+    await pool.query(`DELETE FROM agent_canary_policy WHERE tenant_id = $1`, [TENANT_A]);
+    expect(await motor()).toEqual({ kind: 'ok', engine: 'maia_react', source: 'canary_hold' });
+  });
+
+  it('2. degrau `shadow_offline` ainda não libera turno vivo', async () => {
+    // O §10.1 descreve `shadow_offline` como "resultados não enviados". Um
+    // turno de verdade no motor remoto é o degrau seguinte.
+    expect(
+      await degrau({ stage: 'shadow_offline', acceptance_evidence_ref: 'aceite-1' }),
+    ).toMatchObject({ ok: true });
+    expect(await motor()).toEqual({ kind: 'ok', engine: 'maia_react', source: 'canary_hold' });
+  });
+
+  it('3. `live_informational` COM coorte e aceite: o Hermes atende', async () => {
+    // A contra-prova. Sem ela, um gate que negasse sempre passaria nos dois
+    // casos acima e o canário nunca sairia do lugar.
+    expect(
+      await degrau({
+        stage: 'live_informational',
+        cohort_ref: 'coorte-1',
+        acceptance_evidence_ref: 'aceite-1',
+      }),
+    ).toMatchObject({ ok: true });
+    expect(await motor()).toEqual({ kind: 'ok', engine: 'hermes', source: 'policy' });
+  });
+
+  it('4. degrau `live` SEM coorte nem chega a existir — a escrita recusa', async () => {
+    // `validateCanaryPolicy` roda antes do banco e diz QUAL requisito faltou;
+    // a CHECK da 147 diz a mesma coisa e é a que vale para escrita à mão.
+    const r = await degrau({ stage: 'live_informational', acceptance_evidence_ref: 'aceite-1' });
+    expect(r).toMatchObject({ ok: false, reason: 'incoherent_policy' });
+    // E sem degrau válido o motor continua sendo o incumbente.
+    expect(await motor()).toEqual({ kind: 'ok', engine: 'maia_react', source: 'canary_hold' });
   });
 });
