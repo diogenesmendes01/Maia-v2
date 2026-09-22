@@ -80,6 +80,21 @@ export type ShadowDivergenceV1 =
   | { kind: 'tool_not_recorded'; call_id: string; tool: string }
   | { kind: 'tool_unused'; tool: string; args_digest: string };
 
+/**
+ * Por que não houve comparação. Vocabulário FECHADO, e o fecho é o ponto: um
+ * membro genérico ("erro") deixaria "o motor recusou o trabalho" e "o motor
+ * travou" no mesmo balde, e as duas pedem triagem oposta.
+ */
+export type ShadowNotComparableReasonV1 =
+  /** `start` não devolveu `accepted`: não houve o que observar. */
+  | 'engine_not_accepted'
+  /** `observe` não chegou a terminal: o motor não produziu desfecho. */
+  | 'engine_did_not_terminate'
+  /** `start`/`observe` LANÇARAM. O motor quebrou no meio da avaliação. */
+  | 'engine_threw'
+  /** O prazo da avaliação estourou antes de o motor terminar. */
+  | 'deadline_exceeded';
+
 export type ShadowReportV1 = {
   snapshot_id: string;
   turn_id: string;
@@ -88,6 +103,20 @@ export type ShadowReportV1 = {
   engine_pin: AgentEnginePortV1['pin'];
   production_stop_kind: EngineStopV1['kind'];
   shadow_stop_kind: EngineStopV1['kind'] | 'not_produced';
+  /**
+   * HOUVE comparação?
+   *
+   * O campo existe porque `divergences: []` é ambíguo sozinho, e a ambiguidade
+   * é perigosa na direção errada: "comparei e não achei diferença" e "não
+   * cheguei a comparar" são o mesmo array vazio. Um consumidor que lesse só o
+   * comprimento trataria um motor que travou como um motor que passou.
+   *
+   * `shadow_stop_kind: 'not_produced'` já dava o sinal, mas de lado — exigia
+   * que o leitor soubesse procurá-lo. Aqui a pergunta é feita diretamente.
+   */
+  outcome: 'compared' | 'not_comparable';
+  /** Preenchido exatamente quando `outcome` é `not_comparable`. */
+  not_comparable_reason: ShadowNotComparableReasonV1 | null;
   divergences: ShadowDivergenceV1[];
   /** Chamadas que o motor em shadow pediu e a gravação não tinha. */
   unrecorded_calls: number;
@@ -98,7 +127,9 @@ export type ShadowEvaluationResultV1 =
   | { kind: 'evaluated'; report: ShadowReportV1 }
   | {
       kind: 'non_comparable';
-      reason: 'engine_not_accepted' | 'engine_did_not_terminate';
+      reason: ShadowNotComparableReasonV1;
+      /** O relatório de FALHA, já gravado. Ver `runShadowEvaluation`. */
+      report: ShadowReportV1;
     }
   | { kind: 'refused'; reason: 'turn_not_closed' | 'not_authorized' };
 
@@ -220,6 +251,19 @@ export async function runShadowEvaluation(input: {
   engine: AgentEnginePortV1;
   store: ShadowReportStoreV1;
   signal?: AbortSignal;
+  /**
+   * Prazo da AVALIAÇÃO, em milissegundos. Default: 2 minutos.
+   *
+   * Não é `snapshot.request.limits.deadline_at`: aquele é o prazo do turno
+   * ORIGINAL, que já passou — usá-lo abortaria toda avaliação no primeiro
+   * instante. O prazo de avaliar não é o prazo de atender.
+   *
+   * Sem ele, um motor que trava trava o harness junto, e uma bateria de
+   * avaliação noturna amanhece parada no primeiro snapshot ruim — sem
+   * relatório nenhum, que é a pior forma de falhar aqui: silêncio
+   * indistinguível de "ainda não rodou".
+   */
+  timeout_ms?: number;
   now?: () => Date;
 }): Promise<ShadowEvaluationResultV1> {
   const { snapshot, engine } = input;
@@ -245,12 +289,73 @@ export async function runShadowEvaluation(input: {
   const abortListener = () => controller.abort();
   input.signal?.addEventListener('abort', abortListener, { once: true });
 
+  const relogio = input.now ?? ((): Date => new Date());
+
+  /**
+   * O RELATÓRIO DE FALHA.
+   *
+   * Toda saída que não seja recusa de pré-voo passa por aqui, e é isso que
+   * torna o armazenamento de avaliação completo: um motor que trava ou que
+   * lança deixa uma LINHA, em vez de deixar nada. Deixar nada é a falha que o
+   * §5.3.1 nomeia no resto da épica — ausência de registro sendo lida como
+   * ausência de evento —, e aqui ela apareceria como "aquele snapshot nunca
+   * foi avaliado" quando o fato é "foi avaliado e o motor quebrou".
+   *
+   * As divergências acumuladas até o ponto da falha vão junto: uma chamada
+   * fora da gravação continua sendo o achado mais interessante do relatório,
+   * mesmo que o motor tenha morrido logo depois de fazê-la.
+   */
+  const relatorioDeFalha = (reason: ShadowNotComparableReasonV1): ShadowReportV1 => ({
+    snapshot_id: snapshot.snapshot_id,
+    turn_id: snapshot.turn_id,
+    report_format: 1,
+    engine_pin: engine.pin,
+    production_stop_kind: snapshot.production_stop.kind,
+    shadow_stop_kind: 'not_produced',
+    outcome: 'not_comparable',
+    not_comparable_reason: reason,
+    divergences,
+    unrecorded_calls: divergences.filter((d) => d.kind === 'tool_not_recorded').length,
+    evaluated_at: relogio().toISOString(),
+  });
+
+  const naoComparavel = async (
+    reason: ShadowNotComparableReasonV1,
+  ): Promise<ShadowEvaluationResultV1> => {
+    const report = relatorioDeFalha(reason);
+    await input.store.save(report);
+    return { kind: 'non_comparable', reason, report };
+  };
+
+  /**
+   * O PRAZO. Aborta o `signal` que o motor recebeu, em vez de correr com a
+   * promessa dele: cancelar de verdade é pedir ao motor que pare, não desistir
+   * de esperar e deixá-lo trabalhando. `unref` para que o timer não segure o
+   * processo de uma bateria que já terminou.
+   */
+  let estourouOPrazo = false;
+  const timer = setTimeout(() => {
+    estourouOPrazo = true;
+    controller.abort();
+  }, input.timeout_ms ?? 120_000);
+  timer.unref?.();
+
   try {
     let shadowStop: EngineStopV1 | null = null;
-    const start = await engine.start(snapshot.request, {
-      signal: controller.signal,
-      invokeTool: replay.invokeTool,
-    });
+    let start: Awaited<ReturnType<AgentEnginePortV1['start']>>;
+    try {
+      start = await engine.start(snapshot.request, {
+        signal: controller.signal,
+        invokeTool: replay.invokeTool,
+      });
+    } catch {
+      // O erro não sobe. Um motor que lança é um RESULTADO da avaliação — é
+      // justamente o tipo de coisa que se quer descobrir em shadow —, e
+      // propagá-lo faria a bateria parar no primeiro motor ruim. O que ele
+      // NÃO pode é virar aprovação silenciosa, e não vira: o relatório sai
+      // com `outcome: 'not_comparable'`.
+      return await naoComparavel(estourouOPrazo ? 'deadline_exceeded' : 'engine_threw');
+    }
 
     /**
      * Se o motor foi recusado, não há comparação possível.
@@ -258,25 +363,30 @@ export async function runShadowEvaluation(input: {
      * como avaliado com divergences vazio, que seria confuso.
      */
     if (start.kind !== 'accepted') {
-      return { kind: 'non_comparable', reason: 'engine_not_accepted' };
+      return await naoComparavel('engine_not_accepted');
     }
 
-    const obs = await engine.observe(
-      {
-        run_id: snapshot.request.run_id,
-        request_key: snapshot.request.request_key,
-        remote_instance_id: 'shadow',
-        remote_run_id: start.remote_run_id,
-      },
-      controller.signal,
-    );
+    let obs: Awaited<ReturnType<AgentEnginePortV1['observe']>>;
+    try {
+      obs = await engine.observe(
+        {
+          run_id: snapshot.request.run_id,
+          request_key: snapshot.request.request_key,
+          remote_instance_id: 'shadow',
+          remote_run_id: start.remote_run_id,
+        },
+        controller.signal,
+      );
+    } catch {
+      return await naoComparavel(estourouOPrazo ? 'deadline_exceeded' : 'engine_threw');
+    }
 
     /**
      * Se observe não retornou terminal, o motor não terminou, logo não há
      * um desfecho para comparar com a produção.
      */
     if (obs.kind !== 'terminal') {
-      return { kind: 'non_comparable', reason: 'engine_did_not_terminate' };
+      return await naoComparavel(estourouOPrazo ? 'deadline_exceeded' : 'engine_did_not_terminate');
     }
 
     shadowStop = obs.proposal.stop;
@@ -329,9 +439,11 @@ export async function runShadowEvaluation(input: {
       engine_pin: engine.pin,
       production_stop_kind: snapshot.production_stop.kind,
       shadow_stop_kind: shadowStop.kind,
+      outcome: 'compared',
+      not_comparable_reason: null,
       divergences,
       unrecorded_calls: divergences.filter((d) => d.kind === 'tool_not_recorded').length,
-      evaluated_at: (input.now ?? (() => new Date()))().toISOString(),
+      evaluated_at: relogio().toISOString(),
     };
 
     await input.store.save(report);
@@ -339,5 +451,6 @@ export async function runShadowEvaluation(input: {
   } finally {
     // Remover o listener para evitar vazamento, mesmo se houver exceção.
     input.signal?.removeEventListener('abort', abortListener);
+    clearTimeout(timer);
   }
 }

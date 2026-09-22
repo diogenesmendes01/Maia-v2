@@ -238,3 +238,138 @@ describe('runShadowEvaluation — o relatório', () => {
     expect(salvos[0]).toMatchObject({ report_format: 1, snapshot_id: 'snap-1', turn_id: 'turn-1' });
   });
 });
+
+/**
+ * A segunda rodada de revisão nomeou o buraco: `divergences: []` é a mesma
+ * coisa quando a comparação aconteceu e não achou nada e quando a comparação
+ * NÃO aconteceu. Um consumidor que leia só o comprimento trata um motor que
+ * quebrou como um motor que passou.
+ *
+ * O campo `outcome` responde a pergunta diretamente, e TODO caminho que não
+ * seja recusa de pré-voo grava relatório — inclusive o do motor que lança e o
+ * do motor que trava. Deixar nada seria a ausência de registro lida como
+ * ausência de evento, que é o que o §5.3.1 proíbe no resto da épica.
+ */
+describe('runShadowEvaluation — não comparável NUNCA se parece com aprovado', () => {
+  function motorQueRecusa(): AgentEnginePortV1 {
+    const base = engineFake({ stop: { kind: 'no_reply', reason: 'empty_final_text' } });
+    return { ...base, start: async () => ({ kind: 'refused', code: 'capacity' }) } as never;
+  }
+
+  function motorQueLanca(onde: 'start' | 'observe'): AgentEnginePortV1 {
+    const base = engineFake({ stop: { kind: 'reply', raw_text: 'x' } });
+    return {
+      ...base,
+      ...(onde === 'start'
+        ? {
+            start: async () => {
+              throw new Error('o motor caiu');
+            },
+          }
+        : {
+            observe: async () => {
+              throw new Error('o motor caiu depois de aceitar');
+            },
+          }),
+    } as never;
+  }
+
+  it('motor recusado: `not_comparable`, e o relatório é GRAVADO', async () => {
+    const { store: st, salvos } = store();
+    const r = await runShadowEvaluation({
+      snapshot: snapshot(),
+      engine: motorQueRecusa(),
+      store: st,
+    });
+    expect(r.kind).toBe('non_comparable');
+    expect(r.kind === 'non_comparable' && r.reason).toBe('engine_not_accepted');
+    // A linha existe: "este snapshot foi avaliado e não deu para comparar" é
+    // um fato diferente de "este snapshot nunca foi avaliado".
+    expect(salvos).toHaveLength(1);
+    expect(salvos[0]).toMatchObject({
+      outcome: 'not_comparable',
+      not_comparable_reason: 'engine_not_accepted',
+      shadow_stop_kind: 'not_produced',
+    });
+  });
+
+  it('`start` que LANÇA não derruba a bateria — vira relatório', async () => {
+    // Propagar faria a avaliação noturna parar no primeiro motor ruim, e um
+    // motor ruim é exatamente o que se quer descobrir em shadow.
+    const { store: st, salvos } = store();
+    const r = await runShadowEvaluation({
+      snapshot: snapshot(),
+      engine: motorQueLanca('start'),
+      store: st,
+    });
+    expect(r.kind === 'non_comparable' && r.reason).toBe('engine_threw');
+    expect(salvos[0]).toMatchObject({ outcome: 'not_comparable' });
+  });
+
+  it('`observe` que LANÇA também vira relatório, não exceção', async () => {
+    const { store: st, salvos } = store();
+    const r = await runShadowEvaluation({
+      snapshot: snapshot(),
+      engine: motorQueLanca('observe'),
+      store: st,
+    });
+    expect(r.kind === 'non_comparable' && r.reason).toBe('engine_threw');
+    expect(salvos).toHaveLength(1);
+  });
+
+  it('PRAZO: motor que não termina é abortado e reportado como tal', async () => {
+    // Sem prazo, uma bateria amanhece parada no primeiro snapshot ruim — sem
+    // relatório nenhum, que é silêncio indistinguível de "ainda não rodou".
+    const { store: st, salvos } = store();
+    const base = engineFake({ stop: { kind: 'reply', raw_text: 'x' } });
+    const motorQueTrava: AgentEnginePortV1 = {
+      ...base,
+      observe: (_ref: unknown, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener('abort', () => reject(new Error('aborted')), { once: true });
+        }),
+    } as never;
+
+    const r = await runShadowEvaluation({
+      snapshot: snapshot(),
+      engine: motorQueTrava,
+      store: st,
+      timeout_ms: 20,
+    });
+    expect(r.kind === 'non_comparable' && r.reason).toBe('deadline_exceeded');
+    expect(salvos[0]).toMatchObject({ not_comparable_reason: 'deadline_exceeded' });
+  });
+
+  it('o caminho FELIZ diz `compared` — senão o campo não distinguiria nada', async () => {
+    const { store: st, salvos } = store();
+    const r = await runShadowEvaluation({
+      snapshot: snapshot(),
+      engine: engineFake({ stop: { kind: 'reply', raw_text: 'Seu saldo é R$ 10,00.' } }),
+      store: st,
+    });
+    expect(r.kind).toBe('evaluated');
+    expect(salvos[0]).toMatchObject({ outcome: 'compared', not_comparable_reason: null });
+  });
+
+  it('divergência achada ANTES da falha sobrevive no relatório', async () => {
+    // Uma chamada fora da gravação continua sendo o achado mais interessante,
+    // mesmo que o motor morra logo depois de fazê-la.
+    const { store: st, salvos } = store();
+    const base = engineFake({
+      stop: { kind: 'reply', raw_text: 'x' },
+      chamadas: [{ name: 'transferir_dinheiro', args: { valor: 1000 } }],
+    });
+    const motor: AgentEnginePortV1 = {
+      ...base,
+      observe: async () => {
+        throw new Error('caiu depois de tentar a tool');
+      },
+    } as never;
+
+    await runShadowEvaluation({ snapshot: snapshot(), engine: motor, store: st });
+    expect(salvos[0]).toMatchObject({
+      outcome: 'not_comparable',
+      unrecorded_calls: 1,
+    });
+  });
+});
