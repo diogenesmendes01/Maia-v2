@@ -45,6 +45,7 @@ import {
 } from "@/integrations/hermes/inference-gateway.js";
 import type { EngineRunPhaseV1 } from "@/runtime/engines/contracts.js";
 import { db, withTx } from "../client.js";
+import { auditTx } from "@/governance/audit.js";
 import { lockControlByRunSql, type ConversationControlLockRow } from "./conversation-control-sql.js";
 import {
   agent_turns,
@@ -387,8 +388,43 @@ export const inferenceRepo = {
   }): Promise<AdmitAttemptResult> {
     const { tenant_id, agent_id } = scope();
     return withTx(async (tx): Promise<AdmitAttemptResult> => {
-      const recusa = (code: InferenceErrorCode, audit_reason: string): AdmitAttemptResult => {
+      /**
+       * C24 — a recusa por COTA passa a deixar linha durável.
+       *
+       * Antes havia só `conta(...)` e um comentário afirmando que "o motivo
+       * tipado fica na auditoria e na métrica". A métrica existia; a auditoria
+       * não. O motivo morria no retorno, e a pergunta "por que este agente
+       * parou de responder às 14h?" não tinha como ser respondida depois.
+       *
+       * `auditTx` e não `audit`: a linha entra na MESMA transação da decisão.
+       * Auditar fora dela deixaria a recusa acontecer sem registro num
+       * rollback, que é precisamente o caso em que o registro importa.
+       *
+       * Só cota entra. Grant inválido, controle humano e conta ausente são
+       * fatos de outra natureza, e lê-los como "acabou o orçamento" mandaria o
+       * operador procurar dinheiro onde o problema não está.
+       */
+      const recusaDeCota = (code: InferenceErrorCode): boolean =>
+        code === "budget_exhausted" || code === "inference_limit_exceeded";
+
+      const recusa = async (
+        code: InferenceErrorCode,
+        audit_reason: string,
+      ): Promise<AdmitAttemptResult> => {
         conta("admit", audit_reason);
+        if (recusaDeCota(code)) {
+          await auditTx(tx, {
+            acao: "engine_quota_denied",
+            alvo_id: input.grant_id,
+            metadata: {
+              code,
+              audit_reason,
+              attempt_id: input.attempt_id,
+              model_requested: input.model_requested,
+              estimate_microusd: input.estimate_microusd,
+            },
+          });
+        }
         return { ok: false, code, audit_reason };
       };
 
@@ -399,7 +435,7 @@ export const inferenceRepo = {
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.grant_id}`),
       );
       const run_id = alvo[0]?.run_id;
-      if (!run_id) return recusa("invalid_inference_grant", "absent");
+      if (!run_id) return await recusa("invalid_inference_grant", "absent");
 
       const controle =
         linhas<ConversationControlLockRow>(
@@ -411,7 +447,7 @@ export const inferenceRepo = {
           SELECT ${RUN_COLS} FROM ${engine_runs}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${run_id}`),
       )[0];
-      if (!semLock) return recusa("invalid_inference_grant", "absent");
+      if (!semLock) return await recusa("invalid_inference_grant", "absent");
       await tx.execute(sql`
         SELECT id FROM ${agent_turns}
          WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${semLock.turn_id}
@@ -428,7 +464,7 @@ export const inferenceRepo = {
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.grant_id}
            FOR NO KEY UPDATE`),
       )[0];
-      if (!run || !grant) return recusa("invalid_inference_grant", "absent");
+      if (!run || !grant) return await recusa("invalid_inference_grant", "absent");
 
       const now = await agoraDb(tx);
       const calls_so_far = await contarTentativas(tx, run_id);
@@ -441,15 +477,15 @@ export const inferenceRepo = {
         manifest_digest_effective: run.manifest_digest,
         tool_names_requested: input.tool_names_requested,
       });
-      if (validacao.kind === "refused") return recusa(validacao.code, validacao.audit_reason);
+      if (validacao.kind === "refused") return await recusa(validacao.code, validacao.audit_reason);
       // O que o módulo puro não enxerga: posse do turno, controle humano/epoch
       // e o prazo do run.
       const posse = await posseDoTurno(tx, run, false);
-      if (posse === "stale_claim") return recusa("run_revoked", "stale_claim");
-      if (posse === "turn_not_running") return recusa("run_not_active", "turn_not_running");
-      if (!controleOk(controle, run, grant)) return recusa("run_revoked", "control_changed");
+      if (posse === "stale_claim") return await recusa("run_revoked", "stale_claim");
+      if (posse === "turn_not_running") return await recusa("run_not_active", "turn_not_running");
+      if (!controleOk(controle, run, grant)) return await recusa("run_revoked", "control_changed");
       if (Date.parse(now) >= Date.parse(run.deadline_at)) {
-        return recusa("run_not_active", "deadline_passed");
+        return await recusa("run_not_active", "deadline_passed");
       }
 
       const contaRows = linhas<{
@@ -487,15 +523,15 @@ export const inferenceRepo = {
         });
       } catch {
         // Valor monetário fora do formato: não admitir é o único desfecho seguro.
-        return recusa("admission_unavailable", "money_format");
+        return await recusa("admission_unavailable", "money_format");
       }
       if (decisao.kind === "refuse") {
         // Sem preço, o cliente vê cota (429, terminal no classificador pinado);
         // o motivo tipado fica na auditoria e na métrica.
         const wire = decisao.code === "unknown_price" ? "budget_exhausted" : decisao.code;
-        return recusa(wire, `admission_${decisao.code}`);
+        return await recusa(wire, `admission_${decisao.code}`);
       }
-      if (!account || !linhaConta) return recusa("admission_unavailable", "no_account");
+      if (!account || !linhaConta) return await recusa("admission_unavailable", "no_account");
 
       const proxima = applyAdmission(account, decisao);
       const atualizada = linhas<{ id: string }>(
@@ -508,7 +544,7 @@ export const inferenceRepo = {
              AND id = ${linhaConta.id} AND row_version = ${account.row_version}
            RETURNING id`),
       );
-      if (!atualizada[0]) return recusa("admission_unavailable", "account_cas");
+      if (!atualizada[0]) return await recusa("admission_unavailable", "account_cas");
 
       const attempt_seq = calls_so_far + 1;
       await tx.execute(sql`

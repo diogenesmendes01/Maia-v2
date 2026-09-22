@@ -25,6 +25,18 @@ export const recallMemoryTool: Tool<typeof inputSchema, typeof outputSchema> = {
   input_schema: inputSchema,
   output_schema: outputSchema,
   required_actions: ['read_transactions'],
+  /**
+   * C-P05-7 (§7.10.1) — a autorização é sobre o TITULAR da conversa, não sobre
+   * uma entidade.
+   *
+   * Sem esta linha, o dispatcher exigia entidade e, quando os argumentos não
+   * traziam uma, caía em `ctx.scope.entidades[0]`: a chamada ficava vinculada a
+   * uma entidade arbitrária e as checagens rodavam contra ela. Num escopo SEM
+   * entidade, a mesma chamada era recusada com `no_entity_in_scope` — um
+   * problema que memória pessoal não tem. A spec é literal: "memória pessoal
+   * não pode inventar entidade para passar esse gate".
+   */
+  authorization_target: 'current_subject',
   side_effect: 'read',
   effect_class: 'abort_safe',
   redis_required: false,
