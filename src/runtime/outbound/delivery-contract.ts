@@ -172,6 +172,23 @@ export const DELIVERY_CLAIM_REJECTIONS = [
    *  linha terminal nunca voltará a ser elegível, então insistir é desperdício
    *  e um pico aqui significa job duplicado, não contenção. */
   'terminal',
+  /**
+   * P04.7b (§8.2.4) — a linha está elegível em tudo, menos no que importa: um
+   * humano assumiu a conversa, ou o regime dela mudou desde que esta resposta
+   * foi escrita.
+   *
+   * Código PRÓPRIO, e não `not_eligible`, pela mesma razão que `human_control`
+   * é próprio no commit: as duas recusas descrevem coisas diferentes e pedem
+   * triagem oposta. `not_eligible` fala do ESTADO da linha ("outro worker tem
+   * a lease", "ainda não é hora") e um pico nele é contenção; este fala da
+   * CONVERSA ("tem gente atendendo") e um pico nele é uso normal do console.
+   * Colapsar os dois faria o dashboard de entrega acusar contenção toda vez
+   * que um atendente trabalhasse.
+   *
+   * É HOLD, não descarte: a linha fica como está e o tick seguinte pergunta de
+   * novo (§8.2.5). Quem decide o destino do backlog é a retomada.
+   */
+  'human_control',
 ] as const;
 
 export type DeliveryClaimRejection = (typeof DELIVERY_CLAIM_REJECTIONS)[number];

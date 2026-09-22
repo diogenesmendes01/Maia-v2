@@ -54,7 +54,11 @@ import { auditTx } from '@/governance/audit.js';
 import { assertTurnTransition } from '@/runtime/turns/contract.js';
 import type { TurnStatus } from '@/runtime/turns/contract.js';
 import { turnWriteConditions } from './turn-fence-sql.js';
-import { humanControlProbe, streamNotHumanControlled } from './conversation-control-sql.js';
+import {
+  controlProvenanceForStreamSql,
+  humanControlProbe,
+  streamNotHumanControlled,
+} from './conversation-control-sql.js';
 import type { OutboundArtifact } from '@/runtime/outbound/contract.js';
 import { legacyChannelFor } from '@/runtime/outbound/contract.js';
 
@@ -320,6 +324,28 @@ export const outboundOutboxRepo = {
           payload_hash: artifact.payload_hash,
           logical_dedupe_key: artifact.logical_dedupe_key,
           provider_idempotency_key: artifact.provider_idempotency_key,
+          // ── P04.7b (§8.2.4, C43) — a PROVENIÊNCIA DE CONTROLE. ─────────
+          //
+          // O fence acima decidiu que esta saída PODE ser commitada agora. O
+          // carimbo responde a outra pergunta, que só será feita depois: sob
+          // qual regime ela foi escrita. Sem ele, uma resposta escrita antes
+          // de uma pausa é indistinguível de uma escrita depois da retomada,
+          // e a fila as enviaria igual.
+          //
+          // A stream vem do turno que o passo (1) acabou de devolver — a
+          // MESMA linha que o fence avaliou, na mesma transação. Lê-la numa
+          // consulta à parte reabriria a janela que o passo (1) fechou.
+          //
+          // `origin: 'bot'` porque este caminho é o do raciocínio. Quem
+          // escrever aqui em nome de um operador precisa dizer isso
+          // explicitamente — e não há, hoje, como fazê-lo por engano: o
+          // caller é o dispatcher de saída do turno.
+          ...controlProvenanceForStreamSql({
+            tenant_id,
+            agent_id,
+            stream_key: turn.stream_key ?? null,
+          }),
+          origin: 'bot',
           // Relógio do BANCO. `next_attempt_at` é NOT NULL para row durável
           // (CHECK de completude da 121) e é o gate que o índice (7c) percorre:
           // é ele que torna a linha VISÍVEL para o recovery de #633 no instante

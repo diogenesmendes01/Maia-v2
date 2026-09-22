@@ -994,6 +994,22 @@ export const outbound_messages = pgTable(
     logical_dedupe_key: text('logical_dedupe_key'),
     /** Chave estável entregue ao ADAPTADOR. Mesmo material, domínio de hash DIFERENTE. */
     provider_idempotency_key: text('provider_idempotency_key'),
+    // ── P04.7b (§8.2.4, C43) — proveniência de controle, migration 148. ──
+    /** Controle em vigor no COMMIT. NULL = não havia (equivale a modo `bot`). */
+    control_id: uuid('control_id'),
+    /**
+     * Epoch daquele controle no commit. Epoch diferente no envio significa que
+     * o regime da conversa mudou desde que esta resposta foi escrita.
+     *
+     * `mode: 'number'` seria mentira acima de 2^53; o contrato do §8.3.2
+     * serializa epoch como decimal em string por essa razão.
+     */
+    control_epoch: bigint('control_epoch', { mode: 'bigint' }),
+    /**
+     * Quem escreveu a saída. `bot` e `system` são RETIDOS sob controle humano;
+     * `operator` passa, porque é a fala de quem tem o controle.
+     */
+    origin: text('origin').notNull().default('bot'),
     /** Tentativas de entrega. MUTÁVEL — por isso nunca entra na derivação das chaves. */
     attempt: integer('attempt').notNull().default(0),
     claimed_by: text('claimed_by'),
