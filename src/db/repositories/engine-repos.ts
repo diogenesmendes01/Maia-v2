@@ -1014,13 +1014,33 @@ export const engineRunsRepo = {
     // motor, então o pipeline normal é o caminho certo.
     if (pin === null) return { kind: "no_binding" };
 
+    // `phase <> 'closed'`, e NÃO `LISTA_FASES_ABERTAS`. As duas respondem
+    // perguntas diferentes, e confundi-las deixou um ramo MORTO.
+    //
+    // `FASES_ABERTAS` existe para casar com o predicado dos índices parciais da
+    // varredura de manutenção, que deliberadamente não cobrem `blocked`: um run
+    // bloqueado não pede polling, pede gente, e tem índice próprio. A pergunta
+    // DESTA consulta é outra — este turno tem run que ainda não terminou? — e
+    // `blocked` é exatamente um deles.
+    //
+    // O efeito de usar a lista errada era concreto: run `blocked` respondia
+    // `binding_without_open_run`, a rota devolvia `run_pipeline`, e o turno
+    // reexecutava pendências, procedures e skills — parte delas commitando
+    // efeito — até morrer em `run_already_open` no prepare. O ramo
+    // `await_operator` de `route-existing-run.ts` nunca era alcançado por este
+    // caminho, e os casos que o cobrem passavam porque montam o
+    // `TurnEngineState` à mão, sem passar pelo produtor: função pura provada,
+    // produtor nunca emitindo a entrada.
+    //
+    // `phase <> 'closed'` é a MESMA pergunta que `pinEngineAndPrepareRun` já
+    // fazia antes de recusar com `run_already_open`.
     const abertos = linhas<RunSnapshotRow>(
       await db.execute(sql`
         SELECT ${SNAPSHOT_COLS}
           FROM ${engine_runs}
          WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
            AND turn_id = ${input.turn_id}
-           AND phase IN (${LISTA_FASES_ABERTAS})
+           AND phase <> 'closed'
          ORDER BY generation_no DESC, id
          LIMIT 1`),
     );
