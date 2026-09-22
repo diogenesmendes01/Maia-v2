@@ -270,7 +270,18 @@ export type ReActExitReason =
    * T22 — as capacidades do run foram revogadas ANTES do envio. A resposta
    * existia e foi retida de propósito; não é ausência de resposta.
    */
-  | 'egress_revoked';
+  | 'egress_revoked'
+  /**
+   * U-P04.7a — o commit de outbound foi recusado porque um humano assumiu a
+   * conversa.
+   *
+   * Separado de `outbound_failure` porque as duas pedem reações opostas.
+   * `outbound_failure` é retentável: nada chegou ao usuário e o envio pode dar
+   * certo na próxima. Aqui o envio NÃO vai dar certo na próxima — a conversa
+   * está com um atendente, e o fence continuará recusando. Retentar é a
+   * automação insistindo para voltar ao canal de onde foi tirada.
+   */
+  | 'human_control_blocked';
 
 /**
  * Runs the ReAct iteration loop. Keeps the LLM call → tool execution cycle

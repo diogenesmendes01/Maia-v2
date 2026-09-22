@@ -200,3 +200,41 @@ describe('T22 — resposta RETIDA não é resposta inexistente', () => {
     }
   });
 });
+
+describe('U-P04.7a — tomada humana não é falha de transporte', () => {
+  it('não é retentável: o fence vai recusar de novo enquanto o humano estiver lá', () => {
+    const acao = decideTurnAction({
+      dispatched: false,
+      exitReason: 'human_control_blocked',
+      persistUnknown: false,
+      sideEffectsCommitted: false,
+    });
+    expect(acao.kind).not.toBe('retry');
+  });
+
+  it('fecha o turno em vez de ir para a fila de intervenção', () => {
+    // Tomada humana é operação NORMAL e frequente. Mandar cada handover para
+    // a DLQ encheria a fila de eventos que já têm dono — o atendente.
+    expect(
+      decideTurnAction({
+        dispatched: false,
+        exitReason: 'human_control_blocked',
+        persistUnknown: false,
+        sideEffectsCommitted: false,
+      }),
+    ).toEqual({ kind: 'complete', outcome: 'no_reply_produced' });
+  });
+
+  it('contraste: falha de transporte CONTINUA retentável', () => {
+    // É a distinção inteira. Se este caso cair junto com o de cima, os dois
+    // motivos voltaram a ser tratados como um só.
+    expect(
+      decideTurnAction({
+        dispatched: false,
+        exitReason: 'outbound_failure',
+        persistUnknown: false,
+        sideEffectsCommitted: false,
+      }),
+    ).toEqual({ kind: 'retry', code: 'outbound_failure' });
+  });
+});

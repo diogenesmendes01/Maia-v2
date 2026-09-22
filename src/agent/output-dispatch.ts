@@ -1100,7 +1100,24 @@ export async function dispatchOutput(ctx: DispatchOutputCtx): Promise<void> {
  */
 export type DispatchOutcome =
   | { status: 'delivered' }
-  | { status: 'not_sent'; error: string }
+  | {
+      status: 'not_sent';
+      error: string;
+      /**
+       * U-P04.7a — o motivo TIPADO da recusa, quando ele existe.
+       *
+       * `not_sent` cobre desde "o canal caiu" até "um humano assumiu a
+       * conversa", e o caller classificava os dois como `outbound_failure`,
+       * que é RETENTÁVEL. Retentar uma recusa por controle humano é a
+       * automação insistindo para voltar ao canal de onde foi tirada — e,
+       * mesmo que o claim recuse depois (e recusa), o turno fica rodando um
+       * ciclo de retry que não tem como terminar.
+       *
+       * O campo existe para que o motivo sobreviva até a decisão de retry, em
+       * vez de ficar só na string de erro, que ninguém deveria parsear.
+       */
+      rejection?: 'human_control';
+    }
   | { status: 'sent_no_persist'; error: string };
 
 /**
@@ -1170,9 +1187,28 @@ async function handleDispatchError(e: unknown, ctx: DispatchOutputCtx): Promise<
     delivered === false ? 'pre_send' : delivered === true ? 'post_send' : 'unknown';
   const error = (e as Error).message;
   await recordOutboundAttempt(ctx, phase, error);
-  return phase === 'pre_send'
-    ? { status: 'not_sent', error }
-    : { status: 'sent_no_persist', error };
+  if (phase !== 'pre_send') return { status: 'sent_no_persist', error };
+
+  /**
+   * O motivo tipado, extraído do erro do commit.
+   *
+   * A recusa nasce em `commitTurnOutboundTx` como `OutboundCommitError` com
+   * `rejection: 'human_control'`, e `sendOutboundOrThrow` a embrulha numa
+   * `OutboundDeliveryError` cuja mensagem carrega o texto original. Ler a
+   * mensagem aqui é feio, e a alternativa — propagar o erro tipado através da
+   * fronteira de entrega — mudaria a assinatura de um caminho que quatro
+   * chamadores compartilham.
+   *
+   * O que torna isto aceitável é o campo: o motivo sai da string e vira dado
+   * ANTES de chegar a quem decide retry, que é o consumidor que precisava
+   * dele. Ninguém adiante parseia texto.
+   */
+  const rejection = error.includes('outbound_commit_rejected:human_control')
+    ? ('human_control' as const)
+    : undefined;
+  return rejection !== undefined
+    ? { status: 'not_sent', error, rejection }
+    : { status: 'not_sent', error };
 }
 
 /**

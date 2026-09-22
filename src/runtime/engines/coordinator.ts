@@ -313,11 +313,33 @@ export async function coordinateOutput(
     });
 
     if (outcome.status === 'not_sent') {
+      /**
+       * U-P04.7a — a tomada humana chega aqui como MOTIVO TIPADO.
+       *
+       * Esta classificação nasceu no laço, dentro do bloco de envio inline que
+       * este coordenador substituiu, e veio para cá na integração das duas
+       * unidades. Ela não podia ficar para trás: sem ela, `not_sent` por
+       * controle humano vira `outbound_failure`, que `decideTurnAction`
+       * classifica como RETRY — a automação reenfileirando o turno para
+       * insistir no canal de onde um atendente acabou de tirá-la.
+       * `human_control_blocked` está fora de `RETRYABLE_EXITS` por isso.
+       *
+       * O motivo vem de `DispatchOutcome.rejection`, campo tipado, em vez de a
+       * decisão de retry ter de procurar substring na mensagem de erro.
+       */
+      const porControleHumano = outcome.rejection === 'human_control';
       logger.warn(
-        { conversa_id: conversa.id, mensagem_id: inbound.id, err: outcome.error },
-        'engine.coordinator.outbound_not_delivered',
+        {
+          conversa_id: conversa.id,
+          mensagem_id: inbound.id,
+          err: outcome.error,
+          rejection: outcome.rejection ?? null,
+        },
+        porControleHumano
+          ? 'engine.coordinator.outbound_blocked_human_control'
+          : 'engine.coordinator.outbound_not_delivered',
       );
-      exitReason = 'outbound_failure';
+      exitReason = porControleHumano ? 'human_control_blocked' : 'outbound_failure';
     } else {
       if (outcome.status === 'sent_no_persist') {
         // Chegou ao usuário e a persistência ficou ambígua. NUNCA reenviar.
