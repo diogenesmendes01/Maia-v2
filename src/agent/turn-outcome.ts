@@ -31,6 +31,18 @@ export type TurnAction =
  * `empty_final_text` e `iteration_cap` NÃO entram: no primeiro o modelo
  * deliberadamente não produziu texto (o turno correu até o fim), e no segundo
  * as tools já rodaram — reexecutar duplicaria efeito.
+ *
+ * `human_control_blocked` também não entra, e a ausência é deliberada. Ele
+ * parece `outbound_failure` — nada chegou ao usuário — mas a semelhança para
+ * aí: um envio que falhou por transporte PODE dar certo na próxima; um
+ * recusado porque um atendente assumiu a conversa NÃO vai, porque o fence
+ * continuará recusando enquanto o humano estiver lá. Retentar seria a
+ * automação insistindo para voltar ao canal de onde foi tirada.
+ *
+ * O desfecho é `complete/no_reply_produced`, e não `dead_letter`. Tomada
+ * humana é operação NORMAL e frequente: mandar cada handover para a fila de
+ * intervenção encheria a DLQ de eventos que já têm dono — o atendente. O que
+ * importa é o turno fechar sem retry, e é isso que a ausência daqui garante.
  */
 const RETRYABLE_EXITS: ReadonlySet<ReActExitReason> = new Set<ReActExitReason>([
   'reasoner_failed',

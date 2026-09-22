@@ -435,6 +435,7 @@ export const AUDIT_ACTIONS = [
    * os dois estados que um incidente precisa separar.
    */
   'engine_cancel_reconciled',
+  /**
    * C24 (§8.6.1) — um RESULTADO do motor foi barrado antes de virar resposta.
    *
    * O produtor é o bloqueio por divergência de alegação
@@ -447,6 +448,7 @@ export const AUDIT_ACTIONS = [
    * pede revisão de permissão, a outra pede reconciliação do run.
    */
   'engine_result_fenced',
+  /**
    * G1 (spec §7.6.1 item 7) — uma PROPOSTA de aprendizado nasceu.
    *
    * Ela existe porque `rule_learned` afirma outra coisa. Quem lê essa ação —

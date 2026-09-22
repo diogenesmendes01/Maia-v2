@@ -65,12 +65,7 @@
  * `tests/unit/runtime/conversation-control-claim-contract.spec.ts`.
  */
 import { sql, type SQL } from 'drizzle-orm';
-import {
-  agent_turns,
-  conversation_controls,
-  engine_runs,
-  engine_tool_calls,
-} from '../schema.js';
+import { agent_turns, conversation_controls, engine_runs, engine_tool_calls } from '../schema.js';
 
 /**
  * A linha devolvida pelos dois construtores. Eles selecionam EXATAMENTE as
@@ -227,11 +222,7 @@ export function lockControlByRunSql(input: {
  * `string` obrigaria o dispatcher a montar o predicado à mão — a segunda cópia
  * que este módulo existe para impedir.
  */
-export function streamNotHumanControlled(input: {
-  tenant: SQL;
-  agent: SQL;
-  alvo: SQL;
-}): SQL {
+export function streamNotHumanControlled(input: { tenant: SQL; agent: SQL; alvo: SQL }): SQL {
   return sql`(
         ${input.alvo}.stream_key IS NULL
      OR NOT EXISTS (
@@ -276,11 +267,7 @@ export function streamNotHumanControlled(input: {
  * que o turno muda entre as duas, e a explicação do fracasso passaria a
  * descrever um estado que já não existe.
  */
-export function humanControlProbe(input: {
-  tenant: SQL;
-  agent: SQL;
-  turn_id: string;
-}): SQL {
+export function humanControlProbe(input: { tenant: SQL; agent: SQL; turn_id: string }): SQL {
   return sql`
     SELECT controle.id AS control_id, controle.mode AS mode
       FROM ${agent_turns} AS alvo
@@ -294,6 +281,122 @@ export function humanControlProbe(input: {
        AND alvo.stream_key IS NOT NULL
        AND controle.mode <> 'bot'
      LIMIT 1`;
+}
+
+// ─── P04.7b — O FENCE DE EGRESSO DEPOIS DO COMMIT (§8.2.4, C43) ─────────────
+
+/**
+ * `TRUE` quando esta linha de `outbound_messages` ainda pode SAIR.
+ *
+ * ─── A janela que este predicado fecha ────────────────────────────────────
+ *
+ * `streamNotHumanControlled` fecha o COMMIT: o turno só chega a
+ * `outbound_pending` com a conversa em modo `bot`. A janela seguinte é maior e
+ * ficou aberta até aqui — entre o commit e o envio existe FILA. A linha espera
+ * `next_attempt_at`, e quem a envia é o drain, o recovery ou o takeover de
+ * lease, às vezes minutos depois. O operador que assume a conversa nesse
+ * intervalo tem a resposta do bot saindo por cima dele, e o fence do commit não
+ * vê nada: ele já rodou, e naquele instante estava tudo em modo `bot`.
+ *
+ * ─── As duas metades, e por que nenhuma basta sozinha ─────────────────────
+ *
+ * 1. **O controle VIVO da stream do turno.** É a metade que alcança as linhas
+ *    LEGADAS: uma saída commitada antes desta fatia não tem proveniência
+ *    gravada, mas o turno dela tem `stream_key`, e o controle é endereçado por
+ *    stream. Sem ela, o fence só protegeria conversas pausadas ANTES do commit
+ *    — que é justamente o caso que o commit já protege.
+ *
+ * 2. **O EPOCH do commit.** É a metade que pega pausa seguida de retomada. Ao
+ *    voltar para `bot`, a primeira metade libera de novo — e libera uma
+ *    resposta escrita para um estado da conversa que já não existe. É o
+ *    backlog que o §8.2.5 manda descartar em `future_only`, chegando pelo lado
+ *    do egresso em vez do lado do turno.
+ *
+ * ─── `origin = 'operator'` passa sempre ───────────────────────────────────
+ *
+ * Sem esta cláusula o remédio vira a doença. O atendente que assumiu a
+ * conversa escreve pelo console, a mensagem dele entra no MESMO
+ * `outbound_messages`, e um fence que só perguntasse "há controle humano?"
+ * reteria exatamente quem tem o controle. O sintoma seria o console mudo.
+ *
+ * `system` fica do lado RETIDO, junto com `bot`: um lembrete automático
+ * disparando enquanto um humano atende é a plataforma falando por cima dele.
+ * Só quem TEM o controle fala.
+ *
+ * ─── O escape, e por que não é fail-open ──────────────────────────────────
+ *
+ * Turno sem `stream_key` (ou linha sem turno) não pertence a conversa nenhuma
+ * endereçável por controle — não existe controle que possa alcançá-lo, então
+ * não há o que respeitar. Mesma régua de `streamNotHumanControlled`, e o
+ * fail-closed de verdade continua sendo no INGRESSO.
+ */
+export function outboundEgressAuthorizedSql(input: {
+  tenant: SQL;
+  agent: SQL;
+  /** A linha de `outbound_messages` sendo avaliada. */
+  alvo: SQL;
+}): SQL {
+  return sql`(
+        ${input.alvo}.origin = 'operator'
+     OR NOT EXISTS (
+          SELECT 1
+            FROM ${agent_turns} AS turno
+            JOIN ${conversation_controls} AS controle
+              ON  controle.tenant_id  = turno.tenant_id
+              AND controle.agent_id   = turno.agent_id
+              AND controle.stream_key = turno.stream_key
+           WHERE turno.tenant_id = ${input.tenant}
+             AND turno.agent_id  = ${input.agent}
+             AND turno.id        = ${input.alvo}.turn_id
+             AND turno.stream_key IS NOT NULL
+             AND (
+                  -- Um humano está no controle AGORA.
+                  controle.mode <> 'bot'
+                  -- Ou o regime mudou desde que esta resposta foi escrita:
+                  -- alguém pausou e devolveu, e o que ela responde já passou.
+               OR (
+                    ${input.alvo}.control_epoch IS NOT NULL
+                    AND controle.control_epoch <> ${input.alvo}.control_epoch
+                  )
+             )
+        )
+  )`;
+}
+
+/**
+ * A PROVENIÊNCIA a carimbar no commit: qual controle rege esta stream, e em
+ * que epoch ele está AGORA.
+ *
+ * Devolve `(control_id, control_epoch)` como duas subconsultas escalares, para
+ * serem usadas no `INSERT` de `outbound_messages`. Sem linha de controle —
+ * conversa que nunca foi pausada, o caso comum — as duas saem `NULL`, que é a
+ * forma de dizer "não havia controle", e o CHECK de coerência da 148 exige
+ * exatamente que elas andem juntas.
+ *
+ * Por que aqui e não em `outbound-outbox-repo.ts`: pela razão nº 1 do
+ * cabeçalho deste módulo. Qualquer escritor novo de `outbound_messages` precisa
+ * carimbar a mesma coisa, e uma segunda cópia do SELECT divergiria em silêncio
+ * — deixando linhas sem proveniência que o fence de egresso liberaria por
+ * omissão.
+ */
+export function controlProvenanceForStreamSql(input: {
+  tenant_id: string;
+  agent_id: string;
+  /** `null` para turno sem identidade de stream: as duas colunas saem NULL. */
+  stream_key: string | null;
+}): { control_id: SQL; control_epoch: SQL } {
+  const doControle = (coluna: SQL): SQL =>
+    input.stream_key === null
+      ? sql`NULL`
+      : sql`(SELECT ${coluna}
+               FROM ${conversation_controls} c
+              WHERE c.tenant_id  = ${input.tenant_id}
+                AND c.agent_id   = ${input.agent_id}
+                AND c.stream_key = ${input.stream_key})`;
+  return {
+    control_id: doControle(sql`c.id`),
+    control_epoch: doControle(sql`c.control_epoch`),
+  };
 }
 
 // ─── P04.5b.2a — O DESCARTE ADMINISTRATIVO DE BACKLOG (§8.2.5) ──────────────
@@ -315,11 +418,7 @@ export function humanControlProbe(input: {
  * seguem conciliação específica; não apagar seu resultado/efeito para fazê-los
  * caber no descarte do backlog".
  */
-export const ESTADOS_DESCARTAVEIS_DO_BACKLOG = [
-  'received',
-  'queued',
-  'retryable',
-] as const;
+export const ESTADOS_DESCARTAVEIS_DO_BACKLOG = ['received', 'queued', 'retryable'] as const;
 
 /**
  * Estados em que uma chamada de tool NÃO está liquidada — ela ainda pode
@@ -413,11 +512,7 @@ function literais(valores: readonly string[]): SQL {
  * a unidade dos fences do §8.2.4, não esta. Quem lê este predicado como "o
  * turno não produziu efeito algum" está lendo mais do que ele diz.
  */
-export function turnWithoutPendingEffectSql(input: {
-  tenant: SQL;
-  agent: SQL;
-  alvo: SQL;
-}): SQL {
+export function turnWithoutPendingEffectSql(input: { tenant: SQL; agent: SQL; alvo: SQL }): SQL {
   return sql`(
      NOT EXISTS (
           SELECT 1

@@ -54,6 +54,11 @@ import { auditTx } from '@/governance/audit.js';
 import { assertTurnTransition } from '@/runtime/turns/contract.js';
 import type { TurnStatus } from '@/runtime/turns/contract.js';
 import { turnWriteConditions } from './turn-fence-sql.js';
+import {
+  controlProvenanceForStreamSql,
+  humanControlProbe,
+  streamNotHumanControlled,
+} from './conversation-control-sql.js';
 import type { OutboundArtifact } from '@/runtime/outbound/contract.js';
 import { legacyChannelFor } from '@/runtime/outbound/contract.js';
 
@@ -88,6 +93,17 @@ export const OUTBOUND_COMMIT_REJECTIONS = [
   'stale_claim',
   /** O turno andou de estado (ou de versão) desde a leitura do chamador. */
   'state_mismatch',
+  /**
+   * U-P04.7a (§8.2.4, linha de `commit.ts` / `commitTurnOutboundTx`) — um
+   * humano assumiu a conversa entre a admissão do turno e este commit.
+   *
+   * É um código PRÓPRIO, e não `state_mismatch`, porque as duas recusas pedem
+   * reações opostas. `state_mismatch` diz "releia e talvez insista"; esta diz
+   * "pare, e não volte por conta própria". Um retry automático em cima de uma
+   * tomada humana é a automação disputando o canal com o atendente, que é
+   * exatamente o que o §8.2.4 existe para impedir.
+   */
+  'human_control',
 ] as const;
 
 export type OutboundCommitRejection = (typeof OUTBOUND_COMMIT_REJECTIONS)[number];
@@ -203,6 +219,27 @@ export const outboundOutboxRepo = {
                   ? { kind: 'self', claim_token: input.expected_claim_token }
                   : { kind: 'none' },
             }),
+            // ── U-P04.7a — O FENCE DE CONTROLE HUMANO (§8.2.4) ─────────────
+            //
+            // Dentro da MESMA declaração que move o turno, e não numa leitura
+            // antes dela. A diferença não é estilística: ler o controle e
+            // depois commitar abre a janela em que o humano assume ENTRE as
+            // duas, e o commit passa assim mesmo — a resposta do bot fica
+            // durável e o atendente descobre pelo canal.
+            //
+            // Como predicado do `WHERE`, a checagem e a escrita decidem na
+            // mesma linha do mesmo `UPDATE`, sob o mesmo lock de linha. Ou o
+            // turno anda com a conversa em modo `bot`, ou não anda.
+            //
+            // O predicado é `streamNotHumanControlled`, o MESMO que o claim
+            // usa. Redigitá-lo aqui teria o efeito de sempre: um dos dois
+            // lados envelheceria, e o que envelhecesse seria o que deixa
+            // passar.
+            streamNotHumanControlled({
+              tenant: sql`${tenant_id}`,
+              agent: sql`${agent_id}`,
+              alvo: sql`${agent_turns}`,
+            }),
           ),
         )
         .returning();
@@ -231,8 +268,31 @@ export const outboundOutboxRepo = {
         const fenceBroken =
           input.expected_claim_token !== undefined &&
           (current.claim_token !== input.expected_claim_token || current.lease_live !== true);
+
+        // ── Ordem da classificação ────────────────────────────────────────
+        //
+        // A posse vem PRIMEIRO, pela mesma razão que já valia antes desta
+        // fatia: um worker zumbi precisa ouvir "você perdeu a posse", não
+        // "um humano assumiu" — a segunda mensagem sugere que existe algo a
+        // reconciliar quando o certo é parar.
+        //
+        // A tomada humana vem em seguida e ANTES de `state_mismatch`, porque
+        // uma pausa quase sempre move o estado do turno junto. Classificar
+        // pelo estado nesse caso trocaria "pare" por "releia e insista", que
+        // é a reação errada.
+        if (fenceBroken) throw new OutboundCommitError('stale_claim', artifact.turn_id);
+
+        const sonda = await tx.execute(
+          humanControlProbe({
+            tenant: sql`${tenant_id}`,
+            agent: sql`${agent_id}`,
+            turn_id: artifact.turn_id,
+          }),
+        );
+        const sobControleHumano = Array.from(sonda.rows as unknown as unknown[]).length > 0;
+
         throw new OutboundCommitError(
-          fenceBroken ? 'stale_claim' : 'state_mismatch',
+          sobControleHumano ? 'human_control' : 'state_mismatch',
           artifact.turn_id,
         );
       }
@@ -264,6 +324,28 @@ export const outboundOutboxRepo = {
           payload_hash: artifact.payload_hash,
           logical_dedupe_key: artifact.logical_dedupe_key,
           provider_idempotency_key: artifact.provider_idempotency_key,
+          // ── P04.7b (§8.2.4, C43) — a PROVENIÊNCIA DE CONTROLE. ─────────
+          //
+          // O fence acima decidiu que esta saída PODE ser commitada agora. O
+          // carimbo responde a outra pergunta, que só será feita depois: sob
+          // qual regime ela foi escrita. Sem ele, uma resposta escrita antes
+          // de uma pausa é indistinguível de uma escrita depois da retomada,
+          // e a fila as enviaria igual.
+          //
+          // A stream vem do turno que o passo (1) acabou de devolver — a
+          // MESMA linha que o fence avaliou, na mesma transação. Lê-la numa
+          // consulta à parte reabriria a janela que o passo (1) fechou.
+          //
+          // `origin: 'bot'` porque este caminho é o do raciocínio. Quem
+          // escrever aqui em nome de um operador precisa dizer isso
+          // explicitamente — e não há, hoje, como fazê-lo por engano: o
+          // caller é o dispatcher de saída do turno.
+          ...controlProvenanceForStreamSql({
+            tenant_id,
+            agent_id,
+            stream_key: turn.stream_key ?? null,
+          }),
+          origin: 'bot',
           // Relógio do BANCO. `next_attempt_at` é NOT NULL para row durável
           // (CHECK de completude da 121) e é o gate que o índice (7c) percorre:
           // é ele que torna a linha VISÍVEL para o recovery de #633 no instante
