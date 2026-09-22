@@ -974,6 +974,60 @@ export type ListDueRunsResult = {
   next_cursor: DueRunCursor | null;
 };
 
+/**
+ * "NÃO LIQUIDADA" na definição do índice parcial `engine_tool_calls_unsettled_idx`
+ * (140), que é a MESMA de `ESTADOS_QUE_OCUPAM_A_VAGA`.
+ *
+ * Não confundir com `LISTA_ESTADOS_CONCILIADOS`, que serve a outra pergunta. As
+ * duas listas divergem num membro só, e é justamente o perigoso:
+ * `effect_unknown` é CONCILIADO (tem `finished_at`, não pede outro dispatch) e
+ * ao mesmo tempo NÃO LIQUIDADO (pode ter mexido no mundo e ninguém sabe).
+ * `closeRunAfterHandoff` usa a primeira porque a pergunta dele é "posso
+ * REPETIR o turno?"; a varredura de recovery usa esta porque a pergunta dela é
+ * "sobrou efeito sem desfecho?" — e é essa que `RecoverySnapshotV1` descreve ao
+ * dizer que `effect_unknown_calls` é "o subconjunto PERIGOSO" de
+ * `unreconciled_calls`. Com a lista dos conciliados, esse subconjunto seria
+ * VAZIO por construção e a regra 4 de `classifyRecovery` nunca dispararia.
+ */
+const LISTA_ESTADOS_NAO_LIQUIDADOS = statusList(
+  Array.from(ESTADOS_QUE_OCUPAM_A_VAGA),
+);
+
+/**
+ * Os fatos que a POLÍTICA de recovery (`classifyRecovery`) consome, lidos de
+ * uma vez só.
+ *
+ * Contagens e booleanos, nunca linhas: a política não precisa de argumento,
+ * resultado nem texto de chamada nenhuma, e não recebê-los é o que permite que
+ * a varredura de manutenção rode sem carregar conteúdo de turno para a memória
+ * de um worker que só decide o que fazer com o journal.
+ *
+ * Os três campos ALÉM do instantâneo da política existem porque quem executa
+ * precisa deles e a política não: `turn_id` é argumento obrigatório de toda
+ * porta de escrita do journal, `capabilities_revoked` evita pedir de novo uma
+ * revogação monotônica que já aconteceu, e `reconcile_deadline_passed` é o
+ * "após prazo" do §5.8.2 — sem ele, uma disposição que exige I/O de motor
+ * ficaria em observação para sempre, que é a forma de limbo que esta varredura
+ * existe para acabar.
+ */
+export type RunRecoveryFacts = {
+  run_id: string;
+  turn_id: string;
+  phase: EngineRunPhaseV1;
+  turn_status: string;
+  lease_alive: boolean;
+  control_mode: string;
+  has_terminal: boolean;
+  adopted: boolean;
+  unreconciled_calls: number;
+  effect_unknown_calls: number;
+  outbound_rows: number;
+  outbound_completed: number;
+  remote_run_id_known: boolean;
+  capabilities_revoked: boolean;
+  reconcile_deadline_passed: boolean;
+};
+
 export const engineRunsRepo = {
   /**
    * SEGUNDO SEAM do §5.2 — este turno já tem motor fixado e run em voo?
@@ -1014,13 +1068,32 @@ export const engineRunsRepo = {
     // motor, então o pipeline normal é o caminho certo.
     if (pin === null) return { kind: "no_binding" };
 
+    // `phase <> 'closed'`, e NÃO `LISTA_FASES_ABERTAS` — as duas listas
+    // respondem perguntas diferentes e confundi-las produzia um ramo morto.
+    //
+    // `FASES_ABERTAS` existe para casar com o predicado dos índices parciais da
+    // varredura (`engine_runs_due_idx`), que deliberadamente NÃO cobrem
+    // `blocked`: um run bloqueado não pede polling, ele pede gente, e tem
+    // índice próprio (`engine_runs_blocked_idx`). A pergunta DESTA consulta é
+    // outra — "este turno tem run que ainda ocupa a vaga?" —, e a resposta
+    // certa é a mesma de `pinEngineAndPrepareRun`, que já usa `phase <>
+    // 'closed'` porque é isso que o unique parcial da 140 tranca.
+    //
+    // Com a lista das abertas, um run `blocked` respondia
+    // `binding_without_open_run`, `routeExistingEngineRun` devolvia
+    // `run_pipeline` e o turno reexecutava pendências, procedures e skills até
+    // morrer em `run_already_open` na hora de preparar — reexecutando
+    // exatamente o que o §5.2 existe para não reexecutar. O ramo `blocked` de
+    // `route-existing-run.ts` (que manda o turno para `await_operator`) era
+    // inalcançável por isso, e nenhum teste cobria a função. Encontrado
+    // rodando o reconciliador contra Postgres.
     const abertos = linhas<RunSnapshotRow>(
       await db.execute(sql`
         SELECT ${SNAPSHOT_COLS}
           FROM ${engine_runs}
          WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
            AND turn_id = ${input.turn_id}
-           AND phase IN (${LISTA_FASES_ABERTAS})
+           AND phase <> 'closed'
          ORDER BY generation_no DESC, id
          LIMIT 1`),
     );
@@ -3569,6 +3642,123 @@ export const engineRunsRepo = {
 
     conta("list_due", "ok");
     return { runs, next_cursor };
+  },
+
+  /**
+   * Os fatos de UM run, na forma que a política de recovery consome. **Sob ALS.**
+   *
+   * ─── Por que uma leitura só, e não quatro ───────────────────────────────
+   *
+   * `classifyRecovery` é uma função TOTAL de um instantâneo: ela decide olhando
+   * fase, turno, controle, chamadas e saída ao mesmo tempo. Montar esse
+   * instantâneo com quatro consultas separadas produziria um retrato costurado
+   * de quatro instantes diferentes — e a regra 4 (efeito desconhecido domina a
+   * fase) é exatamente a que sofreria: bastaria a fase ser lida antes e a
+   * contagem de efeito depois para uma chamada que virou `effect_unknown` no
+   * meio ser lida como ausente. Um `SELECT` só devolve um instante só.
+   *
+   * ─── Por que SEM lock, e por que isso é seguro ──────────────────────────
+   *
+   * Nenhum `FOR UPDATE`: esta é a leitura da VARREDURA, não da escrita. Travar
+   * aqui criaria uma aresta de lock (`engine_runs` → `conversation_controls`)
+   * na ordem INVERSA à do §5.6.3, que é o defeito que
+   * `conversation-control-sql.ts` existe para impedir. A leitura ser otimista
+   * não autoriza nada: quem age depois passa pelo fence da operação própria —
+   * a reserva de manutenção (`reserveMaintenanceObservation`) e o CAS por
+   * `row_version` de `recordMaintenanceObservation`. Um instantâneo que
+   * envelheceu entre a leitura e a escrita PERDE o CAS, que é precisamente a
+   * recusa que se quer.
+   *
+   * `null` significa "não existe neste escopo" — inclusive quando existe noutro
+   * tenant. O `WHERE` carrega o escopo do ALS como todas as irmãs.
+   */
+  async readRecoveryFacts(input: {
+    run_id: string;
+  }): Promise<RunRecoveryFacts | null> {
+    const { tenant_id, agent_id } = scope();
+
+    const rows = linhas<{
+      run_id: string;
+      turn_id: string;
+      phase: string;
+      turn_status: string;
+      lease_alive: boolean;
+      control_mode: string;
+      has_terminal: boolean;
+      adopted: boolean;
+      unreconciled_calls: number;
+      effect_unknown_calls: number;
+      outbound_rows: number;
+      outbound_completed: number;
+      remote_run_id_known: boolean;
+      capabilities_revoked: boolean;
+      reconcile_deadline_passed: boolean;
+    }>(
+      await db.execute(sql`
+        SELECT r.id AS run_id, r.turn_id, r.phase,
+               (r.terminal_json IS NOT NULL) AS has_terminal,
+               (r.adopted_by_turn_attempt IS NOT NULL) AS adopted,
+               (r.remote_run_id IS NOT NULL) AS remote_run_id_known,
+               (r.capabilities_revoked_at IS NOT NULL) AS capabilities_revoked,
+               (r.reconcile_deadline_at <= clock_timestamp()) AS reconcile_deadline_passed,
+               t.status AS turn_status,
+               (t.lease_expires_at IS NOT NULL
+                  AND t.lease_expires_at > clock_timestamp()) AS lease_alive,
+               c.mode AS control_mode,
+               chamadas.nao_liquidadas AS unreconciled_calls,
+               chamadas.efeito_desconhecido AS effect_unknown_calls,
+               saida.total AS outbound_rows,
+               saida.entregues AS outbound_completed
+          FROM ${engine_runs} r
+          JOIN ${agent_turns} t
+            ON t.tenant_id = r.tenant_id AND t.agent_id = r.agent_id AND t.id = r.turn_id
+          JOIN ${conversation_controls} c
+            ON c.tenant_id = r.tenant_id AND c.agent_id = r.agent_id AND c.id = r.control_id
+          CROSS JOIN LATERAL (
+            SELECT (count(*) FILTER (
+                      WHERE tc.state IN (${LISTA_ESTADOS_NAO_LIQUIDADOS})))::int
+                     AS nao_liquidadas,
+                   (count(*) FILTER (WHERE tc.state = 'effect_unknown'))::int
+                     AS efeito_desconhecido
+              FROM ${engine_tool_calls} tc
+             WHERE tc.tenant_id = r.tenant_id AND tc.agent_id = r.agent_id
+               AND tc.run_id = r.id
+          ) chamadas
+          CROSS JOIN LATERAL (
+            SELECT count(*)::int AS total,
+                   (count(*) FILTER (WHERE om.status = 'completed'))::int AS entregues
+              FROM ${outbound_messages} om
+             WHERE om.tenant_id = r.tenant_id AND om.agent_id = r.agent_id
+               AND om.turn_id = r.turn_id
+          ) saida
+         WHERE r.tenant_id = ${tenant_id} AND r.agent_id = ${agent_id}
+           AND r.id = ${input.run_id}`),
+    );
+
+    const row = rows[0];
+    if (!row) {
+      conta("read_recovery_facts", "not_found");
+      return null;
+    }
+
+    conta("read_recovery_facts", "ok");
+    return {
+      run_id: row.run_id,
+      turn_id: row.turn_id,
+      phase: row.phase as EngineRunPhaseV1,
+      turn_status: row.turn_status,
+      lease_alive: row.lease_alive === true,
+      control_mode: row.control_mode,
+      has_terminal: row.has_terminal === true,
+      adopted: row.adopted === true,
+      unreconciled_calls: Number(row.unreconciled_calls),
+      effect_unknown_calls: Number(row.effect_unknown_calls),
+      outbound_rows: Number(row.outbound_rows),
+      outbound_completed: Number(row.outbound_completed),
+      remote_run_id_known: row.remote_run_id_known === true,
+      capabilities_revoked: row.capabilities_revoked === true,
+      reconcile_deadline_passed: row.reconcile_deadline_passed === true,
+    };
   },
 
   /**

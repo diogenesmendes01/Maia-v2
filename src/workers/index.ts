@@ -290,6 +290,31 @@ export const JOBS: Job[] = [
     module: 'pending-reminder.ts',
     phase: 1,
   },
+  // Spec Maia+Hermes §5.8.2/§5.8.4 — o RECONCILIADOR do journal de execução do
+  // motor. `routeExistingEngineRun` proíbe reexecutar o pipeline de um turno
+  // com run aberto e manda o turno para `retry`; sem esta varredura o turno
+  // roda o backoff até dead letter sem que ninguém olhe o run. Cadência de 1
+  // min pela mesma razão de `outbound_recovery`: o que está represado é uma
+  // resposta ao usuário. No-op barato quando não há run vencido —
+  // `enumerateDueScopes` bate no índice parcial e volta vazio.
+  {
+    name: 'engine_run_reconciler',
+    cron: '* * * * *',
+    fn: lazy(
+      () => import('./engine-run-reconciler.js'),
+      (m) => m.runEngineRunReconciler,
+    ),
+    group: 'turn-pipeline',
+    effect: 'side-effectful',
+    guard: {
+      kind: 'row-claim',
+      claim:
+        '`reserveMaintenanceObservation` empurra `next_poll_at` sob `FOR UPDATE OF r` (a réplica perdedora recebe `not_due`) e `recordMaintenanceObservation` faz CAS pela `row_version` reservada ANTES de qualquer mudança de fase — perda de fence é `reservation_stale` e nenhuma escrita de estado acontece',
+      tables: ['engine_runs', 'engine_run_events'],
+    },
+    module: 'engine-run-reconciler.ts',
+    phase: 1,
+  },
   // Spec roteamento v4 §1.4 — recovery sweep do staging de inbound
   // não-roteado (modo strict): expira TTL, re-arma jobs órfãos (jobId
   // estável ⇒ idempotente) e vigia o keyring. No-op barato sem rows.
