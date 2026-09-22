@@ -25,6 +25,19 @@ import { db } from '@/db/client.js';
 import { agent_facts, behavioral_hint, learned_rules, memory_entry } from '@/db/schema.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { TypedError } from '@/lib/utils.js';
+
+/**
+ * Executor da consulta: o pool (`db`) ou uma transação.
+ *
+ * Existe para o adapter transacional de aprovação (§7.9.2) poder rodar a
+ * leitura e a escrita do KSM DENTRO da mesma transação do inbox. Sem isso, a
+ * aprovação gravaria a linha de decisão numa transação e mudaria o item
+ * canônico noutra — e um crash entre as duas deixaria decisão sem efeito, ou
+ * efeito sem decisão.
+ *
+ * O default é `db`, então todo chamador existente continua idêntico.
+ */
+type Executor = typeof db;
 import type {
   KnowledgeKind,
   KnowledgeLifecycleStatus,
@@ -182,6 +195,9 @@ export const knowledgeRepos = {
             acao,
             contexto_jsonb: (native.rule_contexto_jsonb ?? {}) as object,
             acoes_jsonb: (native.rule_acoes_jsonb ?? {}) as object,
+            // O exemplo que originou a regra. Sem ele, a revisão humana vê a
+            // proposta e não vê o caso concreto que a motivou.
+            exemplo_origem_id: native.rule_exemplo_origem_id ?? null,
             confianca: String(input.confidence),
             ativa: true,
             lifecycle_status: input.lifecycle_status,
@@ -286,7 +302,24 @@ export const knowledgeRepos = {
     }
   },
 
-  async findById(kind: KnowledgeKind, id: string): Promise<KnowledgeRow | null> {
+  async findById(
+    kind: KnowledgeKind,
+    id: string,
+    exec: Executor = db,
+    /**
+     * PR #775 finding 3 — `forUpdate` locks the row (`SELECT … FOR UPDATE`)
+     * so a caller can validate-then-act atomically inside its own `tx`
+     * without a second writer racing between the read and the write.
+     * Mirrors the `capability_proposal` branch of
+     * `admin-repos.ts#decideAtomically`, which already does this via its
+     * own inline `.for('update')` — the pattern this parameter generalises
+     * for the `knowledge_proposal` branch (see `applyKnowledgeDecisionTx`
+     * callers). Defaults to false so every existing (unlocked) caller is
+     * unaffected.
+     */
+    opts: { forUpdate?: boolean } = {},
+  ): Promise<KnowledgeRow | null> {
+    const forUpdate = opts.forUpdate ?? false;
     switch (kind) {
       case 'fact': {
         // Issue #254 — cross-tenant guard. `agent_facts` reads via the
@@ -300,17 +333,14 @@ export const knowledgeRepos = {
         // tenant_id+agent_id (extended for all 4 kinds by PR #243).
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        const rows = await db
-          .select()
-          .from(agent_facts)
-          .where(
-            and(
-              eq(agent_facts.id, id),
-              eq(agent_facts.tenant_id, tenant_id),
-              eq(agent_facts.agent_id, agent_id),
-            ),
-          )
-          .limit(1);
+        const where = and(
+          eq(agent_facts.id, id),
+          eq(agent_facts.tenant_id, tenant_id),
+          eq(agent_facts.agent_id, agent_id),
+        );
+        const rows = forUpdate
+          ? await exec.select().from(agent_facts).where(where).for('update').limit(1)
+          : await exec.select().from(agent_facts).where(where).limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
@@ -326,17 +356,14 @@ export const knowledgeRepos = {
         // row's persisted tenant_id+agent_id (workers/knowledge-state-promoter.ts).
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        const rows = await db
-          .select()
-          .from(learned_rules)
-          .where(
-            and(
-              eq(learned_rules.id, id),
-              eq(learned_rules.tenant_id, tenant_id),
-              eq(learned_rules.agent_id, agent_id),
-            ),
-          )
-          .limit(1);
+        const where = and(
+          eq(learned_rules.id, id),
+          eq(learned_rules.tenant_id, tenant_id),
+          eq(learned_rules.agent_id, agent_id),
+        );
+        const rows = forUpdate
+          ? await exec.select().from(learned_rules).where(where).for('update').limit(1)
+          : await exec.select().from(learned_rules).where(where).limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
@@ -346,17 +373,14 @@ export const knowledgeRepos = {
         // leak across tenants via the KSM facade.
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        const rows = await db
-          .select()
-          .from(memory_entry)
-          .where(
-            and(
-              eq(memory_entry.id, id),
-              eq(memory_entry.tenant_id, tenant_id),
-              eq(memory_entry.agent_id, agent_id),
-            ),
-          )
-          .limit(1);
+        const where = and(
+          eq(memory_entry.id, id),
+          eq(memory_entry.tenant_id, tenant_id),
+          eq(memory_entry.agent_id, agent_id),
+        );
+        const rows = forUpdate
+          ? await exec.select().from(memory_entry).where(where).for('update').limit(1)
+          : await exec.select().from(memory_entry).where(where).limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
@@ -382,17 +406,14 @@ export const knowledgeRepos = {
         // discrimination is needed.
         const tenant_id = getCurrentTenant();
         const agent_id = getCurrentAgent();
-        const rows = await db
-          .select()
-          .from(behavioral_hint)
-          .where(
-            and(
-              eq(behavioral_hint.id, id),
-              eq(behavioral_hint.tenant_id, tenant_id),
-              eq(behavioral_hint.agent_id, agent_id),
-            ),
-          )
-          .limit(1);
+        const where = and(
+          eq(behavioral_hint.id, id),
+          eq(behavioral_hint.tenant_id, tenant_id),
+          eq(behavioral_hint.agent_id, agent_id),
+        );
+        const rows = forUpdate
+          ? await exec.select().from(behavioral_hint).where(where).for('update').limit(1)
+          : await exec.select().from(behavioral_hint).where(where).limit(1);
         const row = rows[0];
         return row ? normaliseRow(row as unknown as AnyRow) : null;
       }
@@ -418,7 +439,12 @@ export const knowledgeRepos = {
    * second write wins blindly — so a revoke can be lost and a terminal
    * row "resurrected". See Codex review #104 (critical).
    */
-  async update(kind: KnowledgeKind, id: string, updates: UpdateInput): Promise<void> {
+  async update(
+    kind: KnowledgeKind,
+    id: string,
+    updates: UpdateInput,
+    exec: Executor = db,
+  ): Promise<void> {
     const set: Record<string, unknown> = { updated_at: new Date() };
     if (updates.lifecycle_status !== undefined) {
       set['lifecycle_status'] = updates.lifecycle_status;
@@ -463,7 +489,7 @@ export const knowledgeRepos = {
               eq(agent_facts.tenant_id, tenant_id),
               eq(agent_facts.agent_id, agent_id),
             );
-        const rows = await db
+        const rows = await exec
           .update(agent_facts)
           .set(set)
           .where(where)
@@ -477,7 +503,7 @@ export const knowledgeRepos = {
             // as benign for parallel-promote races, but cross-tenant
             // attempts MUST surface as `fact_not_in_scope` for
             // telemetry/alerting.
-            const probe = await db
+            const probe = await exec
               .select({
                 id: agent_facts.id,
                 lifecycle_status: agent_facts.lifecycle_status,
@@ -542,7 +568,7 @@ export const knowledgeRepos = {
               eq(learned_rules.tenant_id, tenant_id),
               eq(learned_rules.agent_id, agent_id),
             );
-        const rows = await db
+        const rows = await exec
           .update(learned_rules)
           .set(set)
           .where(where)
@@ -556,7 +582,7 @@ export const knowledgeRepos = {
             // of KnowledgeConflictError) as benign for parallel-promote
             // races, but cross-tenant attempts MUST surface as
             // `rule_not_in_scope` for telemetry/alerting.
-            const probe = await db
+            const probe = await exec
               .select({
                 id: learned_rules.id,
                 lifecycle_status: learned_rules.lifecycle_status,
@@ -606,14 +632,14 @@ export const knowledgeRepos = {
               eq(memory_entry.tenant_id, tenant_id),
               eq(memory_entry.agent_id, agent_id),
             );
-        const rows = await db
+        const rows = await exec
           .update(memory_entry)
           .set(set)
           .where(where)
           .returning({ id: memory_entry.id });
         if (rows.length === 0) {
           if (expected) {
-            const probe = await db
+            const probe = await exec
               .select({
                 id: memory_entry.id,
                 lifecycle_status: memory_entry.lifecycle_status,
@@ -673,14 +699,14 @@ export const knowledgeRepos = {
               eq(behavioral_hint.tenant_id, tenant_id),
               eq(behavioral_hint.agent_id, agent_id),
             );
-        const rows = await db
+        const rows = await exec
           .update(behavioral_hint)
           .set(set)
           .where(where)
           .returning({ id: behavioral_hint.id });
         if (rows.length === 0) {
           if (expected) {
-            const probe = await db
+            const probe = await exec
               .select({
                 id: behavioral_hint.id,
                 lifecycle_status: behavioral_hint.lifecycle_status,

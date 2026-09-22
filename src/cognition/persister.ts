@@ -8,6 +8,7 @@ import {
   capabilityGapsRepo,
 } from '@/db/repositories.js';
 import { logger } from '@/lib/logger.js';
+import { writeMemory } from '@/memory/vector.js';
 import { classifyMemory } from './memory-classifier.js';
 import { deriveBehavioralHint } from './behavioral-hint-deriver.js';
 import { validateBehavioralHint } from '@/workers/behavioral-hint-validator.js';
@@ -120,6 +121,29 @@ export async function persistCandidate(
               : null,
           });
           memoryEntryId = memEntry.id;
+
+          // PR #775 finding 1 — indexação VINCULADA (migration 146). O item
+          // canônico já existe (acabou de ser criado, linha acima) então a
+          // vetorização pode gravar `memory_entry_id` desde a primeira
+          // escrita — sem isso `recallAuthorized` nunca elegeria este vetor
+          // (o JOIN com `memory_entry` é o fence; ver
+          // src/memory/recall-authorized.ts). Try/catch isolado: falha na
+          // vetorização não derruba o `memory_entry` recém-criado, que já é
+          // legível por outros caminhos (ex.: memoryEntryRepo.findRelevant).
+          try {
+            await writeMemory({
+              conteudo: candidate.content,
+              tipo: classified.memory_type,
+              escopo,
+              memory_entry_id: memEntry.id,
+              metadata: { event_type: event.type, candidate_type: candidate.type },
+            });
+          } catch (err) {
+            logger.warn(
+              { err: (err as Error).message, memory_id: memEntry.id },
+              'persister.memory_vector_write_failed',
+            );
+          }
 
           // Se sensível: deriva hint comportamental, valida anti-vazamento e
           // só persiste se validator aprovar. Tudo isolado em try/catch.

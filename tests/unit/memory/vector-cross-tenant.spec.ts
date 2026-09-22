@@ -76,6 +76,8 @@ type StoredRow = {
   metadata: Record<string, unknown>;
   ref_tabela: string | null;
   ref_id: string | null;
+  memory_entry_id: string | null;
+  content_digest: string | null;
 };
 
 const store: StoredRow[] = [];
@@ -97,6 +99,8 @@ function seedRow(
     metadata: {},
     ref_tabela: null,
     ref_id: null,
+    memory_entry_id: null,
+    content_digest: null,
     ...over,
   });
 }
@@ -137,19 +141,33 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     // Production INSERT param order matches the column order on the production
     // VALUES (...):
     //   ($1 tenant_id, $2 agent_id, $3 conteudo, $4 embedding,
-    //    $5 tipo, $6 escopo, $7 metadata-jsonb, $8 ref_tabela, $9 ref_id)
-    const [tenant_id, agent_id, conteudo, vec, tipo, escopo, metadataJson, ref_tabela, ref_id] =
-      params as [
-        string,
-        string,
-        string,
-        string,
-        string,
-        string,
-        string,
-        string | null,
-        string | null,
-      ];
+    //    $5 tipo, $6 escopo, $7 metadata-jsonb, $8 ref_tabela, $9 ref_id,
+    //    $10 memory_entry_id, $11 content_digest — PR #775 finding 1)
+    const [
+      tenant_id,
+      agent_id,
+      conteudo,
+      vec,
+      tipo,
+      escopo,
+      metadataJson,
+      ref_tabela,
+      ref_id,
+      memory_entry_id,
+      content_digest,
+    ] = params as [
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string,
+      string | null,
+      string | null,
+      string | null,
+      string | null,
+    ];
     const id = `mem_${String(nextId++).padStart(6, '0')}`;
     store.push({
       id,
@@ -162,6 +180,8 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
       metadata: typeof metadataJson === 'string' ? JSON.parse(metadataJson) : (metadataJson ?? {}),
       ref_tabela: ref_tabela ?? null,
       ref_id: ref_id ?? null,
+      memory_entry_id: memory_entry_id ?? null,
+      content_digest: content_digest ?? null,
     });
     return { rows: [{ id }] };
   }
@@ -396,6 +416,53 @@ describe('Issue #229 — vector memory (agent_memories) INSERT + recall are tena
       // Defensive — assert the column list contains both invariants.
       expect(insertSql!).toMatch(/tenant_id/);
       expect(insertSql!).toMatch(/agent_id/);
+    });
+
+    // PR #775 finding 1 — recallAuthorized JOINs on `memory_entry_id`
+    // (src/memory/recall-authorized.ts). A vector written without it is
+    // permanently ineligible; these two cases prove writeMemory can link a
+    // new vector to its canonical item, and that it still degrades to the
+    // orphaned (NULL) legacy shape when the caller has none.
+    it('LINKED — memory_entry_id passed by the caller is written to the row', async () => {
+      const { writeMemory } = await import('@/memory/vector.js');
+      nextEmbedding = [0.1, 0.2, 0.3];
+      const canonicalId = '33333333-3333-4333-8333-333333333333';
+      const { id } = await runWithTenantContext(A_CTX, async () =>
+        writeMemory({
+          conteudo: 'linked memory',
+          tipo: 'fato',
+          escopo: 'global',
+          memory_entry_id: canonicalId,
+        }),
+      );
+      const row = store.find((r) => r.id === id);
+      expect(row!.memory_entry_id).toBe(canonicalId);
+      expect(row!.content_digest).toBeTruthy();
+    });
+
+    it('ORPHAN — without memory_entry_id the row still gets a content_digest but no link', async () => {
+      const { writeMemory } = await import('@/memory/vector.js');
+      nextEmbedding = [0.1, 0.2, 0.3];
+      const { id } = await runWithTenantContext(A_CTX, async () =>
+        writeMemory({ conteudo: 'orphan memory', tipo: 'reflexao', escopo: 'global' }),
+      );
+      const row = store.find((r) => r.id === id);
+      expect(row!.memory_entry_id).toBeNull();
+      expect(row!.content_digest).toBeTruthy();
+    });
+
+    it('DIGEST — content_digest is a deterministic function of conteudo', async () => {
+      const { writeMemory } = await import('@/memory/vector.js');
+      nextEmbedding = [0.1, 0.2, 0.3];
+      const { id: id1 } = await runWithTenantContext(A_CTX, async () =>
+        writeMemory({ conteudo: 'same content', tipo: 'reflexao', escopo: 'global' }),
+      );
+      const { id: id2 } = await runWithTenantContext(A_CTX, async () =>
+        writeMemory({ conteudo: 'same content', tipo: 'reflexao', escopo: 'global' }),
+      );
+      const row1 = store.find((r) => r.id === id1);
+      const row2 = store.find((r) => r.id === id2);
+      expect(row1!.content_digest).toBe(row2!.content_digest);
     });
   });
 
