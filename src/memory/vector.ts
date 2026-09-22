@@ -31,12 +31,29 @@
  * lands with `tenant_id='tenant-A'`, tenant-A `recall` never returns tenant-B
  * rows even when seeded adversarially (tenant-B rows inserted first AND with
  * an embedding closer to the query than tenant-A's).
+ *
+ * ─── PR #775 finding 1 — vínculo com o item CANÔNICO (migration 146) ───────
+ *
+ * Migration 146 (G2, spec §7.6.3) adicionou `agent_memories.memory_entry_id`
+ * + `content_digest`, e `recallAuthorized` (src/memory/recall-authorized.ts)
+ * exige o vínculo via JOIN: vetor sem `memory_entry_id` não é elegível, por
+ * desenho. `writeMemory` agora aceita `memory_entry_id` opcional — quando o
+ * chamador já criou o item canônico em `memory_entry` (e portanto conhece o
+ * id), a indexação grava o vínculo E o digest do conteúdo no momento da
+ * indexação. Quando o chamador NÃO passa `memory_entry_id`, a linha nasce
+ * órfã (NULL) exatamente como as legadas — fora do alcance do recall,
+ * intencionalmente, até que exista um item canônico para linkar.
+ *
+ * O único call site vivo hoje (`reflectOnWorkflowCompletion`,
+ * src/agent/reflection.ts) NÃO cria um `memory_entry` antes de vetorizar —
+ * ver o comentário lá para os detalhes e por que isso não foi forçado aqui.
  */
 import { db } from '@/db/client.js';
 import { Param, sql } from 'drizzle-orm';
 import { getEmbeddingProvider } from '@/lib/embeddings.js';
 import { logger } from '@/lib/logger.js';
 import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
+import { sha256 } from '@/lib/utils.js';
 
 export async function writeMemory(input: {
   conteudo: string;
@@ -45,6 +62,13 @@ export async function writeMemory(input: {
   metadata?: Record<string, unknown>;
   ref_tabela?: string;
   ref_id?: string;
+  /**
+   * Id do item CANÔNICO em `memory_entry` que este vetor representa.
+   * Passe-o sempre que o chamador já tiver criado (ou já conhecer) o
+   * `memory_entry` correspondente — sem isso `recallAuthorized` nunca vai
+   * devolver esta memória (ver o cabeçalho deste módulo).
+   */
+  memory_entry_id?: string;
 }): Promise<{ id: string }> {
   // Resolve tenant/agent BEFORE the embedding round-trip — if there is no
   // active tenant context this throws `MissingTenantContextError`. We refuse
@@ -56,11 +80,15 @@ export async function writeMemory(input: {
   const [embedding] = await provider.embed([input.conteudo]);
   if (!embedding) throw new Error('embedding_generation_failed');
   const vec = `[${embedding.join(',')}]`;
+  // Digest do conteúdo NO MOMENTO da indexação — grava mesmo sem
+  // `memory_entry_id`, para que uma reindexação futura (quando o vínculo
+  // existir) possa comparar sem reescrever a linha inteira.
+  const contentDigest = sha256(input.conteudo);
   const result = await db.execute<{ id: string }>(sql`
-    INSERT INTO agent_memories (tenant_id, agent_id, conteudo, embedding, tipo, escopo, metadata, ref_tabela, ref_id)
+    INSERT INTO agent_memories (tenant_id, agent_id, conteudo, embedding, tipo, escopo, metadata, ref_tabela, ref_id, memory_entry_id, content_digest)
     VALUES (${tenant_id}, ${agent_id}, ${input.conteudo}, ${vec}::vector, ${input.tipo}, ${input.escopo},
             ${JSON.stringify(input.metadata ?? {})}::jsonb, ${input.ref_tabela ?? null},
-            ${input.ref_id ?? null})
+            ${input.ref_id ?? null}, ${input.memory_entry_id ?? null}, ${contentDigest})
     RETURNING id::text
   `);
   return { id: (result.rows[0] as { id: string }).id };

@@ -106,6 +106,29 @@ export async function reflectOnWorkflowCompletion(input: {
   // Vectorize for recall
   const escopo =
     input.scope_entidades.length > 0 ? `entidade:${input.scope_entidades[0]}` : 'global';
+  // PR #775 finding 1 — DELIBERATELY unlinked, and this is the "report, don't
+  // force" branch of that finding.
+  //
+  // `writeMemory` now accepts `memory_entry_id` so a vector can be joined to
+  // its canonical `memory_entry` row (migration 146; enforced by the JOIN
+  // fence in `recallAuthorized`, src/memory/recall-authorized.ts). This call
+  // site is the only one left WITHOUT it, because this function has no
+  // canonical item to link: it never creates a `memory_entry` row — the
+  // workflow summary is written ONLY to `self_state.resumo_aprendizados`
+  // (line above) and, here, straight to `agent_memories`. There's no
+  // "write the vector after the canonical row" fix available without first
+  // deciding whether workflow-completion summaries SHOULD become first-class
+  // `memory_entry` items (own lifecycle_status, review gate, KSM routing,
+  // etc.) — that's a product/architecture decision, not a plumbing fix, so
+  // it's called out here instead of forced.
+  //
+  // Practically: this vector is written orphaned (`memory_entry_id` stays
+  // NULL) and, like the pre-146 legacy rows, is permanently ineligible for
+  // `recallAuthorized`. As of this PR, `reflectOnWorkflowCompletion` also has
+  // no caller anywhere in `src/` (grep confirms), so nothing observable
+  // regresses today — but wiring a caller later would silently reproduce the
+  // "recall stays empty" bug finding 1 described unless this gap is closed
+  // first.
   await writeMemory({
     conteudo: input.summary,
     tipo: 'reflexao',
