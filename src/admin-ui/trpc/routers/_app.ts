@@ -23,6 +23,7 @@ import { playgroundRouter } from './playground.js';
 import { objectivesRouter } from './objectives.js';
 import { mcpRouter } from './mcp.js';
 import { toolRequestsRouter } from './tool-requests.js';
+import { conversationControlRouter } from './conversationControl.js';
 
 export const appRouter = router({
   inbox: inboxRouter,
@@ -51,6 +52,12 @@ export const appRouter = router({
   // com rotas que legitimamente editam grants (`agents`, `mcp`) tornaria a
   // varredura vermelha por motivos que não têm nada a ver com este guardrail.
   toolRequests: toolRequestsRouter,
+  // Spec Maia+Hermes §8.3 — pausa, reconciliação e retomada do controle humano
+  // de conversa. Router PRÓPRIO porque o assunto é a CONVERSA em curso, não a
+  // caixa de entrada nem a governança de capacidades: misturá-lo em `inbox`
+  // faria a ACL de operação (quem pode tomar a conversa) conviver com a de
+  // leitura, que é mais larga por definição.
+  conversationControl: conversationControlRouter,
 });
 
 export type AppRouter = typeof appRouter;
