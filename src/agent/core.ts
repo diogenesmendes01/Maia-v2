@@ -50,7 +50,10 @@ import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
 import { runReActLoop, type ReActDelivery } from './react-loop.js';
 import { decideTurnAction } from './turn-outcome.js';
-import { routeExistingEngineRun } from '@/runtime/engines/route-existing-run.js';
+import {
+  routeExistingEngineRun,
+  decideRouteTurnAction,
+} from '@/runtime/engines/route-existing-run.js';
 // Issue #503 — máquina de estados durável do turno inbound. `core.ts` declara o
 // OUTCOME de negócio; a fachada escolhe o estado terminal e faz o CAS.
 import {
@@ -758,6 +761,31 @@ async function runAgentForMensagemInner(
       },
       'agent.turn_pipeline_skipped_existing_engine_run',
     );
+    /**
+     * E o turno RECEBE desfecho. Sair daqui sem tocar no estado deixaria o
+     * turno em `claimed`/`running` — ambos recuperáveis —, e o recovery o
+     * rearmaria para cair nesta mesma recusa, sem contar tentativa e sem
+     * nunca terminar. A regra de para onde ele vai é pura e mora junto da
+     * rota (`decideRouteTurnAction`); aqui só se aplica, com o fence na mão.
+     */
+    const desfecho = decideRouteTurnAction(rota);
+    if (desfecho.kind === 'retry') {
+      await failTurnRetryable(turn, { code: desfecho.code, mensagem_id });
+      return;
+    }
+    if (desfecho.kind === 'dead_letter') {
+      logger.error(
+        {
+          mensagem_id,
+          turn_id: turn.turn_id,
+          run_id: rota.run.id,
+          error_code: desfecho.code,
+          ops_alert: true,
+        },
+        'agent.turn_unsafe_to_retry',
+      );
+      await deadLetterTurn(turn, { code: desfecho.code, outcome: desfecho.outcome });
+    }
   };
 
   try {

@@ -50,6 +50,18 @@ export type OutputHostContextV1 = {
 };
 
 /**
+ * T22 (§6.9.1) — o fence de egresso do run, na forma de uma ESCOLHA.
+ *
+ * `no_run` não é "sem fence por enquanto": é a afirmação de que este caller
+ * não tem run durável cujas capacidades possam ser revogadas, e por isso não
+ * há o que reler. O motor local é o único caso hoje. Quem tem run passa
+ * `check`, e a função relê `capabilities_revoked_at` no instante do envio.
+ */
+export type EgressFenceV1 =
+  | { kind: 'no_run'; because: 'local_engine_has_no_durable_run' }
+  | { kind: 'check'; isAuthorized: () => Promise<boolean> };
+
+/**
  * Dependências injetadas. Existem para que o coordenador seja exercitável sem
  * banco, sem provider e sem dublar módulo — a mesma razão de `MaiaEngine`
  * receber o laço de raciocínio em vez de importá-lo.
@@ -64,24 +76,28 @@ export type OutputCoordinatorDepsV1 = {
     reason: ReActExitReason,
   ) => Promise<void>;
   /**
-   * T22 — as capacidades deste run ainda valem?
+   * T22 — o fence de egresso, DECLARADO em vez de omitido.
    *
-   * Lida imediatamente antes do envio. Ausente, não há fence: é o regime do
-   * motor LOCAL, que não tem run durável nem grant para revogar. Um caller com
-   * run — o adapter Hermes — liga isto à releitura de
-   * `capabilities_revoked_at`.
+   * Este campo era `isEgressAuthorized?: () => Promise<boolean>`, e o opcional
+   * era o problema: a ausência do fence e o esquecimento do fence tinham
+   * exatamente a mesma forma no código. O caller local está certo em não ter
+   * um — não existe run durável nem grant para revogar —, mas o caller remoto
+   * que esquecesse de ligá-lo compilaria igual, e o sintoma seria uma resposta
+   * saindo depois de um operador revogar as capacidades. Exatamente o que o
+   * T22 existe para impedir.
    *
-   * `false` BLOQUEIA a entrega. Não é "tente de novo": o run foi parado de
-   * propósito por um operador ou pelo recovery.
+   * Com a união discriminada, "não há fence" passa a ser uma AFIRMAÇÃO que
+   * alguém escreveu e o revisor lê. O compilador cobra a escolha.
    */
-  isEgressAuthorized?: () => Promise<boolean>;
+  egress: EgressFenceV1;
   /**
    * C24 — a trilha durável do resultado barrado (`engine_result_fenced`).
    *
-   * Injetada como as demais: `@/governance/audit.js` resolve tenant e agent
-   * pelo ALS, e este módulo é exercitado sem contexto nos testes.
+   * Obrigatória pelo mesmo motivo: ação de governança sem produtor é ação que
+   * não existe. `@/governance/audit.js` resolve tenant e agent pelo ALS, e a
+   * injeção continua existindo para que o módulo seja exercitável sem contexto.
    */
-  audit?: (input: {
+  audit: (input: {
     acao: 'engine_result_fenced';
     alvo_id: string;
     metadata: Record<string, unknown>;
@@ -176,7 +192,16 @@ export async function coordinateOutput(
      * O payload leva IDS de chamada e nada mais: nenhum argumento, resultado
      * ou texto entra, pela mesma razão de sempre.
      */
-    if (deps.audit !== undefined) {
+    /**
+     * A trilha não pode VIRAR o fence. Se a escrita da auditoria falhar, o
+     * erro subiria por `coordinateOutput` e o turno terminaria como falha
+     * genérica — o que `decideTurnAction` classificaria como RETRY. Um turno
+     * bloqueado por divergência que volta para a fila é exatamente o oposto do
+     * desfecho: ele precisa de dead letter e de gente. Então a falha da trilha
+     * é gritada e absorvida, e o bloqueio segue sendo o que este caminho
+     * devolve.
+     */
+    try {
       await deps.audit({
         acao: 'engine_result_fenced',
         alvo_id: inbound.id,
@@ -186,6 +211,11 @@ export async function coordinateOutput(
           side_effects_committed: assembled.sideEffectsCommitted,
         },
       });
+    } catch (err) {
+      logger.error(
+        { conversa_id: conversa.id, mensagem_id: inbound.id, err, ops_alert: true },
+        'engine.coordinator.result_fenced_audit_failed',
+      );
     }
 
     if (assembled.toolSummaries.length > 0) {
@@ -240,8 +270,8 @@ export async function coordinateOutput(
    * começo da coordenação: qualquer trabalho entre a leitura e o envio
    * reabriria a janela que ela existe para fechar.
    */
-  if (candidato !== null && candidato.text.length > 0 && deps.isEgressAuthorized !== undefined) {
-    const autorizado = await deps.isEgressAuthorized();
+  if (candidato !== null && candidato.text.length > 0 && deps.egress.kind === 'check') {
+    const autorizado = await deps.egress.isAuthorized();
     if (!autorizado) {
       logger.warn(
         { conversa_id: conversa.id, mensagem_id: inbound.id },

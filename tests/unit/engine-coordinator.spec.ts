@@ -128,6 +128,8 @@ describe('MaiaOutputCoordinator', () => {
       const deps: OutputCoordinatorDepsV1 = {
         dispatch: vi.fn(async () => ({ status: 'delivered' })),
         flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+        audit: vi.fn(async () => {}),
+        egress: { kind: 'no_run', because: 'local_engine_has_no_durable_run' },
         onDelivered: onDeliveredHook,
       };
 
@@ -165,6 +167,8 @@ describe('MaiaOutputCoordinator', () => {
       const deps: OutputCoordinatorDepsV1 = {
         dispatch: vi.fn(async () => ({ status: 'delivered' })),
         flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+        audit: vi.fn(async () => {}),
+        egress: { kind: 'no_run', because: 'local_engine_has_no_durable_run' },
         onDelivered: onDeliveredHook,
       };
 
@@ -202,6 +206,8 @@ describe('MaiaOutputCoordinator', () => {
       const deps: OutputCoordinatorDepsV1 = {
         dispatch: vi.fn(),
         flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+        audit: vi.fn(async () => {}),
+        egress: { kind: 'no_run', because: 'local_engine_has_no_durable_run' },
       };
 
       const result = await coordinateOutput(HOST, assembled, deps);
@@ -249,7 +255,8 @@ describe('T22 — egresso bloqueado depois da revogação de grant', () => {
     const r = await coordinateOutput(HOST, comResposta('Pronto.'), {
       dispatch,
       flushUnconfirmedToolSummaries: vi.fn(async () => {}),
-      isEgressAuthorized: vi.fn(async () => false),
+      audit: vi.fn(async () => {}),
+      egress: { kind: 'check', isAuthorized: vi.fn(async () => false) },
     });
 
     expect(dispatch).not.toHaveBeenCalled();
@@ -263,19 +270,23 @@ describe('T22 — egresso bloqueado depois da revogação de grant', () => {
     const r = await coordinateOutput(HOST, comResposta('Pronto.'), {
       dispatch,
       flushUnconfirmedToolSummaries: vi.fn(async () => {}),
-      isEgressAuthorized: vi.fn(async () => true),
+      audit: vi.fn(async () => {}),
+      egress: { kind: 'check', isAuthorized: vi.fn(async () => true) },
     });
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(r.delivery.dispatched).toBe(true);
   });
 
-  it('sem o fence ligado, o motor LOCAL entrega como sempre', async () => {
-    // O motor local não tem run durável nem grant para revogar. A ausência da
-    // dependência é o regime dele, não um fence desligado por engano.
+  it('`no_run` declarado: o motor LOCAL entrega como sempre', async () => {
+    // O motor local não tem run durável nem grant para revogar. Isso é uma
+    // AFIRMAÇÃO do caller (`kind: 'no_run'`), não uma chave esquecida — o
+    // campo é obrigatório justamente para que as duas não se pareçam.
     const dispatch = vi.fn(async () => ({ status: 'delivered' as const }));
     const r = await coordinateOutput(HOST, comResposta('Pronto.'), {
       dispatch,
       flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+      audit: vi.fn(async () => {}),
+      egress: { kind: 'no_run', because: 'local_engine_has_no_durable_run' },
     });
     expect(dispatch).toHaveBeenCalledTimes(1);
     expect(r.delivery.dispatched).toBe(true);
@@ -312,6 +323,7 @@ describe('C24 — resultado barrado deixa linha durável (engine_result_fenced)'
       dispatch,
       flushUnconfirmedToolSummaries: vi.fn(async () => {}),
       audit,
+      egress: { kind: 'no_run', because: 'local_engine_has_no_durable_run' },
     });
 
     expect(dispatch).not.toHaveBeenCalled();
@@ -326,15 +338,21 @@ describe('C24 — resultado barrado deixa linha durável (engine_result_fenced)'
     );
   });
 
-  it('o log não substitui a linha: sem a dependência, o bloqueio ainda acontece', async () => {
-    // A auditoria é a trilha, não o fence. Quem não liga a dependência perde a
-    // trilha — nunca o bloqueio.
+  it('trilha que FALHA não vira fence: o bloqueio continua sendo o desfecho', async () => {
+    // A auditoria é a trilha, não o fence. Se a escrita falhasse e o erro
+    // subisse, o turno viraria falha genérica — e falha genérica volta para a
+    // fila. Um turno com divergência reenfileirado é o oposto do desfecho.
     const dispatch = vi.fn(async () => ({ status: 'delivered' as const }));
     const r = await coordinateOutput(HOST, comDivergencia(), {
       dispatch,
       flushUnconfirmedToolSummaries: vi.fn(async () => {}),
+      audit: vi.fn(async () => {
+        throw new Error('audit_log indisponível');
+      }),
+      egress: { kind: 'no_run', because: 'local_engine_has_no_durable_run' },
     });
     expect(dispatch).not.toHaveBeenCalled();
     expect(r.delivery.dispatched).toBe(false);
+    expect(r.delivery.exitReason).toBe('claim_divergence_blocked');
   });
 });

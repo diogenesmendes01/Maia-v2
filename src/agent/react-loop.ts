@@ -288,8 +288,6 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   let totalTokens = 0;
   const conversation: LLMMessage[] = messages;
   let latestPending: LatestPending | null = null;
-  let turnHasSensitive = false;
-  const sensitiveTools: string[] = [];
   let latestReportPdf: LatestReportPdf | null = null;
   let outboundText = '';
   /**
@@ -325,10 +323,6 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   const receipts: EngineToolReceiptV1[] = [];
   /** Iterações efetivamente executadas — entra na proposta terminal. */
   let iteracoes = 0;
-  // Codex C1 (PR #74): tracks whether any iteration successfully ran the
-  // outbound dispatch path. `false` at exit + non-empty toolSummaries triggers
-  // the placeholder flush so the next turn's anchor isn't lost.
-  let outboundDispatched = false;
   // Reason recorded when we exit the loop without dispatching outbound.
   // Defaults to empty_final_text (the model returned no end_turn text);
   // overridden to 'iteration_cap' when we hit MAX_REACT_ITERATIONS.
@@ -337,9 +331,6 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // através dessa fronteira — com `let`, ele estreita o tipo para o valor
   // inicial e a leitura lá embaixo vira comparação "sem sobreposição".
   const saida: { motivo: ReActExitReason } = { motivo: 'empty_final_text' };
-  // Issue #503 — dispatch entregue mas persistência ambígua: o usuário TEM a
-  // resposta, então nunca reenviar; o outcome é `reply_delivery_unknown`.
-  let persistUnknown = false;
   // Issue #503 — alguma tool com efeito externo irreversível chegou a rodar?
   // Enquanto false, um retry é seguro; a partir de true, não é.
   let sideEffectsCommitted = false;
@@ -579,14 +570,11 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
 
       // Sub-A: silent ack via reaction on side-effect tool outcomes.
       const tool = REGISTRY[tu.tool];
-      // B3a: track sensitive tools dispatched in this turn. The dedup guard
-      // (`!sensitiveTools.includes`) keeps the audit's `sensitive_tools`
-      // list as a unique set even when the LLM dispatches the same tool
-      // multiple times (e.g., balance for two entidade_ids).
-      if (tool?.sensitive && !sensitiveTools.includes(tu.tool)) {
-        turnHasSensitive = true;
-        sensitiveTools.push(tu.tool);
-      }
+      // B3a: a lista única de ferramentas sensíveis do turno era montada aqui
+      // e lida no fim do laço. Agora ela sai dos RECEIPTS, no assembler
+      // (`sensitive: tool?.sensitive === true`, logo abaixo), que é a mesma
+      // informação por um caminho que o motor remoto também percorre. Manter
+      // as duas contagens seria manter duas verdades sobre o mesmo turno.
 
       // B3b: capture PDF report result for outbound document send.
       if (
@@ -787,6 +775,27 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
     dispatch: safeDispatchOutput,
     flushUnconfirmedToolSummaries: (conversa_id, inbound_id, summaries, reason) =>
       flushUnconfirmedToolSummaries(conversa_id, inbound_id, summaries, reason),
+    /**
+     * C24 — o produtor de `engine_result_fenced`.
+     *
+     * Neste caminho a divergência é estruturalmente `none` (os ids afirmados
+     * SÃO os receipts, logo em cima), então a linha não chega a ser escrita
+     * hoje. Injetar assim mesmo é deliberado: a ação deixa de ser uma entrada
+     * do catálogo sem chamador nenhum, e o dia em que o assembler passar a
+     * enxergar divergência por aqui — troca no laço, motor novo, receipt
+     * perdido — a trilha já existe em vez de precisar ser lembrada.
+     */
+    audit: (input) => audit(input),
+    /**
+     * T22 — a declaração, não a omissão.
+     *
+     * O laço local não tem run durável: não há `engine_runs.id`, não há grant
+     * de capacidades e não há `capabilities_revoked_at` para reler. Um fence
+     * aqui não protegeria nada e mentiria sobre existir revogação possível. O
+     * campo é obrigatório justamente para que isto seja escrito e lido, em vez
+     * de inferido de uma chave ausente.
+     */
+    egress: { kind: 'no_run', because: 'local_engine_has_no_durable_run' },
     onDelivered: (rawText) =>
       dispararReflexaoDeLacuna(rawText, {
         conversa_id: c.id,

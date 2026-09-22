@@ -127,3 +127,87 @@ export function routeExistingEngineRun(state: TurnEngineState): TurnRouteV1 {
 export function routeAllowsPipeline(route: TurnRouteV1): boolean {
   return route.kind === 'run_pipeline';
 }
+
+/**
+ * O DESFECHO DURÁVEL da rota — a metade que faltava.
+ *
+ * ─── Por que "só não reexecutar" não era desfecho ───────────────────────────
+ *
+ * A primeira versão deste seam decidia o CAMINHO e voltava: quando a rota não
+ * era `run_pipeline`, o call site logava e retornava. Isso deixa o turno no
+ * estado em que o claim o pôs — `claimed` ou `running` —, e esses dois estão
+ * em `RECOVERABLE_TURN_STATUSES`. O recovery rearma; o worker reclama; a rota
+ * recusa de novo; ninguém conta tentativa. É um laço sem fim e sem rastro, e o
+ * sintoma para quem usa é uma mensagem que nunca é respondida e nunca aparece
+ * em lugar nenhum — a falha que o §2 do #503 nomeia como a pior de todas.
+ *
+ * Então a rota também decide o desfecho. Continua pura: traduz estado lido em
+ * intenção, e quem aplica é o `core.ts`, com o fence do turno na mão.
+ *
+ * ─── Por que `retry` para um run em voo ─────────────────────────────────────
+ *
+ * Retry aqui NÃO é reexecutar o pipeline: na volta, o claim passa por esta
+ * mesma função antes do pipeline e recusa de novo. O que o retry faz é
+ * ESPERAR com backoff e com contador — dá ao caminho de reconciliação a
+ * janela para fechar o run, e, se ele não fechar, o esgotamento de tentativas
+ * leva o turno a dead letter na frente de uma pessoa, em vez de mantê-lo
+ * girando para sempre.
+ *
+ * ─── Por que `blocked` não espera ───────────────────────────────────────────
+ *
+ * `await_operator` significa que alguém JÁ decidiu que este run precisa de
+ * gente (§5.7.1). Marcar retry seria fingir que o tempo resolve o que uma
+ * decisão humana travou. E o outcome é `unsafe_to_retry` — não porque se saiba
+ * de algum efeito, mas porque não se consegue descartá-lo: o run ficou aberto
+ * com trabalho possivelmente em voo, e o §5.3.1 proíbe ler ausência de
+ * registro como prova de ausência de efeito.
+ */
+export type RouteTurnActionV1 =
+  /** Segue o caminho de sempre. */
+  | { kind: 'run_pipeline' }
+  /** Não reexecuta, espera com backoff e conta a tentativa. */
+  | { kind: 'retry'; code: RouteErrorCodeV1 }
+  /** Não reexecuta e não espera: exige decisão humana. */
+  | { kind: 'dead_letter'; code: RouteErrorCodeV1; outcome: 'unsafe_to_retry' };
+
+/**
+ * Códigos de erro do turno emitidos por esta rota. Fechados de propósito: eles
+ * aparecem em `agent_turns.last_error_code`, em `maia_turn_retries_total` e na
+ * classificação de veneno, e um código livre viraria cardinalidade infinita
+ * em métrica e um rótulo que ninguém consegue procurar depois.
+ */
+export type RouteErrorCodeV1 =
+  | 'engine_run_result_ready'
+  | 'engine_run_in_flight'
+  | 'engine_run_submission_unknown'
+  | 'engine_run_blocked';
+
+const MOTIVO_PARA_CODIGO: Record<
+  'result_ready' | 'in_flight' | 'submission_unknown' | 'blocked',
+  RouteErrorCodeV1
+> = {
+  result_ready: 'engine_run_result_ready',
+  in_flight: 'engine_run_in_flight',
+  submission_unknown: 'engine_run_submission_unknown',
+  blocked: 'engine_run_blocked',
+};
+
+export function decideRouteTurnAction(route: TurnRouteV1): RouteTurnActionV1 {
+  if (route.kind === 'run_pipeline') return { kind: 'run_pipeline' };
+
+  const code = MOTIVO_PARA_CODIGO[route.reason];
+
+  if (route.kind === 'await_operator') {
+    return { kind: 'dead_letter', code, outcome: 'unsafe_to_retry' };
+  }
+
+  // `reconcile_run` com motivo `blocked` não é produzido por
+  // `routeExistingEngineRun` — o tipo admite, o construtor não. Se um caller
+  // novo o construir, a decisão é a do `blocked`, não a do "espera e tenta":
+  // o lado seguro de um run travado é sempre a pessoa.
+  if (route.reason === 'blocked') {
+    return { kind: 'dead_letter', code, outcome: 'unsafe_to_retry' };
+  }
+
+  return { kind: 'retry', code };
+}

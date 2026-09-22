@@ -7,7 +7,10 @@
  * que alguém já mandou parar.
  */
 import { describe, it, expect } from 'vitest';
-import { routeExistingEngineRun } from '@/runtime/engines/route-existing-run.js';
+import {
+  routeExistingEngineRun,
+  decideRouteTurnAction,
+} from '@/runtime/engines/route-existing-run.js';
 import type { EngineRunSnapshot, TurnEngineState } from '@/db/repositories/engine-repos.js';
 import type { EngineRunPhaseV1 } from '@/runtime/engines/contracts.js';
 
@@ -80,5 +83,74 @@ describe('routeExistingEngineRun — run em voo não autoriza reexecutar', () =>
     const rota = routeExistingEngineRun(comRun('closed'));
     expect(rota.kind).toBe('reconcile_run');
     expect(rota.kind === 'reconcile_run' && rota.reason).toBe('submission_unknown');
+  });
+});
+
+/**
+ * O desfecho DURÁVEL da rota.
+ *
+ * O caso que dá nome a este bloco é o do laço: antes, quando a rota recusava o
+ * pipeline, o turno ficava no estado do claim — `claimed`/`running`, ambos
+ * recuperáveis —, o recovery o rearmava, a rota recusava de novo, e nada
+ * contava tentativa. Uma mensagem de cliente girando para sempre sem resposta
+ * e sem aparecer em lugar nenhum.
+ */
+describe('decideRouteTurnAction — nenhuma rota sai sem desfecho', () => {
+  it('pipeline segue sendo pipeline', () => {
+    expect(decideRouteTurnAction({ kind: 'run_pipeline' })).toEqual({ kind: 'run_pipeline' });
+  });
+
+  it('run em voo: retry com contador, não silêncio', () => {
+    // Retry NÃO reexecuta o pipeline — na volta, a rota recusa de novo antes
+    // dele. O que o retry compra é backoff e tentativa contada, para que a
+    // reconciliação tenha janela e o esgotamento tenha fim.
+    const acao = decideRouteTurnAction(routeExistingEngineRun(comRun('running')));
+    expect(acao).toEqual({ kind: 'retry', code: 'engine_run_in_flight' });
+  });
+
+  it('submissão incerta: espera, mas com o código que diz o que houve', () => {
+    const acao = decideRouteTurnAction(routeExistingEngineRun(comRun('submitting')));
+    expect(acao).toEqual({ kind: 'retry', code: 'engine_run_submission_unknown' });
+  });
+
+  it('resultado pronto: espera a adoção em vez de concluir o turno vazio', () => {
+    // Concluir aqui apagaria do registro durável um resultado que existe e
+    // ninguém entregou.
+    const acao = decideRouteTurnAction(routeExistingEngineRun(comRun('result_ready')));
+    expect(acao).toEqual({ kind: 'retry', code: 'engine_run_result_ready' });
+  });
+
+  it('run bloqueado: dead letter, porque tempo não resolve decisão humana', () => {
+    const acao = decideRouteTurnAction(routeExistingEngineRun(comRun('blocked')));
+    expect(acao).toEqual({
+      kind: 'dead_letter',
+      code: 'engine_run_blocked',
+      outcome: 'unsafe_to_retry',
+    });
+  });
+
+  it('`unsafe_to_retry` não afirma efeito: afirma que não dá para descartá-lo', () => {
+    // O §5.3.1 proíbe ler ausência de registro como prova de ausência de
+    // efeito, e é essa proibição — não um efeito conhecido — que torna o
+    // retry inseguro num run que alguém travou com trabalho possivelmente em
+    // voo.
+    const acao = decideRouteTurnAction(routeExistingEngineRun(comRun('blocked')));
+    expect(acao.kind === 'dead_letter' && acao.outcome).toBe('unsafe_to_retry');
+  });
+
+  it('`reconcile_run` com motivo blocked cai no lado da pessoa, não no da espera', () => {
+    // `routeExistingEngineRun` não constrói esse par, mas o TIPO admite. Um
+    // caller novo que o construa não pode cair no ramo do "espera e tenta".
+    const acao = decideRouteTurnAction({
+      kind: 'reconcile_run',
+      pin: PIN,
+      run: run('blocked'),
+      reason: 'blocked',
+    });
+    expect(acao).toEqual({
+      kind: 'dead_letter',
+      code: 'engine_run_blocked',
+      outcome: 'unsafe_to_retry',
+    });
   });
 });
