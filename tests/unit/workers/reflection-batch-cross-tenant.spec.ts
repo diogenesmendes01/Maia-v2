@@ -66,12 +66,19 @@ import { runWithTenantContext, tryGetCurrentContext } from '@/db/tenant-context.
 // In-memory audit_log + db.execute fake
 // ---------------------------------------------------------------------------
 type AuditRow = {
+  /**
+   * G1 item 1 — `id`, `conversa_id` e `created_at` entram porque a consulta
+   * real passou a selecioná-los: sem id estável não há linhagem auditável, e
+   * sem titular derivável o sinal vai para quarentena em vez de virar cluster.
+   */
+  id: string;
   tenant_id: string;
   agent_id: string;
   acao: string;
   alvo_id: string | null;
   metadata: Record<string, unknown>;
   pessoa_id: string | null;
+  conversa_id: string | null;
   created_at: Date;
 };
 
@@ -104,7 +111,12 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
   }
 
   // (B) Per-tenant inner read — filters by acao + tenant_id + agent_id.
-  if (/SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id\s+FROM/i.test(sqlText)) {
+  // G1 item 1 — a projeção real passou a incluir `id`, `conversa_id` e
+  // `created_at`. O casamento é pela ÂNCORA da consulta (a coluna `acao` e a
+  // tabela), não pela lista inteira de colunas: prender a lista faria este
+  // fake deixar de casar a cada coluna nova, e o sintoma seria um teste
+  // "sem sinais" em vez de um erro que aponta para cá.
+  if (/SELECT[\s\S]*acao[\s\S]*FROM/i.test(sqlText) && /audit_log/i.test(sqlText)) {
     // Param order from the production SQL: $1=tenant_id, $2=agent_id.
     // (The `since` is a raw sql template, not a bound param.)
     const tenant_id = params[0] as string;
@@ -115,10 +127,13 @@ const dbExecuteMock = vi.fn(async (query: SQL) => {
     );
     return {
       rows: filtered.map((r) => ({
+        id: r.id,
         acao: r.acao,
         alvo_id: r.alvo_id,
         metadata: r.metadata,
         pessoa_id: r.pessoa_id,
+        conversa_id: r.conversa_id,
+        created_at: r.created_at,
       })),
     };
   }
@@ -207,65 +222,88 @@ type AuditCall = {
   agent_id: string;
 };
 
+type ProposeCall = {
+  kind: string;
+  key: string;
+  /** tenant passado por PARÂMETRO. */
+  arg_tenant_id: string;
+  arg_agent_id: string;
+  /** tenant do contexto ALS ATIVO no momento da chamada. */
+  tenant_id: string;
+  agent_id: string;
+};
+
 const writeMemoryCalls: WriteMemoryCall[] = [];
-const rulesRepoCreateCalls: RulesRepoCreateCall[] = [];
+const proposeCalls: ProposeCall[] = [];
 const auditCalls: AuditCall[] = [];
 let nextRuleSeq = 1;
 
+/**
+ * G1 (spec §7.6.1) — A CAPTURA MUDOU DE LUGAR, O INVARIANTE NÃO.
+ *
+ * Antes este arquivo capturava `writeMemory` e `rulesRepo.create`, porque eram
+ * essas as duas escritas que o worker fazia. Elas saíram: o worker não cria
+ * mais regra ATIVA nem publica o raciocínio do modelo como memória global.
+ * Agora existe UMA escrita, por `proposeFromWorker`.
+ *
+ * O que este arquivo prova continua sendo o mesmo: a escrita acontece SOB o
+ * contexto de tenant roteado, e nunca sob `default/default`. Mudou onde se
+ * observa isso, não o que se exige.
+ *
+ * `writeMemory` continua mockado de propósito, e agora com outra função: se
+ * alguém reintroduzir a escrita de memória global, o array fica não-vazio e o
+ * caso dedicado a isso falha.
+ */
 vi.mock('@/memory/vector.js', () => ({
-  writeMemory: vi.fn(
-    async (input: {
-      conteudo: string;
-      tipo: string;
-      escopo: string;
-      metadata?: Record<string, unknown>;
-    }) => {
-      // Capture the ACTIVE tenant context — production resolves tenant_id /
-      // agent_id from `getCurrentTenant()`/`getCurrentAgent()` before writing
-      // to `agent_memories`. We mirror that here to PROVE the worker opened
-      // the right context before calling writeMemory.
+  writeMemory: vi.fn(async (input: { conteudo: string; tipo: string; escopo: string }) => {
+    const ctx = tryGetCurrentContext();
+    writeMemoryCalls.push({
+      conteudo: input.conteudo,
+      tipo: input.tipo,
+      escopo: input.escopo,
+      tenant_id: ctx?.tenant_id ?? 'system',
+      agent_id: ctx?.agent_id ?? 'system',
+    });
+    return { id: 'mem_unexpected' };
+  }),
+}));
+
+vi.mock('@/learning/service.js', () => ({
+  proposeFromWorker: vi.fn(
+    async (input: { kind: string; key: string; tenant_id: string; agent_id: string }) => {
+      // O contexto ATIVO prova que o worker abriu o escopo certo antes de
+      // propor — mesma prova de antes, noutro ponto.
       const ctx = tryGetCurrentContext();
       if (!ctx) {
         throw new Error(
-          'writeMemory called outside tenant context — would throw MissingTenantContextError in prod',
+          'proposeFromWorker chamado fora do contexto de tenant — em produção o guard lançaria',
         );
       }
-      writeMemoryCalls.push({
-        conteudo: input.conteudo,
-        tipo: input.tipo,
-        escopo: input.escopo,
-        metadata: input.metadata,
+      // E os argumentos EXPLÍCITOS têm de bater com o contexto: passar
+      // tenant errado por parâmetro burlaria o ALS silenciosamente.
+      proposeCalls.push({
+        kind: input.kind,
+        key: input.key,
+        arg_tenant_id: input.tenant_id,
+        arg_agent_id: input.agent_id,
         tenant_id: ctx.tenant_id,
         agent_id: ctx.agent_id,
       });
-      return { id: `mem_${writeMemoryCalls.length.toString().padStart(6, '0')}` };
+      const id = `00000000-0000-0000-0000-${String(nextRuleSeq++).padStart(12, '0')}`;
+      return {
+        kind: 'proposed' as const,
+        proposal_id: id,
+        lifecycle_status: 'pending_review',
+        visible_to_llm: false,
+        approval_class: 'knowledge_rule' as const,
+        risk: 'low' as const,
+      };
     },
   ),
 }));
 
 vi.mock('@/db/repositories.js', () => ({
-  rulesRepo: {
-    findByContext: vi.fn(async (_tipo: string, _contexto: string) => null),
-    create: vi.fn(async (input: { tipo: string; contexto: string; acao: string }) => {
-      // Same capture pattern as writeMemory: tenant context proves the
-      // worker routed correctly before mutating learned_rules.
-      const ctx = tryGetCurrentContext();
-      if (!ctx) {
-        throw new Error(
-          'rulesRepo.create called outside tenant context — prod applyTenantGuard would throw',
-        );
-      }
-      rulesRepoCreateCalls.push({
-        tipo: input.tipo,
-        contexto: input.contexto,
-        acao: input.acao,
-        tenant_id: ctx.tenant_id,
-        agent_id: ctx.agent_id,
-      });
-      const id = `00000000-0000-0000-0000-${String(nextRuleSeq++).padStart(12, '0')}`;
-      return { id, ...input } as { id: string };
-    }),
-  },
+  rulesRepo: { findByContext: vi.fn(async () => null) },
 }));
 
 vi.mock('@/governance/audit.js', () => ({
@@ -343,12 +381,17 @@ function seedCorrection(
     .padStart(12, '0')}`,
 ): void {
   auditStore.push({
+    id: `ev-${auditStore.length}`,
     tenant_id: ctx.tenant_id,
     agent_id: ctx.agent_id,
     acao: 'transaction_corrected',
     alvo_id,
-    metadata: { descricao },
+    // G1 item 1 — o titular precisa ser DEMONSTRÁVEL. O evento declara a
+    // referência; sem ela o sinal iria para quarentena em vez de virar
+    // cluster, que é o comportamento correto e não o que este arquivo mede.
+    metadata: { descricao, data_subject_ref: `titular-${ctx.tenant_id}` },
     pessoa_id: null,
+    conversa_id: null,
     created_at: new Date(),
   });
 }
@@ -357,7 +400,7 @@ beforeEach(() => {
   auditStore.length = 0;
   renderedSqls.length = 0;
   writeMemoryCalls.length = 0;
-  rulesRepoCreateCalls.length = 0;
+  proposeCalls.length = 0;
   auditCalls.length = 0;
   nextRuleSeq = 1;
   heldLocks.clear();
@@ -378,17 +421,19 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     await runReflectionBatch();
 
     // Dispatcher discovered tenant-A
-    expect(rulesRepoCreateCalls).toHaveLength(1);
-    expect(rulesRepoCreateCalls[0]!.tenant_id).toBe('tenant-A');
-    expect(rulesRepoCreateCalls[0]!.agent_id).toBe('agent-A');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-A');
+    expect(proposeCalls[0]!.agent_id).toBe('agent-A');
+    expect(proposeCalls[0]!.kind).toBe('learned_rule');
+    // Os argumentos explícitos batem com o contexto ALS: passar tenant errado
+    // por parâmetro burlaria o escopo sem o ALS perceber.
+    expect(proposeCalls[0]!.arg_tenant_id).toBe('tenant-A');
+    expect(proposeCalls[0]!.arg_agent_id).toBe('agent-A');
+    // G1: nenhuma memória global é escrita.
+    expect(writeMemoryCalls).toHaveLength(0);
 
-    expect(writeMemoryCalls).toHaveLength(1);
-    expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-A');
-    expect(writeMemoryCalls[0]!.agent_id).toBe('agent-A');
-    expect(writeMemoryCalls[0]!.tipo).toBe('reflexao');
-
-    // audit(rule_learned) also under tenant-A
-    expect(auditCalls.filter((c) => c.acao === 'rule_learned')).toHaveLength(1);
+    // audit(learning_proposed) also under tenant-A
+    expect(auditCalls.filter((c) => c.acao === 'learning_proposed')).toHaveLength(1);
     expect(auditCalls[0]!.tenant_id).toBe('tenant-A');
     expect(auditCalls[0]!.agent_id).toBe('agent-A');
   });
@@ -400,13 +445,13 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
     await runReflectionBatch();
 
-    expect(rulesRepoCreateCalls).toHaveLength(1);
-    expect(rulesRepoCreateCalls[0]!.tenant_id).toBe('tenant-B');
-    expect(rulesRepoCreateCalls[0]!.agent_id).toBe('agent-B');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-B');
+    expect(proposeCalls[0]!.agent_id).toBe('agent-B');
 
-    expect(writeMemoryCalls).toHaveLength(1);
-    expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-B');
-    expect(writeMemoryCalls[0]!.agent_id).toBe('agent-B');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-B');
+    expect(proposeCalls[0]!.agent_id).toBe('agent-B');
   });
 
   it("MULTI-TENANT — both tenants processed; each tenant's writes scoped to its own (tenant_id, agent_id)", async () => {
@@ -421,25 +466,25 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     await runReflectionBatch();
 
     // Both tenants produced exactly one rule each.
-    expect(rulesRepoCreateCalls).toHaveLength(2);
-    const tenants = rulesRepoCreateCalls.map((c) => c.tenant_id).sort();
+    expect(proposeCalls).toHaveLength(2);
+    const tenants = proposeCalls.map((c) => c.tenant_id).sort();
     expect(tenants).toEqual(['tenant-A', 'tenant-B']);
 
     // Both tenants produced exactly one memory each.
-    expect(writeMemoryCalls).toHaveLength(2);
-    const memTenants = writeMemoryCalls.map((c) => c.tenant_id).sort();
+    expect(proposeCalls).toHaveLength(2);
+    const memTenants = proposeCalls.map((c) => c.tenant_id).sort();
     expect(memTenants).toEqual(['tenant-A', 'tenant-B']);
 
     // CRITICAL — no write landed under 'default'
-    for (const call of [...writeMemoryCalls, ...rulesRepoCreateCalls]) {
+    for (const call of proposeCalls) {
       expect(call.tenant_id).not.toBe('default');
       expect(call.agent_id).not.toBe('default');
     }
 
     // Pairs are internally consistent — tenant-A rule + tenant-A memory etc.
     // (not a tenant-A rule paired with a tenant-B memory in the same loop iter).
-    const aCreate = rulesRepoCreateCalls.find((c) => c.tenant_id === 'tenant-A')!;
-    const aMem = writeMemoryCalls.find((c) => c.tenant_id === 'tenant-A')!;
+    const aCreate = proposeCalls.find((c) => c.tenant_id === 'tenant-A')!;
+    const aMem = proposeCalls.find((c) => c.tenant_id === 'tenant-A')!;
     expect(aCreate.agent_id).toBe(aMem.agent_id);
   });
 
@@ -456,22 +501,22 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
     await runReflectionBatch();
 
-    expect(rulesRepoCreateCalls).toHaveLength(2);
-    expect(writeMemoryCalls).toHaveLength(2);
+    expect(proposeCalls).toHaveLength(2);
+    expect(proposeCalls).toHaveLength(2);
 
     // Per-tenant pairing still holds despite reverse seed order.
-    const aCount = rulesRepoCreateCalls.filter((c) => c.tenant_id === 'tenant-A').length;
-    const bCount = rulesRepoCreateCalls.filter((c) => c.tenant_id === 'tenant-B').length;
+    const aCount = proposeCalls.filter((c) => c.tenant_id === 'tenant-A').length;
+    const bCount = proposeCalls.filter((c) => c.tenant_id === 'tenant-B').length;
     expect(aCount).toBe(1);
     expect(bCount).toBe(1);
 
-    const aMemCount = writeMemoryCalls.filter((c) => c.tenant_id === 'tenant-A').length;
-    const bMemCount = writeMemoryCalls.filter((c) => c.tenant_id === 'tenant-B').length;
+    const aMemCount = proposeCalls.filter((c) => c.tenant_id === 'tenant-A').length;
+    const bMemCount = proposeCalls.filter((c) => c.tenant_id === 'tenant-B').length;
     expect(aMemCount).toBe(1);
     expect(bMemCount).toBe(1);
 
     // No 'default' bucket leak under adversarial ordering.
-    for (const c of writeMemoryCalls) {
+    for (const c of proposeCalls) {
       expect(c.tenant_id).not.toBe('default');
     }
   });
@@ -488,11 +533,11 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
     await runReflectionBatch();
 
-    expect(rulesRepoCreateCalls).toHaveLength(2);
-    expect(writeMemoryCalls).toHaveLength(2);
+    expect(proposeCalls).toHaveLength(2);
+    expect(proposeCalls).toHaveLength(2);
 
     // Distinct tenant attribution despite identical descricao.
-    const memByTenant = new Set(writeMemoryCalls.map((c) => `${c.tenant_id}|${c.agent_id}`));
+    const memByTenant = new Set(proposeCalls.map((c) => `${c.tenant_id}|${c.agent_id}`));
     expect(memByTenant).toEqual(new Set(['tenant-A|agent-A', 'tenant-B|agent-B']));
   });
 
@@ -501,15 +546,15 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
     await runReflectionBatch();
 
-    expect(rulesRepoCreateCalls).toHaveLength(0);
-    expect(writeMemoryCalls).toHaveLength(0);
+    expect(proposeCalls).toHaveLength(0);
+    expect(proposeCalls).toHaveLength(0);
     expect(auditCalls).toHaveLength(0);
 
     // Defensive: the SELECT acao,alvo_id,... per-tenant read was NEVER fired
     // because we never entered a tenant context. (The dispatcher SELECT
     // DISTINCT DID fire — that's expected.)
-    const perTenantReads = renderedSqls.filter((s) =>
-      /SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id/i.test(s),
+    const perTenantReads = renderedSqls.filter(
+      (s) => /audit_log/i.test(s) && !/\bDISTINCT\b/i.test(s),
     );
     expect(perTenantReads).toHaveLength(0);
   });
@@ -529,9 +574,7 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     // Every per-tenant inner SELECT must include tenant_id AND agent_id in
     // its WHERE clause — that's the defense-in-depth predicate that protects
     // against future dispatcher bugs.
-    const innerReads = renderedSqls.filter((s) =>
-      /SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id/i.test(s),
-    );
+    const innerReads = renderedSqls.filter((s) => /audit_log/i.test(s) && !/\bDISTINCT\b/i.test(s));
     expect(innerReads.length).toBeGreaterThan(0);
     for (const s of innerReads) {
       expect(s).toMatch(/tenant_id\s*=/);
@@ -553,9 +596,8 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     await runReflectionBatch();
 
     const allTenantsTouched = new Set([
-      ...writeMemoryCalls.map((c) => c.tenant_id),
-      ...rulesRepoCreateCalls.map((c) => c.tenant_id),
-      ...auditCalls.filter((c) => c.acao === 'rule_learned').map((c) => c.tenant_id),
+      ...proposeCalls.map((c) => c.tenant_id),
+      ...auditCalls.filter((c) => c.acao === 'learning_proposed').map((c) => c.tenant_id),
     ]);
     expect(allTenantsTouched.has('default')).toBe(false);
     expect(allTenantsTouched.has('system')).toBe(false);
@@ -572,8 +614,8 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
 
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
     await expect(runReflectionBatch()).resolves.toBeUndefined();
-    expect(writeMemoryCalls).toHaveLength(1);
-    expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-A');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-A');
   });
 
   it('CROSS-AGENT — same tenant_id, different agent_id pairs are routed separately', async () => {
@@ -588,10 +630,10 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
     await runReflectionBatch();
 
-    expect(rulesRepoCreateCalls).toHaveLength(2);
-    expect(writeMemoryCalls).toHaveLength(2);
+    expect(proposeCalls).toHaveLength(2);
+    expect(proposeCalls).toHaveLength(2);
 
-    const pairs = new Set(writeMemoryCalls.map((c) => `${c.tenant_id}|${c.agent_id}`));
+    const pairs = new Set(proposeCalls.map((c) => `${c.tenant_id}|${c.agent_id}`));
     expect(pairs).toEqual(new Set(['tenant-A|agent-A', 'tenant-A|agent-OTHER']));
   });
 
@@ -605,8 +647,8 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     const { runReflectionBatch } = await import('@/workers/reflection-batch.js');
     // No `runWithTenantContext` wrap here — production cron path.
     await expect(runReflectionBatch()).resolves.toBeUndefined();
-    expect(rulesRepoCreateCalls).toHaveLength(1);
-    expect(rulesRepoCreateCalls[0]!.tenant_id).toBe('tenant-A');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-A');
   });
 
   it('OUTSIDE-TENANT NO LEAK — when runWithTenantContext for tenant-A is active around the call, A is still routed correctly (not coupled to caller context)', async () => {
@@ -621,9 +663,9 @@ describe('Issue #240 — runReflectionBatch is per-tenant scoped (no default/def
     await runWithTenantContext(A_CTX, runReflectionBatch);
 
     // B's events should produce a B-routed write — NOT inherit the ambient A.
-    expect(writeMemoryCalls).toHaveLength(1);
-    expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-B');
-    expect(writeMemoryCalls[0]!.agent_id).toBe('agent-B');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-B');
+    expect(proposeCalls[0]!.agent_id).toBe('agent-B');
   });
 
   it('DISPATCHER QUERY filters tenant_id IS NOT NULL AND agent_id IS NOT NULL (Codex REQUEST_CHANGES MINOR)', async () => {
@@ -669,11 +711,11 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #1: fail-isolated per-tenant', () =
     // tenant-B's write must have landed despite tenant-A blowing up. This is
     // the entire point of fail-isolated: a buggy tenant doesn't take down
     // the whole nightly batch.
-    expect(writeMemoryCalls).toHaveLength(1);
-    expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-B');
-    expect(writeMemoryCalls[0]!.agent_id).toBe('agent-B');
-    expect(rulesRepoCreateCalls).toHaveLength(1);
-    expect(rulesRepoCreateCalls[0]!.tenant_id).toBe('tenant-B');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-B');
+    expect(proposeCalls[0]!.agent_id).toBe('agent-B');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-B');
   });
 
   it('tenant-A failure is logged with tenant_id+agent_id; other tenants still emit reflection_batch.tenant_done', async () => {
@@ -773,7 +815,7 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #2: concurrent worker guard (adviso
     // And acquire happens BEFORE the inner write (otherwise the lock can't
     // be protecting the read-then-create race).
     expect(heldLocks.size).toBe(0);
-    expect(writeMemoryCalls).toHaveLength(1);
+    expect(proposeCalls).toHaveLength(1);
   });
 
   it('if the lock is already held by another worker, the tenant is SKIPPED (no writes, no inner read)', async () => {
@@ -788,14 +830,12 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #2: concurrent worker guard (adviso
     await runReflectionBatch();
 
     // No writes happened — the tenant was skipped before entering the inner.
-    expect(writeMemoryCalls).toHaveLength(0);
-    expect(rulesRepoCreateCalls).toHaveLength(0);
+    expect(proposeCalls).toHaveLength(0);
+    expect(proposeCalls).toHaveLength(0);
 
     // The per-tenant inner SELECT (acao, alvo_id, ...) must NOT have fired
     // for tenant-A because we skipped before opening the tenant context.
-    const innerReads = renderedSqls.filter((s) =>
-      /SELECT\s+acao,\s*alvo_id,\s*metadata,\s*pessoa_id/i.test(s),
-    );
+    const innerReads = renderedSqls.filter((s) => /audit_log/i.test(s) && !/\bDISTINCT\b/i.test(s));
     expect(innerReads).toHaveLength(0);
 
     // The pre-seeded lock is still held (we never unlocked it — the worker
@@ -818,8 +858,8 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #2: concurrent worker guard (adviso
     await runReflectionBatch();
 
     // tenant-B processed normally.
-    expect(writeMemoryCalls).toHaveLength(1);
-    expect(writeMemoryCalls[0]!.tenant_id).toBe('tenant-B');
+    expect(proposeCalls).toHaveLength(1);
+    expect(proposeCalls[0]!.tenant_id).toBe('tenant-B');
 
     // Counters reflect the skip.
     const doneLogs = infoSpy.mock.calls.filter((c) => c[1] === 'reflection_batch.done');
@@ -873,8 +913,8 @@ describe('PR #251 REQUEST_CHANGES — MEDIUM #2: concurrent worker guard (adviso
     await runReflectionBatch();
 
     // Both pairs processed.
-    expect(writeMemoryCalls).toHaveLength(2);
-    const pairs = new Set(writeMemoryCalls.map((c) => `${c.tenant_id}|${c.agent_id}`));
+    expect(proposeCalls).toHaveLength(2);
+    const pairs = new Set(proposeCalls.map((c) => `${c.tenant_id}|${c.agent_id}`));
     expect(pairs).toEqual(new Set(['tenant-A|agent-A', 'tenant-A|agent-OTHER']));
 
     // Both locks acquired and released — no held lock at end.

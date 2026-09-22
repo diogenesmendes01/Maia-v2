@@ -447,6 +447,19 @@ export const AUDIT_ACTIONS = [
    * pede revisão de permissão, a outra pede reconciliação do run.
    */
   'engine_result_fenced',
+   * G1 (spec §7.6.1 item 7) — uma PROPOSTA de aprendizado nasceu.
+   *
+   * Ela existe porque `rule_learned` afirma outra coisa. Quem lê essa ação —
+   * contador, UI, relatório — conclui que o agente APRENDEU: que o
+   * comportamento dele mudou. O que aconteceu foi que alguém propôs uma
+   * mudança e ela está esperando um humano.
+   *
+   * `rule_learned` continua existindo para o caminho legado. Distinguir
+   * proposta de publicação é o item inteiro, e reusar a ação antiga teria
+   * feito o worker parar de escrever regra ativa sem que nenhum consumidor
+   * percebesse a diferença.
+   */
+  'learning_proposed',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused
