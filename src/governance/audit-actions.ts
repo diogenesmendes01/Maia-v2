@@ -403,6 +403,38 @@ export const AUDIT_ACTIONS = [
   'conversation_resume_requested',
   'conversation_automation_resumed',
   'conversation_control_conflict',
+  /**
+   * C24 (spec §8.6.1) — a ADMISSÃO DE INFERÊNCIA foi recusada por cota.
+   *
+   * Ela estava nomeada na spec e deliberadamente fora deste arquivo, "em vez
+   * de acrescentada sem produtor". O produtor passou a existir: a admissão em
+   * `inference-repos.ts` já computava um `audit_reason` tipado e um comentário
+   * dizendo que ele ficava "na auditoria e na métrica" — mas só a métrica
+   * existia. O motivo tipado morria no retorno.
+   *
+   * Só as recusas de COTA entram aqui. As outras (grant inválido, controle
+   * humano, conta ausente) são fatos de outra natureza e não devem ser lidas
+   * como "acabou o orçamento" por um operador procurando dinheiro.
+   */
+  'engine_quota_denied',
+  /**
+   * C24 (§8.6.1) — CANCELAMENTO de um run do motor foi PEDIDO.
+   *
+   * "Pedido" é a palavra exata, e por isso ela é uma ação separada da
+   * reconciliação: `cancel` devolve `requested`, que confirma o PEDIDO e não
+   * a ausência de efeito (INV-06). Um operador que veja só esta linha sabe
+   * que alguém mandou parar — não que parou.
+   */
+  'engine_cancel_requested',
+  /**
+   * C24 (§8.6.1) — e o cancelamento foi RECONCILIADO: o run chegou a um
+   * desfecho conhecido depois do pedido.
+   *
+   * Sem este par, o registro durável não distingue "mandaram parar e parou"
+   * de "mandaram parar e ninguém sabe o que aconteceu" — que são exatamente
+   * os dois estados que um incidente precisa separar.
+   */
+  'engine_cancel_reconciled',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused
