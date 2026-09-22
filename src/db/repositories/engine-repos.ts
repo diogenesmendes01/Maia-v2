@@ -117,6 +117,23 @@ export type EngineRunSnapshot = {
   request_key: string;
 };
 
+/** Motor fixado no turno. Imutável depois de gravado (§5.7.1). */
+export type PersistedTurnPin = {
+  engine: string;
+  adapter_revision: string;
+  configuration_digest: string;
+};
+
+/**
+ * O que o claim descobre sobre o motor deste turno, antes de decidir se o
+ * pipeline roda de novo. Três casos, e a diferença entre os dois últimos é
+ * exatamente o que o §5.2 pede que não se confunda.
+ */
+export type TurnEngineState =
+  | { kind: "no_binding" }
+  | { kind: "binding_without_open_run"; pin: PersistedTurnPin }
+  | { kind: "open_run"; pin: PersistedTurnPin; run: EngineRunSnapshot };
+
 /** Consultas de run são single-table; nomes nus são inequívocos. */
 const SNAPSHOT_COLS = sql`id, phase, generation_no, row_version, submit_count, remote_run_id, request_key`;
 
@@ -958,6 +975,66 @@ export type ListDueRunsResult = {
 };
 
 export const engineRunsRepo = {
+  /**
+   * SEGUNDO SEAM do §5.2 — este turno já tem motor fixado e run em voo?
+   *
+   * Existe para ser consultada LOGO DEPOIS do claim/ALS, antes de o pipeline
+   * do turno rodar de novo. A pergunta que ela responde não é "em que estado
+   * está o run" (isso é o snapshot): é "posso reexecutar o pipeline, ou já há
+   * trabalho durável para reconciliar?".
+   *
+   * O motivo de ela existir no claim e não lá embaixo, na altura do reasoner:
+   * um recovery que só descobre o ledger na hora de chamar o motor JÁ passou
+   * de novo por pendências, procedures e skills — efeitos que a primeira
+   * tentativa pode ter commitado. A resposta chega cedo demais para ser útil.
+   *
+   * Leitura pura, sem lock e sem TX: quem for agir sobre o run toma o fence
+   * dele na operação própria. Uma leitura otimista aqui não autoriza nada —
+   * ela só escolhe o CAMINHO.
+   */
+  async findTurnEngineState(input: {
+    turn_id: string;
+  }): Promise<TurnEngineState> {
+    const { tenant_id, agent_id } = scope();
+
+    const pins = linhas<{
+      engine: string;
+      adapter_revision: string;
+      configuration_digest: string;
+    }>(
+      await db.execute(sql`
+        SELECT engine, adapter_revision, configuration_digest
+          FROM ${engine_turn_bindings}
+         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+           AND turn_id = ${input.turn_id}`),
+    );
+    const pin = pins[0] ?? null;
+
+    // Sem binding não há o que reconciliar: o turno nunca chegou a fixar
+    // motor, então o pipeline normal é o caminho certo.
+    if (pin === null) return { kind: "no_binding" };
+
+    const abertos = linhas<RunSnapshotRow>(
+      await db.execute(sql`
+        SELECT ${SNAPSHOT_COLS}
+          FROM ${engine_runs}
+         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+           AND turn_id = ${input.turn_id}
+           AND phase IN (${LISTA_FASES_ABERTAS})
+         ORDER BY generation_no DESC, id
+         LIMIT 1`),
+    );
+    const aberto = abertos[0];
+
+    // Binding sem run aberto é o caso do turno que fixou motor e fechou o run
+    // (ou nem chegou a criar). Reexecutar o pipeline é seguro quanto ao
+    // LEDGER; se havia efeito, quem barra é o gate de efeito do turno, não
+    // esta função.
+    if (!aberto) return { kind: "binding_without_open_run", pin };
+
+    return { kind: "open_run", pin, run: snapshot(aberto) };
+  },
+
   /**
    * TX A do §5.7.3: fixa o motor no turno e cria o run `prepared`.
    *

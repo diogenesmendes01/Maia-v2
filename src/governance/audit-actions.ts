@@ -435,6 +435,18 @@ export const AUDIT_ACTIONS = [
    * os dois estados que um incidente precisa separar.
    */
   'engine_cancel_reconciled',
+   * C24 (§8.6.1) — um RESULTADO do motor foi barrado antes de virar resposta.
+   *
+   * O produtor é o bloqueio por divergência de alegação
+   * (`MaiaOutputCoordinator`): o motor afirmou ter chamado ferramentas que não
+   * têm receipt, e a Maia recusou entregar texto construído sobre isso.
+   *
+   * Distinta de `unauthorized_access_attempt`, que registra uma TENTATIVA
+   * barrada na porta. Aqui a tentativa passou, produziu resultado, e o que foi
+   * barrado foi o RESULTADO — momento diferente e remediação diferente: uma
+   * pede revisão de permissão, a outra pede reconciliação do run.
+   */
+  'engine_result_fenced',
   // Issue #514: a MANDATORY runtime-trace envelope could not be written, so the
   // turn was aborted before any side effect and the job was failed for retry /
   // dead-letter. The audit row is the durable record that the platform refused

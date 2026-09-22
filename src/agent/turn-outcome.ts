@@ -57,6 +57,37 @@ export function decideTurnAction(delivery: ReActDelivery): TurnAction {
       : { kind: 'retry', code: delivery.exitReason };
   }
 
+  // 2b. Bloqueio de reconciliação — o motor alegou chamadas sem receipt.
+  //
+  //     `sideEffectsCommitted` NÃO entra nesta condição, e a ausência dele é o
+  //     ponto. Ele é derivado dos receipts: ele diz "das chamadas que a Maia
+  //     GRAVOU, alguma tinha efeito". A divergência é justamente sobre chamadas
+  //     que a Maia NÃO gravou — então `sideEffectsCommitted: false` aqui não
+  //     significa "nada rodou", significa "não temos registro", e tratar a
+  //     ausência de registro como prova de não-execução é exatamente o que o
+  //     §5.3.1 proíbe no resto da épica.
+  //
+  //     Por isso `unsafe_to_retry` é o rótulo certo nos dois casos: o que torna
+  //     o retry inseguro não é um efeito conhecido, é um efeito que não se
+  //     consegue descartar. Um humano olha e reconcilia.
+  if (delivery.exitReason === 'claim_divergence_blocked') {
+    return { kind: 'dead_letter', code: delivery.exitReason, outcome: 'unsafe_to_retry' };
+  }
+
+  // 2c. T22 — as capacidades do run foram revogadas antes do envio.
+  //
+  //     Não é `complete/no_reply_produced`, e a diferença não é cosmética:
+  //     ali o modelo não produziu texto; aqui ele produziu e a Maia RETEVE.
+  //     Concluir como "sem resposta" apagaria do registro durável o fato de
+  //     que existe uma resposta pronta que ninguém entregou.
+  //
+  //     E não é `retry`: alguém — operador ou recovery — parou este run de
+  //     propósito. Reexecutar seria desfazer a decisão por conta própria, que
+  //     é o oposto do que uma revogação significa.
+  if (delivery.exitReason === 'egress_revoked') {
+    return { kind: 'dead_letter', code: delivery.exitReason, outcome: 'unsafe_to_retry' };
+  }
+
   // 3. O turno correu até o fim sem produzir resposta.
   return { kind: 'complete', outcome: 'no_reply_produced' };
 }

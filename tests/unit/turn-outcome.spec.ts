@@ -132,3 +132,71 @@ describe('decideTurnAction — matriz completa', () => {
     expect(checked).toBe(32);
   });
 });
+
+describe('divergência de alegação — ausência de receipt não é prova de ausência de efeito', () => {
+  it('bloqueia com dead_letter MESMO sem efeito registrado', () => {
+    // `sideEffectsCommitted` é derivado dos receipts: ele fala das chamadas que
+    // a Maia GRAVOU. A divergência é sobre chamadas que ela NÃO gravou, então
+    // `false` aqui significa "não temos registro" — não "nada rodou".
+    const acao = decideTurnAction({
+      dispatched: false,
+      exitReason: 'claim_divergence_blocked',
+      persistUnknown: false,
+      sideEffectsCommitted: false,
+    });
+    expect(acao).toEqual({
+      kind: 'dead_letter',
+      code: 'claim_divergence_blocked',
+      outcome: 'unsafe_to_retry',
+    });
+  });
+
+  it('e com efeito registrado, idem', () => {
+    const acao = decideTurnAction({
+      dispatched: false,
+      exitReason: 'claim_divergence_blocked',
+      persistUnknown: false,
+      sideEffectsCommitted: true,
+    });
+    expect(acao.kind).toBe('dead_letter');
+  });
+
+  it('nunca vira conclusão normal sem resposta', () => {
+    for (const efeito of [true, false]) {
+      const acao = decideTurnAction({
+        dispatched: false,
+        exitReason: 'claim_divergence_blocked',
+        persistUnknown: false,
+        sideEffectsCommitted: efeito,
+      });
+      expect(acao.kind).not.toBe('complete');
+    }
+  });
+});
+
+describe('T22 — resposta RETIDA não é resposta inexistente', () => {
+  it('egresso revogado vira dead_letter, não conclusão sem resposta', () => {
+    // `complete/no_reply_produced` diria que o modelo não produziu texto. Ele
+    // produziu — a Maia é que reteve, porque alguém revogou as capacidades.
+    expect(
+      decideTurnAction({
+        dispatched: false,
+        exitReason: 'egress_revoked',
+        persistUnknown: false,
+        sideEffectsCommitted: false,
+      }),
+    ).toEqual({ kind: 'dead_letter', code: 'egress_revoked', outcome: 'unsafe_to_retry' });
+  });
+
+  it('e nunca vira retry: revogar foi decisão de alguém', () => {
+    for (const efeito of [true, false]) {
+      const acao = decideTurnAction({
+        dispatched: false,
+        exitReason: 'egress_revoked',
+        persistUnknown: false,
+        sideEffectsCommitted: efeito,
+      });
+      expect(acao.kind).toBe('dead_letter');
+    }
+  });
+});

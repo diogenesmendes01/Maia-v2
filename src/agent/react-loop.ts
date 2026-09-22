@@ -24,6 +24,57 @@ import {
   getTurnExecutionContext,
   TurnOwnershipLostError,
 } from '@/runtime/turns/execution-context.js';
+import { assembleTurnResult, type EngineToolReceiptV1 } from '@/runtime/engines/assembler.js';
+import { coordinateOutput } from '@/runtime/engines/coordinator.js';
+
+/**
+ * `run_id`/`request_key` do motor LOCAL.
+ *
+ * A porta os exige porque um motor remoto precisa deles para correlacionar
+ * frames. O laço local não tem run durável — ele É o turno —, então usa um
+ * UUID nulo em vez de fabricar identificadores que ninguém poderia procurar
+ * depois. Um id inventado aqui vazaria para a proposta e pareceria referência
+ * a um run que não existe.
+ */
+const ZERO_UUID = '00000000-0000-0000-0000-000000000000';
+
+/**
+ * Gatilho de reflexão de lacuna, disparado SÓ depois de algo chegar ao usuário.
+ *
+ * Saiu de dentro da fachada de saída quando ela virou o coordenador, e a regra
+ * que ele carrega é a mesma de antes: fire-and-forget, nunca bloqueia a
+ * resposta, e recebe o texto CRU — sem o prefixo de anúncio de role, que é
+ * frase da Maia e dispararia lacuna por conta própria ([P88-C4]).
+ */
+function dispararReflexaoDeLacuna(
+  rawText: string,
+  ctx: { conversa_id: string; inbound_id: string; pessoa_id: string },
+): void {
+  const gap = detectGap(rawText);
+  if (!gap.detected) return;
+  const signal = gap.signal ?? '';
+  void (async () => {
+    try {
+      const event = {
+        type: CognitiveEventType.INTERNAL_GAP,
+        conversa_id: ctx.conversa_id,
+        inbound_mensagem_id: ctx.inbound_id,
+        gap_description: signal,
+        attempted_response: rawText,
+      } as const;
+      const reflected = await reflect(event, { pessoa_id: ctx.pessoa_id });
+      if (!reflected || !reflected.insight) return;
+      const classified = await classify(reflected.insight);
+      if (!classified) return;
+      await persistCandidate(classified, event);
+    } catch (err) {
+      logger.warn(
+        { err: (err as Error).message, mensagem_id: ctx.inbound_id },
+        'gap.reflection.failed',
+      );
+    }
+  })();
+}
 
 /**
  * Codex C1 (PR #74): when the ReAct loop exits without dispatching outbound
@@ -213,7 +264,13 @@ export type ReActExitReason =
   | 'reasoner_failed'
   | 'outbound_failure'
   | 'empty_final_text'
-  | 'iteration_cap';
+  | 'iteration_cap'
+  | 'claim_divergence_blocked'
+  /**
+   * T22 — as capacidades do run foram revogadas ANTES do envio. A resposta
+   * existia e foi retida de propósito; não é ausência de resposta.
+   */
+  | 'egress_revoked';
 
 /**
  * Runs the ReAct iteration loop. Keeps the LLM call → tool execution cycle
@@ -231,8 +288,6 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   let totalTokens = 0;
   const conversation: LLMMessage[] = messages;
   let latestPending: LatestPending | null = null;
-  let turnHasSensitive = false;
-  const sensitiveTools: string[] = [];
   let latestReportPdf: LatestReportPdf | null = null;
   let outboundText = '';
   /**
@@ -257,17 +312,25 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // in `mensagens.ferramentas_chamadas` of the dispatched outbound, or via
   // `flushUnconfirmedToolSummaries` when no outbound was dispatched.
   const toolSummaries: ToolExecutionSummary[] = [];
-  // Codex C1 (PR #74): tracks whether any iteration successfully ran the
-  // outbound dispatch path. `false` at exit + non-empty toolSummaries triggers
-  // the placeholder flush so the next turn's anchor isn't lost.
-  let outboundDispatched = false;
+  /**
+   * P02 (§5.9.2.1) — os RECEIPTS desta execução, na ordem do despacho.
+   *
+   * O acumulador que o `EngineResultAssembler` consome. Ele coexiste com
+   * `toolsCalled`/`toolSummaries` em vez de substituí-los porque os dois
+   * antigos têm consumidores próprios (step-evaluator pós-turno e bloco de
+   * eventos do prompt), e trocar a fonte deles caberia noutra fatia.
+   */
+  const receipts: EngineToolReceiptV1[] = [];
+  /** Iterações efetivamente executadas — entra na proposta terminal. */
+  let iteracoes = 0;
   // Reason recorded when we exit the loop without dispatching outbound.
   // Defaults to empty_final_text (the model returned no end_turn text);
   // overridden to 'iteration_cap' when we hit MAX_REACT_ITERATIONS.
-  let exitReason: ReActExitReason = 'empty_final_text';
-  // Issue #503 — dispatch entregue mas persistência ambígua: o usuário TEM a
-  // resposta, então nunca reenviar; o outcome é `reply_delivery_unknown`.
-  let persistUnknown = false;
+  // Container mutável pela MESMA razão de `candidato` acima: as atribuições
+  // acontecem dentro da closure da iteração, e o compilador não as acompanha
+  // através dessa fronteira — com `let`, ele estreita o tipo para o valor
+  // inicial e a leitura lá embaixo vira comparação "sem sobreposição".
+  const saida: { motivo: ReActExitReason } = { motivo: 'empty_final_text' };
   // Issue #503 — alguma tool com efeito externo irreversível chegou a rodar?
   // Enquanto false, um retry é seguro; a partir de true, não é.
   let sideEffectsCommitted = false;
@@ -371,7 +434,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       );
       // #503 cenário A: o turno NÃO está concluído — nada foi produzido nem
       // entregue. O caller agenda retry em vez de marcar `completed`.
-      exitReason = 'reasoner_failed';
+      saida.motivo = 'reasoner_failed';
       return 'stop';
     }
     totalTokens += res.usage.input_tokens + res.usage.output_tokens;
@@ -468,6 +531,13 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       // step-evaluator (tool_result success criteria).
       toolsCalled.push({ name: tu.tool, result: out });
 
+      // Estado ANTES desta chamada, para o receipt registrar o DELTA dela.
+      // Sem isto, a segunda chamada de um turno reafirmaria o pending que a
+      // primeira abriu, e o journal passaria a atribuir a cada chamada tudo
+      // que aconteceu antes dela.
+      const pendingAntes = latestPending;
+      const pdfAntes = latestReportPdf;
+
       // B0: capture the freshly-created pending id, with re-validation against
       // the dispatcher's 5-min idempotency cache.
       if (
@@ -500,14 +570,11 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
 
       // Sub-A: silent ack via reaction on side-effect tool outcomes.
       const tool = REGISTRY[tu.tool];
-      // B3a: track sensitive tools dispatched in this turn. The dedup guard
-      // (`!sensitiveTools.includes`) keeps the audit's `sensitive_tools`
-      // list as a unique set even when the LLM dispatches the same tool
-      // multiple times (e.g., balance for two entidade_ids).
-      if (tool?.sensitive && !sensitiveTools.includes(tu.tool)) {
-        turnHasSensitive = true;
-        sensitiveTools.push(tu.tool);
-      }
+      // B3a: a lista única de ferramentas sensíveis do turno era montada aqui
+      // e lida no fim do laço. Agora ela sai dos RECEIPTS, no assembler
+      // (`sensitive: tool?.sensitive === true`, logo abaixo), que é a mesma
+      // informação por um caminho que o motor remoto também percorre. Manter
+      // as duas contagens seria manter duas verdades sobre o mesmo turno.
 
       // B3b: capture PDF report result for outbound document send.
       if (
@@ -579,17 +646,41 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
       // Side-effect 'none' tools (parse_only) still get summarized to keep
       // the audit trail intact; the prompt-builder events-block filters by
       // priority later.
-      toolSummaries.push(
-        buildToolSummary({
-          tool_call_id: tu.id,
-          tool_name: tu.tool,
-          side_effect: tool?.side_effect ?? 'none',
-          args: tu.args,
-          result: out,
-          status: isError ? 'error' : 'success',
-          dispatched_at,
-        }),
-      );
+      const summary = buildToolSummary({
+        tool_call_id: tu.id,
+        tool_name: tu.tool,
+        side_effect: tool?.side_effect ?? 'none',
+        args: tu.args,
+        result: out,
+        status: isError ? 'error' : 'success',
+        dispatched_at,
+      });
+      toolSummaries.push(summary);
+
+      /**
+       * P02 (§5.9.2.1) — O RECEIPT.
+       *
+       * Um por chamada DESPACHADA, na ordem em que despachamos. É o que o
+       * `EngineResultAssembler` lê para montar o resultado do turno, e a razão
+       * de ele existir aqui em vez de ser derivado depois: o que prova a
+       * chamada é o dispatcher ter rodado, não o laço ter lembrado.
+       *
+       * `pending` e `report_pdf` entram como DELTA desta chamada — o assembler
+       * é quem decide que o último vence. Gravar o acumulado aqui faria toda
+       * chamada posterior reafirmar um pending que não foi dela.
+       */
+      receipts.push({
+        call_id: tu.id,
+        ordinal: receipts.length,
+        tool_name: tu.tool,
+        result: out,
+        status: isError ? 'error' : 'success',
+        side_effect: tool?.side_effect ?? null,
+        sensitive: tool?.sensitive === true,
+        summary,
+        pending: latestPending !== pendingAntes ? latestPending : null,
+        report_pdf: latestReportPdf !== pdfAntes ? latestReportPdf : null,
+      });
 
       await audit({
         acao: (isError ? 'unauthorized_access_attempt' : 'classification_suggested') as never,
@@ -603,7 +694,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
     // If we completed the final iteration with tool_uses, we'll exit the
     // for-loop without dispatching outbound. Mark for the flush path.
     if (i === MAX_REACT_ITERATIONS - 1) {
-      exitReason = 'iteration_cap';
+      saida.motivo = 'iteration_cap';
     }
     return 'continue';
   };
@@ -616,6 +707,7 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // aberto no ALS eles aninham, e "o segundo round-trip é o lento" passa a ser
   // legível na waterfall em vez de inferível pelos timestamps.
   for (let i = 0; i < MAX_REACT_ITERATIONS; i++) {
+    iteracoes = i + 1;
     const step = await instrumentReactIteration(i + 1, () => runIteration(i));
     if (step === 'stop') break;
   }
@@ -631,88 +723,100 @@ export async function runReActLoop(params: RunReActLoopParams): Promise<ReActLoo
   // Capturado numa const: o acumulador é um container mutável porque a
   // atribuição acontece dentro da closure da iteração, e o compilador não
   // acompanha atribuições através dessa fronteira.
+  /**
+   * P02 (§5.2, §5.9.2) — A ENTREGA MUDOU DE DONO.
+   *
+   * O que estava aqui — `safeDispatchOutput`, a classificação do desfecho, o
+   * gatilho de lacuna e o flush de sumários — virou `coordinateOutput`
+   * (`@/runtime/engines/coordinator.js`), e o laço passou a CHAMÁ-LO.
+   *
+   * O call site continua sendo este, de propósito. Arrancar a fachada para o
+   * `core.ts` de uma vez obrigaria a reescrever os 37 casos de caracterização
+   * que provam o comportamento atual — e o ponto de uma extração é preservar
+   * comportamento, não trocar a prova dele. Aqui o que muda é QUEM entrega; o
+   * que se observa de fora é o mesmo.
+   *
+   * O ganho é que o coordenador deixa de ser código sem chamador: quando o
+   * motor remoto entrar, ele chega no mesmo assembler e no mesmo coordenador,
+   * por um caminho que já roda em produção todo dia.
+   */
   const proposta = candidato.atual;
-  if (proposta && proposta.text) {
-    // Centralised, never-throwing dispatch (Codex #216 HIGH-1). We are the
-    // terminal ReAct turn, so there's no further fallback: on a not_sent
-    // (pre-send / disconnected) outcome NOTHING reached the user — record an
-    // outbound_failure exit (tool summaries still flush below) instead of
-    // silently marking the turn delivered.
-    const outcome = await safeDispatchOutput({
-      pessoa,
-      conversa: c,
-      inbound,
-      jid,
-      text: proposta.text,
-      latestPending,
-      latestReportPdf,
-      turnHasSensitive,
-      sensitiveTools,
-    });
-    if (outcome.status === 'not_sent') {
-      logger.warn(
-        { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error },
-        'react_loop.outbound_not_delivered',
-      );
-      exitReason = 'outbound_failure';
-    } else {
-      if (outcome.status === 'sent_no_persist') {
-        // Sent but persist failed (or ambiguous) — user has it; do NOT re-send.
-        logger.error(
-          { conversa_id: c.id, mensagem_id: inbound.id, err: outcome.error, ops_alert: true },
-          'react_loop.dispatch_inconsistency',
-        );
-        persistUnknown = true;
-      }
-      outboundDispatched = true;
+  const assembled = assembleTurnResult({
+    proposal: {
+      version: 1,
+      run_id: getTurnExecutionContext()?.turn_id ?? ZERO_UUID,
+      request_key: ZERO_UUID,
+      stop: proposta
+        ? { kind: 'reply', raw_text: proposta.rawText }
+        : saida.motivo === 'reasoner_failed'
+          ? { kind: 'failed', code: 'reasoner_failed' }
+          : {
+              kind: 'no_reply',
+              reason: saida.motivo === 'iteration_cap' ? 'iteration_cap' : 'empty_final_text',
+            },
+      iterations: iteracoes,
+      // O laço LOCAL não afirma nada além do que gravou: a lista de ids
+      // afirmados é a própria lista de receipts, então a divergência é
+      // estruturalmente `none`. Num motor remoto as duas podem diferir, e é
+      // exatamente essa diferença que o assembler existe para pegar.
+      observed_tool_call_ids: receipts.map((r) => r.call_id),
+      usage: {
+        input_tokens: null,
+        output_tokens: totalTokens > 0 ? totalTokens : null,
+        cost_microusd: null,
+        source: 'engine_reported',
+      },
+    },
+    receipts,
+    outboundPrefix: params.outboundPrefix ?? null,
+  });
 
-      // P1 reflection trigger: INTERNAL_GAP. Inspects the final outbound
-      // text for self-recognized gaps ("não sei", "preciso verificar",
-      // "sem acesso a..."). Fire-and-forget — reflection MUST never
-      // block the user-facing reply or the ReAct return.
-      // [P88-C4] Use rawText (without role announcement prefix) so the
-      // announcement string can't trigger spurious gap detection.
-      const gap = detectGap(proposta.rawText);
-      if (gap.detected) {
-        const responseText = proposta.rawText;
-        const signal = gap.signal ?? '';
-        void (async () => {
-          try {
-            const event = {
-              type: CognitiveEventType.INTERNAL_GAP,
-              conversa_id: c.id,
-              inbound_mensagem_id: inbound.id,
-              gap_description: signal,
-              attempted_response: responseText,
-            } as const;
-            const reflected = await reflect(event, { pessoa_id: pessoa.id });
-            if (!reflected || !reflected.insight) return;
-            const classified = await classify(reflected.insight);
-            if (!classified) return;
-            await persistCandidate(classified, event);
-          } catch (err) {
-            logger.warn(
-              { err: (err as Error).message, mensagem_id: inbound.id },
-              'gap.reflection.failed',
-            );
-          }
-        })();
-      }
-    }
-  }
-
-  // Codex C1 (PR #74): when no outbound was dispatched but tools ran, persist
-  // their summaries via a placeholder event row so the next turn's
-  // prompt-builder still surfaces them in the "## Eventos confirmados pelo
-  // backend" block. Covers iteration-cap and empty-final-text paths.
-  if (!outboundDispatched && toolSummaries.length > 0) {
-    await flushUnconfirmedToolSummaries(c.id, inbound.id, toolSummaries, exitReason);
-  }
+  const coordenado = await coordinateOutput({ pessoa, conversa: c, inbound, jid }, assembled, {
+    dispatch: safeDispatchOutput,
+    flushUnconfirmedToolSummaries: (conversa_id, inbound_id, summaries, reason) =>
+      flushUnconfirmedToolSummaries(conversa_id, inbound_id, summaries, reason),
+    /**
+     * C24 — o produtor de `engine_result_fenced`.
+     *
+     * Neste caminho a divergência é estruturalmente `none` (os ids afirmados
+     * SÃO os receipts, logo em cima), então a linha não chega a ser escrita
+     * hoje. Injetar assim mesmo é deliberado: a ação deixa de ser uma entrada
+     * do catálogo sem chamador nenhum, e o dia em que o assembler passar a
+     * enxergar divergência por aqui — troca no laço, motor novo, receipt
+     * perdido — a trilha já existe em vez de precisar ser lembrada.
+     */
+    audit: (input) => audit(input),
+    /**
+     * T22 — a declaração, não a omissão.
+     *
+     * O laço local não tem run durável: não há `engine_runs.id`, não há grant
+     * de capacidades e não há `capabilities_revoked_at` para reler. Um fence
+     * aqui não protegeria nada e mentiria sobre existir revogação possível. O
+     * campo é obrigatório justamente para que isto seja escrito e lido, em vez
+     * de inferido de uma chave ausente.
+     */
+    egress: { kind: 'no_run', because: 'local_engine_has_no_durable_run' },
+    onDelivered: (rawText) =>
+      dispararReflexaoDeLacuna(rawText, {
+        conversa_id: c.id,
+        inbound_id: inbound.id,
+        pessoa_id: pessoa.id,
+      }),
+  });
 
   return {
     totalTokens,
+    // `outboundText` continua sendo o texto MONTADO no laço, e não o do
+    // coordenador: ele é lido por quem só quer saber o que o modelo produziu,
+    // inclusive quando o envio falhou.
     outboundText,
     toolsCalled,
-    delivery: { dispatched: outboundDispatched, exitReason, persistUnknown, sideEffectsCommitted },
+    delivery: {
+      ...coordenado.delivery,
+      // O efeito irreversível é rastreado na INVOCAÇÃO pelo laço (linha do
+      // `spec?.side_effect`), que é mais conservador que derivá-lo do receipt:
+      // ele marca mesmo quando o receipt não chegou a ser construído.
+      sideEffectsCommitted,
+    },
   };
 }
