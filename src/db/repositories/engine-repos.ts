@@ -90,6 +90,7 @@ import {
   outbound_messages,
 } from "../schema.js";
 import { getCurrentAgent, getCurrentTenant } from "../tenant-context.js";
+import { auditTx } from "@/governance/audit.js";
 
 type Executor = typeof db;
 
@@ -1667,6 +1668,34 @@ export const engineRunsRepo = {
           usage_source: proposta.usage.source,
         },
       });
+
+      /**
+       * C24 — o PAR do `engine_cancel_requested`.
+       *
+       * Só quando o run vinha de `cancelling`. Um run que chega a terminal
+       * pelo caminho normal não reconcilia cancelamento nenhum, e auditar
+       * todos faria a ação perder o significado que ela existe para carregar.
+       *
+       * Este é o registro que distingue "mandaram parar e parou" de "mandaram
+       * parar e ninguém sabe o que aconteceu" — os dois estados que um
+       * incidente precisa separar. Sem ele, existe o pedido e não existe o
+       * desfecho, e quem lê o histórico não consegue fechar a história.
+       *
+       * `stop_kind` vai junto porque reconciliar NÃO é o mesmo que ter sido
+       * cancelado: um run em `cancelling` pode chegar a terminal com resultado
+       * pronto, e afirmar cancelamento ali seria apagar o efeito que houve.
+       */
+      if (atual.phase === "cancelling") {
+        await auditTx(tx, {
+          acao: "engine_cancel_reconciled",
+          alvo_id: input.run_id,
+          metadata: {
+            stop_kind: proposta.stop.kind,
+            observed_calls: proposta.observed_tool_call_ids.length,
+            generation_no: run.generation_no,
+          },
+        });
+      }
 
       conta("terminal", "ok");
       return { ok: true, run: snapshot(run) };
