@@ -404,6 +404,19 @@ export const AUDIT_ACTIONS = [
   'conversation_automation_resumed',
   'conversation_control_conflict',
   /**
+   * C24 (§8.6.1) — um RESULTADO do motor foi barrado antes de virar resposta.
+   *
+   * O produtor é o bloqueio por divergência de alegação
+   * (`MaiaOutputCoordinator`): o motor afirmou ter chamado ferramentas que não
+   * têm receipt, e a Maia recusou entregar texto construído sobre isso.
+   *
+   * Distinta de `unauthorized_access_attempt`, que registra uma TENTATIVA
+   * barrada na porta. Aqui a tentativa passou, produziu resultado, e o que foi
+   * barrado foi o RESULTADO — momento diferente e remediação diferente: uma
+   * pede revisão de permissão, a outra pede reconciliação do run.
+   */
+  'engine_result_fenced',
+  /**
    * G1 (spec §7.6.1 item 7) — uma PROPOSTA de aprendizado nasceu.
    *
    * Ela existe porque `rule_learned` afirma outra coisa. Quem lê essa ação —
