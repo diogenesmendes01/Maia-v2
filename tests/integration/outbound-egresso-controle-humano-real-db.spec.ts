@@ -28,15 +28,22 @@
  *     confirmada, e é justamente nela que um envio escaparia;
  *  4. a fala do OPERADOR passa com o humano no controle. Sem isto o remédio
  *     vira a doença: o console ficaria mudo;
- *  5. pausa e retomada: o modo volta a `bot`, o epoch avança, e a resposta
+ *  5. `system` não passa: um lembrete automático durante atendimento humano é
+ *     a plataforma falando por cima dele;
+ *  6. pausa e retomada: o modo volta a `bot`, o epoch avança, e a resposta
  *     escrita ANTES continua retida — ela responde a um estado da conversa que
  *     já não existe (§8.2.5);
- *  6. retomada sem que nada tenha sido escrito antes: epoch igual, posse
- *     concedida. É a contra-prova de que o caso 5 fala do EPOCH e não de
- *     "qualquer coisa que passou por uma pausa".
+ *  7. retomada sem que nada tenha sido escrito antes: epoch igual, posse
+ *     concedida. É a contra-prova de que o caso 6 fala do EPOCH e não de
+ *     "qualquer coisa que passou por uma pausa";
+ *  8. linha legada, sem proveniência, retida pelo controle vivo — é a metade
+ *     do predicado que não depende das colunas novas;
+ *  9. conversa que nunca foi pausada: nada muda. Sem este caso, um fence que
+ *     retivesse tudo passaria os outros oito.
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
+import { createHash } from 'node:crypto';
 
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { outboundDeliveryRepo } from '@/db/repositories/outbound-delivery-repo.js';
@@ -71,17 +78,37 @@ function claim() {
   );
 }
 
-/** Cria (ou move) o controle da stream deste turno. */
+/**
+ * Cria (ou move) o controle da stream deste turno.
+ *
+ * `owner_app_user_id` e `paused_at` acompanham todo modo que não é `bot`
+ * porque a 140 os EXIGE por CHECK: "quem está no controle precisa ter nome" —
+ * `human`/`pausing` sem dono é indistinguível de bug de escrita.
+ */
 async function controle(input: { mode: string; epoch: number }): Promise<string> {
+  const humano = input.mode !== 'bot';
   const { rows } = await pool.query<{ id: string }>(
     `INSERT INTO conversation_controls
        (tenant_id, agent_id, stream_key, stream_key_version, channel_id, conversa_id,
-        mode, control_epoch)
-     VALUES ($1, $2, $3, 1, $4, $5, $6, $7)
+        mode, control_epoch, owner_app_user_id, paused_at)
+     VALUES ($1, $2, $3, 1, $4, $5, $6, $7, $8, $9)
      ON CONFLICT (tenant_id, agent_id, stream_key)
-       DO UPDATE SET mode = EXCLUDED.mode, control_epoch = EXCLUDED.control_epoch
+       DO UPDATE SET mode              = EXCLUDED.mode,
+                     control_epoch     = EXCLUDED.control_epoch,
+                     owner_app_user_id = EXCLUDED.owner_app_user_id,
+                     paused_at         = EXCLUDED.paused_at
      RETURNING id`,
-    [TENANT, AGENT, streamKey, canalId, conversaId, input.mode, input.epoch],
+    [
+      TENANT,
+      AGENT,
+      streamKey,
+      canalId,
+      conversaId,
+      input.mode,
+      input.epoch,
+      humano ? 'operador-p047b' : null,
+      humano ? new Date() : null,
+    ],
   );
   return rows[0]!.id;
 }
@@ -162,7 +189,7 @@ d('P04.7b — o egresso respeita o controle humano depois do commit', () => {
             status, turn_id, sequence_in_turn, payload_version, payload_type,
             payload_json, payload_hash, logical_dedupe_key, provider_idempotency_key,
             next_attempt_at)
-         VALUES ($1, $2, $3, $4, $5, 'whatsapp', 'pending', $6, 0, 1, 'text',
+         VALUES ($1, $2, $3, $4, $5, 'text', 'pending', $6, 0, 1, 'text',
                  '{"text":"oi"}'::jsonb, $7, $3, $8, now())
          RETURNING id`,
         [
@@ -172,7 +199,9 @@ d('P04.7b — o egresso respeita o controle humano depois do commit', () => {
           conversaId,
           inboundId,
           turnId,
-          `hash_${streamKey}`,
+          // `outbound_messages_payload_hash_format_check` exige 64 hex: a
+          // coluna guarda um sha256, e um valor inventado não caberia.
+          createHash('sha256').update(streamKey).digest('hex'),
           `prov_${streamKey}`,
         ],
       );
