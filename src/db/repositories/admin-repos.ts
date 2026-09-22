@@ -75,6 +75,31 @@ export function encodeListCursor(item: { proposed_at: Date; id: string }): strin
   );
 }
 
+/**
+ * As quatro tabelas do KSM que alimentam a fila de `knowledge_proposal`, com a
+ * coluna de texto de cada uma.
+ *
+ * Exportada por um motivo só: este mapa é interpolado CRU no SQL
+ * (`sql.raw`), então um nome errado não é erro de tipo — é `column "x" does
+ * not exist` em produção, derrubando a fila inteira. Foi o que quase
+ * aconteceu: enquanto um probe de tabela matava o laço, `behavioral_hint`
+ * apontava para `content`, coluna que essa tabela nunca teve. O laço voltou a
+ * rodar e o nome errado deixou de ser inofensivo.
+ *
+ * `tests/unit/admin-repos-ksm-source-tables.spec.ts` confere cada par contra o
+ * `schema.ts`. A trava que faltava é exatamente essa.
+ */
+export const KSM_SOURCE_TABLES: ReadonlyArray<{
+  nome: string;
+  kind: string;
+  descritor: string;
+}> = [
+  { nome: 'agent_facts', kind: 'fact', descritor: 'chave' },
+  { nome: 'memory_entry', kind: 'memory', descritor: 'content' },
+  { nome: 'learned_rules', kind: 'rule', descritor: 'contexto' },
+  { nome: 'behavioral_hint', kind: 'behavioral_hint', descritor: 'hint_text' },
+];
+
 export function decodeListCursor(
   cursor: string | null | undefined,
 ): { ts: Date; id: string } | null {
@@ -278,12 +303,7 @@ export const proposalsUnifiedRepo = {
       };
       const alvo = ksmStatusMap[status];
       if (alvo !== null) {
-        const tabelas: Array<{ nome: string; kind: string; descritor: string }> = [
-          { nome: 'agent_facts', kind: 'fact', descritor: 'chave' },
-          { nome: 'memory_entry', kind: 'memory', descritor: 'content' },
-          { nome: 'learned_rules', kind: 'rule', descritor: 'contexto' },
-          { nome: 'behavioral_hint', kind: 'behavioral_hint', descritor: 'content' },
-        ];
+        const tabelas = KSM_SOURCE_TABLES;
         // PR #775 finding 4 — o predicado de cursor faltava aqui. As outras
         // fontes (capability_proposals, agent_operational_profile_versions,
         // abaixo) recebem `(created_at, id) < (cursor.ts, cursor.id)`; este
@@ -450,7 +470,7 @@ export const proposalsUnifiedRepo = {
     // (ver o comentário equivalente em `list()`).
     {
       let total = 0;
-      for (const nome of ['agent_facts', 'memory_entry', 'learned_rules', 'behavioral_hint']) {
+      for (const { nome } of KSM_SOURCE_TABLES) {
         const result = await db.execute<{ count: number | string }>(sql`
           SELECT COUNT(*)::int AS count
             FROM ${sql.raw(nome)}
