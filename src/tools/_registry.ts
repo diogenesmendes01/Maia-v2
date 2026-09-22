@@ -129,6 +129,30 @@ export type Tool<I extends z.ZodTypeAny, O extends z.ZodTypeAny> = {
   input_schema: I;
   output_schema: O;
   required_actions: ReadonlyArray<ActionKey>;
+  /**
+   * P05 / C-P05-7 (spec §7.10.1) — CONTRA O QUE ESTA FERRAMENTA É AUTORIZADA.
+   *
+   * O dispatcher exigia uma entidade para TODA ferramenta
+   * (`_dispatcher.ts`, `no_entity_in_scope`), e quando os argumentos não
+   * traziam uma ele caía em `ctx.scope.entidades[0]` — a primeira do escopo.
+   * Para uma ferramenta que nada tem a ver com entidades, isso não é um
+   * default inofensivo: é vincular a chamada a uma entidade ARBITRÁRIA e
+   * depois checar permissão contra ela.
+   *
+   * A spec nomeia a consequência: "memória pessoal não pode inventar entidade
+   * para passar esse gate".
+   *
+   *   - `entity`          — a autorização é sobre uma entidade do escopo.
+   *   - `current_subject` — é sobre o TITULAR da conversa (`ctx.pessoa`).
+   *   - `current_turn`    — é sobre o turno em si; não há sujeito de dado.
+   *
+   * OPCIONAL com default `entity` de propósito. Tornar obrigatório forçaria
+   * anotar as 60 ferramentas existentes de uma vez, e uma classificação errada
+   * aqui AFROUXA autorização — é pior que não classificar. O default preserva
+   * exatamente o comportamento atual; reclassificar cada ferramenta é decisão
+   * por ferramenta, com revisão própria.
+   */
+  authorization_target?: 'entity' | 'current_subject' | 'current_turn';
   side_effect: 'none' | 'read' | 'write' | 'communication';
   /**
    * Issue #507 §Tools — a SEMÂNTICA DE CANCELAMENTO desta ferramenta. Campo
