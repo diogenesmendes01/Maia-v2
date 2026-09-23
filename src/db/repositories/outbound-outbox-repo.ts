@@ -61,6 +61,7 @@ import {
 } from './conversation-control-sql.js';
 import type { OutboundArtifact } from '@/runtime/outbound/contract.js';
 import { legacyChannelFor } from '@/runtime/outbound/contract.js';
+import type { EngineOutputOrigin } from '@/runtime/outbound/turn-scope.js';
 
 /** A row do outbox, como o Drizzle a projeta. */
 export type OutboundOutboxRow = typeof outbound_messages.$inferSelect;
@@ -104,6 +105,7 @@ export const OUTBOUND_COMMIT_REJECTIONS = [
    * exatamente o que o §8.2.4 existe para impedir.
    */
   'human_control',
+  'engine_origin_invalid',
 ] as const;
 
 export type OutboundCommitRejection = (typeof OUTBOUND_COMMIT_REJECTIONS)[number];
@@ -129,6 +131,7 @@ export class OutboundCommitError extends Error {
 }
 
 export type OutboundCommitInput = {
+  engine_origin?: EngineOutputOrigin;
   /** O artefato determinístico de #630, já construído e validado. */
   artifact: OutboundArtifact;
   /** Conversa da saída. Coluna NOT NULL desde a 063. */
@@ -195,6 +198,18 @@ export const outboundOutboxRepo = {
     assertTurnTransition('running', 'outbound_pending', null);
 
     return withTx(async (tx) => {
+      // A remote output carries the OLD epoch, not whatever regime happens
+      // to exist at commit time. Lock control BEFORE turn; no I/O under locks.
+      if (input.engine_origin) {
+        const control = await tx.execute(sql`
+          SELECT c.id FROM conversation_controls c JOIN engine_runs r
+            ON r.tenant_id=c.tenant_id AND r.agent_id=c.agent_id AND r.control_id=c.id
+          WHERE r.tenant_id=${tenant_id} AND r.agent_id=${agent_id}
+            AND r.id=${input.engine_origin.run_id} AND r.turn_id=${artifact.turn_id}
+          FOR UPDATE OF c`);
+        if (!control.rows.length || !input.expected_claim_token)
+          throw new OutboundCommitError('engine_origin_invalid', artifact.turn_id);
+      }
       // ── (1) O TURNO. Fenced + CAS, numa única declaração. ────────────────
       const turnRows = await tx
         .update(agent_turns)
@@ -295,6 +310,54 @@ export const outboundOutboxRepo = {
           sobControleHumano ? 'human_control' : 'state_mismatch',
           artifact.turn_id,
         );
+      }
+
+      if (input.engine_origin) {
+        // Turn is locked by the fenced UPDATE above; run comes last. A failure
+        // rolls back that UPDATE too. Never upgrade an old terminal to a new epoch.
+        const origin = (
+          await tx.execute(sql`
+          SELECT r.output_preparation_json FROM engine_runs r
+          JOIN conversation_controls c ON c.tenant_id=r.tenant_id AND c.agent_id=r.agent_id AND c.id=r.control_id
+          JOIN hermes_runtime_manifests m ON m.tenant_id=r.tenant_id AND m.agent_id=r.agent_id AND m.run_id=r.id AND m.digest=r.manifest_digest
+          JOIN channels ch ON ch.tenant_id=c.tenant_id AND ch.agent_id=c.agent_id AND ch.id=c.channel_id
+          JOIN agent_canary_policy cp ON cp.tenant_id=r.tenant_id AND cp.agent_id=r.agent_id
+          WHERE r.tenant_id=${tenant_id} AND r.agent_id=${agent_id}
+            AND r.id=${input.engine_origin.run_id} AND r.turn_id=${artifact.turn_id}
+            AND r.phase='result_ready' AND r.mode='live'
+            AND r.terminal_hash=${input.engine_origin.terminal_hash}
+            AND r.adopted_by_turn_attempt=${turn.attempt_count}
+            AND c.mode='bot' AND c.control_epoch=r.control_epoch
+            AND c.stream_key=${turn.stream_key} AND c.conversa_id=${input.conversa_id}::uuid
+            AND c.pessoa_id=${input.pessoa_id ?? null}::uuid
+            AND r.host_context_json->>'representative_message_id'=${input.in_reply_to}
+            AND r.host_context_json->>'channel_id'=c.channel_id::text
+            AND m.evidence_class='synthetic' AND ch.is_synthetic=true AND cp.stage='synthetic'
+            AND NOT EXISTS (SELECT 1 FROM engine_tool_calls tc WHERE tc.tenant_id=r.tenant_id AND tc.agent_id=r.agent_id AND tc.run_id=r.id)
+          FOR UPDATE OF r
+          FOR SHARE OF ch,cp
+        `)
+        ).rows[0] as
+          | {
+              output_preparation_json: {
+                version?: number;
+                run_id?: string;
+                terminal_hash?: string;
+                text?: string;
+              };
+            }
+          | undefined;
+        const preparation = origin?.output_preparation_json;
+        if (
+          !preparation ||
+          preparation.version !== 1 ||
+          preparation.run_id !== input.engine_origin.run_id ||
+          preparation.terminal_hash !== input.engine_origin.terminal_hash ||
+          artifact.sequence_in_turn !== 0 ||
+          artifact.payload.type !== 'text' ||
+          artifact.payload.text !== preparation.text
+        )
+          throw new OutboundCommitError('engine_origin_invalid', artifact.turn_id);
       }
 
       // ── (2) O ARTEFATO. Mesma transação, mesma conexão. ──────────────────
@@ -427,6 +490,12 @@ export const outboundOutboxRepo = {
         alvo_id: row.id,
         metadata: {
           turn_id: artifact.turn_id,
+          ...(input.engine_origin
+            ? {
+                engine_run_id: input.engine_origin.run_id,
+                engine_terminal_hash: input.engine_origin.terminal_hash,
+              }
+            : {}),
           outbound_id: row.id,
           sequence_in_turn: artifact.sequence_in_turn,
           payload_type: artifact.payload_type,

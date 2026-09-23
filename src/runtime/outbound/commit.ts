@@ -41,7 +41,7 @@ import { getCurrentTenant, getCurrentAgent } from '@/db/tenant-context.js';
 import { turnStateMachineEnabled } from '@/runtime/turns/lifecycle.js';
 import { instrumentOutboundCommit } from '@/observability/instrumentation.js';
 import type { TurnHandle } from '@/runtime/turns/lifecycle.js';
-import { getOutboundTurnScope } from './turn-scope.js';
+import { getOutboundTurnScope, getEngineOutputOrigin } from './turn-scope.js';
 import {
   buildOutboundArtifact,
   type OutboundPayload,
@@ -206,6 +206,7 @@ async function commitOutboundIntentInner(
   try {
     result = await outboundOutboxRepo.commitTurnOutboundTx({
       artifact,
+      engine_origin: getEngineOutputOrigin(),
       conversa_id: input.conversa_id,
       in_reply_to: input.in_reply_to,
       expected_state_version: handle.state_version,

@@ -54,6 +54,48 @@ Planejados nas fatias seguintes (ainda **não** existem): `supervisor.ts`
 - **Não** conhece Baileys, repositórios de negócio nem o dispatcher: quem os usa
   é o broker, nas fatias seguintes, sempre por `dispatchTool`.
 
+## Composição sintética journal → worker
+
+`src/runtime/engines/hermes-runtime.ts` expõe uma fábrica disabled-safe: sem
+ativação, não consulta deployment nem constrói supervisor. O único deployment
+admitido por essa fábrica é explicitamente `synthetic/local_ipc_v1`, com gateway
+HTTP em `127.0.0.1`, sem userinfo/query/hash. `MAIA_HERMES_ENABLED` nasce false;
+ativação via env recusa no boot enquanto não existir loader homologado de
+produção. A fábrica do harness recebe sua configuração explicitamente.
+
+`src/db/repositories/hermes-manifest-repo.ts` persiste o manifest compilado de
+um run preparado no PostgreSQL (migration 149), imutável, com FK escopada e audit
+na mesma TX. O produtor exige claim/lease/epoch atuais, digest/contexto/pin
+compatíveis, estágio canary `synthetic` e `channels.is_synthetic`. Não aceita
+tools nem publication refs; bundle vazio não é aprovação de conhecimento.
+Leitura e watchdog reconsultam o gate sintético. Isso NÃO substitui o fence
+transacional por request de inferência, nem homologa dados reais.
+
+A identidade operacional usa `supervisor.incarnation`, separada do pin de
+build. Start de run preparado de outra encarnação recusa sem submetê-lo;
+observe/cancel de locator alheio são inconclusivos, nunca prova de não execução.
+
+A composição `runtime.withSyntheticCore(() => runAgentForMensagem(id))` é
+async-scoped, sem instalação global ou alteração do boot live. O consumidor core
+seleciona pela policy real; o produtor `hermes-admission-repo.ts` exige canary
+synthetic/canal sintético, uma mensagem textual persistida, identidade escopada,
+claim/lease/epoch atuais. Control é produzido pelo backend; request, binding e
+manifest são gravados na mesma transação antes de start. Nenhum pending gate,
+classificador, procedure, skill ou prompt de produção roda nesse recorte.
+
+`run-synthetic-admission.ts` faz start uma única vez e observa até terminal
+persistido; erro/timeout não prova ausência de execução e não faz novo start.
+Terminal segue recovery/adoption/coordinator/outbox existentes, sem segundo
+sender. Reentrada consulta journal antes do pipeline e conserva os mesmos bytes.
+Os testes de admissão começam sem engine run/binding e usam PostgreSQL e AIAgent
+reais, provider **STUB localhost** e canal **FAKE**; não são evidência de modelo
+pago nem tráfego WhatsApp real. Local/disabled seguem o caminho anterior.
+
+Este recorte NÃO habilita atendimento live, bundles/tools de negócio, dados
+reais, pipeline cognitivo completo ou recovery geral de todos estados. Labels de
+artefato synthetic não são hashes de release aprovados; loader e atestação live
+permanecem gates separados.
+
 ## Testes
 
 - `tests/unit/hermes-wire-contract.spec.ts` — contrato wire (T05, T07, T08, T20 parcial, T70 da matriz da spec).

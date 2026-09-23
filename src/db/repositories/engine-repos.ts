@@ -790,11 +790,13 @@ const PREPARACAO_MAX_BYTES = 262_144;
 
 export type AdoptTerminalResultResult =
   | { ok: true; adopted_by_turn_attempt: number; row_version: number }
+  | ControlConflict
   | TurnFenceConflict
   | NotFound
   | { ok: false; reason: "phase_conflict"; current_phase: EngineRunPhaseV1 }
   | { ok: false; reason: "version_conflict"; current_row_version: number }
-  | { ok: false; reason: "preparation_too_large"; max_bytes: number };
+  | { ok: false; reason: "preparation_too_large"; max_bytes: number }
+  | { ok: false; reason: "preparation_conflict" };
 
 /**
  * As razões de fechamento que ESTA porta implementa.
@@ -1044,9 +1046,11 @@ export const engineRunsRepo = {
    */
   async pinEngineAndPrepareRun(
     input: PrepareRunInput,
+    transaction?: typeof db,
   ): Promise<PrepareRunResult> {
     const { tenant_id, agent_id } = scope();
-    return withTx(async (tx): Promise<PrepareRunResult> => {
+    const transact = transaction ? <T>(fn: (tx: typeof db) => Promise<T>) => fn(transaction) : withTx;
+    return transact(async (tx): Promise<PrepareRunResult> => {
       const controle = await lockControl(tx, { control_id: input.control_id });
       if (!controle) {
         conta("prepare", "not_found");
@@ -3087,7 +3091,32 @@ export const engineRunsRepo = {
         conta("adopt", fence.reason);
         return fence;
       }
+      // A live claim is authority only for its OWN turn, never for another
+      // run in the same tenant/agent. Read and lock that relation before CAS.
+      const ownedRun = linhas<{
+        id: string; control_epoch: string; phase: EngineRunPhaseV1;
+        output_preparation_json: Record<string, Json> | null;
+        adopted_by_turn_attempt: number | null; row_version: number;
+      }>(await tx.execute(sql`
+        SELECT id, control_epoch::text, phase, output_preparation_json,
+               adopted_by_turn_attempt, row_version FROM ${engine_runs}
+         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+           AND id = ${input.run_id} AND turn_id = ${input.turn_id}
+         FOR UPDATE`));
+      if (!ownedRun[0]) return { ok: false, reason: "not_found" };
+      if (controle.mode !== "bot")
+        return { ok: false, reason: "control_not_bot", control_mode: controle.mode };
+      if (String(controle.control_epoch) !== ownedRun[0].control_epoch)
+        return { ok: false, reason: "control_epoch_changed", current_control_epoch: String(controle.control_epoch) };
       const attempt = Number(fence.turno.attempt_count);
+      const prior = ownedRun[0];
+      if (prior.phase === "result_ready" && prior.output_preparation_json !== null) {
+        if (canonicalDigest(prior.output_preparation_json) !== canonicalDigest(input.output_preparation))
+          return { ok: false, reason: "preparation_conflict" };
+        if (Number(prior.adopted_by_turn_attempt) === attempt)
+          return { ok: true, adopted_by_turn_attempt: attempt, row_version: Number(prior.row_version) };
+        // A successor may adopt the SAME preparation, never regenerate it.
+      }
 
       const versaoEsperada =
         input.expected_row_version === undefined
@@ -3236,6 +3265,7 @@ export const engineRunsRepo = {
                  adopted_by_turn_attempt AS adotado
             FROM ${engine_runs}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+             AND turn_id = ${input.turn_id}
            FOR UPDATE`),
       );
       const run = rows[0];

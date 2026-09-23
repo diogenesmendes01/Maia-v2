@@ -1864,6 +1864,54 @@ d("engine-repos — journal de execução contra Postgres real", () => {
 
   const preparacao = { texto: "resposta", canal: "whatsapp" };
 
+  it("adoption rejects the live owner of a DIFFERENT turn in the same scope", async () => {
+    const { run_id } = await runComTerminal();
+    const other = await mkTurnoVivo();
+    const result = await noEscopo(() => engineRunsRepo.adoptTerminalResult({
+      run_id, turn_id: other.turn_id, claim_token: other.claim_token,
+      output_preparation: preparacao,
+    }));
+    expect(result).toMatchObject({ ok: false, reason: "not_found" });
+    const row = await pool.query("SELECT output_preparation_json FROM engine_runs WHERE id=$1", [run_id]);
+    expect(row.rows[0].output_preparation_json).toBeNull();
+  });
+
+  it("adoption rejects an ABA control epoch change after the terminal", async () => {
+    const { run_id, turno, p } = await runComTerminal();
+    await pool.query("UPDATE conversation_controls SET control_epoch=control_epoch+2 WHERE id=$1", [p.control_id]);
+    const result = await noEscopo(() => engineRunsRepo.adoptTerminalResult({
+      run_id, turn_id: turno.turn_id, claim_token: turno.claim_token,
+      output_preparation: preparacao,
+    }));
+    expect(result).toMatchObject({ ok: false, reason: "control_epoch_changed" });
+    const row = await pool.query("SELECT output_preparation_json FROM engine_runs WHERE id=$1", [run_id]);
+    expect(row.rows[0].output_preparation_json).toBeNull();
+  });
+
+  it("adoption preserves frozen output bytes on retry and rejects replacement", async () => {
+    const { run_id, turno } = await runComTerminal();
+    const input = { run_id, turn_id: turno.turn_id, claim_token: turno.claim_token, output_preparation: preparacao };
+    const first = await noEscopo(() => engineRunsRepo.adoptTerminalResult(input));
+    expect(first.ok).toBe(true);
+    const changed = await noEscopo(() => engineRunsRepo.adoptTerminalResult({ ...input, output_preparation: { texto: "changed" } }));
+    expect(changed).toMatchObject({ ok: false, reason: "preparation_conflict" });
+    const same = await noEscopo(() => engineRunsRepo.adoptTerminalResult(input));
+    expect(same).toEqual(first);
+    const row = await pool.query("SELECT output_preparation_json FROM engine_runs WHERE id=$1", [run_id]);
+    expect(row.rows[0].output_preparation_json).toEqual(preparacao);
+  });
+
+  it("close refuses evidence from another turn in the same scope", async () => {
+    const { run_id } = await runComTerminal();
+    const other = await mkTurnoVivo();
+    const result = await noEscopo(() => engineRunsRepo.closeRunAfterHandoff({
+      run_id, turn_id: other.turn_id, decision: "safe_to_retry",
+      actor: { kind: "recovery", actor_ref: "synthetic-recovery" },
+    }));
+    expect(result).toMatchObject({ ok: false, reason: "not_found" });
+    expect((await pool.query("SELECT phase FROM engine_runs WHERE id=$1", [run_id])).rows[0].phase).toBe("result_ready");
+  });
+
   it("46. o dono atual adota: registra a tentativa e a preparação", async () => {
     const { run_id, turno } = await runComTerminal();
 

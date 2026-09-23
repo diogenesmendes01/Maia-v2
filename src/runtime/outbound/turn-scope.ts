@@ -47,6 +47,20 @@ import type { TurnHandle } from '@/runtime/turns/lifecycle.js';
 
 const storage = new AsyncLocalStorage<TurnHandle>();
 
+/** Backend-only origin proof. The outbox revalidates it under DB locks; the
+ * presence of this scope is not authorization by itself. */
+export type EngineOutputOrigin = { run_id: string; terminal_hash: string };
+const engineOrigin = new AsyncLocalStorage<EngineOutputOrigin>();
+export function runWithEngineOutputOrigin<T>(
+  origin: EngineOutputOrigin,
+  fn: () => Promise<T>,
+): Promise<T> {
+  return engineOrigin.run(origin, fn);
+}
+export function getEngineOutputOrigin(): EngineOutputOrigin | undefined {
+  return engineOrigin.getStore();
+}
+
 /**
  * Abre o escopo do turno para os limites de saída.
  *

@@ -398,6 +398,9 @@ export const AUDIT_ACTIONS = [
   // e `operator_reply_committed` — NÃO entram aqui: pertencem a P05/P06/P07 e
   // ao composer do §8.3.4, cujas semânticas ainda não estão fixadas. Ficam
   // nomeadas como pendentes em vez de acrescentadas sem produtor.
+  'hermes_manifest_persisted',
+  'hermes_admission_refused',
+  'conversation_control_created',
   'conversation_pause_requested',
   'conversation_control_acquired',
   'conversation_resume_requested',

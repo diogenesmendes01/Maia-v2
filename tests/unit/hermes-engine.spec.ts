@@ -19,7 +19,11 @@ import {
   parseRuntimeManifest,
   type RuntimeManifestV1,
 } from '@/integrations/hermes/manifest.js';
-import { parseMaiaFrame, serializeFrame, type ResultFrame } from '@/integrations/hermes/protocol.js';
+import {
+  parseMaiaFrame,
+  serializeFrame,
+  type ResultFrame,
+} from '@/integrations/hermes/protocol.js';
 import { parseRunBinding, type RunBindingV1 } from '@/integrations/hermes/run-binding.js';
 import {
   createHermesSupervisor,
@@ -271,8 +275,13 @@ describe('planWorkerStart — o start só sai se as fontes concordam', () => {
     expect(plan.start.manifest.tools).toEqual([]);
   });
 
-  const cases: Array<[string, (r: EngineRequestV1, c: HermesRunContextV1) => [EngineRequestV1, HermesRunContextV1]]> = [
-    ['binding_invalid', (r, c) => [r, { ...c, binding: { ...c.binding, execution_id: randomUUID() } }]],
+  const cases: Array<
+    [string, (r: EngineRequestV1, c: HermesRunContextV1) => [EngineRequestV1, HermesRunContextV1]]
+  > = [
+    [
+      'binding_invalid',
+      (r, c) => [r, { ...c, binding: { ...c.binding, execution_id: randomUUID() } }],
+    ],
     ['binding_mismatch', (r, c) => [{ ...r, run_id: randomUUID() }, c]],
     ['manifest_invalid', (r, c) => [r, { ...c, manifest: { ...c.manifest, tools: 'x' } as never }]],
     [
@@ -337,7 +346,10 @@ describe('planWorkerStart — o start só sai se as fontes concordam', () => {
     ],
     [
       'deadline_exceeded',
-      (r, c) => [{ ...r, limits: { ...r.limits, deadline_at: new Date(Date.now() - 1).toISOString() } }, c],
+      (r, c) => [
+        { ...r, limits: { ...r.limits, deadline_at: new Date(Date.now() - 1).toISOString() } },
+        c,
+      ],
     ],
     [
       'inference_not_allowed',
@@ -456,14 +468,33 @@ function io(
   return { signal: new AbortController().signal, invokeTool: vi.fn(invoke) };
 }
 
-const locator = (request: EngineRequestV1, remote_run_id: string | null) => ({
+const locator = (
+  engine: { remoteInstanceId: string },
+  request: EngineRequestV1,
+  remote_run_id: string | null,
+) => ({
   run_id: request.run_id,
   request_key: request.request_key,
-  remote_instance_id: 'x',
+  remote_instance_id: engine.remoteInstanceId,
   remote_run_id,
 });
 
 describe('HermesEngine — turno pela porta, com processo real', () => {
+  it('identifica a encarnação do supervisor, não a versão do código', () => {
+    const a = supervisor('happy');
+    const b = supervisor('happy');
+    const make = (s: HermesSupervisorV1) =>
+      createHermesEngine({
+        supervisor: s,
+        resolveRunContext: async (r) => contextFor(r),
+        journal: journal(),
+      });
+    const first = make(a);
+    expect(first.remoteInstanceId).toBe(`hermes-supervisor:${a.incarnation}`);
+    expect(make(a).remoteInstanceId).toBe(first.remoteInstanceId);
+    expect(make(b).remoteInstanceId).not.toBe(first.remoteInstanceId);
+    expect(make(b).pin).toEqual(first.pin);
+  });
   it('start aceito, tool com identidade da Maia, terminal gravado pelo journal com o binding', async () => {
     const sup = supervisor('happy');
     const j = journal();
@@ -494,14 +525,20 @@ describe('HermesEngine — turno pela porta, com processo real', () => {
       args: { texto: 'oi' },
     });
 
-    const obs = await engine.observe(locator(request, start.remote_run_id), new AbortController().signal);
+    const obs = await engine.observe(
+      locator(engine, request, start.remote_run_id),
+      new AbortController().signal,
+    );
     expect(obs.kind).toBe('terminal');
     if (obs.kind !== 'terminal') return;
     expect(obs.proposal.observed_tool_call_ids).toEqual([`${request.run_id}:0`]);
     expect(obs.proposal.stop).toEqual({ kind: 'reply', raw_text: 'tool=result:{"ok":true}' });
 
     expect(j.recordTerminal).toHaveBeenCalledTimes(1);
-    const gravado = j.recordTerminal.mock.calls[0]![0] as { binding: RunBindingV1; proposal: unknown };
+    const gravado = j.recordTerminal.mock.calls[0]![0] as {
+      binding: RunBindingV1;
+      proposal: unknown;
+    };
     expect(gravado.binding).toEqual(context.binding);
     expect(Object.isFrozen(gravado.binding.acl)).toBe(true);
     expect(canonicalDigest(gravado.proposal)).toBe(canonicalDigest(obs.proposal));
@@ -569,7 +606,9 @@ describe('HermesEngine — turno pela porta, com processo real', () => {
     const start = await engine.start(request, io());
     if (start.kind !== 'accepted') throw new Error(start.kind);
     expect((await sup.get(request.run_id)!.exited).code).toBe(0);
-    const gravado = j.recordTerminal.mock.calls[0]![0] as { proposal: { observed_tool_call_ids: string[] } };
+    const gravado = j.recordTerminal.mock.calls[0]![0] as {
+      proposal: { observed_tool_call_ids: string[] };
+    };
     // O worker reportou o seq 0; ele foi recusado aqui e nunca chegou ao journal.
     expect(gravado.proposal.observed_tool_call_ids).toEqual([]);
   });
@@ -622,7 +661,11 @@ describe('HermesEngine — turno pela porta, com processo real', () => {
     expect(resolveRunContext).toHaveBeenCalledTimes(1);
     expect(
       await engine.start({ ...request, limits: { ...request.limits, max_iterations: 2 } }, io()),
-    ).toEqual({ kind: 'rejected', definitely_not_accepted: true, code: 'request_key_payload_conflict' });
+    ).toEqual({
+      kind: 'rejected',
+      definitely_not_accepted: true,
+      code: 'request_key_payload_conflict',
+    });
   });
 
   it('cancel pela porta: requested, e o terminal de cancelamento aparece no observe', async () => {
@@ -635,12 +678,17 @@ describe('HermesEngine — turno pela porta, com processo real', () => {
     });
     const start = await engine.start(request, io());
     if (start.kind !== 'accepted') throw new Error(start.kind);
-    const loc = locator(request, start.remote_run_id);
+    const loc = locator(engine, request, start.remote_run_id);
     expect(await engine.cancel(loc, new AbortController().signal)).toEqual({ kind: 'requested' });
     await sup.get(request.run_id)!.exited;
     const obs = await engine.observe(loc, new AbortController().signal);
-    expect(obs.kind === 'terminal' && obs.proposal.stop).toEqual({ kind: 'cancelled', reason: 'operator' });
-    expect(await engine.cancel(loc, new AbortController().signal)).toEqual({ kind: 'already_terminal' });
+    expect(obs.kind === 'terminal' && obs.proposal.stop).toEqual({
+      kind: 'cancelled',
+      reason: 'operator',
+    });
+    expect(await engine.cancel(loc, new AbortController().signal)).toEqual({
+      kind: 'already_terminal',
+    });
   });
 
   it('observe: run desconhecido ou remote_run_id divergente é inconclusivo', async () => {
@@ -652,21 +700,32 @@ describe('HermesEngine — turno pela porta, com processo real', () => {
       journal: journal(),
     });
     const sinal = new AbortController().signal;
-    expect(await engine.observe(locator(request, null), sinal)).toEqual({
+    expect(await engine.observe(locator(engine, request, null), sinal)).toEqual({
       kind: 'not_found',
       proof: 'inconclusive',
     });
     const start = await engine.start(request, io());
     if (start.kind !== 'accepted') throw new Error(start.kind);
-    expect(await engine.observe(locator(request, 'hermes:outro'), sinal)).toEqual({
+    expect(await engine.observe(locator(engine, request, 'hermes:outro'), sinal)).toEqual({
       kind: 'not_found',
       proof: 'inconclusive',
     });
-    expect(await engine.observe(locator(request, start.remote_run_id), sinal)).toEqual({
+    const foreign = {
+      ...locator(engine, request, start.remote_run_id),
+      remote_instance_id: 'hermes-supervisor:other',
+    };
+    expect(await engine.observe(foreign, sinal)).toEqual({
+      kind: 'not_found',
+      proof: 'inconclusive',
+    });
+    expect(await engine.cancel(foreign, sinal)).toEqual({ kind: 'unknown' });
+    expect(await engine.observe(locator(engine, request, start.remote_run_id), sinal)).toEqual({
       kind: 'running',
       remote_run_id: start.remote_run_id,
     });
-    expect(await engine.cancel(locator(request, 'hermes:outro'), sinal)).toEqual({ kind: 'unknown' });
+    expect(await engine.cancel(locator(engine, request, 'hermes:outro'), sinal)).toEqual({
+      kind: 'unknown',
+    });
   });
 
   it('worker que morre sem terminal: observe unavailable, nunca terminal inventado', async () => {
@@ -681,7 +740,12 @@ describe('HermesEngine — turno pela porta, com processo real', () => {
     const start = await engine.start(request, io());
     if (start.kind !== 'accepted') throw new Error(start.kind);
     await sup.get(request.run_id)!.exited;
-    expect(await engine.observe(locator(request, start.remote_run_id), new AbortController().signal)).toEqual({
+    expect(
+      await engine.observe(
+        locator(engine, request, start.remote_run_id),
+        new AbortController().signal,
+      ),
+    ).toEqual({
       kind: 'unavailable',
       code: 'transport',
     });
@@ -705,7 +769,10 @@ describe('HermesEngine — turno pela porta, com processo real', () => {
     );
     if (start.kind !== 'accepted') throw new Error(start.kind);
     await sup.get(request.run_id)!.exited;
-    const obs = await engine.observe(locator(request, start.remote_run_id), new AbortController().signal);
+    const obs = await engine.observe(
+      locator(engine, request, start.remote_run_id),
+      new AbortController().signal,
+    );
     expect(obs.kind === 'terminal' && obs.proposal.stop).toEqual({
       kind: 'reply',
       raw_text: 'tool=refused:effect_unknown',
