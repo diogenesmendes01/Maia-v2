@@ -11,6 +11,48 @@
 | `src/workers/index.ts` | Worker registry, startup orchestration and the cron **drain** (`stopWorkers`). **#726**: cada entrada de `JOBS` declara o handler com `lazy(() => import('./x.js'), (m) => m.runX)` — o módulo do worker é avaliado no PRIMEIRO tick, não no import do registro (que passou de 407 para 19 arquivos de `src/`) |
 | `src/workers/job-contract.ts` | **Contrato de concorrência** (#513 §9): grupos, classificação, `validateJobRegistry` |
 
+### Engine recovery (G03, tranche de metadata e triagem)
+
+`engine_recovery` roda no grupo `turn-pipeline`, a cada minuto, com o mesmo
+lifecycle/drain do scheduler. `src/workers/engine-recovery.ts` enumera pares,
+abre ALS tenant+agent, consulta runs devidos e reserva `next_poll_at`/`row_version`.
+`engineRunsRepo.reconcileReservedRun` revalida controle → turno → run em TX;
+reserva vencida, CAS antigo ou owner vivo não conferem autoridade.
+
+O runner conserva os cursores de escopo/run entre ticks: uma página de pares
+em memória, um cursor de run vinculado ao primeiro par e horizonte fixo para
+terminar essa visita mesmo com novas dívidas. Cada tick executa no máximo
+`maxPages × scopeLimit` páginas de runs, cada qual limitada por `runLimit`
+(defaults 10, 20, 20). Avança inclusive após `owner_alive` e falha de close;
+esgota a visita antes de seguir ao próximo par. Ao terminar a varredura,
+reinicia do começo. Reiniciar o processo perde apenas a posição, não a dívida
+nem os fences; não há promessa de latência independente do backlog.
+
+Wakeup usa `enqueueAgentForRecovery`: conexão exclusiva por chamada, deadline
+padrão de 1s, sem offline queue/reconnect/resend e com disconnect real aguardado
+antes do retorno. A conexão do Worker conserva retries ilimitados. Após a
+primeira falha de transporte no tick, outros wakeups aguardam a janela DB,
+mas close/triagem DB-only continuam. ACK perdido pode ter criado o job:
+o retry reutiliza seu id determinístico, nunca cria outra identidade.
+
+Postgres é a fila durável de manutenção. Crash após reserva ou falha Redis deixa
+a dívida para a próxima janela; terminal elegível sinaliza o MESMO job BullMQ
+do turno. O scanner não adquire claim, renova lease, executa LLM/tool nem envia.
+Handoff sintético com prova correlacionada fecha via CAS mesmo após o turno
+terminar. A prova desta lane exige ausência de tool calls; efeito desconhecido
+não pode ser escondido por um outbound já entregue.
+
+Sem observador/cancelador de produção homologado, runs incertos são revogados e
+`blocked` com evento de reconciliação e alerta operacional, nunca `safe_to_retry`.
+Bloqueados saem da fila automática e continuam no journal para intervenção.
+Terminais revogados vão diretamente a `dead_letter/unsafe_to_retry` no core,
+inclusive revogação durante output, sem gastar retries de saída.
+
+**Não é recovery geral completo:** G02/G04/G05/G06 ainda devem compor
+observe/cancel da incarnation pinada, broker e reconciliação de ferramentas,
+quota/custo e resolução autenticada. Nenhum gate live foi aberto. A lane
+funcional de saída continua sintética e tool-free; outras são triadas.
+
 ### Contrato de concorrência dos jobs (issue #513 §9)
 
 Todo job do registro DECLARA, além de nome e cadência:

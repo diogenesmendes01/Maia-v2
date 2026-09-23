@@ -231,6 +231,20 @@ export const JOBS: Job[] = [
     phase: 1,
   },
   {
+    name: 'engine_recovery',
+    cron: '*/1 * * * *',
+    fn: lazy(() => import('./engine-recovery.js'), (m) => m.runEngineRecovery),
+    group: 'turn-pipeline',
+    effect: 'idempotent',
+    guard: {
+      kind: 'row-claim',
+      claim: 'reserveMaintenanceObservation: next_poll_at + row_version CAS; turn/control locks at reconciliation',
+      tables: ['engine_runs'],
+    },
+    module: 'engine-recovery.ts',
+    phase: 1,
+  },
+  {
     name: 'message_recovery',
     cron: '*/2 * * * *',
     fn: lazy(

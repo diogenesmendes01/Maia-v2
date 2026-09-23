@@ -44,7 +44,9 @@ const previous = vi.hoisted(() => {
 });
 // External infrastructure only. The core, channel resolver, repositories,
 // claim, assembler, output facade, commit and delivery fences are REAL.
-vi.mock('../../src/gateway/queue.js', () => ({
+vi.mock('../../src/gateway/queue.js', async (original) => ({
+  enqueueAgentForRecovery: (await original<typeof import('@/gateway/queue.js')>())
+    .enqueueAgentForRecovery,
   agentQueue: { add: vi.fn(), getJob: vi.fn() },
   startAgentWorker: vi.fn(),
   enqueueAgent: vi.fn(),
@@ -305,6 +307,8 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
   it.each([
     'deliver',
     'close_crash',
+    'scanner_close',
+    'scanner_unknown',
     'close_cas',
     'outbound_unknown',
     'pause',
@@ -523,7 +527,11 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
               [f.execution.turn_id],
             );
         };
-        if (scenario === 'close_crash') {
+        if (
+          scenario === 'close_crash' ||
+          scenario === 'scanner_close' ||
+          scenario === 'scanner_unknown'
+        ) {
           // Commit the real five-second reservation, then lose the process at
           // close. Also seeds a legacy reservation when the caller is atomic.
           const failOnce = vi
@@ -586,9 +594,128 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
                 ])
               ).rows[0].status,
             ).toBe('completed');
+            if (scenario === 'scanner_close' || scenario === 'scanner_unknown') {
+              await pool.query("UPDATE engine_runs SET next_poll_at='1900-01-01' WHERE id=$1", [
+                f.run_id,
+              ]);
+            }
+            if (scenario === 'scanner_unknown') {
+              await pool.query(
+                `INSERT INTO engine_tool_calls(tenant_id,agent_id,turn_id,run_id,call_id,ordinal,tool_name,args_json,args_hash,request_id,state,effect_evidence,finished_at,result_json)
+                VALUES($1,$2,$3,$4,'call-1',0,'synthetic_tool','{}',$5,$6,'effect_unknown','unknown',now(),'{}')`,
+                [tenant_id, agent_id, f.execution.turn_id, f.run_id, 'a'.repeat(64), randomUUID()],
+              );
+            }
             worker = new Worker(
               name,
               async (retry) => {
+                if (scenario === 'scanner_close' || scenario === 'scanner_unknown') {
+                  const { JOBS } = await import('@/workers/index.js');
+                  const tick = JOBS.find((j) => j.name === 'engine_recovery')!.fn as (opts: {
+                    scopeLimit: number;
+                    maxPages: number;
+                  }) => Promise<void>;
+                  if (scenario === 'scanner_close') {
+                    // Older debt needs Redis; the already-delivered orphan behind
+                    // it must close using PostgreSQL even while TCP blackholes.
+                    const debt = await fixture();
+                    await pool.query(
+                      "UPDATE agent_turns SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+                      [debt.execution.turn_id],
+                    );
+                    await pool.query(
+                      "UPDATE engine_runs SET phase='result_ready',terminal_json='{}',terminal_hash=$2,next_poll_at='1800-01-01' WHERE id=$1",
+                      [debt.run_id, 'a'.repeat(64)],
+                    );
+                    const { recoveryRedisTransport } =
+                      await import('../helpers/recovery-redis-transport.js');
+                    const transport = await recoveryRedisTransport(process.env.REDIS_URL!);
+                    const producerModule = await import('@/gateway/queue.js');
+                    const realProducer = producerModule.enqueueAgentForRecovery;
+                    const producer = vi
+                      .spyOn(producerModule, 'enqueueAgentForRecovery')
+                      .mockImplementation((data) =>
+                        realProducer(data, { redisUrl: transport.url, timeoutMs: 150 }),
+                      );
+                    const { createEngineRecoveryRunner } =
+                      await import('@/workers/engine-recovery.js');
+                    const scheduler = await import('@/workers/index.js');
+                    const recoveryJob = scheduler.JOBS.find((j) => j.name === 'engine_recovery')!;
+                    const realQueue = (
+                      await vi.importActual<typeof import('@/gateway/queue.js')>(
+                        '@/gateway/queue.js',
+                      )
+                    ).agentQueue;
+                    const { agentTurnJobId } = await import('@/runtime/turns/job.js');
+                    const id = agentTurnJobId(debt.execution.turn_id);
+                    try {
+                      scheduler._internal.runTick({
+                        ...recoveryJob,
+                        fn: () =>
+                          createEngineRecoveryRunner()({
+                            scopeLimit: 1,
+                            runLimit: 20,
+                            maxPages: 1,
+                          }),
+                      });
+                      expect(await scheduler.drainWorkers(2000)).toEqual({
+                        drained: ['engine_recovery'],
+                        pending: [],
+                      });
+                      await expect.poll(() => transport.sockets).toBe(0);
+                      expect(transport.accepted).toBe(1);
+                      expect(
+                        (await pool.query('SELECT phase FROM engine_runs WHERE id=$1', [f.run_id]))
+                          .rows[0].phase,
+                      ).toBe('closed');
+                      expect(
+                        (
+                          await pool.query(
+                            'SELECT phase,closed_reason FROM engine_runs WHERE id=$1',
+                            [debt.run_id],
+                          )
+                        ).rows[0],
+                      ).toEqual({ phase: 'result_ready', closed_reason: null });
+                      expect(await realQueue.getJob(id)).toBeUndefined();
+                      transport.recover();
+                      for (let attempt = 0; attempt < 2; attempt++) {
+                        await pool.query(
+                          "UPDATE engine_runs SET next_poll_at='1800-01-01' WHERE id=$1",
+                          [debt.run_id],
+                        );
+                        await createEngineRecoveryRunner()({
+                          scopeLimit: 1,
+                          runLimit: 20,
+                          maxPages: 1,
+                        });
+                      }
+                      const queued = await realQueue.getJob(id);
+                      expect(queued?.id).toBe(id);
+                      expect(await queued?.getState()).toBe('waiting');
+                      expect(
+                        (await realQueue.getJobs(['waiting'])).filter((j) => j.id === id),
+                      ).toHaveLength(1);
+                      expect(
+                        (
+                          await pool.query('SELECT attempt_count FROM agent_turns WHERE id=$1', [
+                            debt.execution.turn_id,
+                          ])
+                        ).rows[0].attempt_count,
+                      ).toBe(1);
+                    } finally {
+                      producer.mockRestore();
+                      await (await realQueue.getJob(id))?.remove();
+                      await transport.close();
+                      await pool.query(
+                        "UPDATE engine_runs SET next_poll_at=now()+interval '100 years' WHERE id=$1",
+                        [debt.run_id],
+                      );
+                    }
+                  } else {
+                    await tick({ scopeLimit: 1, maxPages: 1 });
+                  }
+                  return;
+                }
                 // Retry is still inside the reserved window; it must converge,
                 // not acknowledge `not_due` and abandon the journal.
                 expect(
@@ -645,6 +772,18 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
         } else {
           await runCore(f.host.representative_message_id);
         }
+        if (scenario === 'scanner_unknown') {
+          expect(
+            (
+              await pool.query('SELECT phase,closed_reason FROM engine_runs WHERE id=$1', [
+                f.run_id,
+              ])
+            ).rows[0],
+          ).toEqual({ phase: 'blocked', closed_reason: null });
+          expect(channel.sent).toEqual(['synthetic response']);
+          expect(stub.requests).toHaveLength(1);
+          return;
+        }
         if (scenario === 'outbound_unknown') {
           const before = (await pool.query('SELECT * FROM engine_runs WHERE id=$1', [f.run_id]))
             .rows[0];
@@ -677,6 +816,13 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
           return;
         }
         if (scenario.startsWith('revoked_')) {
+          expect(
+            (
+              await pool.query('SELECT status,outcome FROM agent_turns WHERE id=$1', [
+                f.execution.turn_id,
+              ])
+            ).rows[0],
+          ).toMatchObject({ status: 'dead_letter', outcome: 'unsafe_to_retry' });
           const revoked = (
             await pool.query(
               'SELECT capabilities_revoked_at::text, phase, closed_reason, request_json FROM engine_runs WHERE id=$1',
@@ -719,7 +865,12 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
             ).rows[0].capabilities_revoked_at,
           ).toBe(revoked.capabilities_revoked_at);
         }
-        if (scenario !== 'deliver' && scenario !== 'close_crash' && scenario !== 'close_cas') {
+        if (
+          scenario !== 'deliver' &&
+          scenario !== 'close_crash' &&
+          scenario !== 'scanner_close' &&
+          scenario !== 'close_cas'
+        ) {
           expect(channel.sent).toEqual([]);
           expect(
             (

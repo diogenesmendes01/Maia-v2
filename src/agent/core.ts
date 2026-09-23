@@ -845,7 +845,13 @@ async function runAgentForMensagemInner(
      * nunca terminar. A regra de para onde ele vai é pura e mora junto da
      * rota (`decideRouteTurnAction`); aqui só se aplica, com o fence na mão.
      */
-    const desfecho = decideRouteTurnAction(rota);
+    // Revocation can commit at the output boundary AFTER the original route
+    // read. Reread only to tighten the outcome; never reopen the pipeline.
+    const current = await engineRunsRepo.findTurnEngineState({ turn_id: turn.turn_id });
+    const revoked = current.kind === 'open_run' && current.run.capabilities_revoked;
+    const desfecho = decideRouteTurnAction(revoked
+      ? { ...rota, kind: 'await_operator', reason: 'blocked' }
+      : rota);
     if (desfecho.kind === 'retry') {
       await failTurnRetryable(turn, { code: desfecho.code, mensagem_id });
       return;

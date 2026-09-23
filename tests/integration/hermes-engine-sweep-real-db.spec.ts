@@ -20,7 +20,7 @@
  *
  * Skipped sem `TEST_DB_URL`.
  */
-import { describe, it, expect, beforeAll, afterAll } from "vitest";
+import { describe, it, expect, beforeAll, afterAll, vi } from "vitest";
 import pg from "pg";
 import { randomUUID } from "node:crypto";
 import { runWithTenantContext } from "@/db/tenant-context.js";
@@ -166,6 +166,7 @@ async function criarRunDevido(
 d("engine-repos — varredura do journal contra Postgres real", () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 4 });
+    await import('@/workers/engine-recovery.js');
   });
   /**
    * REMOVE o que este spec criou.
@@ -208,6 +209,302 @@ d("engine-repos — varredura do journal contra Postgres real", () => {
       );
     }
     await pool.end();
+  });
+
+  it.each(['owner_alive', 'close_failure'])("R1 progresses beyond a persistent %s prefix across ticks and scopes", async (scenario) => {
+    const { createEngineRecoveryRunner } = await import('@/workers/engine-recovery.js');
+    const runEngineRecovery = createEngineRecoveryRunner();
+    const close = await import('@/runtime/engines/recover-synthetic-output.js');
+    const prefixes: string[] = [];
+    const targets: string[] = [];
+    for (let s = 0; s < 2; s++) {
+      const e = novoEscopo();
+      await seedEscopo(e);
+      for (let i = 0; i < 4; i++) {
+        const f = await criarRunDevido(e);
+        await pool.query("UPDATE engine_runs SET next_poll_at=$2 WHERE id=$1", [f.run_id, `1800-01-0${i + 1}`]);
+        if (i < 3) prefixes.push(f.run_id);
+        else {
+          targets.push(f.run_id);
+          await matarLease(f.turn_id);
+        }
+      }
+    }
+    const failingTurns = (await pool.query('SELECT turn_id FROM engine_runs WHERE id=ANY($1::uuid[])', [prefixes])).rows.map(r => r.turn_id);
+    const original = close.closeSyntheticHermesHandoff;
+    const fault = scenario === 'close_failure' ? vi.spyOn(close, 'closeSyntheticHermesHandoff').mockImplementation(async turn => {
+      if (failingTurns.includes(turn)) throw new Error('persistent close failure');
+      return original(turn);
+    }) : null;
+    const pages = vi.spyOn(engineRunsRepo, 'listDueRuns');
+    try {
+      for (let tick = 0; tick < 8; tick++) {
+        pages.mockClear();
+        await runEngineRecovery({ scopeLimit: 1, runLimit: 2, maxPages: 1 });
+        expect(pages.mock.calls.length).toBeLessThanOrEqual(1);
+      }
+      expect((await pool.query('SELECT phase FROM engine_runs WHERE id=ANY($1::uuid[])', [targets])).rows.map(r => r.phase)).toEqual(['blocked', 'blocked']);
+      expect((await pool.query('SELECT phase,poll_count FROM engine_runs WHERE id=ANY($1::uuid[])', [prefixes])).rows).toEqual(prefixes.map(() => ({phase: 'prepared', poll_count: 0})));
+    } finally {
+      fault?.mockRestore();
+      pages.mockRestore();
+      await pool.query("UPDATE engine_runs SET next_poll_at=now()+interval '100 years' WHERE id=ANY($1::uuid[])", [[...prefixes, ...targets]]);
+    }
+  });
+
+  it('R2 bounded transport allows later DB maintenance and closes sockets before returning', async () => {
+    const queueModule = await import('@/gateway/queue.js');
+
+    const { recoveryRedisTransport } = await import('../helpers/recovery-redis-transport.js');
+    const transport = await recoveryRedisTransport(process.env.REDIS_URL!);
+    const original = queueModule.enqueueAgentForRecovery;
+    const producer = vi.spyOn(queueModule, 'enqueueAgentForRecovery').mockImplementation(data => original(data, {redisUrl: transport.url, timeoutMs: 150}));
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const first = await criarRunDevido(e);
+    const later = await criarRunDevido(e);
+    await matarLease(first.turn_id);
+    await matarLease(later.turn_id);
+    await pool.query("UPDATE engine_runs SET phase='result_ready',terminal_json='{}',terminal_hash=$2,next_poll_at='1700-01-01' WHERE id=$1", [first.run_id, SHA]);
+    await pool.query("UPDATE engine_runs SET next_poll_at='1700-01-02' WHERE id=$1", [later.run_id]);
+    const { createEngineRecoveryRunner } = await import('@/workers/engine-recovery.js');
+    let finished = false;
+    const scan = createEngineRecoveryRunner()({scopeLimit: 1,runLimit: 3,maxPages: 1}).then(() => { finished = true; });
+    try {
+      await new Promise(resolve => setTimeout(resolve, 600));
+      expect(transport.accepted).toBeGreaterThan(0);
+      expect(finished, 'Redis wait must not retain scheduler inflight/drain').toBe(true);
+      expect(transport.sockets, 'deadline must cancel actual TCP IO').toBe(0);
+      expect((await pool.query('SELECT phase FROM engine_runs WHERE id=$1', [later.run_id])).rows[0].phase).toBe('blocked');
+      expect((await pool.query('SELECT phase,closed_reason FROM engine_runs WHERE id=$1', [first.run_id])).rows[0]).toEqual({phase: 'result_ready',closed_reason: null});
+    } finally {
+      await scan;
+      producer.mockRestore();
+      await transport.close();
+      await pool.query("UPDATE engine_runs SET next_poll_at=now()+interval '100 years' WHERE id=ANY($1::uuid[])", [[first.run_id,later.run_id]]);
+    }
+  });
+
+  it("scheduler durável bloqueia submission_unknown sem replay e preserva request", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const f = await criarRunDevido(e);
+    await pool.query(
+      "UPDATE agent_turns SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [f.turn_id],
+    );
+    await pool.query(
+      "UPDATE engine_runs SET phase='submission_unknown', next_poll_at='1900-01-01' WHERE id=$1",
+      [f.run_id],
+    );
+    const before = (
+      await pool.query("SELECT request_key,request_hash FROM engine_runs WHERE id=$1", [f.run_id])
+    ).rows[0];
+    const { JOBS } = await import("@/workers/index.js");
+    const job = JOBS.find((j) => j.name === "engine_recovery");
+    expect(job, "production scheduler caller").toBeDefined();
+    await (job!.fn as (options: { scopeLimit: number; maxPages: number }) => Promise<void>)({
+      scopeLimit: 1,
+      maxPages: 1,
+    });
+    const after = (
+      await pool.query(
+        "SELECT phase,capabilities_revoked_at,request_key,request_hash FROM engine_runs WHERE id=$1",
+        [f.run_id],
+      )
+    ).rows[0];
+    expect(after).toMatchObject({ ...before, phase: "blocked" });
+    expect(after.capabilities_revoked_at).not.toBeNull();
+    expect(
+      (await pool.query("SELECT attempt_count FROM agent_turns WHERE id=$1", [f.turn_id])).rows[0]
+        .attempt_count,
+    ).toBe(1);
+  });
+
+  it.each([
+    "prepared",
+    "submitting",
+    "running",
+    "cancelling",
+    "reconciling",
+    "revoked_terminal",
+    "effect_unknown",
+  ])("maintenance failclosed: %s", async (scenario) => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const f = await criarRunDevido(e);
+    await pool.query(
+      "UPDATE agent_turns SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [f.turn_id],
+    );
+    if (scenario === "revoked_terminal" || scenario === "effect_unknown") {
+      await pool.query(
+        "UPDATE engine_runs SET phase='result_ready',terminal_json='{}',terminal_hash=$2 WHERE id=$1",
+        [f.run_id, SHA],
+      );
+      if (scenario === "revoked_terminal")
+        await sob(e, () =>
+          engineRunsRepo.revokeRunCapabilities({
+            run_id: f.run_id,
+            turn_id: f.turn_id,
+            actor: { kind: "recovery", actor_ref: "g03-test" },
+            reason_code: "test",
+          }),
+        );
+      else
+        await pool.query(
+          `INSERT INTO engine_tool_calls(tenant_id,agent_id,turn_id,run_id,call_id,ordinal,tool_name,args_json,args_hash,request_id,state,effect_evidence,finished_at,result_json)
+        VALUES($1,$2,$3,$4,'call-1',0,'synthetic_tool','{}',$5,$6,'effect_unknown','unknown',now(),'{}')`,
+          [e.tenant_id, e.agent_id, f.turn_id, f.run_id, SHA, randomUUID()],
+        );
+    } else await pool.query("UPDATE engine_runs SET phase=$2 WHERE id=$1", [f.run_id, scenario]);
+    const r = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id: f.run_id,
+        window_ms: 60000,
+        actor: { kind: "recovery", actor_ref: "g03-test" },
+      }),
+    );
+    if (!r.ok) throw new Error(r.reason);
+    expect(
+      await sob(e, () =>
+        engineRunsRepo.reconcileReservedRun({
+          run_id: f.run_id,
+          reserved_row_version: r.reserved_row_version,
+        }),
+      ),
+    ).toEqual({ kind: "blocked" });
+    const row = (
+      await pool.query(
+        "SELECT phase,closed_reason,capabilities_revoked_at FROM engine_runs WHERE id=$1",
+        [f.run_id],
+      )
+    ).rows[0];
+    expect(row).toMatchObject({ phase: "blocked", closed_reason: null });
+    expect(row.capabilities_revoked_at).not.toBeNull();
+  });
+
+  it("reserva perdida sobrevive restart; CAS atrasado e outros escopos não conciliam", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const f = await criarRunDevido(e);
+    await pool.query(
+      "UPDATE agent_turns SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [f.turn_id],
+    );
+    const reserve = () =>
+      sob(e, () =>
+        engineRunsRepo.reserveMaintenanceObservation({
+          run_id: f.run_id,
+          window_ms: 60000,
+          actor: { kind: "recovery", actor_ref: "g03-test" },
+        }),
+      );
+    const reservations = await Promise.all([reserve(), reserve()]);
+    expect(reservations.filter((r) => r.ok)).toHaveLength(1);
+    const old = reservations.find((r) => r.ok)!;
+    if (!old.ok) throw new Error("reservation missing");
+    // Simulated process loss AFTER committed reservation, no local retry state.
+    await pool.query("UPDATE engine_runs SET next_poll_at=now()-interval '1 second' WHERE id=$1", [
+      f.run_id,
+    ]);
+    const newer = await reserve();
+    if (!newer.ok) throw new Error("takeover missing");
+    expect(
+      await sob(e, () =>
+        engineRunsRepo.reconcileReservedRun({
+          run_id: f.run_id,
+          reserved_row_version: old.reserved_row_version,
+        }),
+      ),
+    ).toEqual({ kind: "stale" });
+    for (const foreign of [
+      { ...e, agent_id: "other-agent" },
+      { ...e, tenant_id: "other-tenant" },
+    ]) {
+      expect(
+        await sob(foreign, () =>
+          engineRunsRepo.reconcileReservedRun({
+            run_id: f.run_id,
+            reserved_row_version: newer.reserved_row_version,
+          }),
+        ),
+      ).toEqual({ kind: "stale" });
+    }
+    // A new normal owner between reservation and settlement wins.
+    await pool.query(
+      "UPDATE agent_turns SET lease_expires_at=now()+interval '1 minute' WHERE id=$1",
+      [f.turn_id],
+    );
+    expect(
+      await sob(e, () =>
+        engineRunsRepo.reconcileReservedRun({
+          run_id: f.run_id,
+          reserved_row_version: newer.reserved_row_version,
+        }),
+      ),
+    ).toEqual({ kind: "owner_alive" });
+    await pool.query(
+      "UPDATE agent_turns SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [f.turn_id],
+    );
+    expect(
+      await sob(e, () =>
+        engineRunsRepo.reconcileReservedRun({
+          run_id: f.run_id,
+          reserved_row_version: newer.reserved_row_version,
+        }),
+      ),
+    ).toEqual({ kind: "blocked" });
+    expect(
+      await sob(e, () =>
+        engineRunsRepo.reconcileReservedRun({
+          run_id: f.run_id,
+          reserved_row_version: newer.reserved_row_version,
+        }),
+      ),
+    ).toEqual({ kind: "stale" });
+  });
+
+  it("terminal agenda o mesmo job BullMQ real, persistido após substituir conexão", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    const f = await criarRunDevido(e);
+    await pool.query(
+      "UPDATE agent_turns SET lease_expires_at=now()-interval '1 second' WHERE id=$1",
+      [f.turn_id],
+    );
+    // Transport-only fixture: core must still validate the terminal before output.
+    await pool.query(
+      "UPDATE engine_runs SET phase='result_ready',terminal_json='{}',terminal_hash=$2,next_poll_at='1900-01-01' WHERE id=$1",
+      [f.run_id, SHA],
+    );
+    const { createEngineRecoveryRunner } = await import("@/workers/engine-recovery.js");
+    const { agentQueue } = await import("@/gateway/queue.js");
+    const { agentTurnJobId } = await import("@/runtime/turns/job.js");
+    const id = agentTurnJobId(f.turn_id);
+    try {
+      await Promise.all([
+        createEngineRecoveryRunner()({ scopeLimit: 1, maxPages: 1 }),
+        createEngineRecoveryRunner()({ scopeLimit: 1, maxPages: 1 }),
+      ]);
+      const job = await agentQueue.getJob(id);
+      expect(job?.data).toMatchObject({ turn_id: f.turn_id });
+      expect(await job?.getState()).toBe("waiting");
+      const { Queue } = await import("bullmq");
+      const replacement = new Queue(agentQueue.name, { connection: agentQueue.opts.connection });
+      try {
+        expect((await replacement.getJob(id))?.data).toEqual(job?.data);
+      } finally {
+        await replacement.close();
+      }
+      expect(
+        (await pool.query("SELECT phase,submit_count FROM engine_runs WHERE id=$1", [f.run_id]))
+          .rows[0],
+      ).toEqual({ phase: "result_ready", submit_count: 0 });
+    } finally {
+      await (await agentQueue.getJob(id))?.remove();
+    }
   });
 
   // ══════════════════════════════════════════════════════════════════════════

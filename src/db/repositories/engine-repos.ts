@@ -115,6 +115,7 @@ export type EngineRunSnapshot = {
   submit_count: number;
   remote_run_id: string | null;
   request_key: string;
+  capabilities_revoked?: boolean;
 };
 
 /** Motor fixado no turno. Imutável depois de gravado (§5.7.1). */
@@ -135,7 +136,7 @@ export type TurnEngineState =
   | { kind: "open_run"; pin: PersistedTurnPin; run: EngineRunSnapshot };
 
 /** Consultas de run são single-table; nomes nus são inequívocos. */
-const SNAPSHOT_COLS = sql`id, phase, generation_no, row_version, submit_count, remote_run_id, request_key`;
+const SNAPSHOT_COLS = sql`id, phase, generation_no, row_version, submit_count, remote_run_id, request_key, (capabilities_revoked_at IS NOT NULL) AS capabilities_revoked`;
 
 type RunSnapshotRow = {
   id: string;
@@ -145,6 +146,7 @@ type RunSnapshotRow = {
   submit_count: number | string;
   remote_run_id: string | null;
   request_key: string;
+  capabilities_revoked: boolean;
 };
 
 /**
@@ -181,6 +183,7 @@ function snapshot(row: RunSnapshotRow): EngineRunSnapshot {
     submit_count: Number(row.submit_count),
     remote_run_id: row.remote_run_id,
     request_key: row.request_key,
+    capabilities_revoked: row.capabilities_revoked,
   };
 }
 
@@ -3551,6 +3554,8 @@ export const engineRunsRepo = {
   async listDueRuns(input: {
     limit: number;
     cursor?: DueRunCursor | null;
+    /** Fixed traversal horizon: reservations/new debt cannot extend a pass forever. */
+    dueBefore?: string;
   }): Promise<ListDueRunsResult> {
     const { tenant_id, agent_id } = scope();
     const cursor = input.cursor ?? null;
@@ -3578,6 +3583,7 @@ export const engineRunsRepo = {
          WHERE r.tenant_id = ${tenant_id} AND r.agent_id = ${agent_id}
            AND r.phase IN (${LISTA_FASES_ABERTAS})
            AND r.next_poll_at <= clock_timestamp()
+           ${input.dueBefore ? sql`AND r.next_poll_at <= ${input.dueBefore}::timestamptz` : sql``}
            ${depoisDoCursor}
          ORDER BY r.next_poll_at, r.id
          LIMIT ${input.limit}`),
@@ -3599,6 +3605,115 @@ export const engineRunsRepo = {
 
     conta("list_due", "ok");
     return { runs, next_cursor };
+  },
+
+  /** G03: consume a reserved observation without acquiring business authority.
+   * No remote adapter is available in production yet: uncertain executions stay
+   * blocked, never safe_to_retry. The turn lock closes the reserve→takeover race.
+   */
+  async reconcileReservedRun(input: {
+    run_id: string;
+    reserved_row_version: number;
+  }): Promise<
+    | { kind: "stale" | "owner_alive" | "blocked" | "waiting" }
+    | { kind: "enqueue"; turn_id: string; mensagem_id: string }
+  > {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx) => {
+      const control = await lockControl(tx, { run_id: input.run_id });
+      if (!control) return { kind: "stale" };
+      const turns = linhas<{
+        id: string;
+        status: string;
+        representative_message_id: string;
+        alive: boolean;
+      }>(
+        await tx.execute(sql`
+          SELECT t.id, t.status, t.representative_message_id,
+                 (t.lease_expires_at > clock_timestamp()) AS alive
+          FROM ${agent_turns} t
+          JOIN ${engine_runs} r ON r.tenant_id=t.tenant_id AND r.agent_id=t.agent_id AND r.turn_id=t.id
+          WHERE r.tenant_id=${tenant_id} AND r.agent_id=${agent_id} AND r.id=${input.run_id}
+          FOR UPDATE OF t`),
+      );
+      const turn = turns[0];
+      if (!turn) return { kind: "stale" };
+      if (turn.alive && TURNOS_RECUPERAVEIS.has(turn.status)) return { kind: "owner_alive" };
+      const rows = linhas<{
+        phase: string;
+        revoked: boolean;
+        eligible: boolean;
+        outbound: number;
+        calls: number;
+      }>(
+        await tx.execute(sql`
+          SELECT r.phase, (r.capabilities_revoked_at IS NOT NULL) AS revoked,
+            (SELECT count(*)::int FROM ${engine_tool_calls} tc WHERE tc.tenant_id=r.tenant_id AND tc.agent_id=r.agent_id AND tc.run_id=r.id) AS calls,
+            (r.phase='result_ready' AND r.terminal_json IS NOT NULL
+             AND r.capabilities_revoked_at IS NULL
+             AND c.mode='bot' AND c.control_epoch=r.control_epoch) AS eligible,
+            (SELECT count(*)::int FROM ${outbound_messages} o
+             WHERE o.tenant_id=r.tenant_id AND o.agent_id=r.agent_id AND o.turn_id=r.turn_id) AS outbound
+          FROM ${engine_runs} r
+          JOIN ${conversation_controls} c ON c.tenant_id=r.tenant_id AND c.agent_id=r.agent_id AND c.id=r.control_id
+          WHERE r.tenant_id=${tenant_id} AND r.agent_id=${agent_id} AND r.id=${input.run_id}
+            AND r.row_version=${input.reserved_row_version}
+            AND r.next_poll_at > clock_timestamp() AND r.phase <> 'closed'
+          FOR UPDATE OF r`),
+      );
+      const run = rows[0];
+      if (!run) return { kind: "stale" };
+      const enqueue =
+        run.calls === 0 &&
+        run.eligible &&
+        TURNOS_RECUPERAVEIS.has(turn.status) &&
+        run.outbound === 0;
+      // Existing delivery owns outbound; lack of a delivery proof is NOT failure.
+      const waiting = run.calls === 0 && run.phase === "result_ready" && run.outbound > 0;
+      const decision = enqueue
+        ? "terminal_ready"
+        : waiting
+          ? "await_delivery"
+          : "operator_required";
+      const updated = linhas<{ last_event_sequence: number | string }>(
+        await tx.execute(sql`
+        UPDATE ${engine_runs}
+        SET phase = CASE WHEN ${enqueue || waiting} THEN phase ELSE 'blocked' END,
+            capabilities_revoked_at = CASE WHEN ${enqueue} THEN capabilities_revoked_at
+              ELSE COALESCE(capabilities_revoked_at, clock_timestamp()) END,
+            last_error_code = CASE WHEN ${enqueue || waiting} THEN last_error_code
+              ELSE 'engine_recovery_operator_required' END,
+            last_observed_at=clock_timestamp(), row_version=row_version+1,
+            last_event_sequence=last_event_sequence+1, updated_at=clock_timestamp(),
+            next_poll_at=clock_timestamp()+make_interval(secs => ${enqueue || waiting ? 60 : 900})
+        WHERE tenant_id=${tenant_id} AND agent_id=${agent_id} AND id=${input.run_id}
+        RETURNING last_event_sequence`),
+      );
+      const event = updated[0];
+      if (!event) throw new Error("engine_recovery_update_missing");
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(event.last_event_sequence),
+        dedupe_key: `reconcile_decision:recovery:${input.reserved_row_version}`,
+        event_type: "reconcile_decision",
+        actor_kind: "recovery",
+        actor_turn_attempt: null,
+        metadata: {
+          decision,
+          actor_ref: "engine_recovery",
+          previous_phase: run.phase,
+          reason:
+            enqueue || waiting
+              ? decision
+              : run.revoked
+                ? "capabilities_revoked"
+                : "remote_recovery_unavailable",
+        },
+      });
+      if (enqueue)
+        return { kind: "enqueue", turn_id: turn.id, mensagem_id: turn.representative_message_id };
+      return { kind: waiting ? "waiting" : "blocked" };
+    });
   },
 
   /**

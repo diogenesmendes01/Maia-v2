@@ -116,7 +116,7 @@ export function routeExistingEngineRun(state: TurnEngineState): TurnRouteV1 {
   // `blocked` não é reconciliável por conta própria: alguém já decidiu que
   // este run precisa de gente. Reconciliar em cima disso é passar por cima da
   // decisão (§5.7.1).
-  if (motivo === 'blocked') {
+  if (motivo === 'blocked' || state.run.capabilities_revoked) {
     return { kind: 'await_operator', pin: state.pin, run: state.run, reason: 'blocked' };
   }
 
