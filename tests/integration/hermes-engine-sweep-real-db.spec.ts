@@ -25,6 +25,12 @@ import pg from "pg";
 import { randomUUID } from "node:crypto";
 import { runWithTenantContext } from "@/db/tenant-context.js";
 import { engineRunsRepo } from "@/db/repositories/engine-repos.js";
+import {
+  computePayloadHash,
+  deriveLogicalDedupeKey,
+  deriveProviderIdempotencyKey,
+  OUTBOUND_PAYLOAD_VERSION,
+} from "@/runtime/outbound/contract.js";
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL &&
@@ -1187,5 +1193,128 @@ d("engine-repos — varredura do journal contra Postgres real", () => {
     );
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("not_found");
+  });
+
+  /**
+   * Outbound EM VOO (status `pending`) para o turno, com o tuplo durável
+   * inteiro que a migration 121 exige (`outbound_messages_durable_row_complete_check`:
+   * row com `turn_id` NOT NULL precisa de sequence/payload/hash/duas chaves/
+   * next_attempt_at). Chaves DERIVADAS pelo contrato, nunca literais — mesmo
+   * padrão do `mkOutbound` da suite de engine-repos.
+   */
+  async function mkOutboundEmVoo(
+    e: { tenant_id: string; agent_id: string },
+    turn_id: string,
+  ): Promise<void> {
+    const payload = { type: "text" as const, text: "resposta" };
+    const payload_hash = computePayloadHash(payload);
+    const identidade = {
+      tenant_id: e.tenant_id,
+      agent_id: e.agent_id,
+      turn_id,
+      sequence_in_turn: 0,
+      payload_hash,
+    };
+    const id = randomUUID();
+    await pool.query(
+      `INSERT INTO outbound_messages
+         (id, tenant_id, agent_id, idempotency_key, conversa_id, in_reply_to, channel,
+          status, turn_id, sequence_in_turn, payload_version, payload_type, payload_json,
+          payload_hash, logical_dedupe_key, provider_idempotency_key, next_attempt_at)
+       VALUES ($1,$2,$3,$4,$5,$6,'text','pending',$7,0,$8,'text',$9::jsonb,$10,$11,$12, now())`,
+      [
+        id,
+        e.tenant_id,
+        e.agent_id,
+        `idem-${id}`,
+        randomUUID(),
+        randomUUID(),
+        turn_id,
+        OUTBOUND_PAYLOAD_VERSION,
+        JSON.stringify(payload),
+        payload_hash,
+        deriveLogicalDedupeKey(identidade),
+        deriveProviderIdempotencyKey(identidade, "whatsapp"),
+      ],
+    );
+  }
+
+  /**
+   * 31 — BLOQUEADOR da revisão da PR780: `await_delivery` NÃO revoga run saudável.
+   *
+   * Cenário do reviewer: terminal `result_ready` com outbound em voo e turno
+   * `outbound_pending` de lease VIVA — quem manda no turno é o delivery worker,
+   * não o reasoner (o caso 22 prova que a reserva aceita exatamente isso). Sem
+   * tool calls, `reconcileReservedRun` decide `await_delivery` e preserva a
+   * phase. O bug: o CASE de `capabilities_revoked_at` usava só `${enqueue}`,
+   * então a visita waiting — que adia — REVOGAVA o run, envenenando os fences
+   * G01 que exigem `capabilities_revoked_at IS NULL` (leitura do output em
+   * hermes-output-repo.ts:81 e commit da outbox em outbound-outbox-repo.ts:330).
+   * "Espera a entrega" virava "o dono não pode mais commitar".
+   *
+   * Prova do fence: por SQL, no predicado exato que os dois leitores G01 usam
+   * (`capabilities_revoked_at IS NULL`). Uma chamada real de
+   * `loadSyntheticHermesOutput` é IMPOSSÍVEL neste fixture sem mentir o cenário:
+   * o fence dela também exige `t.status='running'` com claim do dono, e aqui o
+   * turno é `outbound_pending` — o estado real de quem entrega. A chamada
+   * retornaria null pelos JOINs de status/manifesto, com ou sem revogação, e
+   * não discriminaria o fix.
+   */
+  it("31. await_delivery preserva phase e NÃO revoga run saudável (fence G01)", async () => {
+    const e = novoEscopo();
+    await seedEscopo(e);
+    // O dono da entrega está VIVO — é exatamente o cenário. NÃO matar a lease.
+    const { run_id, turn_id } = await criarRunDevido(e, {
+      statusDoTurnoDepois: "outbound_pending",
+    });
+    await pool.query(
+      "UPDATE engine_runs SET phase='result_ready',terminal_json='{}',terminal_hash=$2,next_poll_at='1900-01-01' WHERE id=$1",
+      [run_id, SHA],
+    );
+    await mkOutboundEmVoo(e, turn_id);
+
+    const reserva = await sob(e, () =>
+      engineRunsRepo.reserveMaintenanceObservation({
+        run_id,
+        window_ms: JANELA_MS,
+        actor: { kind: "recovery", actor_ref: "scanner-1" },
+      }),
+    );
+    if (!reserva.ok) throw new Error(`setup: reserva falhou (${reserva.reason})`);
+
+    expect(
+      await sob(e, () =>
+        engineRunsRepo.reconcileReservedRun({
+          run_id,
+          reserved_row_version: reserva.reserved_row_version,
+        }),
+      ),
+    ).toEqual({ kind: "waiting" });
+
+    const row = await pool.query<{
+      phase: string;
+      capabilities_revoked_at: string | null;
+      last_error_code: string | null;
+    }>(
+      `SELECT phase, capabilities_revoked_at::text AS capabilities_revoked_at,
+              last_error_code
+         FROM engine_runs WHERE id = $1`,
+      [run_id],
+    );
+    // Esperar a entrega não é falha: phase preservada, nenhum código de erro.
+    expect(row.rows[0]?.phase).toBe("result_ready");
+    expect(row.rows[0]?.last_error_code).toBeNull();
+    // O ponto causal. Este NULL É o predicado dos dois fences G01
+    // (hermes-output-repo.ts:81, outbound-outbox-repo.ts:330): com ele, o dono
+    // da entrega continua podendo ler o output e commitar a outbox.
+    expect(row.rows[0]?.capabilities_revoked_at).toBeNull();
+
+    // A decisão fica journalizada como espera, não como intervenção.
+    const ev = await pool.query<{ decision: string | null }>(
+      `SELECT metadata_json->>'decision' AS decision FROM engine_run_events
+        WHERE run_id = $1 AND event_type = 'reconcile_decision'`,
+      [run_id],
+    );
+    expect(ev.rows[0]?.decision).toBe("await_delivery");
   });
 });

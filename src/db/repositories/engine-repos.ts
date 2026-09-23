@@ -3679,7 +3679,7 @@ export const engineRunsRepo = {
         await tx.execute(sql`
         UPDATE ${engine_runs}
         SET phase = CASE WHEN ${enqueue || waiting} THEN phase ELSE 'blocked' END,
-            capabilities_revoked_at = CASE WHEN ${enqueue} THEN capabilities_revoked_at
+            capabilities_revoked_at = CASE WHEN ${enqueue || waiting} THEN capabilities_revoked_at
               ELSE COALESCE(capabilities_revoked_at, clock_timestamp()) END,
             last_error_code = CASE WHEN ${enqueue || waiting} THEN last_error_code
               ELSE 'engine_recovery_operator_required' END,
