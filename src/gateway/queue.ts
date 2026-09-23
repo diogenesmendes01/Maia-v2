@@ -409,9 +409,9 @@ function recordTurnOutcome(
  * `add` é ignorado e o sweep tenta de novo no próximo tick — perde-se latência
  * de recuperação, nunca correção.
  */
-async function clearRetainedTurnJob(jobId: string): Promise<void> {
+async function clearRetainedTurnJob(jobId: string, queue = agentQueue): Promise<void> {
   try {
-    const existing = await agentQueue.getJob(jobId);
+    const existing = await queue.getJob(jobId);
     if (!existing) return;
     const state = await existing.getState();
     if (state !== 'completed' && state !== 'failed') return;
@@ -473,13 +473,13 @@ export class QueueRedisUnavailableError extends Error {
  * @throws QueueRedisUnavailableError on a Redis OOM (oom=true).
  * @throws the underlying error for any non-OOM failure.
  */
-export async function enqueueAgent(data: AgentJob): Promise<void> {
+export async function enqueueAgent(data: AgentJob, queue = agentQueue): Promise<void> {
   try {
     // Issue #504 — `jobId` DETERMINÍSTICO quando o produtor conhece o turno.
     // Dois enfileiramentos do mesmo turno (ingresso + recovery, ou duas
     // réplicas do recovery) colidem no mesmo id e a BullMQ cria UM job.
     const jobId = data.turn_id ? agentTurnJobId(data.turn_id) : undefined;
-    if (jobId) await clearRetainedTurnJob(jobId);
+    if (jobId) await clearRetainedTurnJob(jobId, queue);
     // Issue #504 §Contrato do job, passo 5 do rollout — o PRODUTOR V2.
     //
     // Só quando a flag está ligada E o turno é conhecido. As duas condições são
@@ -502,7 +502,7 @@ export async function enqueueAgent(data: AgentJob): Promise<void> {
       config.FEATURE_TURN_JOB_V2 && data.turn_id
         ? { version: 2, turn_id: data.turn_id.toLowerCase() }
         : withCorrelation(data);
-    await agentQueue.add('process-message', payload, {
+    await queue.add('process-message', payload, {
       ...(jobId ? { jobId } : {}),
       attempts: 3,
       backoff: { type: 'exponential', delay: 2000 },
@@ -517,6 +517,46 @@ export async function enqueueAgent(data: AgentJob): Promise<void> {
       throw new QueueRedisUnavailableError({ oom: true });
     }
     throw err;
+  }
+}
+
+/** Scheduler-only producer. Never borrow the Worker's infinite-retry socket.
+ * Deadline destroys the dedicated socket (and flushes pending commands), then
+ * awaits the operation and cleanup: no abandoned Promise.race. A lost add ACK
+ * is safe to retry under the same deterministic job id; DB debt is untouched.
+ */
+export async function enqueueAgentForRecovery(
+  data: AgentJob,
+  options: { redisUrl?: string; timeoutMs?: number } = {},
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 1000;
+  const client = new IORedis(options.redisUrl ?? config.REDIS_URL, {
+    lazyConnect: true,
+    maxRetriesPerRequest: 0,
+    retryStrategy: () => null,
+    enableOfflineQueue: false,
+    autoResendUnfulfilledCommands: false,
+    connectTimeout: timeoutMs,
+    commandTimeout: timeoutMs,
+  });
+  client.on('error', () => {}); // awaited operation reports the failure
+  let queue: Queue<AgentQueuePayload> | undefined;
+  const deadline = setTimeout(() => client.disconnect(), timeoutMs);
+  try {
+    await client.connect();
+    queue = new Queue<AgentQueuePayload>('agent', { connection: client });
+    queue.on('error', () => {});
+    await enqueueAgent(data, queue);
+  } finally {
+    clearTimeout(deadline);
+    // QUIT can itself hang behind lost replies. Disconnect really closes IO.
+    const ended =
+      client.status === 'end'
+        ? Promise.resolve()
+        : new Promise<void>((resolve) => client.once('end', resolve));
+    client.disconnect();
+    await ended;
+    await queue?.close();
   }
 }
 

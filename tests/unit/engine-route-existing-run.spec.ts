@@ -71,6 +71,17 @@ describe('routeExistingEngineRun — run em voo não autoriza reexecutar', () =>
     expect(rota.kind === 'reconcile_run' && rota.reason).toBe('result_ready');
   });
 
+  it('terminal revogado exige intervenção, não retries de saída', () => {
+    const rota = routeExistingEngineRun({
+      kind: 'open_run', pin: PIN,
+      run: { ...run('result_ready'), capabilities_revoked: true },
+    });
+    expect(rota.kind).toBe('await_operator');
+    expect(decideRouteTurnAction(rota)).toEqual({
+      kind: 'dead_letter', code: 'engine_run_blocked', outcome: 'unsafe_to_retry',
+    });
+  });
+
   it('run bloqueado espera gente: reconciliar seria passar por cima da decisão', () => {
     const rota = routeExistingEngineRun(comRun('blocked'));
     expect(rota.kind).toBe('await_operator');

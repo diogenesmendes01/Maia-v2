@@ -29,6 +29,7 @@ export async function readSyntheticHermesHandoff(turn_id: string) {
     WHERE r.tenant_id=${tenant} AND r.agent_id=${agent} AND r.turn_id=${turn_id}
       AND r.phase='result_ready' AND r.adopted_by_turn_attempt IS NOT NULL
       AND m.evidence_class='synthetic' AND t.status IN ('outbound_pending','completed')
+      AND NOT EXISTS (SELECT 1 FROM engine_tool_calls tc WHERE tc.tenant_id=r.tenant_id AND tc.agent_id=r.agent_id AND tc.run_id=r.id)
       AND o.status IN ('delivered','completed') AND o.sequence_in_turn=0 AND o.origin='bot'
       AND EXISTS (SELECT 1 FROM mensagens h WHERE h.tenant_id=o.tenant_id AND h.agent_id=o.agent_id AND h.outbound_id=o.id AND h.direcao='out' AND h.conversa_id=o.conversa_id)
       AND o.control_id=r.control_id AND o.control_epoch=r.control_epoch

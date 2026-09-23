@@ -81,6 +81,12 @@ VIVO intocado (é ele quem faz a deduplicação). Quem decide se o trabalho aind
 vale continua sendo o PostgreSQL — aqui só se impede que o transporte vete uma
 decisão já tomada no banco.
 
+**Produtor de manutenção G03.** `enqueueAgentForRecovery` reaproveita o mesmo
+payload, id e tratamento de jobs retidos de `enqueueAgent`, mas usa uma conexão
+exclusiva e descartável, com deadline de 1s e disconnect real. Não altera a
+conexão de retries ilimitados do Worker. Queda/ACK perdido não apaga dívida no
+PostgreSQL; detalhes do orçamento e continuação estão em [workers.md](workers.md).
+
 O caminho do **debounce** mantém o `jobId` próprio (`debounce:<escopo>`): ele
 depende de remover e re-adicionar o job a cada mensagem para reiniciar a janela,
 o que é incompatível com um id que representa o trabalho e não a janela.
