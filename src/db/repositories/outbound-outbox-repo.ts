@@ -315,6 +315,8 @@ export const outboundOutboxRepo = {
       if (input.engine_origin) {
         // Turn is locked by the fenced UPDATE above; run comes last. A failure
         // rolls back that UPDATE too. Never upgrade an old terminal to a new epoch.
+        // Recheck revocation under the same control/run locks used by revoke:
+        // authorization before dispatch is not authority for a later commit.
         const origin = (
           await tx.execute(sql`
           SELECT r.output_preparation_json FROM engine_runs r
@@ -325,6 +327,7 @@ export const outboundOutboxRepo = {
           WHERE r.tenant_id=${tenant_id} AND r.agent_id=${agent_id}
             AND r.id=${input.engine_origin.run_id} AND r.turn_id=${artifact.turn_id}
             AND r.phase='result_ready' AND r.mode='live'
+            AND r.capabilities_revoked_at IS NULL
             AND r.terminal_hash=${input.engine_origin.terminal_hash}
             AND r.adopted_by_turn_attempt=${turn.attempt_count}
             AND c.mode='bot' AND c.control_epoch=r.control_epoch
