@@ -1,4 +1,7 @@
 import * as manifestsRepo from '@/db/repositories/hermes-manifest-repo.js';
+import { loadSyntheticHermesOutput } from '@/db/repositories/hermes-output-repo.js';
+import { outboundOutboxRepo } from '@/db/repositories/outbound-outbox-repo.js';
+import { buildOutboundArtifact } from '@/runtime/outbound/contract.js';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
@@ -307,6 +310,9 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
     'pause',
     'pause_resume',
     'lease_expired',
+    'revoked_before_load',
+    'revoked_before_commit',
+    'revoked_pause_resume',
   ])(
     'core terminal recovery: %s',
     async (scenario) => {
@@ -398,6 +404,79 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
             { timeout: 60000, interval: 100 },
           )
           .toBe('result_ready');
+        const authorized = await scoped(() => loadSyntheticHermesOutput(f.run_id, f.execution));
+        expect(authorized).not.toBeNull();
+        if (!authorized) throw new Error('fixture output not authorized');
+        if (scenario === 'deliver') {
+          // Forge both the ALS and claimed scope: these must reach the SQL
+          // authority, not merely fail the execution-context equality check.
+          for (const foreign of [
+            { tenant_id: `foreign-${randomUUID()}`, agent_id },
+            { tenant_id, agent_id: `foreign-${randomUUID()}` },
+          ]) {
+            await runWithTenantContext(foreign, async () => {
+              expect(
+                await loadSyntheticHermesOutput(f.run_id, { ...f.execution, ...foreign }),
+              ).toBeNull();
+              expect(
+                await engineRunsRepo.revokeRunCapabilities({
+                  run_id: f.run_id,
+                  turn_id: f.execution.turn_id,
+                  actor: { kind: 'recovery', actor_ref: 'foreign-scope' },
+                  reason_code: 'synthetic_revocation',
+                }),
+              ).toMatchObject({ ok: false, reason: 'not_found' });
+              await expect(
+                outboundOutboxRepo.commitTurnOutboundTx({
+                  engine_origin: {
+                    run_id: f.run_id,
+                    terminal_hash: authorized.preparation.terminal_hash,
+                  },
+                  artifact: buildOutboundArtifact({
+                    ...foreign,
+                    turn_id: f.execution.turn_id,
+                    sequence_in_turn: 0,
+                    payload: { type: 'text', text: authorized.preparation.text },
+                    channel: 'whatsapp',
+                  }),
+                  conversa_id: f.host.conversa_id,
+                  pessoa_id: f.host.pessoa_id,
+                  in_reply_to: f.host.representative_message_id,
+                  expected_claim_token: f.execution.claim_token,
+                }),
+              ).rejects.toThrow('outbound_commit_rejected:engine_origin_invalid');
+            });
+          }
+          expect(
+            await scoped(() => loadSyntheticHermesOutput(f.run_id, f.execution)),
+          ).not.toBeNull();
+        }
+        if (scenario === 'revoked_before_load') {
+          expect(
+            await scoped(() =>
+              engineRunsRepo.revokeRunCapabilities({
+                run_id: f.run_id,
+                turn_id: f.execution.turn_id,
+                actor: { kind: 'turn_owner', origin_claim_token: f.execution.claim_token },
+                reason_code: 'synthetic_revocation',
+              }),
+            ),
+          ).toMatchObject({ ok: true });
+          // Adoption is reconciliation, NOT permission to send. Preserve its
+          // existing capability to retain terminal evidence after revocation.
+          expect(
+            await scoped(() =>
+              engineRunsRepo.adoptTerminalResult({
+                run_id: f.run_id,
+                turn_id: f.execution.turn_id,
+                claim_token: f.execution.claim_token,
+                output_preparation: authorized.preparation,
+                expected_row_version: authorized.row_version,
+              }),
+            ),
+          ).toMatchObject({ ok: true });
+          expect(await scoped(() => loadSyntheticHermesOutput(f.run_id, f.execution))).toBeNull();
+        }
         // Simulate process death AFTER terminal, before output. Real core obtains
         // a NEW claim. Neither the old origin token nor request is rewritten.
         await pool.query(
@@ -414,12 +493,26 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
         );
         // Race AFTER adoption, inside the real facade before its commit.
         channel.beforeResolve = async () => {
+          if (scenario === 'revoked_before_commit' || scenario === 'revoked_pause_resume') {
+            // This external channel boundary is reached only AFTER the real
+            // coordinator authorized egress. Revoke through the DB authority.
+            expect(
+              await scoped(() =>
+                engineRunsRepo.revokeRunCapabilities({
+                  run_id: f.run_id,
+                  turn_id: f.execution.turn_id,
+                  actor: { kind: 'recovery', actor_ref: 'synthetic-revoker' },
+                  reason_code: 'synthetic_revocation',
+                }),
+              ),
+            ).toMatchObject({ ok: true });
+          }
           if (scenario === 'pause')
             await pool.query(
               `UPDATE conversation_controls SET mode='pausing',control_epoch=control_epoch+1,owner_app_user_id='synthetic-operator',paused_at=now() WHERE id=$1`,
               [f.control_id],
             );
-          if (scenario === 'pause_resume')
+          if (scenario === 'pause_resume' || scenario === 'revoked_pause_resume')
             await pool.query(
               `UPDATE conversation_controls SET control_epoch=control_epoch+2 WHERE id=$1`,
               [f.control_id],
@@ -582,6 +675,49 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
             ).rows[0],
           ).toMatchObject({ status: 'outbound_pending', released: true });
           return;
+        }
+        if (scenario.startsWith('revoked_')) {
+          const revoked = (
+            await pool.query(
+              'SELECT capabilities_revoked_at::text, phase, closed_reason, request_json FROM engine_runs WHERE id=$1',
+              [f.run_id],
+            )
+          ).rows[0];
+          expect(revoked.capabilities_revoked_at).not.toBeNull();
+          expect(revoked).toMatchObject({
+            phase: 'result_ready',
+            closed_reason: null,
+            request_json: f.request,
+          });
+          expect(
+            await scoped(() =>
+              engineRunsRepo.revokeRunCapabilities({
+                run_id: f.run_id,
+                turn_id: f.execution.turn_id,
+                actor: { kind: 'recovery', actor_ref: 'synthetic-repeat' },
+                reason_code: 'synthetic_revocation',
+              }),
+            ),
+          ).toMatchObject({ ok: true, already: true, revoked_at: revoked.capabilities_revoked_at });
+          expect(
+            (
+              await pool.query('SELECT outbound_committed_at FROM agent_turns WHERE id=$1', [
+                f.execution.turn_id,
+              ])
+            ).rows[0].outbound_committed_at,
+          ).toBeNull();
+          // Redelivery may reconcile/retry metadata, never another inference or send.
+          channel.beforeResolve = null;
+          await runtime.shutdown();
+          await runCore(f.host.representative_message_id);
+          expect(
+            (
+              await pool.query(
+                'SELECT capabilities_revoked_at::text FROM engine_runs WHERE id=$1',
+                [f.run_id],
+              )
+            ).rows[0].capabilities_revoked_at,
+          ).toBe(revoked.capabilities_revoked_at);
         }
         if (scenario !== 'deliver' && scenario !== 'close_crash' && scenario !== 'close_cas') {
           expect(channel.sent).toEqual([]);

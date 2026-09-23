@@ -50,6 +50,9 @@ export async function readSyntheticHermesHandoff(turn_id: string) {
   return row ?? null;
 }
 
+/** Authorizes synthetic egress, not generic terminal reconciliation/adoption.
+ * Revocation is monotonic; a valid terminal/claim never grants permission by itself.
+ * This optimistic read must still be fenced by the outbox commit transaction. */
 export async function loadSyntheticHermesOutput(run_id: string, execution: TurnExecutionContext) {
   const tenant = getCurrentTenant(),
     agent = getCurrentAgent();
@@ -74,6 +77,7 @@ export async function loadSyntheticHermesOutput(run_id: string, execution: TurnE
     JOIN agent_canary_policy cp ON cp.tenant_id=r.tenant_id AND cp.agent_id=r.agent_id
     WHERE r.tenant_id=${tenant} AND r.agent_id=${agent} AND r.id=${run_id} AND r.turn_id=${execution.turn_id}
       AND r.phase='result_ready' AND r.mode='live' AND b.engine='hermes'
+      AND r.capabilities_revoked_at IS NULL
       AND t.status='running' AND t.claim_token=${execution.claim_token}::uuid AND t.attempt_count=${execution.attempt}
       AND t.claimed_by=${execution.worker_id} AND t.lease_expires_at>clock_timestamp()
       AND c.mode='bot' AND c.control_epoch=r.control_epoch AND t.stream_key=c.stream_key
