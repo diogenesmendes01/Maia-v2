@@ -88,21 +88,15 @@ export type TurnEnginePortsV1 = {
    * A instância do motor remoto neste processo, ou `null` quando ele não é
    * executável aqui.
    *
-   * Hoje é SEMPRE `null`, e o motivo é verificável: `createHermesSupervisor`
-   * (`@/integrations/hermes/supervisor.ts:459`) exige `python_executable`,
-   * `worker_cwd`, `hermes_sha`, `home_root` e `expected_bridge_revision`, e o
-   * contrato de env declara exatamente duas variáveis `MAIA_HERMES_*`
-   * (`INFERENCE_ALLOWED_SOURCES` e `KILL_SWITCH`) — nenhuma delas descreve a
-   * implantação do worker. Os únicos chamadores de `createHermesSupervisor`
-   * nesta árvore são specs.
-   *
-   * Devolver `null` — em vez de montar um supervisor com valores inventados —
-   * é o que mantém a degradação HONESTA: a política pode dizer `hermes`, o
-   * degrau pode permitir, e o turno é atendido pelo motor incumbente com essa
-   * decisão registrada, em vez de morrer contra um processo que não existe.
+   * Fora de `withSyntheticCore`, permanece null: não inventa deployment live.
+   * A composição async-scoped é backend-only e aceita apenas deployment
+   * synthetic/local_ipc_v1. Admissão revalida canary/canal/policy no banco
+   * antes de persistir request e antes de qualquer I/O do worker.
    */
   hermesEngine(): AgentEnginePortV1 | null;
 };
+
+import { getSyntheticCoreRuntime } from './synthetic-core-context.js';
 
 const PRODUCTION_PORTS: TurnEnginePortsV1 = {
   killSwitch: () => config.MAIA_HERMES_KILL_SWITCH,
@@ -111,10 +105,12 @@ const PRODUCTION_PORTS: TurnEnginePortsV1 = {
     return readEnginePolicyForScope(escopo);
   },
   async canaryAllowsHermes() {
-    const { canaryAllowsHermesLiveTurn } = await import('@/db/repositories/canary-policy-repos.js');
+    const { canaryAllowsHermesLiveTurn, canaryPolicyRepo } =
+      await import('@/db/repositories/canary-policy-repos.js');
+    if (getSyntheticCoreRuntime()) return (await canaryPolicyRepo.find())?.stage === 'synthetic';
     return canaryAllowsHermesLiveTurn();
   },
-  hermesEngine: () => null,
+  hermesEngine: () => getSyntheticCoreRuntime()?.engine ?? null,
 };
 
 let portasAtivas: TurnEnginePortsV1 = PRODUCTION_PORTS;

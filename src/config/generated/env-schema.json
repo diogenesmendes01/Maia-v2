@@ -2093,6 +2093,25 @@
         "true"
       ]
     },
+    "MAIA_HERMES_ENABLED": {
+      "type": "string",
+      "description": "Gate de runtime Hermes, default off. Ativação por env ainda recusa no boot: loader de deployment homologado ausente. Harness sintético usa configuração explícita separada; a flag não aprova coorte, bundle ou release.",
+      "x-maia-type": "string",
+      "x-maia-group": "feature-flags",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "enum": [
+        "true",
+        "false"
+      ],
+      "default": "false",
+      "examples": [
+        "false"
+      ]
+    },
     "MAIA_HERMES_KILL_SWITCH": {
       "type": "string",
       "description": "Kill switch do Hermes (K-15): true força maia_react em todo turno novo, por cima de agent_engine_policies. Só desliga; nunca liga o Hermes — ligar é linha por (tenant, agente, canal). Não muda turno já pinado. Só false/0 explícitos o deixam solto: qualquer outro valor aciona.",

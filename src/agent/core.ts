@@ -627,6 +627,8 @@ async function runAgentForMensagemInner(
   // contra reprocessamento.
   if (turnStateAuthoritative() && turn) {
     if (isTerminalTurnStatus(turn.status)) {
+      const { closeSyntheticHermesHandoff } = await import('@/runtime/engines/recover-synthetic-output.js');
+      await closeSyntheticHermesHandoff(turn.turn_id);
       logger.debug(
         { mensagem_id, turn_id: turn.turn_id, status: turn.status },
         'agent.turn_terminal',
@@ -634,6 +636,8 @@ async function runAgentForMensagemInner(
       return;
     }
     if (turn.status === 'outbound_pending') {
+      const { closeSyntheticHermesHandoff } = await import('@/runtime/engines/recover-synthetic-output.js');
+      await closeSyntheticHermesHandoff(turn.turn_id);
       logger.debug({ mensagem_id, turn_id: turn.turn_id }, 'agent.turn_outbound_pending_skip');
       return;
     }
@@ -795,14 +799,14 @@ async function runAgentForMensagemInner(
        * volta do processo que sabe rodar aquele pin —, e o esgotamento das
        * tentativas leva o turno para dead letter na frente de uma pessoa.
        *
-       * `remote`: existe instância do motor remoto, mas preparar o run dela
-       * (`pinEngineAndPrepareRun`) ainda é impossível nesta árvore. Atender
-       * localmente seria responder com um motor diferente do que a política e
-       * o degrau escolheram, sem registro nenhum de que isso aconteceu. Hoje
-       * é inalcançável (a porta `hermesEngine()` devolve `null`, e o `null`
-       * já degrada para local com motivo próprio); o ramo existe para que o
-       * dia em que ela devolver uma instância seja BARULHENTO e não silencioso.
+       * `remote`: somente a composição synthetic explícita admite texto novo,
+       * sem executar o pipeline local. Recusa de admissão nunca faz fallback.
+       * Produção/live continua sem loader homologado e sem instância remota.
        */
+      if (motor.kind === 'remote') {
+        const { runSyntheticHermesAdmission } = await import('@/runtime/engines/run-synthetic-admission.js');
+        if (await runSyntheticHermesAdmission({ turn, inbound })) return;
+      }
       if (motor.kind !== 'local') {
         const code =
           motor.kind === 'refused' ? `engine_${motor.reason}` : 'engine_remote_turn_not_wired';
@@ -814,6 +818,10 @@ async function runAgentForMensagemInner(
         return;
       }
       return runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
+    }
+    if (rota.kind === 'reconcile_run' && rota.reason === 'result_ready' && rota.pin.engine === 'hermes') {
+      const { recoverSyntheticHermesOutput } = await import('@/runtime/engines/recover-synthetic-output.js');
+      if (await recoverSyntheticHermesOutput({ run_id: rota.run.id, turn, inbound })) return;
     }
     // Não reexecuta. O run está no journal e quem o retoma é o caminho de
     // manutenção (`engineRunsRepo.listDueRuns`), que sabe tomar o fence dele —
@@ -874,14 +882,13 @@ async function runAgentForMensagemInner(
       );
       return;
     }
-    // A post-commit failure must leave `outbound_pending` authoritative, but
-    // it must not keep renewing this worker's lease forever. Releasing only the
-    // lease makes the recovery finalizer eligible without reopening the turn
-    // for another hot-path execution (`outbound_pending` is not claimable).
-    if (turn?.status === 'outbound_pending') {
-      await turn.lease?.release();
-    }
     throw err;
+  } finally {
+    // The core owns the claim's lifetime, including preparation/readback errors.
+    // Release only possession: a durable run (including uncertain submission)
+    // remains authoritative, and recovery must route it rather than resubmit.
+    if (turn && isTerminalTurnStatus(turn.status)) turn.lease?.stop();
+    else await turn?.lease?.release();
   }
 }
 

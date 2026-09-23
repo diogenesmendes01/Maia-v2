@@ -99,6 +99,21 @@ export function evaluateCrossFieldRules(view: CrossFieldView): CrossFieldFinding
   const out: CrossFieldFinding[] = [];
   const push = (f: CrossFieldFinding) => out.push(f);
 
+  // The explicit local synthetic factory is not an attested deployment loader.
+  // Until that loader is installed, env-only activation must fail at boot.
+  if (c.MAIA_HERMES_ENABLED === true) {
+    push({
+      scope: 'boot',
+      severity: 'error',
+      variable: 'MAIA_HERMES_ENABLED',
+      rule: 'hermes/deployment-unavailable',
+      message:
+        'Hermes env activation requires an attested deployment loader; only the explicit synthetic harness is implemented.',
+      remediation:
+        'Keep MAIA_HERMES_ENABLED=false. Run synthetic checks through the explicit local deployment factory; do not enable real traffic.',
+    });
+  }
+
   // -------------------------------------------------------------------
   // BOOT-SCOPE rules — messages preserved verbatim from the pre-contract
   // loader. Changing a message here changes a production boot error.

@@ -345,7 +345,7 @@ type RunRecord = {
 };
 
 export interface HermesEngineV1 extends AgentEnginePortV1 {
-  /** Identidade não secreta desta implantação, para `remote_instance_id`. */
+  /** Identidade não secreta desta encarnação do supervisor (não versão/build). */
   readonly remoteInstanceId: string;
   /** Encerramento do processo Maia: cancela e espera todos os workers. */
   shutdown(): Promise<void>;
@@ -369,7 +369,7 @@ export function createHermesEngine(deps: HermesEngineDepsV1): HermesEngineV1 {
     }),
     protocol_version: 1,
   };
-  const remoteInstanceId = `hermes-supervisor:${sup.config.hermes_sha.slice(0, 12)}`;
+  const remoteInstanceId = `hermes-supervisor:${sup.incarnation}`;
 
   async function doStart(
     request: EngineRequestV1,
@@ -484,6 +484,7 @@ export function createHermesEngine(deps: HermesEngineDepsV1): HermesEngineV1 {
   }
 
   function lookup(locator: EngineRunLocatorV1): RunRecord | null {
+    if (locator.remote_instance_id !== remoteInstanceId) return null;
     const record = runs.get(locator.run_id);
     if (!record || !record.session || record.request_key !== locator.request_key) return null;
     if (locator.remote_run_id !== null && locator.remote_run_id !== record.remote_run_id)

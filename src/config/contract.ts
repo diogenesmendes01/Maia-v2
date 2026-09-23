@@ -1942,6 +1942,22 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  MAIA_HERMES_ENABLED: {
+    name: 'MAIA_HERMES_ENABLED',
+    description:
+      'Gate de runtime Hermes, default off. Ativação por env ainda recusa no boot: loader de deployment homologado ausente. Harness sintético usa configuração explícita separada; a flag não aprova coorte, bundle ou release.',
+    group: 'feature-flags',
+    secret: false,
+    services: ['runtime'],
+    schema: z
+      .enum(['true', 'false'])
+      .default('false')
+      .transform((v) => v === 'true'),
+    example: 'false',
+    fixture: 'false',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   MAIA_HERMES_KILL_SWITCH: {
     name: 'MAIA_HERMES_KILL_SWITCH',
     description:

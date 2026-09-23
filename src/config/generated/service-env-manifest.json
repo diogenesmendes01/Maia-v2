@@ -887,6 +887,13 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_HERMES_ENABLED",
+          "secret": false,
+          "required": false,
+          "group": "feature-flags",
+          "restartRequired": true
+        },
+        {
           "name": "MAIA_HERMES_KILL_SWITCH",
           "secret": false,
           "required": false,
@@ -1537,6 +1544,7 @@
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "MAIA_HERMES_ENABLED",
             "MAIA_HERMES_KILL_SWITCH",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
@@ -1739,6 +1747,7 @@
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "MAIA_HERMES_ENABLED",
             "MAIA_HERMES_KILL_SWITCH",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
@@ -1940,6 +1949,7 @@
             "FEATURE_TURN_CLAIM",
             "FEATURE_TURN_JOB_V2",
             "FEATURE_TURN_STATE_AUTHORITATIVE",
+            "MAIA_HERMES_ENABLED",
             "MAIA_HERMES_KILL_SWITCH",
             "MAIA_SYNTHETIC_PROBE",
             "MAIA_PROBE_LLM_JUDGE",
