@@ -48,7 +48,8 @@ import { sendOutbound, safeDispatchOutput, OutboundDeliveryError } from './outpu
 import { executeSelectedSkill } from './execute-skill.js';
 import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
-import { runReActLoop, type ReActDelivery } from './react-loop.js';
+import { type ReActDelivery } from './react-loop.js';
+import { runReasonerStage } from '@/runtime/engines/reasoner-stage.js';
 import { decideTurnAction } from './turn-outcome.js';
 import {
   routeExistingEngineRun,
@@ -2182,7 +2183,25 @@ async function runAgentTurnPipeline(params: {
   let reactToolsCalled: Array<{ name: string; result: unknown }>;
   let reactDelivery: ReActDelivery;
   try {
-    const result = await runReActLoop({
+    /**
+     * SC01 (§5.2) — O SEAM PÓS-GATES.
+     *
+     * Este é o bloco que o §5.2 nomeia como principal: até a extração, o core
+     * pedia "raciocine E entregue" numa função só (`runReActLoop`). Agora ele
+     * pede o estágio — que chama a PORTA do motor (`AgentEnginePortV1`, com o
+     * `runReasoning` real atrás dela), monta o resultado confiável a partir dos
+     * receipts e entrega pelo `MaiaOutputCoordinator`.
+     *
+     * A POSIÇÃO não mudou, e isso é a parte que importa: identidade, canal,
+     * pendência, procedimentos, skills e Decision Engine já decidiram o turno
+     * ANTES desta linha. Um gate determinístico que encerra acima NÃO aciona o
+     * motor (§5.10.3, "Fronteira reasoner") — e é por isso que o contador
+     * `maia_engine_start_total` de um turno gated fica em zero.
+     *
+     * `runAgentForMensagem` NÃO se move para o motor remoto: gates, estado,
+     * efeitos, histórico e pós-turno continuam da Maia.
+     */
+    const result = await runReasonerStage({
       pessoa,
       conversa: c,
       inbound,
@@ -2192,7 +2211,8 @@ async function runAgentTurnPipeline(params: {
       messages,
       tools,
       // [P88-C4] Pass the precomputed role-switch announcement (if any) so
-      // react-loop can prepend it to the final assistant text before dispatch.
+      // the reasoner stage can prepend it to the final assistant text before
+      // dispatch.
       outboundPrefix: roleAnnouncement,
     });
     totalTokens = result.totalTokens;
