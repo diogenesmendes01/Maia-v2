@@ -319,11 +319,15 @@ describe('checkRoleReadiness — WhatsApp: channel capacity vs API capacity', ()
     lifecycle.transitionTo('ready');
   });
 
-  it('a session that was NEVER established keeps the instance out of rotation', async () => {
+  it('a session that was NEVER established does NOT block readiness (WhatsApp optional)', async () => {
+    // Issue #XXX: com READINESS_REQUIRE_WHATSAPP=false (default), o WhatsApp
+    // não é required, então uma sessão pending não bloqueia readiness.
     lifecycle.setComponent('whatsapp_session', 'pending');
     const r = await checkRoleReadiness();
-    expect(r.ready).toBe(false);
-    expect(r.reason).toMatch(/whatsapp_session=unknown/);
+    expect(r.ready).toBe(true);
+    const wa = r.checks.find((c) => c.component === 'whatsapp_session')!;
+    expect(wa.status).toBe('unknown');
+    expect(wa.required).toBe(false); // não é required no papel 'all' com flag default
   });
 
   it('a transient reconnect degrades but does NOT drain (anti-flapping policy)', async () => {

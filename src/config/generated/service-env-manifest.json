@@ -1357,6 +1357,13 @@
           "restartRequired": true
         },
         {
+          "name": "READINESS_REQUIRE_WHATSAPP",
+          "secret": false,
+          "required": false,
+          "group": "lifecycle",
+          "restartRequired": true
+        },
+        {
           "name": "READINESS_REQUIRE_WHATSAPP_LIVE",
           "secret": false,
           "required": false,
@@ -1604,6 +1611,7 @@
             "READINESS_PROBE_TIMEOUT_MS",
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
             "SETUP_TOKEN_OVERRIDE",
             "MAIA_TOOL_REQUEST_ISSUE_REPO",
@@ -1805,6 +1813,7 @@
             "READINESS_PROBE_TIMEOUT_MS",
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
             "SETUP_TOKEN_OVERRIDE",
             "MAIA_TOOL_REQUEST_ISSUE_REPO",
@@ -2006,6 +2015,7 @@
             "READINESS_PROBE_TIMEOUT_MS",
             "READINESS_SCHEMA_CHECK",
             "READINESS_BACKLOG_MAX",
+            "READINESS_REQUIRE_WHATSAPP",
             "READINESS_REQUIRE_WHATSAPP_LIVE",
             "SETUP_TOKEN_OVERRIDE",
             "MAIA_TOOL_REQUEST_ISSUE_REPO",

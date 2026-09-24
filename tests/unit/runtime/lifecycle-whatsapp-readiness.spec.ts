@@ -12,19 +12,32 @@
  * The fix: `ready` is set from the `open` handler. `degraded` is only reachable
  * AFTER the session was established once — before that the component stays
  * `starting`, which readiness treats as `unknown` and therefore fails closed.
+ * 
+ * Issue #XXX: estes testes verificam o comportamento com READINESS_REQUIRE_WHATSAPP=true
+ * (WhatsApp obrigatório), que não é mais o default mas continua sendo suportado.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
-const { baileysConnectedMock, memoryReadinessMock, schemaMock, probeDbMock } = vi.hoisted(() => ({
+const { baileysConnectedMock, memoryReadinessMock, schemaMock, probeDbMock, configMock } = vi.hoisted(() => ({
   baileysConnectedMock: vi.fn<[], boolean>(),
   memoryReadinessMock: vi.fn(),
   schemaMock: vi.fn(),
   probeDbMock: vi.fn<[], Promise<boolean>>(),
+  // Issue #XXX: estes testes verificam o comportamento STRICT (WhatsApp obrigatório).
+  configMock: { 
+    READINESS_REQUIRE_WHATSAPP: true,
+    READINESS_REQUIRE_WHATSAPP_LIVE: false,
+    READINESS_SCHEMA_CHECK: true,
+    READINESS_BACKLOG_MAX: 0,
+    READINESS_CACHE_MS: 2000,
+    READINESS_PROBE_TIMEOUT_MS: 5000,
+  },
 }));
 
 vi.mock('../../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), error: vi.fn(), debug: vi.fn() },
 }));
+vi.mock('../../../src/config/env.js', () => ({ config: configMock }));
 vi.mock('../../../src/db/client.js', () => ({
   probeDb: probeDbMock,
   // `schema-readiness.js` binds the application pool at import time.

@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 195 | 20 |
+| `runtime` | 196 | 20 |
 | `admin-ui` | 28 | 6 |
 | `migrator` | 15 | 2 |
 | `backup` | 44 | 7 |
@@ -358,7 +358,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 | `READINESS_PROBE_TIMEOUT_MS` | number | `1500` | não | `runtime` | sim | Timeout por componente nas probes de readiness. Componente que não responde a tempo é reportado como `unknown` — o que é fail-closed para um componente obrigatório do papel. |
 | `READINESS_SCHEMA_CHECK` | string | `true` | não | `runtime` | sim | Liga o veredito canônico de schema (getSchemaReadiness, #516) nos DOIS gates: no BOOT e na readiness. No boot (ADR 0004) dirty state, checksum divergente, migration ausente e schema incompatível ENCERRAM o processo com exit code 90-98, específico da invariante; num processo já no ar as mesmas condições derrubam o /readyz para 503, e um veredito `unknown` também (fail-closed). Nenhum dos dois aplica migration — quem aplica é o job de migration. INVÁLIDO no profile production: `false` recusa o boot. Fora de production, desligue apenas onde código e schema são publicados fora de banda de propósito (é o que mantém um `npm run dev` vivo contra um banco desalinhado); isso é política explícita, não fallback silencioso. |
 | `READINESS_BACKLOG_MAX` | number | `0` | não | `runtime` | sim | Shedding de capacidade opcional: reporta NÃO-pronto quando a fila do agente tem mais de N jobs esperando. Default 0 = DESLIGADO, deliberadamente — um limiar mal escolhido drena a frota inteira durante um pico legítimo e transforma backlog em outage. Ligue por ambiente depois de conhecer o formato normal do backlog. |
-| `READINESS_REQUIRE_WHATSAPP_LIVE` | string | `false` | não | `runtime` | sim | Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não. |
+| `READINESS_REQUIRE_WHATSAPP` | string | `false` | não | `runtime` | sim | Se o WhatsApp é um componente OBRIGATÓRIO para readiness no papel `all`. Default false: a instância fica pronta quando db e redis estão ok, INDEPENDENTE do estado do WhatsApp. O WhatsApp continua sendo monitorado e reportado em /health, mas não bloqueia /readyz nem /startupz. Ligue onde a capacidade de responder HTTP e a capacidade de enviar/receber mensagens no WhatsApp precisam ser acopladas. Afeta APENAS o papel `all`; os papéis especializados já têm seus próprios contratos (api/worker nunca exigem WhatsApp, session-owner sempre exige). |
+| `READINESS_REQUIRE_WHATSAPP_LIVE` | string | `false` | não | `runtime` | sim | Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não. Só tem efeito quando READINESS_REQUIRE_WHATSAPP=true ou o papel é session-owner. |
 
 ### Bootstrap / setup
 

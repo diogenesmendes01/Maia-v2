@@ -11,7 +11,8 @@ WORKDIR /app
 # node:22-alpine embarca npm 10.x, mas o preinstall guard do package.json
 # exige npm >=11.5.2 <12 (pin do formato do package-lock.json — ver
 # CONTRIBUTING.md). Alinha o builder ANTES de qualquer `npm ci`.
-RUN apk add --no-cache postgresql-client tini \
+# curl: necessário para healthchecks do Docker/Coolify (issue #XXX).
+RUN apk add --no-cache postgresql-client tini curl \
   && npm install -g npm@11.5.2
 
 FROM base AS deps

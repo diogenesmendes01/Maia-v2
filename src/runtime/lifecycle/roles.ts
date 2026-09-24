@@ -26,7 +26,14 @@
  *     `src/config/env.ts`), never a silent fallback to a permissive default;
  *   - every role REQUIRES `config`, `db`, `schema` and `redis` — there is no
  *     Maia process that can do useful, tenant-scoped work without them.
+ *
+ * Issue #XXX (WhatsApp optional for readiness):
+ *   - the `all` role's `requires` list is adjusted at runtime based on
+ *     `READINESS_REQUIRE_WHATSAPP`. When false (default), `whatsapp_session`
+ *     is OWNED but not REQUIRED, so the instance can serve HTTP and be ready
+ *     even when WhatsApp is down/starting.
  */
+import { config } from '@/config/env.js';
 
 /**
  * Every role a Maia process can play. `all` is the single-process compat mode
@@ -133,6 +140,18 @@ export function getRoleContract(role: ProcessRole): RoleContract {
   // Defensive: `role` is typed, but a value crossing a JSON/env boundary could
   // still be wrong. Fail-closed rather than returning a permissive default.
   if (!contract) throw new Error(`unknown process role: ${String(role)}`);
+  
+  // Issue #XXX: WhatsApp optional for readiness in the `all` role.
+  // When READINESS_REQUIRE_WHATSAPP=false (default), remove `whatsapp_session`
+  // from the requires list. The component is still OWNED (started and monitored)
+  // but does not gate readiness.
+  if (role === 'all' && !config.READINESS_REQUIRE_WHATSAPP) {
+    return {
+      ...contract,
+      requires: contract.requires.filter(c => c !== 'whatsapp_session'),
+    };
+  }
+  
   return contract;
 }
 
