@@ -61,6 +61,18 @@ const killSwitchFlag = () =>
     .default('false')
     .transform((s) => !['false', '0'].includes(s.trim().toLowerCase()));
 
+/**
+ * Parser de gate fail-closed invertido (para READINESS_REQUIRE_WHATSAPP).
+ * Default: true (gate ligado). Só 'false'/'0' explícitos desligam; qualquer
+ * outro valor (ausente, TRUE, yes, on, lixo, com espaço) mantém ligado.
+ * Exportado para testes.
+ */
+export const gateFlag = () =>
+  z
+    .string()
+    .default('true')
+    .transform((s) => !['false', '0'].includes(s.trim().toLowerCase()));
+
 const posInt = (def: number) => z.coerce.number().int().positive().default(def);
 
 // ---------------------------------------------------------------------------
@@ -2868,11 +2880,11 @@ export const ENV_CONTRACT = {
   READINESS_REQUIRE_WHATSAPP: {
     name: 'READINESS_REQUIRE_WHATSAPP',
     description:
-      'Se o WhatsApp é um componente OBRIGATÓRIO para readiness e startup no papel `all`. Default TRUE: preserva o comportamento da main (instância só fica pronta quando a sessão abre, system_started só é gravado após o primeiro open, /readyz e /startupz ficam 503 até lá). False = OPT-IN EXPLÍCITO para relaxar: a instância fica pronta quando db e redis estão ok, INDEPENDENTE do estado do WhatsApp. O WhatsApp continua sendo monitorado e reportado em /health, mas não bloqueia /readyz nem /startupz. PRECEDÊNCIA: READINESS_REQUIRE_WHATSAPP_LIVE=true (modo estrito de reconexão) SEMPRE vence e força WhatsApp obrigatório, mesmo que esta flag esteja em false — o boot emite warning se as duas conflitarem. Afeta APENAS o papel `all`; os papéis especializados já têm seus próprios contratos (api/worker nunca exigem WhatsApp, session-owner sempre exige).',
+      'Se o WhatsApp é um componente OBRIGATÓRIO para readiness e startup no papel `all`. Default TRUE: preserva o comportamento da main (instância só fica pronta quando a sessão abre, system_started só é gravado após o primeiro open, /readyz e /startupz ficam 503 até lá). False = OPT-IN EXPLÍCITO para relaxar (apenas `false` ou `0` desligam; qualquer outro valor, incluindo ausente, TRUE, yes, on, lixo ou com espaço, mantém o gate): a instância fica pronta quando db e redis estão ok, INDEPENDENTE do estado do WhatsApp. O WhatsApp continua sendo monitorado e reportado em /health, mas não bloqueia /readyz nem /startupz. PRECEDÊNCIA: READINESS_REQUIRE_WHATSAPP_LIVE=true (modo estrito de reconexão) SEMPRE vence e força WhatsApp obrigatório, mesmo que esta flag esteja em false — o boot emite warning se as duas conflitarem. Afeta APENAS o papel `all`; os papéis especializados já têm seus próprios contratos (api/worker nunca exigem WhatsApp, session-owner sempre exige).',
     group: 'lifecycle',
     secret: false,
     services: ['runtime'],
-    schema: boolFlag('true'),
+    schema: gateFlag(),
     example: 'true',
     fixture: 'true',
     restartRequired: true,
@@ -2881,7 +2893,7 @@ export const ENV_CONTRACT = {
   READINESS_REQUIRE_WHATSAPP_LIVE: {
     name: 'READINESS_REQUIRE_WHATSAPP_LIVE',
     description:
-      'Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não. PRECEDÊNCIA: true aqui SEMPRE força READINESS_REQUIRE_WHATSAPP=true no papel `all` (WhatsApp obrigatório), mesmo que aquela flag esteja explicitamente em false — o boot emite warning se as duas conflitarem. Só tem efeito quando READINESS_REQUIRE_WHATSAPP=true ou o papel é session-owner.',
+      'Readiness estrita de WhatsApp. Default false: uma sessão JÁ estabelecida que está reconectando reporta `degraded` e a instância PERMANECE em rotação, porque queda de socket Baileys é rotina e travar nisso faz a readiness flapar. Ligue onde capacidade de canal e capacidade de API precisam ser o mesmo sinal. Não afeta o cold start: antes do primeiro `open` a instância nunca fica pronta, com a flag ligada ou não. PRECEDÊNCIA: true aqui SEMPRE força WhatsApp obrigatório no papel `all` (mesmo que READINESS_REQUIRE_WHATSAPP=false) e vence a outra flag — o boot emite warning se as duas conflitarem.',
     group: 'lifecycle',
     secret: false,
     services: ['runtime'],

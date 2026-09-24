@@ -128,4 +128,39 @@ describe('WhatsApp opcional para readiness (READINESS_REQUIRE_WHATSAPP, opt-in)'
     expect(contract.requires).toContain('agent_worker');
     expect(contract.requires).toContain('cron_scheduler');
   });
+
+  it('parser fail-closed: valores inválidos mantêm WhatsApp obrigatório', async () => {
+    // Força reimport para pegar o parser do gateFlag.
+    vi.resetModules();
+    const { gateFlag } = await import('../../../src/config/contract.js');
+    const parser = gateFlag();
+    
+    // Só 'false' e '0' relaxam; resto mantém obrigatório (retorna true).
+    expect(parser.parse('false')).toBe(false);
+    expect(parser.parse('0')).toBe(false);
+    expect(parser.parse('true')).toBe(true);
+    expect(parser.parse('TRUE')).toBe(true);
+    expect(parser.parse('yes')).toBe(true);
+    expect(parser.parse('on')).toBe(true);
+    expect(parser.parse('true ')).toBe(true); // com espaço
+    expect(parser.parse('lixo')).toBe(true);
+    expect(parser.parse(undefined as any)).toBe(true); // ausente
+  });
+
+  it('config mockada sem a chave READINESS_REQUIRE_WHATSAPP mantém whatsapp_session nos requires', async () => {
+    // Simula config parcial (undefined na chave).
+    vi.resetModules();
+    const configParcial = {
+      READINESS_REQUIRE_WHATSAPP: undefined as any,
+      READINESS_REQUIRE_WHATSAPP_LIVE: false,
+    };
+    vi.doMock('../../../src/config/env.js', () => ({ config: configParcial }));
+    vi.doMock('../../../src/lib/logger.js', () => ({ logger: loggerMock }));
+    
+    const { getRoleContract: freshGetRoleContract } = await import('../../../src/runtime/lifecycle/roles.js');
+    const contract = freshGetRoleContract('all');
+    
+    // Com config parcial, comparação explícita (=== false) falha e WhatsApp fica obrigatório.
+    expect(contract.requires).toContain('whatsapp_session');
+  });
 });

@@ -27,7 +27,7 @@
  *   - every role REQUIRES `config`, `db`, `schema` and `redis` — there is no
  *     Maia process that can do useful, tenant-scoped work without them.
  *
- * Issue #XXX (WhatsApp opcional para readiness, opt-in):
+ * WhatsApp opcional para readiness (opt-in fail-closed):
  *   - DEFAULT: `whatsapp_session` É obrigatório no `all` (comportamento da main).
  *   - OPT-IN: `READINESS_REQUIRE_WHATSAPP=false` remove `whatsapp_session` dos
  *     `requires`, permitindo readiness sem WhatsApp conectado.
@@ -146,7 +146,7 @@ export function getRoleContract(role: ProcessRole): RoleContract {
   // still be wrong. Fail-closed rather than returning a permissive default.
   if (!contract) throw new Error(`unknown process role: ${String(role)}`);
   
-  // Issue #XXX: WhatsApp opcional para readiness no role `all`, OPT-IN.
+  // WhatsApp opcional para readiness no role `all`, OPT-IN fail-closed.
   // DEFAULT (sem flags setadas): WhatsApp É obrigatório (comportamento da main).
   // OPT-IN: READINESS_REQUIRE_WHATSAPP=false remove `whatsapp_session` dos requires.
   // PRECEDÊNCIA: READINESS_REQUIRE_WHATSAPP_LIVE=true SEMPRE vence e força WhatsApp
@@ -156,7 +156,9 @@ export function getRoleContract(role: ProcessRole): RoleContract {
     const strictLive = config.READINESS_REQUIRE_WHATSAPP_LIVE;
     
     // Conflito: _LIVE=true mas REQUIRE_WHATSAPP=false → emitir warning, _LIVE vence.
-    if (strictLive && !requireWhatsApp && !conflictWarningEmitted) {
+    // Comparação EXPLÍCITA para fail-closed: só age se os valores forem exatamente
+    // true/false, não undefined ou outro tipo.
+    if (strictLive === true && requireWhatsApp === false && !conflictWarningEmitted) {
       logger.warn(
         {
           READINESS_REQUIRE_WHATSAPP: requireWhatsApp,
@@ -168,9 +170,10 @@ export function getRoleContract(role: ProcessRole): RoleContract {
     }
     
     // Decide: remove WhatsApp dos requires APENAS se:
-    // - READINESS_REQUIRE_WHATSAPP=false (opt-in explícito) E
-    // - READINESS_REQUIRE_WHATSAPP_LIVE=false (não está no modo estrito)
-    const shouldRemoveWhatsApp = !requireWhatsApp && !strictLive;
+    // - READINESS_REQUIRE_WHATSAPP === false (opt-in explícito, não undefined) E
+    // - READINESS_REQUIRE_WHATSAPP_LIVE !== true (não está no modo estrito)
+    // Fail-closed: undefined, null ou qualquer outro valor mantém WhatsApp obrigatório.
+    const shouldRemoveWhatsApp = requireWhatsApp === false && strictLive !== true;
     
     if (shouldRemoveWhatsApp) {
       return {
