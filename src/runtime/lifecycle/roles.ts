@@ -27,13 +27,18 @@
  *   - every role REQUIRES `config`, `db`, `schema` and `redis` — there is no
  *     Maia process that can do useful, tenant-scoped work without them.
  *
- * Issue #XXX (WhatsApp optional for readiness):
- *   - the `all` role's `requires` list is adjusted at runtime based on
- *     `READINESS_REQUIRE_WHATSAPP`. When false (default), `whatsapp_session`
- *     is OWNED but not REQUIRED, so the instance can serve HTTP and be ready
- *     even when WhatsApp is down/starting.
+ * Issue #XXX (WhatsApp opcional para readiness, opt-in):
+ *   - DEFAULT: `whatsapp_session` É obrigatório no `all` (comportamento da main).
+ *   - OPT-IN: `READINESS_REQUIRE_WHATSAPP=false` remove `whatsapp_session` dos
+ *     `requires`, permitindo readiness sem WhatsApp conectado.
+ *   - PRECEDÊNCIA: `READINESS_REQUIRE_WHATSAPP_LIVE=true` SEMPRE força WhatsApp
+ *     obrigatório, mesmo que `READINESS_REQUIRE_WHATSAPP=false`. O boot emite
+ *     warning se as duas conflitarem.
  */
 import { config } from '@/config/env.js';
+import { logger } from '@/lib/logger.js';
+
+let conflictWarningEmitted = false;
 
 /**
  * Every role a Maia process can play. `all` is the single-process compat mode
@@ -141,15 +146,38 @@ export function getRoleContract(role: ProcessRole): RoleContract {
   // still be wrong. Fail-closed rather than returning a permissive default.
   if (!contract) throw new Error(`unknown process role: ${String(role)}`);
   
-  // Issue #XXX: WhatsApp optional for readiness in the `all` role.
-  // When READINESS_REQUIRE_WHATSAPP=false (default), remove `whatsapp_session`
-  // from the requires list. The component is still OWNED (started and monitored)
-  // but does not gate readiness.
-  if (role === 'all' && !config.READINESS_REQUIRE_WHATSAPP) {
-    return {
-      ...contract,
-      requires: contract.requires.filter(c => c !== 'whatsapp_session'),
-    };
+  // Issue #XXX: WhatsApp opcional para readiness no role `all`, OPT-IN.
+  // DEFAULT (sem flags setadas): WhatsApp É obrigatório (comportamento da main).
+  // OPT-IN: READINESS_REQUIRE_WHATSAPP=false remove `whatsapp_session` dos requires.
+  // PRECEDÊNCIA: READINESS_REQUIRE_WHATSAPP_LIVE=true SEMPRE vence e força WhatsApp
+  // obrigatório, mesmo que READINESS_REQUIRE_WHATSAPP=false.
+  if (role === 'all') {
+    const requireWhatsApp = config.READINESS_REQUIRE_WHATSAPP;
+    const strictLive = config.READINESS_REQUIRE_WHATSAPP_LIVE;
+    
+    // Conflito: _LIVE=true mas REQUIRE_WHATSAPP=false → emitir warning, _LIVE vence.
+    if (strictLive && !requireWhatsApp && !conflictWarningEmitted) {
+      logger.warn(
+        {
+          READINESS_REQUIRE_WHATSAPP: requireWhatsApp,
+          READINESS_REQUIRE_WHATSAPP_LIVE: strictLive,
+        },
+        'roles.whatsapp_precedence_conflict: READINESS_REQUIRE_WHATSAPP_LIVE=true força WhatsApp obrigatório, mas READINESS_REQUIRE_WHATSAPP=false tenta relaxar. READINESS_REQUIRE_WHATSAPP_LIVE vence: WhatsApp será obrigatório.'
+      );
+      conflictWarningEmitted = true;
+    }
+    
+    // Decide: remove WhatsApp dos requires APENAS se:
+    // - READINESS_REQUIRE_WHATSAPP=false (opt-in explícito) E
+    // - READINESS_REQUIRE_WHATSAPP_LIVE=false (não está no modo estrito)
+    const shouldRemoveWhatsApp = !requireWhatsApp && !strictLive;
+    
+    if (shouldRemoveWhatsApp) {
+      return {
+        ...contract,
+        requires: contract.requires.filter(c => c !== 'whatsapp_session'),
+      };
+    }
   }
   
   return contract;
