@@ -72,8 +72,6 @@ COPY --from=build /app/tsconfig.json ./tsconfig.json
 # chown único para uid 1001 — ver docs/runbooks/deploy-prod.md.
 RUN mkdir -p /app/.baileys-auth /app/media /app/backups \
   && chown -R maia:maia /app/.baileys-auth /app/media /app/backups
-# Torna o entrypoint executável — sem isto o `exec` falha.
-RUN chmod +x /app/scripts/docker-entrypoint.sh
 ENV TZ=America/Sao_Paulo
 EXPOSE 3000
 USER maia

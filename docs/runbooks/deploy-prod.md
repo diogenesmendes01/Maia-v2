@@ -500,12 +500,14 @@ incidente.
 | Ele **sai != 0** quando o migrate falha (ledger `dirty`) | **EXECUTADO** | idem |
 | Ele entrega ao migrator **só o subset `migrator`** (#515) — nada de chave de LLM, sessão de WhatsApp ou credencial S3 | **EXECUTADO** | idem: a mesma variável derruba o migrator cru (saída 2) e não chega nele pelo gate (saída 0) |
 | `gate && consumidor` **impede o consumidor de rodar** quando o gate falha | **EXECUTADO** | idem: o marcador que o consumidor escreveria não existe no disco |
-| **O painel do Coolify executa o gate antes do rollout e desiste do rollout quando ele sai != 0** | **NÃO VERIFICADO** | Não há instância de Coolify acessível a quem escreveu isto. O que se afirma é só o contrato: *"rode este comando; se ele sair != 0, não suba"* |
-| **O nome e a localização do campo do painel onde o comando é colado** | **NÃO VERIFICADO** | Varia por versão do Coolify e não foi conferido em nenhuma. Procure-o na sua instância; o texto abaixo descreve o que o campo precisa fazer, não onde ele fica |
-| Um redeploy **re-executa** o gate, e o que acontece quando ele sai `up_to_date` | **NÃO VERIFICADO** | Ver §7.4 |
-| O recurso de migration separado recebe **só** o subset `migrator`, e o processo dele valida **só** esse subset | **EXECUTADO** | `tests/unit/scripts/migrate-subset-boot.spec.ts` roda `tsx scripts/migrate.ts` num processo com o `.env.migrator.prod.example` (lido do disco) e nada mais |
-| Uma chave de aplicação acrescentada ao subset `migrator` **derruba o migrator**, em vez de aumentar o raio de explosão em silêncio | **EXECUTADO** | `src/config/migrator-subset.ts`, chamado por `loadMigrationConfig()`; guard em `tests/unit/config/migrator-subset.spec.ts` |
-| **O painel do Coolify permite criar o recurso separado, e como se chama o campo** | **NÃO VERIFICADO** | Mesma razão das duas linhas acima: não há instância acessível a quem escreveu isto. O que §7.5 descreve é o CONJUNTO DE VARIÁVEIS do recurso, que é verificável aqui, e não a navegação do painel |
+| **O entrypoint docker-entrypoint.sh roda o gate antes do app quando AUTO_MIGRATE_ON_BOOT=true** | **EXECUTADO** | `tests/unit/scripts/docker-entrypoint.spec.ts`, script real com npm/node falsos |
+| **Migration que FALHA → entrypoint sai != 0, app NUNCA roda** | **EXECUTADO** | idem |
+| **AUTO_MIGRATE_ON_BOOT=false → migration pulada** | **EXECUTADO** | idem |
+| **Fail-closed: só 'false'/'0' (case-insensitive, trimmed) desligam; typo/vazio/'no'/'off' mantêm ligado** | **EXECUTADO** | idem, 14 valores testados, paridade com gateFlag() TS |
+| **SIGTERM durante migration chega ao migrator e não sobe o app** | **EXECUTADO** | idem: trap no entrypoint repassa sinal, fake migrator marca recebimento |
+| **Coolify pre-deployment command** (ApplicationDeploymentJob::run_pre_deployment_command) serve para migrations | **NÃO UTILIZÁVEL** | Roda via `docker exec` no container ANTIGO antes do novo existir (verificado no código-fonte Coolify 4.3.23); migrator antigo não enxerga migrations novas → novo container bate em SCHEMA BOOT REFUSED exit 94 |
+| **Coolify post-deployment** serve para migrations | **NÃO UTILIZÁVEL** | Roda DEPOIS do rollout; container novo já tentou boot e saiu 94 |
+| **Rolling update do Coolify mantém old container quando new sai != 0** | **ESPERADO (não verificado aqui)** | Comportamento padrão de orquestradores; depende da instância Coolify |
 
 ### 7.1 O comando
 
@@ -550,49 +552,91 @@ boot), e por isso mesmo a nomeia.
 
 ### 7.2 Self-migrate: a imagem roda o gate automaticamente (issue #565)
 
-**A partir da issue #565, a imagem Docker auto-migra por padrão.** O
-`docker-entrypoint.sh` verifica `AUTO_MIGRATE_ON_BOOT` (default true,
+**TOPOLOGIA ADOTADA para Coolify.** A imagem Docker auto-migra por padrão. O
+`scripts/docker-entrypoint.sh` verifica `AUTO_MIGRATE_ON_BOOT` (default true,
 fail-closed via `gateFlag()`): se ligado, executa `npm run release:migrate`
 ANTES de `exec node dist/index.js`. Migration que falha → app NÃO inicia.
 
+Dockerfile CMD:
+
 ```dockerfile
-# Dockerfile, linha 79-85
 CMD ["sh", "/app/scripts/docker-entrypoint.sh"]
 ```
 
-```bash
-# scripts/docker-entrypoint.sh (simplificado)
-if [ "$AUTO_MIGRATE_ON_BOOT" != "false" ] && [ "$AUTO_MIGRATE_ON_BOOT" != "0" ]; then
-  npm run release:migrate || exit $?
-fi
-exec node dist/index.js
-```
+Ver `scripts/docker-entrypoint.sh` para o comportamento completo (trap de
+sinais, normalização da flag, propagação de exit code). A lógica é fail-closed:
+a flag ausente ou malformada NUNCA relaxa a segurança — só 'false'/'0'
+(case-insensitive, trimmed) desligam.
 
 **Topologias:**
 
 | Deploy | AUTO_MIGRATE_ON_BOOT | Quem migra |
 |---|---|---|
 | Single-container (Coolify, Dockerfile direto) | ausente (default **true**) | a imagem, no entrypoint |
-| Multi-serviço (compose.prod.yml) | **false** (setado no `app` service) | o job `migrate` separado |
+| Multi-serviço (compose.prod.yml) | **false** (setado no serviço `app`) | o job `migrate` separado |
 
 **Fail-closed no centro:** o default é **true**. Só `false` ou `0` explícitos
 desligam. Um typo (`AUTO_MIGRATE_ON_BOOT=flase`) mantém o gate ligado, não o
-desliga em silêncio.
+desliga em silêncio. Testado em `tests/unit/scripts/docker-entrypoint.spec.ts`
+com 14 valores, incluindo vazio, typos, 'no', 'off', 'yes', 'on'.
 
-**Signal handling:** o `exec` no entrypoint faz o node process SUBSTITUIR o
-shell e virar PID correto sob o tini (ENTRYPOINT). SIGTERM/SIGINT propagam para
-o graceful shutdown (`SHUTDOWN_GRACE_MS`).
+**Signal handling durante a migration:**
 
-**Compose multi-serviço não quebrou:** `compose.prod.yml` seta
-`AUTO_MIGRATE_ON_BOOT: false` no serviço `app` (linha 268), porque o job
-`migrate` separado já aplica. Não há migração dupla nem race condition — o
-container do app nem tenta.
+Um `trap` no entrypoint captura SIGTERM/SIGINT durante a execução do migrator e
+os repassa ao processo dele (`npm run release:migrate` → `tsx scripts/migrate.ts`).
 
-### 7.3 Coolify pre-deployment command NÃO é usável para isto
+**IMPORTANTE:** O migrator NÃO tem handler próprio de SIGTERM. Quando recebe o
+sinal, ele morre imediatamente (src/migrations/runner.ts e scripts/migrate.ts
+não fazem `process.on('SIGTERM', ...)`). Isso significa:
+
+- O advisory lock global (`src/migrations/lock.ts`) é liberado automaticamente
+  (lock de SESSÃO: morre com a conexão pg)
+- Uma migration `-- maia:no-transaction` PODE ficar dirty se morrer no meio
+- Não há "parada entre migrations" ou "finalização limpa" — é morte imediata
+
+O trap do entrypoint só garante que o SINAL CHEGA ao migrator (em vez de ser
+ignorado). A morte do migrator é abrupta. Recovery em
+`docs/runbooks/migrations.md`.
+
+APÓS a migration, o `exec node dist/index.js` SUBSTITUI o shell e vira PID 1
+real sob o tini (ENTRYPOINT). O trap deixa de existir; o tini propaga
+SIGTERM/SIGINT diretamente ao node para graceful shutdown (`SHUTDOWN_GRACE_MS`).
+
+**Limite de tempo:**
+
+O Coolify tem uma janela de healthcheck/start configurável. Se a migration
+demorar mais que essa janela, o Coolify mata o container (SIGTERM) e o rollout
+falha. Para migrations longas (backfills, reindex):
+
+1. Aumente a janela de start period/timeout no healthcheck do Coolify ANTES do
+   deploy, OU
+2. Rode `npm run release:migrate` **manualmente** no servidor (com o `.env.app`
+   do ambiente) ANTES de disparar o deploy. O advisory lock global serializa; o
+   migrator manual aplica, o do container subsequente sai `up_to_date`.
+
+**Compose multi-serviço não quebrou:**
+
+`compose.prod.yml` seta `AUTO_MIGRATE_ON_BOOT: false` no serviço `app`, porque
+o job `migrate` separado já aplica. É **OBRIGATÓRIO** setar false quando há job
+migrate separado, senão ambos migram (race no advisory lock). Não há migração
+dupla nem race condition — o container do app nem tenta.
+
+**Recovery de SIGTERM no meio da migration:**
+
+Se o migrator receber SIGTERM e morrer no meio de uma migration `--
+maia:no-transaction`, o ledger pode ficar `dirty`. Nesse caso:
+
+1. Verifique o estado: `npm run db:migrate -- status` (read-only, não pega lock)
+2. Se `dirty`: siga `docs/runbooks/migrations.md` (repair, manual fix, rerun)
+3. Se o advisory lock ficou preso (migrator morto sem release): o lock é de
+   **sessão** e morre com a conexão. Reinicie o Postgres se necessário.
+4. Redeploye: o próximo migrator retenta a migration que falhou
+
+### 7.3 Por que o Coolify pre-deployment command NÃO serve
 
 A issue #565 investigou o `ApplicationDeploymentJob::run_pre_deployment_command`
-do Coolify 4.3.23. Ele executa via `docker exec` **no container ANTIGO**, antes
-do novo existir. Logo:
+do Coolify 4.3.23 (código-fonte verificado). Ele executa via `docker exec` **no
+container ANTIGO**, antes do novo existir. Logo:
 
 - roda o migrator da build **anterior**;
 - não enxerga as migrations novas que motivaram o deploy;
@@ -600,57 +644,12 @@ do novo existir. Logo:
 - o novo container sobe, bate no `SCHEMA BOOT REFUSED — exit 94`, e morre.
 
 **Coolify post-deployment** roda DEPOIS do rollout (tarde demais — o novo
-container já tentou boot). A solução é o entrypoint auto-migrate documentado em
-§7.2: ele roda **da nova imagem**, com as migrations novas, ANTES do app
-iniciar.
+container já tentou boot e saiu 94).
 
-### 7.4 Duas formas de ligar o gate, e o que cada uma custa
+A solução é o entrypoint auto-migrate de §7.2: ele roda **da nova imagem**, com
+as migrations novas, ANTES do app iniciar.
 
-| | (A) campo de comando pré-deploy | (B) encadeado no comando de start |
-|---|---|---|
-| Como fica | o painel roda o gate; se sair != 0, não faz o rollout | `npm run release:migrate && exec node dist/index.js` |
-| Quem faz o exit code valer | o painel | o `&&` do shell |
-| Roda quantas vezes | uma por deploy | uma por container que sobe (o lock global de `src/migrations/lock.ts` serializa) |
-| Falha aparece como | deploy abortado, versão anterior intacta | container em crash-loop |
-| **Verificado aqui?** | **NÃO** — depende do painel | **SIM** — `tests/integration/release-migrate-gate.spec.ts` roda o encadeamento num shell e prova que o consumidor não executa |
-
-Prefira **(A)** se a sua instância tem o campo: um deploy abortado deixa a
-versão anterior de pé, um crash-loop não. Use **(B)** como rede de segurança —
-ela é a única das duas cuja semântica não depende de nenhuma promessa de
-painel, e é a que está exercitada em teste.
-
-Com **(B)**, o comando de start de cada aplicação passa a ser:
-
-```bash
-# aplicação `app` — precisa de um SHELL, porque quem faz o `&&` valer é ele
-sh -c 'npm run release:migrate && exec node dist/index.js'
-```
-
-`node dist/index.js` é o `CMD` do `Dockerfile`; o `ENTRYPOINT` é
-`/sbin/tini --`, então o `sh` acima entra como argumento do tini e continua
-sendo PID 1 quem repassa sinais. Se o painel já monta um `sh -c` em volta do
-que você digita, digite só o miolo — dois `sh -c` aninhados funcionam, mas a
-mensagem de erro fica pior.
-
-O `admin-ui` **não pode** rodar este comando, e a razão é da imagem, não de
-preferência: `src/admin-ui/Dockerfile` produz o `standalone` do Next.js — o
-estágio de runtime copia `.next/standalone` e `.next/static` e mais nada.
-Não há `scripts/`, não há `migrations/`, não há o `package.json` da raiz (logo
-não existe o script `release:migrate`) e não há `tsx`. Colar o comando no
-editor da Aplicação 2 falha com "missing script", não com um erro de
-migration.
-
-O gate mora na Aplicação 1 (`app`), e só nela — o que também evita dois
-migradores disputando o lock global. O `admin-ui` depende de o gate do `app`
-ter passado, e essa dependência **não existe como aresta** fora do Compose:
-é ordem de deploy. Deploy do `app` primeiro.
-
-**Na topologia adotada (§7.5) o gate não mora na Aplicação 1: ele é um recurso
-próprio, o terceiro.** Tudo desta subseção continua descrevendo o caminho de
-duas aplicações — leia-a se a sua instância não tiver o recurso separado, ou
-como a rede de segurança de §7.5 quando o painel herdar variáveis de projeto.
-
-### 7.3 O que este gate NÃO recupera do Compose
+### 7.4 O que este gate NÃO recupera do Compose
 
 Dito por inteiro, porque a diferença importa num incidente:
 
@@ -663,11 +662,9 @@ Dito por inteiro, porque a diferença importa num incidente:
   aresta;
 - **o container ainda POSSUI os segredos.** No Compose, o migrator não recebe
   `.env.app` — ele não pode vazar o que nunca teve. Aqui, o processo do
-  migrator não os recebe, mas o container em volta dele sim. É um raio de
-  explosão menor, não o mesmo raio de explosão. **Esta é exatamente a lacuna
-  que o recurso separado de §7.5 fecha**, e é por isso que ele é a topologia
-  adotada: com editor de variáveis próprio, o container também nunca tem o que
-  não usa;
+  migrator não os recebe (filtragem em `src/migrations/release-gate.ts`), mas o
+  container em volta dele sim. É um raio de explosão menor, não o mesmo raio de
+  explosão. **O recurso separado de §7.5 fecha essa lacuna.**
 - **nada aqui verifica configuração de `app`/`admin-ui`.** O migrator satisfaz
   o contrato dele e sai 0; `app`/`admin-ui` ainda podem reprovar no boot pelas
   chaves listadas em §1. O gate é sobre schema, não sobre bring-up.
@@ -685,42 +682,31 @@ E o que **não** foi reusado, com o motivo — porque a pergunta é razoável:
   "está de pé?". O gate roda ANTES de existir instância para perguntar. São
   passos diferentes do mesmo deploy, não um substituto do outro.
 
-### 7.4 Perguntas que só uma instância real responde
+### 7.5 Alternativa: recurso de migration SEPARADO (não existe hoje no Coolify)
 
-Registradas aqui em vez de respondidas, porque respondê-las de cabeça é
-exatamente o que esta seção não faz:
+**Esta topologia NÃO existe hoje na instância Coolify de produção**, que só tem
+os recursos `app` e `admin-ui` (conforme `docs/admin-ui-deploy.md`). É
+documentada aqui como ALTERNATIVA caso seja criada no futuro.
 
-1. Se o seu Coolify deploya por **arquivo de Compose** (e não por Dockerfile),
-   o gate da #516 pode valer como está — mas só se a versão de Compose usada
-   honrar `service_completed_successfully`, que é `depends_on` de forma longa
-   e é **ignorada em silêncio** por versões antigas. Confirme antes de assumir
-   que esta seção inteira é desnecessária.
-2. Como `${MAIA_ENV:?…}` se comporta na interpolação do painel. A variável é
-   obrigatória de propósito (§1); um orquestrador que injete env por outro
-   caminho pode reintroduzir o default silencioso que ela eliminou.
-3. Se um redeploy re-executa o gate e o que o painel faz com a saída
-   `up_to_date` (que é 0, e é o caso normal de todo deploy sem migration
-   nova).
+Se um operador criar um **terceiro recurso** no Coolify apontando para o mesmo
+repositório, só para migrations (com seu próprio editor de variáveis), ele
+compra a garantia (2) da #516 de volta: **o container de migration não recebe
+os segredos da aplicação**. Não "recebe e o gate filtra" — não recebe.
 
-### 7.5 O recurso de migration SEPARADO — a topologia adotada
-
-Decisão do dono, já tomada: a infraestrutura real tem **uma aplicação/job de
-migration própria**, além das duas de `docs/admin-ui-deploy.md`. São três
-recursos apontando para o mesmo repositório:
+Topologia com três recursos:
 
 | Recurso | Comando | Editor de variáveis |
 |---|---|---|
-| 1. `app` | `node dist/index.js` | `.env.app.prod.example` |
+| 1. `app` | (usa entrypoint da imagem) | `.env.app.prod.example` |
 | 2. `admin-ui` | `server.js` do standalone | `.env.admin.prod.example` |
-| 3. **`migrate`** | `npm run db:migrate` | **`.env.migrator.prod.example`** |
+| 3. **`migrate`** (NOVO) | `npm run db:migrate` | **`.env.migrator.prod.example`** |
 
-O que isso compra, e é o motivo inteiro de existir: **o container de migration
-não recebe os segredos da aplicação**. Não "recebe e o gate filtra" — não
-recebe. Um job que só aplica DDL não tem motivo para carregar a chave que fala
-com o cliente, e o que ele nunca teve ele não pode vazar. É a garantia (2) da
-#516, que §7.3 listava como perdida fora do Compose, de volta inteira.
+**OBRIGATÓRIO se criar o recurso 3:** setar `AUTO_MIGRATE_ON_BOOT=false` no
+editor de variáveis do recurso 1 (`app`), senão ambos migram (race no advisory
+lock). O compose multi-serviço já faz isso (ver `compose.prod.yml`, serviço
+`app`).
 
-#### O conjunto de variáveis
+#### O conjunto de variáveis do recurso 3 (se criado)
 
 ```bash
 cp .env.migrator.prod.example .env.migrator && chmod 600 .env.migrator
@@ -728,37 +714,34 @@ cp .env.migrator.prod.example .env.migrator && chmod 600 .env.migrator
 
 Cole o conteúdo no editor de variáveis do recurso 3 e preencha os
 `__SET_ME__`. São 15 chaves — o subset `migrator` do contrato
-(`src/config/contract.ts`, #515) inteiro, das quais 5 o operador preenche:
+(`src/config/contract.ts`, #515) inteiro:
 
 | Chave | Por quê |
 |---|---|
 | `MAIA_ENV` | o profile. Obrigatória em staging/production; sem ela o boot reprova |
-| `NODE_ENV` | otimizações da plataforma Node. `production` com `MAIA_ENV=production` — a combinação contrária é recusada |
-| `DATABASE_URL` | o destino do DDL. **As mesmas credenciais do `app`**: um migrator que aponta para outro banco não gateia nada |
+| `NODE_ENV` | otimizações da plataforma Node. `production` com `MAIA_ENV=production` |
+| `DATABASE_URL` | o destino do DDL. **As mesmas credenciais do `app`** |
 | `POSTGRES_USER` · `POSTGRES_PASSWORD` · `POSTGRES_DB` | o mesmo banco, pelas partes |
 | `TZ` · `LOG_LEVEL` | knobs de processo |
 | `MAIA_BUILD_COMMIT` · `MAIA_CONFIG_STRICT_BOOT` | opcionais, comentadas no exemplo |
 | as quatro `MIGRATION_*_MS` | os tetos de lock/statement da #516, com default do contrato |
 
-E o que ele **não** recebe, que é a metade que importa: nenhuma `WHATSAPP_*`
-ou `BAILEYS_*`, nenhuma `OWNER_*`, nenhuma chave de LLM
-(`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`), nenhuma
-`VOYAGE_API_KEY`/`COHERE_API_KEY`, nenhuma `BACKUP_S3_*` ou
-`BACKUP_ENCRYPTION_*`, nenhum `NEXTAUTH_SECRET`, nenhuma `OIDC_*`, nenhuma
-`REDIS_URL`, nenhum transporte de alerta.
+E o que ele **não** recebe: nenhuma `WHATSAPP_*`, `BAILEYS_*`, `OWNER_*`, chave
+de LLM (`ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY`),
+`VOYAGE_API_KEY`, `COHERE_API_KEY`, `BACKUP_S3_*`, `BACKUP_ENCRYPTION_*`,
+`NEXTAUTH_SECRET`, `OIDC_*`, `REDIS_URL`, nenhum transporte de alerta.
 
 Essa lista **não é uma lista para manter à mão** — uma allowlist copiada
 envelhece em silêncio, e a `WHATSAPP_*` criada na semana que vem passaria por
 ela. A invariante é travada pela ORIGEM da chave em
-[`src/config/migrator-subset.ts`](../../src/config/migrator-subset.ts): grupo
-do contrato (só `core` e `database`), namespace (só `MAIA_` entre os da Maia)
-e segredo-só-de-banco. Um domínio novo em `GROUP_ORDER`, ou um prefixo novo em
-`MAIA_KEY_PREFIXES`, nasce proibido para o migrator sem ninguém editar nada.
-`loadMigrationConfig()` chama esse guard no boot: um contrato que dê ao
-migrator uma chave de aplicação vira um migrator que **recusa rodar**,
-nomeando a variável e a regra, com exit 2.
+`src/config/migrator-subset.ts`: grupo do contrato (só `core` e `database`),
+namespace (só `MAIA_` entre os da Maia) e segredo-só-de-banco. Um domínio novo
+em `GROUP_ORDER`, ou um prefixo novo em `MAIA_KEY_PREFIXES`, nasce proibido
+para o migrator sem ninguém editar nada. `loadMigrationConfig()` chama esse
+guard no boot: um contrato que dê ao migrator uma chave de aplicação vira um
+migrator que **recusa rodar**, nomeando a variável e a regra, com exit 2.
 
-#### Ordem do deploy, que continua sendo disciplina e não aresta
+#### Ordem do deploy com recurso 3
 
 ```
 recurso 3 (migrate) → sai 0 → recurso 1 (app) → recurso 2 (admin-ui)
@@ -780,25 +763,12 @@ falha, blocker (dirty, checksum mismatch, missing_file) ou lock indisponível.
 
 Alguns painéis têm variáveis de PROJETO, herdadas por todos os recursos. Nesse
 caso o recurso 3 recebe o ambiente completo mesmo tendo editor próprio, e a
-separação some. A rede de segurança é o gate de §7.1:
-
-```bash
-npm run release:migrate     # em vez de `npm run db:migrate`
-```
-
-Ele filtra o ambiente para este mesmo subset antes de chamar o migrator, e
-**nomeia** (nunca por valor) o que reteve na linha
+separação some. A rede de segurança é o gate `npm run release:migrate` (em vez
+de `npm run db:migrate`): ele filtra o ambiente para o subset `migrator` antes
+de chamar o migrator, e **nomeia** (nunca por valor) o que reteve na linha
 `release_gate.env_scrubbed`. `withheld_contract` não vazio nesse recurso é o
 sinal de que a herança está acontecendo — o raio de explosão volta a ser o do
 container, não o do processo.
-
-#### O que continua NÃO verificável daqui
-
-- se o painel realmente desiste do rollout quando o recurso 3 sai != 0 (§7.0);
-- se `${MAIA_ENV:?…}` sobrevive à interpolação do painel — no recurso 3 a
-  variável é declarada literalmente (`MAIA_ENV=production`), sem interpolação,
-  justamente para não depender disso;
-- o que o painel faz com um redeploy que sai `up_to_date` (§7.4).
 
 ### 7.6 Kubernetes
 
