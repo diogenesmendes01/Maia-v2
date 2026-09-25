@@ -46,6 +46,9 @@ vi.hoisted(() => {
   for (const [k, v] of Object.entries({
     FEATURE_TURN_STATE_MACHINE: 'true',
     FEATURE_TURN_CLAIM: 'true',
+    // O gate de pendência é um dos gates NOMEADOS do AC02: sem ele ligado o
+    // bloco do caminho de produção não exercita a fronteira.
+    FEATURE_PENDING_GATE: 'true',
     // A entrega inline é o caminho que o coordenador reusa (§5.9.2.3); a
     // deduplicação durável e a voz têm suites próprias e desviariam o foco.
     FEATURE_OUTBOUND_DEDUP: 'false',
@@ -123,6 +126,14 @@ const llm = vi.hoisted(() => ({
   workloads: [] as string[],
   /** `texto` → resposta final do reasoner; `falha` → o provedor falha. */
   roteiro: { texto: 'ok', modo: 'texto' as 'texto' | 'falha' | 'tool_loop' },
+  /**
+   * Roteiro POR `workload` (bloco do caminho de produção). Quando há uma
+   * entrada para o workload da chamada, ELA vence o `roteiro` acima — é assim
+   * que o pending-gate (que classifica via `callLLM`), o classificador de
+   * intenção e o reasoner recebem respostas DIFERENTES no mesmo turno sem que
+   * nenhum deles seja substituído.
+   */
+  porWorkload: {} as Record<string, { content: string | null }>,
 }));
 
 vi.mock('@/lib/claude.js', async (importOriginal) => {
@@ -133,6 +144,16 @@ vi.mock('@/lib/claude.js', async (importOriginal) => {
       const workload = params.workload ?? 'sem_workload';
       llm.workloads.push(workload);
       if (llm.roteiro.modo === 'falha') throw new Error('provider indisponível (dublê)');
+      const roteirizado = llm.porWorkload[workload];
+      if (roteirizado) {
+        return {
+          content: roteirizado.content,
+          tool_uses: [],
+          stop_reason: 'end_turn',
+          usage: { input_tokens: 10, output_tokens: 5 },
+          model: 'dublê',
+        } satisfies LLMResponse;
+      }
       if (llm.roteiro.modo === 'tool_loop') {
         return {
           content: null,
@@ -553,4 +574,446 @@ describe('SC01-AC03/AC08 — matriz de desfechos', () => {
   it('o objeto base do harness é o caso trivial documentado', () => {
     expect(decideTurnAction(base)).toEqual({ kind: 'complete', outcome: 'no_reply_produced' });
   });
+});
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SC01 — O ENTRY POINT DE PRODUÇÃO (`runAgentForMensagem`) E A FRONTEIRA
+// ═════════════════════════════════════════════════════════════════════════════
+/**
+ * ─── Por que este bloco existe, separado do de cima ─────────────────────────
+ *
+ * O bloco anterior mede o SEAM pela máscara (`runReActLoop`) e prova o NEGATIVO
+ * do T02 (turno barrado antes do seam ⇒ `engine.start=0`). Faltava o POSITIVO
+ * pelo caminho que o worker da BullMQ usa de verdade: `runAgentForMensagem` →
+ * pipeline inteiro (canal, identidade, audiência, grafo pré-turno, Decision
+ * Engine always-on, gates determinísticos) → seam → coordenador → outbound.
+ *
+ * E faltavam os gates NOMEADOS do AC02 — pendência, aprovação, bloqueio,
+ * escalação e skill — terminando cada um com o contador do motor em ZERO. O
+ * que o bloco anterior provava era "algum gate do topo barra o turno"; aqui
+ * cada gate tem o SEU fixture e a SUA testemunha.
+ *
+ * ─── Dublês: os dois que a spec permite, e só eles ──────────────────────────
+ *
+ *   - `callLLM` — o PROVEDOR (pago, externo). É por ele que o pending-gate
+ *     classifica e por ele que o reasoner responde; o roteiro é por `workload`,
+ *     então cada consumidor recebe a resposta DELE sem que nenhum seja
+ *     substituído.
+ *   - `forCurrentAgentChannel` — o CANAL (WhatsApp não existe no sandbox).
+ *
+ * REAL: resolver de canal, identidade, audiência, `agent_audience_profiles`,
+ * `channel_policies`, role-selector, grafo pré-turno, Decision Engine (com os
+ * PEPs lendo `policy_rules` de verdade), `pending-gate`, aprovação
+ * (`approval_requests`), engine local (`createMaiaEngine` + `runReasoning`),
+ * gateway de ferramentas, assembler, `MaiaOutputCoordinator`, máquina de
+ * estados do turno e `decideTurnAction`.
+ *
+ * ─── Sobre o `digest` do pedido ─────────────────────────────────────────────
+ *
+ * `MaiaEngine.start` chama `canonicalDigest(request)` FORA do `try` que
+ * classifica falha do raciocínio (`maia-engine.ts:160`): um pedido que o
+ * digest não aceite não vira `reasoner_failed` — a chamada estoura e o turno
+ * não entrega. Logo o positivo abaixo, que atravessa `buildPrompt` e entrega
+ * um reply, é evidência de que o digest aceitou o pedido REAL (system prompt +
+ * histórico + tools do turno), e não o `messages:[{role,content}]`/`tools:[]`
+ * sintético do bloco de caracterização. Instrumentar `canonicalDigest` com
+ * `vi.spyOn` foi deliberadamente evitado: um spy que não consiga redefinir a
+ * export ESM reprova o arquivo por um motivo que não é o comportamento sob
+ * prova.
+ */
+d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates', () => {
+  let pool2: pg.Pool;
+  let pessoa2: Pessoa;
+  let conversa2: Conversa;
+  /** O texto que o PEP de bloqueio/escalação devolve ao usuário (`core.ts`). */
+  const TEXTO_DE_GATE = 'Esta ação requer aprovação adicional antes de prosseguir.';
+
+  async function mkInbound2(conteudo: string): Promise<Mensagem> {
+    const r = await pool2.query(
+      `INSERT INTO mensagens (tenant_id, agent_id, conversa_id, direcao, tipo, conteudo, metadata)
+       VALUES ($1,$2,$3,'in','texto',$4,'{}'::jsonb) RETURNING *`,
+      [T, A, conversa2.id, conteudo],
+    );
+    return r.rows[0] as Mensagem;
+  }
+
+  /** Roda o turno pelo ENTRY POINT e mede a fronteira do motor. */
+  async function rodarPeloCore(conteudo: string): Promise<{
+    inbound: Mensagem;
+    starts: number;
+    reasoners: number;
+    enviados: string[];
+    turno: { status: string; outcome: string | null } | undefined;
+  }> {
+    const { runAgentForMensagem } = await import('@/agent/core.js');
+    const inbound = await mkInbound2(conteudo);
+    llm.workloads.length = 0;
+    const antesStarts = await engineStarts();
+    const antesEnviados = canal.enviados.length;
+
+    await inT(() => runAgentForMensagem(inbound.id));
+
+    const turno = await pool2.query<{ status: string; outcome: string | null }>(
+      `SELECT status, outcome FROM agent_turns WHERE representative_message_id = $1`,
+      [inbound.id],
+    );
+    return {
+      inbound,
+      starts: (await engineStarts()) - antesStarts,
+      reasoners: llm.workloads.filter((w) => w === 'reasoner').length,
+      enviados: canal.enviados.slice(antesEnviados),
+      turno: turno.rows[0],
+    };
+  }
+
+  async function auditDaMensagem(mensagem_id: string): Promise<Array<Record<string, unknown>>> {
+    const r = await pool2.query<{ acao: string; metadata: Record<string, unknown> }>(
+      `SELECT acao, metadata FROM audit_logs WHERE mensagem_id = $1 ORDER BY created_at`,
+      [mensagem_id],
+    );
+    return r.rows;
+  }
+
+  /**
+   * Insere uma `policy_rules` ATIVA que só casa com UMA pessoa (o predicado é
+   * `actor.pessoa_id`, um dos campos que o Mid PEP expõe no fato DSL —
+   * `src/runtime/decision/mid-pep.ts`). Escopar por pessoa é o que torna o
+   * fixture invisível para as outras suítes que dividem este banco: nenhuma
+   * delas usa a pessoa desta fixture.
+   *
+   * O descriptor tem de ser um dos que o resolvedor de produção expande a
+   * partir de `'*'` (`RUNTIME_ENFORCED_WRITE_RISK_DESCRIPTORS`): um descriptor
+   * inventado nunca chegaria ao PEP e o caso passaria por NÃO ter rodado nada.
+   */
+  async function inserirPolicy(args: {
+    descriptor: string;
+    action: 'block' | 'require_dual_approval';
+    regra: string;
+    pessoa_id: string;
+  }): Promise<string> {
+    const body = {
+      rule_id: args.regra,
+      predicate: {
+        kind: 'leaf',
+        field: 'actor.pessoa_id',
+        op: 'eq',
+        value: args.pessoa_id,
+      },
+      effect: {
+        action: args.action,
+        metadata: { severity: 'high', applies_to_peps: ['mid', 'late'] },
+      },
+    };
+    const r = await pool2.query<{ id: string }>(
+      `INSERT INTO policy_rules
+         (tenant_id, agent_id, rule_kind, rule_descriptor, rule_body, scope, source_of_truth,
+          status, version, proposed_by, proposed_reason, approved_by, approved_at, activated_at)
+       VALUES ($1,$2,'dual_approval',$3,$4::jsonb,'{}'::jsonb,'founder_explicit','active',1,
+               'sc01_fixture','fixture do aceite SC01-AC02','sc01_fixture',now(),now())
+       RETURNING id`,
+      [T, A, args.descriptor, JSON.stringify(body)],
+    );
+    return r.rows[0]!.id;
+  }
+
+  beforeAll(async () => {
+    pool2 = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 2 });
+    // `tenants`/`agents`/`roles`: o turno só chega ao seam com papel default
+    // ativo na política de canal (o role-selector falha fechado). Idempotente —
+    // se o banco do CI já os semeia, isto é um no-op.
+    await pool2.query(`INSERT INTO tenants(id, nome) VALUES($1,$1) ON CONFLICT DO NOTHING`, [T]);
+    await pool2.query(
+      `INSERT INTO agents(id, tenant_id, nome) VALUES($1,$2,$1) ON CONFLICT DO NOTHING`,
+      [A, T],
+    );
+    await pool2.query(
+      `INSERT INTO roles(tenant_id, agent_id, role_key, display_name, description, is_default, active)
+       VALUES ($1,$2,'default','Default SC01','papel default do fixture SC01',true,true)
+       ON CONFLICT (tenant_id, agent_id, role_key) DO NOTHING`,
+      [T, A],
+    );
+
+    const telefone = `+55119${Date.now().toString().slice(-8)}`;
+    const p = await pool2.query(
+      `INSERT INTO pessoas(tenant_id, agent_id, nome, telefone_whatsapp, tipo, status)
+       VALUES ($1,$2,'SC01 Gate',$3,'dono','ativa') RETURNING *`,
+      [T, A, telefone],
+    );
+    pessoa2 = p.rows[0] as Pessoa;
+    // `resolveAudience` é fail-closed: a pessoa existir não basta.
+    await pool2.query(
+      `INSERT INTO agent_audience_profiles(tenant_id, agent_id, pessoa_id, audience_type, trust_level, status)
+       VALUES ($1,$2,$3,'owner','trusted_internal','active') ON CONFLICT DO NOTHING`,
+      [T, A, pessoa2.id],
+    );
+
+    const conv = await pool2.query(
+      `INSERT INTO conversas(tenant_id, agent_id, pessoa_id, status) VALUES ($1,$2,$3,'ativa') RETURNING *`,
+      [T, A, pessoa2.id],
+    );
+    conversa2 = conv.rows[0] as Conversa;
+
+    const ch = await pool2.query<{ id: string }>(
+      `INSERT INTO channels(tenant_id, agent_id, channel_type, external_id, display_name, active, is_synthetic)
+       VALUES ($1,$2,'whatsapp',$3,'Linha SC01',false,false) RETURNING id`,
+      [T, A, telefone],
+    );
+    await pool2.query(`UPDATE conversas SET channel_id = $2 WHERE id = $1`, [
+      conversa2.id,
+      ch.rows[0]!.id,
+    ]);
+
+    const role = await pool2.query<{ id: string }>(
+      `SELECT id FROM roles WHERE tenant_id=$1 AND agent_id=$2 AND active LIMIT 1`,
+      [T, A],
+    );
+    if (role.rows.length === 0) throw new Error('nenhum role ativo em primary/primary — seed mudou');
+    await pool2.query(
+      `INSERT INTO channel_policies(tenant_id, agent_id, channel_id, default_role_id, switch_behavior)
+       VALUES ($1,$2,$3,$4,'free_with_trigger')`,
+      [T, A, ch.rows[0]!.id, role.rows[0]!.id],
+    );
+  }, 60_000);
+
+  afterAll(async () => {
+    await pool2?.end().catch(() => {});
+  });
+
+  /**
+   * T01 · SC01-AC01 · SC01-AC04 — o POSITIVO pelo caminho de produção.
+   *
+   * O que este caso fecha, e que nenhum outro fechava: o turno NÃO é invocado
+   * por dentro (a máscara/`runReActLoop`), e sim pelo ponto de entrada que o
+   * worker usa. As três testemunhas são independentes:
+   *   1. `engine.start` +1 — o core pós-gates ACIONOU a porta do motor;
+   *   2. o reasoner do motor rodou UMA vez (workload `reasoner`);
+   *   3. exatamente UM outbound saiu, e o turno fechou TERMINAL com
+   *      `reply_delivered` — o caminho inteiro, do gate ao canal.
+   */
+  it('AC01/T01/AC04 — o entry point de produção atravessa o seam: 1 reply, 1 outbound, motor acionado', async () => {
+    llm.roteiro = { texto: 'ok', modo: 'texto' };
+    llm.porWorkload = { reasoner: { content: 'resposta do caminho de produção' } };
+    try {
+      const r = await rodarPeloCore('oi');
+
+      expect(r.starts, 'o core pós-gates tem de ACIONAR a porta do motor').toBe(1);
+      expect(r.reasoners, 'o raciocínio real do motor tem de rodar uma vez').toBe(1);
+      expect(r.enviados).toEqual(['resposta do caminho de produção']);
+      expect(r.turno?.status, 'o turno tem de existir e ter desfecho').toBeDefined();
+      expect(r.turno?.outcome).toBe('reply_delivered');
+      const { isTerminalTurnStatus } = await import('@/runtime/turns/index.js');
+      expect(isTerminalTurnStatus(r.turno!.status as never)).toBe(true);
+      expect(await outboundsTexto(conversa2.id)).toBe(1);
+    } finally {
+      llm.porWorkload = {};
+    }
+  });
+
+  /**
+   * SC01-AC02 (pendência) — o gate determinístico resolve a pendência e o
+   * turno PARA ali: `engine.start=0`, nenhum workload `reasoner`, nenhum envio
+   * inventado. A classificação é REAL (o gate chama o provedor com o workload
+   * `pending_gate`; a resposta é do dublê do provedor, que é o dublê permitido)
+   * e a resolução é real: a linha da pendência vira `respondida`.
+   *
+   * `acao_proposta` SEM `tool` é deliberado: `pending-resolver.ts` resolve sem
+   * despachar efeito nenhum, então o caso mede a FRONTEIRA do gate, não uma
+   * ferramenta.
+   */
+  it('AC02 — pendência: o gate resolve e o motor fica em start=0', async () => {
+    llm.porWorkload = {
+      pending_gate: {
+        content: JSON.stringify({
+          resolves_pending: true,
+          option_chosen: 'sim',
+          confidence: 0.95,
+          is_topic_change: false,
+          is_cancellation: false,
+        }),
+      },
+    };
+    try {
+      const pq = await pool2.query<{ id: string }>(
+        `INSERT INTO pending_questions(tenant_id, agent_id, conversa_id, pessoa_id, tipo, pergunta,
+                                       opcoes_validas, acao_proposta, expira_em, status, metadata)
+         VALUES ($1,$2,$3,$4,'gate','Confirma?',$5::jsonb,'{}'::jsonb,
+                 now() + interval '10 min','aberta','{}'::jsonb) RETURNING id`,
+        [
+          T,
+          A,
+          conversa2.id,
+          pessoa2.id,
+          JSON.stringify([
+            { key: 'sim', label: 'Sim' },
+            { key: 'nao', label: 'Não' },
+          ]),
+        ],
+      );
+
+      const r = await rodarPeloCore('sim');
+
+      expect(r.starts, 'um turno resolvido por pendência não aciona o motor').toBe(0);
+      expect(r.reasoners).toBe(0);
+      expect(r.enviados).toEqual([]);
+      expect(r.turno?.outcome).toBe('pending_action_resolved');
+
+      const st = await pool2.query<{ status: string }>(
+        `SELECT status FROM pending_questions WHERE id = $1`,
+        [pq.rows[0]!.id],
+      );
+      expect(st.rows[0]?.status).toBe('respondida');
+    } finally {
+      llm.porWorkload = {};
+    }
+  });
+
+  /**
+   * SC01-AC02 (aprovação) — uma resposta de aprovação (`aprova AP-<8 hex>`)
+   * é governança DETERMINÍSTICA: `parseApprovalReply` casa antes do LLM, a
+   * decisão vai ao store de `approval_requests` e o turno encerra. Nada de
+   * motor: `engine.start=0`, nenhum envio pelo coordenador (a resposta desta
+   * ramificação sai direto pelo `sendOutbound` do core).
+   */
+  it('AC02 — aprovação ("aprova AP-…"): decisão determinística, motor em start=0', async () => {
+    const prefixo = 'ab12cd34';
+    await pool2.query(
+      `INSERT INTO approval_requests
+         (id, tenant_id, agent_id, requester_pessoa_id, conversa_id, request_id, tool, operation_type,
+          intent_payload, intent_hash, approval_class, required_approvals, fingerprint, expires_at, status)
+       VALUES ($1::uuid,$2,$3,$4,$5,$6,'boleto_cancel','write','{}'::jsonb,'sc01-hash',
+               'single_confirmation',1,$7, now() + interval '10 min','pending')`,
+      [
+        `${prefixo}-0000-4000-8000-000000000000`,
+        T,
+        A,
+        pessoa2.id,
+        conversa2.id,
+        prefixo,
+        `sc01-fingerprint-${randomUUID()}`,
+      ],
+    );
+
+    const r = await rodarPeloCore(`aprova AP-${prefixo}`);
+
+    expect(r.starts, 'resposta de aprovação não aciona o motor').toBe(0);
+    expect(r.reasoners).toBe(0);
+    expect(r.turno?.outcome).toBe('pending_action_resolved');
+    expect(r.enviados, 'a decisão é respondida ao humano, uma vez').toHaveLength(1);
+  });
+
+  /**
+   * SC01-AC02 (bloqueio) — um PEP REAL (Mid) bloqueia o turno lendo
+   * `policy_rules`. O turno termina ANTES da linha do seam: `start=0`, nenhum
+   * reasoner, e o usuário recebe o texto fixo do ramo `block` do core (o texto
+   * da política NUNCA é exposto). A trilha é própria e verificável:
+   * `decision_engine_policy_refused` com `metadata.decision='block'`.
+   */
+  it('AC02 — bloqueio por política: motor em start=0 e auditoria do ramo block', async () => {
+    const policy_id = await inserirPolicy({
+      descriptor: 'confirm_before_write_policy',
+      action: 'block',
+      regra: 'sc01_block_fixture',
+      pessoa_id: pessoa2.id,
+    });
+    try {
+      const r = await rodarPeloCore('preciso de ajuda com um boleto');
+
+      expect(r.starts, 'turno bloqueado antes do seam não aciona o motor').toBe(0);
+      expect(r.reasoners).toBe(0);
+      expect(r.enviados).toEqual([TEXTO_DE_GATE]);
+      expect(
+        ['fallback_delivered', 'no_reply_produced', 'reply_delivered'],
+        `desfecho terminal esperado, veio ${String(r.turno?.outcome)}`,
+      ).toContain(r.turno?.outcome);
+
+      const audit = await auditDaMensagem(r.inbound.id);
+      const recusa = audit.find((a) => a['acao'] === 'decision_engine_policy_refused');
+      expect(recusa, 'o bloqueio tem de deixar rastro de auditoria').toBeDefined();
+      expect((recusa!['metadata'] as Record<string, unknown>)['decision']).toBe('block');
+    } finally {
+      await pool2.query(`DELETE FROM policy_rules WHERE id = $1`, [policy_id]);
+    }
+  });
+
+  /**
+   * SC01-AC02 (escalação) — `require_dual_approval` do Mid PEP vira
+   * `action_mode='escalate'` SEM `block` no pacote, e é o OUTRO ramo do core
+   * (`packet.action_mode === 'escalate'`). Mesma fronteira, trilha distinta:
+   * `metadata.decision='escalate'`.
+   */
+  it('AC02 — escalação por política: motor em start=0 e auditoria do ramo escalate', async () => {
+    const policy_id = await inserirPolicy({
+      descriptor: 'human_confirmation_policy',
+      action: 'require_dual_approval',
+      regra: 'sc01_escalate_fixture',
+      pessoa_id: pessoa2.id,
+    });
+    try {
+      const r = await rodarPeloCore('quero cancelar um boleto agora');
+
+      expect(r.starts, 'turno escalado antes do seam não aciona o motor').toBe(0);
+      expect(r.reasoners).toBe(0);
+      expect(r.enviados).toEqual([TEXTO_DE_GATE]);
+
+      const audit = await auditDaMensagem(r.inbound.id);
+      const recusa = audit.find((a) => a['acao'] === 'decision_engine_policy_refused');
+      expect(recusa).toBeDefined();
+      expect((recusa!['metadata'] as Record<string, unknown>)['decision']).toBe('escalate');
+    } finally {
+      await pool2.query(`DELETE FROM policy_rules WHERE id = $1`, [policy_id]);
+    }
+  });
+
+  /**
+   * SC01-AC02 (execute_skill) — o Decision Engine seleciona uma skill
+   * `prompt_only` e o core a executa (`executeSelectedSkill` → `runSkill` →
+   * entrega), SEM passar pelo motor: `engine.start=0` e nenhum workload
+   * `reasoner`.
+   *
+   * A seleção é REAL: o intent vem dos heurísticos do classificador
+   * (`^/ajuda|^ajuda$` → `help_request`, sem LLM) e o `skill_descriptor`
+   * `help_request` casa por igualdade exata com ele
+   * (`deriveIntentLabels` + `scoreSkillMatch`).
+   *
+   * NOTA DE EVIDÊNCIA: este é o caso com MENOS validação local desta fatia —
+   * o caminho de `runSkill` depende de `procedure`/`usage_policy` da skill e
+   * foi escrito contra o código, não contra uma execução verde (o sandbox
+   * desta rodada não conseguiu alcançar um Postgres — ver o comentário de
+   * bloqueio do card). Se ele cair para o motor (`starts=1`), o defeito é do
+   * fixture, não do seam.
+   */
+  it('AC02 — execute_skill: a skill executa e o motor fica em start=0', async () => {
+    const skill = await pool2.query<{ id: string }>(
+      `INSERT INTO skills(tenant_id, agent_id, skill_descriptor, category, execution_mode, goal,
+                          when_to_use, procedure, input_schema, output_schema, usage_policy,
+                          status, version, proposed_by, approved_by, approved_at, activated_at,
+                          applicable_to_role)
+       VALUES ($1,$2,'help_request','compose','prompt_only','responder um pedido de ajuda',
+               'Quando o usuário pede ajuda pelo WhatsApp.',
+               $3::jsonb,'{}'::jsonb,'{}'::jsonb,$4::jsonb,
+               'active',1,'sc01_fixture','sc01_fixture',now(),now(),'{}')
+       RETURNING id`,
+      [
+        T,
+        A,
+        JSON.stringify({ system_prompt: 'Você é a Maia. Responda o pedido de ajuda.' }),
+        JSON.stringify({
+          allowed_audiences: ['owner'],
+          allowed_trust_levels: ['trusted_internal'],
+          allowed_channels: ['whatsapp'],
+          max_risk_level: 'high',
+        }),
+      ],
+    );
+    llm.roteiro = { texto: 'ok', modo: 'texto' };
+    try {
+      const r = await rodarPeloCore('ajuda');
+
+      expect(r.starts, 'uma skill terminal não pode acionar o motor').toBe(0);
+      expect(r.reasoners, 'nenhuma deliberação do motor nesta ramificação').toBe(0);
+      expect(r.enviados, 'a skill entrega a própria resposta').toHaveLength(1);
+    } finally {
+      await pool2.query(`DELETE FROM skills WHERE id = $1`, [skill.rows[0]!.id]);
+    }
+  }, 60_000);
 });
