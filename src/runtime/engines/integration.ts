@@ -134,32 +134,35 @@ export function _resetTurnEnginePorts(): void {
  * pin da instância, e para responder a um pin `maia_react` (ou para RECUSAR um
  * pin local com revisão divergente) ele precisa da instância local.
  *
- * Ela nunca é EXECUTADA neste build. O laço da casa ainda não passa pela porta
- * — a extração de `runReActLoop` para `RunReasoningV1` é fatia própria, e o
- * cabeçalho de `maia-engine.ts` a nomeia como tal —, então o `core.ts` continua
- * chamando o laço direto e a decisão `local` devolve ANTES de qualquer `start`.
+ * O `runReasoning` dela é o RACIOCÍNIO DE PRODUÇÃO (`@/runtime/engines/
+ * maia-reasoning.js`) — o mesmo que o stage usa no caminho quente. Até o SC01
+ * este ponto devolvia um placeholder `protocol_error` ("este build não sabe
+ * executar isto"); agora ele sabe, e um placeholder que declara ignorância
+ * enquanto o laço real roda noutro lugar seria uma mentira barata de manter
+ * (§5.2 — o adapter local mantém `runCognitiveModule` e gateway LLM).
  *
- * O `runReasoning` devolve `protocol_error` em vez de lançar por dois motivos:
- * o contrato da porta diz que `start` não lança (fora de perda de posse), e um
- * `throw` aqui seria capturado pelo próprio `MaiaEngine` e traduzido em
- * `reasoner_failed` — indistinguível de um modelo que falhou. `protocol_error`
- * é o código que significa "este build não sabe executar isto", que é o fato.
+ * Ela ainda não é EXECUTADA por este módulo: quem executa é o seam
+ * (`runReasonerStage`), com a instância dele por turno — o motor local não tem
+ * run durável, ninguém o observa depois do processo (§5.3.1). O que esta
+ * instância serve aqui é o casamento de PIN.
  */
 let portaLocal: AgentEnginePortV1 | null = null;
 
 function motorLocal(): AgentEnginePortV1 {
   portaLocal ??= createMaiaEngine({
-    runReasoning: async () => ({
-      stop: { kind: 'failed', code: 'protocol_error' },
-      iterations: 0,
-      observed_tool_call_ids: [],
-      usage: {
-        input_tokens: null,
-        output_tokens: null,
-        cost_microusd: null,
-        source: 'unavailable',
-      },
-    }),
+    /**
+     * Import TARDIO, e não por preguiça.
+     *
+     * `maia-reasoning` arrasta `@/cognition/runner.js` → `@/db/repositories.js`
+     * → `@/db/client.js`, que constrói o `pg.Pool` no import. Estático aqui,
+     * esse grafo entraria no import de TODO caller deste módulo — inclusive
+     * `tests/unit/turn-engine-integration.spec.ts`, que prova a DECISÃO de
+     * motor sem banco nenhum e passaria a exigir um `DATABASE_URL` só para
+     * importar. O que este módulo resolve na hora é o PIN; o raciocínio pode
+     * chegar quando for chamado.
+     */
+    runReasoning: (request, io) =>
+      import('./maia-reasoning.js').then((m) => m.runReasoning(request, io)),
   });
   return portaLocal;
 }

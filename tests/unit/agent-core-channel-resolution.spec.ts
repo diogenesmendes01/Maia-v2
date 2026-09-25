@@ -30,7 +30,7 @@ const {
   findOwnerByIdCrossTenantMock,
   runWithTenantContextMock,
   buildPromptMock,
-  runReActLoopMock,
+  runReasonerStageMock,
   probeQueryMock,
   loadConversationMock,
 } = vi.hoisted(() => {
@@ -52,7 +52,7 @@ const {
   const findOwnerByIdCrossTenantMock = vi.fn();
   const runWithTenantContextMock = vi.fn(async (_ctx: unknown, fn: () => Promise<unknown>) => fn());
   const buildPromptMock = vi.fn();
-  const runReActLoopMock = vi.fn();
+  const runReasonerStageMock = vi.fn();
   // Mock para o `db.select().from().where().limit()` chain — uma .limit() por chamada.
   // O caller faz primeiro o `probeMessageForChannel` (1 chamada), depois o
   // `runAgentForMensagemInner` faz outra (1 chamada). Cada teste configura.
@@ -68,7 +68,7 @@ const {
     findOwnerByIdCrossTenantMock,
     runWithTenantContextMock,
     buildPromptMock,
-    runReActLoopMock,
+    runReasonerStageMock,
     probeQueryMock,
     loadConversationMock,
   };
@@ -129,7 +129,23 @@ vi.mock('@/agent/prompt-builder.js', () => ({
   PROMPT_TOKEN_BUDGET_OUTPUT: 1024,
 }));
 
-vi.mock('@/agent/react-loop.js', () => ({ runReActLoop: runReActLoopMock }));
+/**
+ * SC01 (extração do MaiaEngine) — o dublê é do SEAM, não de `react-loop.js`.
+ *
+ * `runAgentForMensagem` deixou de chamar `runReActLoop`: o bloco pós-gates do
+ * `core.ts` chama `runReasonerStage` direto (§5.2), e `react-loop.ts` passou a
+ * ser uma máscara que delega. Manter o dublê no módulo antigo deixava os casos
+ * negativos verdes por vacuidade e o positivo vermelho com `Number of calls: 0`
+ * — os dois pelo mesmo motivo: ninguém estava dublê-ando o que o core chama.
+ *
+ * A asserção sob teste não mudou: o CANAL RESOLVIDO tem de chegar ao seam
+ * (`conversa.channel_id`). O caso positivo do alvo SC01 prova o fim-a-fim, mas
+ * não substitui esta asserção de plumbing — aqui o core é exercitado de
+ * verdade, com o canal resolvido no pedido.
+ */
+vi.mock('@/runtime/engines/reasoner-stage.js', () => ({
+  runReasonerStage: runReasonerStageMock,
+}));
 
 vi.mock('@/runtime/feature-flags/context-packet-flag.js', () => ({
   isContextPacketV1Enabled: isContextPacketV1EnabledMock,
@@ -452,7 +468,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       system: 'legacy-system',
       messages: [{ role: 'user', content: 'oi' }],
     });
-    runReActLoopMock.mockResolvedValue({
+    runReasonerStageMock.mockResolvedValue({
       totalTokens: 10,
       outboundText: 'resposta',
       toolsCalled: [],
@@ -496,7 +512,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       tenant_id: 'primary',
       agent_id: 'primary',
     });
-    expect(runReActLoopMock).toHaveBeenCalledWith(
+    expect(runReasonerStageMock).toHaveBeenCalledWith(
       expect.objectContaining({
         conversa: expect.objectContaining({ channel_id: 'primary-channel-uuid' }),
       }),
@@ -545,7 +561,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       }),
     );
     expect(buildPromptMock).not.toHaveBeenCalled();
-    expect(runReActLoopMock).not.toHaveBeenCalled();
+    expect(runReasonerStageMock).not.toHaveBeenCalled();
   });
 
   it('bloqueia quando o canal persistido no inbound diverge da conversa resolvida', async () => {
@@ -602,7 +618,7 @@ describe('runAgentForMensagem — channel resolution (#268 fail-loud + #411 catc
       }),
     );
     expect(buildPromptMock).not.toHaveBeenCalled();
-    expect(runReActLoopMock).not.toHaveBeenCalled();
+    expect(runReasonerStageMock).not.toHaveBeenCalled();
   });
 
   it('multi-tenant: resolveChannel sucesso → tenant/agent reais, sem audit de falha, adoção chamada ANTES do runWithTenantContext', async () => {
