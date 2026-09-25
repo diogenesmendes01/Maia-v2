@@ -219,9 +219,17 @@ async function flushRows(mensagem_id: string): Promise<
   return r.rows as Array<{ metadata: Record<string, unknown>; ferramentas_chamadas: unknown[] }>;
 }
 
-/** Outbounds TEXTO desta conversa — o que o usuário teria recebido. */
-async function outboundsTexto(conversa_id: string): Promise<number> {
-  const r = await pool.query<{ n: number }>(
+/**
+ * Outbounds TEXTO desta conversa — o que o usuário teria recebido.
+ *
+ * O POOL vem por PARÂMETRO. O `pool` do bloco anterior é encerrado no
+ * `afterAll` dele (`pool.end()`), e o bloco do caminho de produção roda depois,
+ * com o seu próprio `pool2`: usar aqui o pool de módulo estourava com
+ * `Cannot use a pool after calling end on the pool` — ruído de harness que
+ * escondia a asserção de verdade (a testemunha de `enviados` já passava).
+ */
+async function outboundsTexto(cliente: pg.Pool, conversa_id: string): Promise<number> {
+  const r = await cliente.query<{ n: number }>(
     `SELECT count(*)::int AS n FROM mensagens
       WHERE conversa_id=$1 AND direcao='out' AND conteudo <> ''`,
     [conversa_id],
@@ -342,7 +350,7 @@ d('SC01 — Extração do MaiaEngine no seam real pós-gates', () => {
     expect(r.outboundText).toBe('resposta de teste');
     expect(r.toolsCalled).toEqual([]);
     expect(r.totalTokens).toBe(15);
-    expect(await outboundsTexto(conversa.id)).toBe(1);
+    expect(await outboundsTexto(pool, conversa.id)).toBe(1);
     expect(await flushRows(inbound.id)).toHaveLength(0);
   });
 
@@ -666,12 +674,62 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
     };
   }
 
+  /**
+   * A trilha de auditoria DESTA mensagem.
+   *
+   * A tabela é `audit_log` (migrations/001_initial.sql:290) e a correlação é
+   * `mensagem_id` (o `audit()` do core recebe o id do inbound). `audit_logs` —
+   * plural em inglês — NÃO existe: a query estourava com
+   * `relation "audit_logs" does not exist` e derrubava o caso por um erro de
+   * digitação, não por comportamento do PEP.
+   */
   async function auditDaMensagem(mensagem_id: string): Promise<Array<Record<string, unknown>>> {
     const r = await pool2.query<{ acao: string; metadata: Record<string, unknown> }>(
-      `SELECT acao, metadata FROM audit_logs WHERE mensagem_id = $1 ORDER BY created_at`,
+      `SELECT acao, metadata FROM audit_log WHERE mensagem_id = $1 ORDER BY created_at`,
       [mensagem_id],
     );
     return r.rows;
+  }
+
+  /**
+   * O resolver de descritores tem CACHE de processo, positivo E negativo
+   * (`policyResolverCache`, TTL 5min — `src/control-plane/policy/policy-cache.ts`).
+   * Em produção, ativar/deprecar uma regra publica
+   * `policy_rule_lifecycle:<tenant>` e o subscriber invalida a entrada. Um
+   * fixture que escreve a linha DIRETO por SQL NÃO publica esse evento — sem o
+   * flush abaixo o Mid PEP continua enxergando a resolução cacheada pelo turno
+   * ANTERIOR (a `confirm_before_write_policy` tenant-wide do seed) e o caso
+   * falha por NÃO ter exercitado policy nenhuma, não por defeito do produto.
+   * O fixture reproduz o evento de ciclo de vida.
+   */
+  async function descartarCacheDePoliticas(): Promise<void> {
+    const { policyResolverCache } = await import('@/control-plane/policy/policy-cache.js');
+    policyResolverCache.invalidateAll();
+  }
+
+  /**
+   * Testemunha do fixture: a policy recém-inserida é a que o RUNTIME resolve
+   * para o descritor? Sem isto, um fixture invisível (cache velho, colisão de
+   * índice, escopo) produzia o mesmo sintoma de um PEP que não bloqueou — e os
+   * dois casos ficavam indistinguíveis no relatório.
+   *
+   * O descritor vai CONCRETO: quem expande o sentinela `'*'` é o adapter do
+   * Decision Engine (`prod-env.ts`), não o resolver P8e — passar `'*'` aqui
+   * casaria literalmente com nada e a testemunha mediria o próprio erro.
+   */
+  async function resolvidoParaOPolicy(policy_id: string, descriptor: string): Promise<boolean> {
+    const { policyDescriptorResolver } = await import(
+      '@/control-plane/policy/policy-descriptor-resolver.js'
+    );
+    const out = await inT(() =>
+      policyDescriptorResolver.resolveDescriptors({
+        tenant_id: T,
+        agent_id: A,
+        descriptors: [descriptor],
+        scope: { channel: 'whatsapp' },
+      }),
+    );
+    return out.resolved.some((p) => p.descriptor === descriptor && p.policy_id === policy_id);
   }
 
   /**
@@ -682,8 +740,28 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
    * delas usa a pessoa desta fixture.
    *
    * O descriptor tem de ser um dos que o resolvedor de produção expande a
-   * partir de `'*'` (`RUNTIME_ENFORCED_WRITE_RISK_DESCRIPTORS`): um descriptor
+   * partir de `'*'` (`RUNTIME_ENFORCED_WRITE_RISK_DESCRIPTORS` em
+   * `src/control-plane/policy/boleto-write-policies.ts`): um descriptor
    * inventado nunca chegaria ao PEP e o caso passaria por NÃO ter rodado nada.
+   *
+   * ── Duas armadilhas do schema, e como o fixture as contorna ────────────────
+   *
+   * 1. **Uma única linha ATIVA por (tenant, agent_or_tenant_wide, descriptor)**
+   *    (`idx_policy_rules_one_active_uq`, migrations/036). O seed de
+   *    `migrations/078` deixa `confirm_before_write_policy` ativo TENANT-WIDE
+   *    (`agent_id IS NULL`) e a 086 deixa `human_confirmation_policy` ativo em
+   *    `(primary, primary)` com `scope={"roles":[…]}`. Por isso o fixture grava
+   *    a regra como linha **agent-specific** de `confirm_before_write_policy`
+   *    — a chave do índice (`COALESCE(agent_id,'tenant_wide')`) difere da linha
+   *    do seed, e o resolver PREFERE a agent-specific
+   *    (`findActiveCandidates` devolve agent-first). Um fixture de
+   *    `human_confirmation_policy` em `(primary, primary)` seria impossível sem
+   *    mutar o seed: colidiria em `version` E em `one_active`. O descriptor é o
+   *    MESMO que o seed usa para `require_dual_approval`; o que varia por caso
+   *    de aceite é o `effect`.
+   *
+   * 2. **Cache de resolução de descritores** — ver `descartarCacheDePoliticas()`.
+   *    O flush roda aqui, depois do INSERT, para o Mid PEP ver a linha nova.
    */
   async function inserirPolicy(args: {
     descriptor: string;
@@ -713,7 +791,16 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
        RETURNING id`,
       [T, A, args.descriptor, JSON.stringify(body)],
     );
+    // Evento de ciclo de vida reproduzido: a linha nova tem de ser VISTA pelo
+    // Mid PEP NESTE turno (ver `descartarCacheDePoliticas`).
+    await descartarCacheDePoliticas();
     return r.rows[0]!.id;
+  }
+
+  /** Remove a policy do fixture e invalida o cache outra vez (pós-deprecação). */
+  async function removerPolicy(policy_id: string): Promise<void> {
+    await pool2.query(`DELETE FROM policy_rules WHERE id = $1`, [policy_id]);
+    await descartarCacheDePoliticas();
   }
 
   beforeAll(async () => {
@@ -803,7 +890,7 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
       expect(r.turno?.outcome).toBe('reply_delivered');
       const { isTerminalTurnStatus } = await import('@/runtime/turns/index.js');
       expect(isTerminalTurnStatus(r.turno!.status as never)).toBe(true);
-      expect(await outboundsTexto(conversa2.id)).toBe(1);
+      expect(await outboundsTexto(pool2, conversa2.id)).toBe(1);
     } finally {
       llm.porWorkload = {};
     }
@@ -875,7 +962,15 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
    * ramificação sai direto pelo `sendOutbound` do core).
    */
   it('AC02 — aprovação ("aprova AP-…"): decisão determinística, motor em start=0', async () => {
-    const prefixo = 'ab12cd34';
+    /**
+     * O prefixo é o `request_id` que o texto da resposta carrega
+     * (`parseApprovalReply` casa `aprova AP-<8 hex>`) e entra também no `id` da
+     * linha — que é chave primária. Prefixo FIXO passa na primeira execução e
+     * estoura com `duplicate key … approval_requests_pkey` na segunda (a linha
+     * `pending` do turno anterior fica no banco). Prefixo por execução ⇒ caso
+     * re-executável, que é o que o comando de aceite exige.
+     */
+    const prefixo = randomUUID().replace(/-/g, '').slice(0, 8);
     await pool2.query(
       `INSERT INTO approval_requests
          (id, tenant_id, agent_id, requester_pessoa_id, conversa_id, request_id, tool, operation_type,
@@ -916,6 +1011,14 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
       pessoa_id: pessoa2.id,
     });
     try {
+      // Testemunha de FIXTURE (não de produto): prova que o PEP tem o que ler.
+      // Sem ela, "o turno não foi bloqueado" e "o fixture era invisível"
+      // produziam exatamente o mesmo relatório.
+      expect(
+        await resolvidoParaOPolicy(policy_id, 'confirm_before_write_policy'),
+        'a policy do fixture tem de ser a RESOLVIDA pelo runtime (cache/escopo/índice)',
+      ).toBe(true);
+
       const r = await rodarPeloCore('preciso de ajuda com um boleto');
 
       expect(r.starts, 'turno bloqueado antes do seam não aciona o motor').toBe(0);
@@ -931,24 +1034,46 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
       expect(recusa, 'o bloqueio tem de deixar rastro de auditoria').toBeDefined();
       expect((recusa!['metadata'] as Record<string, unknown>)['decision']).toBe('block');
     } finally {
-      await pool2.query(`DELETE FROM policy_rules WHERE id = $1`, [policy_id]);
+      await removerPolicy(policy_id);
     }
   });
 
   /**
-   * SC01-AC02 (escalação) — `require_dual_approval` do Mid PEP vira
-   * `action_mode='escalate'` SEM `block` no pacote, e é o OUTRO ramo do core
+   * SC01-AC02 (escalação) — o OUTRO ramo do core
    * (`packet.action_mode === 'escalate'`). Mesma fronteira, trilha distinta:
    * `metadata.decision='escalate'`.
+   *
+   * O fixture usa `confirm_before_write_policy` — o ÚNICO dos dois descritores
+   * que o Decision Engine consegue resolver aqui com linha própria — com
+   * `effect.action='require_dual_approval'` e SEM `metadata.intent`:
+   *
+   *   - `MidPepImpl` converte `require_dual_approval` sem
+   *     `intent='escalate_to_human'` numa `RequireDualApprovalDecision`
+   *     (`mid-pep.ts:104-137`), e o `DecisionEngine` monta o pacote com
+   *     `action_mode='escalate'` e SEM `block` (`decision-engine.ts:381-393`);
+   *   - sem `block`, o core cai no ramo de escalação (`core.ts:1977`), audita
+   *     `decision='escalate'` e responde o mesmo texto — sem passar pelo seam.
+   *
+   * `human_confirmation_policy` não serve como fixture aditivo: a 086 já deixa
+   * uma linha ATIVA agent-specific desse descritor em `(primary, primary)`, e
+   * `idx_policy_rules_one_active_uq` proíbe uma segunda ativa para a mesma
+   * chave (era a colisão que o QA reportou). O ramo exercitado é o mesmo; o que
+   * muda em relação ao seed é só de qual descritor o `require_dual_approval`
+   * vem.
    */
   it('AC02 — escalação por política: motor em start=0 e auditoria do ramo escalate', async () => {
     const policy_id = await inserirPolicy({
-      descriptor: 'human_confirmation_policy',
+      descriptor: 'confirm_before_write_policy',
       action: 'require_dual_approval',
       regra: 'sc01_escalate_fixture',
       pessoa_id: pessoa2.id,
     });
     try {
+      expect(
+        await resolvidoParaOPolicy(policy_id, 'confirm_before_write_policy'),
+        'a policy do fixture tem de ser a RESOLVIDA pelo runtime (cache/escopo/índice)',
+      ).toBe(true);
+
       const r = await rodarPeloCore('quero cancelar um boleto agora');
 
       expect(r.starts, 'turno escalado antes do seam não aciona o motor').toBe(0);
@@ -960,7 +1085,7 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
       expect(recusa).toBeDefined();
       expect((recusa!['metadata'] as Record<string, unknown>)['decision']).toBe('escalate');
     } finally {
-      await pool2.query(`DELETE FROM policy_rules WHERE id = $1`, [policy_id]);
+      await removerPolicy(policy_id);
     }
   });
 
@@ -975,14 +1100,30 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
    * `help_request` casa por igualdade exata com ele
    * (`deriveIntentLabels` + `scoreSkillMatch`).
    *
-   * NOTA DE EVIDÊNCIA: este é o caso com MENOS validação local desta fatia —
-   * o caminho de `runSkill` depende de `procedure`/`usage_policy` da skill e
-   * foi escrito contra o código, não contra uma execução verde (o sandbox
-   * desta rodada não conseguiu alcançar um Postgres — ver o comentário de
-   * bloqueio do card). Se ele cair para o motor (`starts=1`), o defeito é do
-   * fixture, não do seam.
+   * ── Duas causas do vermelho anterior, e as duas eram do FIXTURE ────────────
+   *
+   * 1. `usage_policy` INVÁLIDA. `SkillUsagePolicySchema` é `.strict()` e exige
+   *    `allowed_audience` (≥1) + `data_scope` (≥1) + `exposure_policy` +
+   *    `requires_auth_level` + `requires_confirmation`; o fixture escrevia
+   *    `allowed_audiences`/`allowed_trust_levels`/`max_risk_level` — chaves
+   *    desconhecidas e campos obrigatórios ausentes. O parser falha, e o
+   *    filtro do `SkillSelector` remove o candidato (fail-closed,
+   *    `skill-selector.ts` step 6). Sem candidato, o ActionDecider devolve
+   *    `respond` e o turno cai no seam (`starts=1`) — foi exatamente o que o
+   *    QA mediu (`agent_turns completed`, outbound `ok`). A política abaixo
+   *    espelha o par (audience `owner`, `trusted_internal`) que o
+   *    `resolveAudience` desta fixture realmente resolve, e passa as 7 regras
+   *    de `evaluateUsagePolicy` (inclusive a contenção de `data_scope`).
+   *
+   * 2. O provedor devolvia `'ok'`, que NÃO é JSON. `prompt_only` faz
+   *    `parseJsonResponse(text)` e lança `invalid_json_in_llm_response`; o
+   *    SkillRunner converte em `executor_error`, o core trata como skill não
+   *    entregue e cai no seam. O dublê do provedor responde o que a skill
+   *    espera: um objeto com `output.reply` (o texto que vai ao usuário —
+   *    `execute-skill.ts:184`).
    */
   it('AC02 — execute_skill: a skill executa e o motor fica em start=0', async () => {
+    const RESPOSTA_DA_SKILL = 'Resposta da skill de ajuda (AC02).';
     const skill = await pool2.query<{ id: string }>(
       `INSERT INTO skills(tenant_id, agent_id, skill_descriptor, category, execution_mode, goal,
                           when_to_use, procedure, input_schema, output_schema, usage_policy,
@@ -998,21 +1139,24 @@ d('SC01 — runAgentForMensagem (caminho de produção) e a fronteira pós-gates
         A,
         JSON.stringify({ system_prompt: 'Você é a Maia. Responda o pedido de ajuda.' }),
         JSON.stringify({
-          allowed_audiences: ['owner'],
-          allowed_trust_levels: ['trusted_internal'],
+          allowed_audience: ['owner'],
           allowed_channels: ['whatsapp'],
-          max_risk_level: 'high',
+          data_scope: ['public_info'],
+          exposure_policy: 'internal_only',
+          requires_auth_level: 'trusted_internal',
+          requires_confirmation: false,
         }),
       ],
     );
-    llm.roteiro = { texto: 'ok', modo: 'texto' };
+    llm.porWorkload = { skill: { content: JSON.stringify({ reply: RESPOSTA_DA_SKILL }) } };
     try {
       const r = await rodarPeloCore('ajuda');
 
       expect(r.starts, 'uma skill terminal não pode acionar o motor').toBe(0);
       expect(r.reasoners, 'nenhuma deliberação do motor nesta ramificação').toBe(0);
-      expect(r.enviados, 'a skill entrega a própria resposta').toHaveLength(1);
+      expect(r.enviados, 'a skill entrega a própria resposta').toEqual([RESPOSTA_DA_SKILL]);
     } finally {
+      llm.porWorkload = {};
       await pool2.query(`DELETE FROM skills WHERE id = $1`, [skill.rows[0]!.id]);
     }
   }, 60_000);
