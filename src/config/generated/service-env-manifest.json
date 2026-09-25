@@ -95,6 +95,13 @@
           "restartRequired": true
         },
         {
+          "name": "AUTO_MIGRATE_ON_BOOT",
+          "secret": false,
+          "required": false,
+          "group": "database",
+          "restartRequired": true
+        },
+        {
           "name": "REDIS_URL",
           "secret": true,
           "required": true,
@@ -1437,6 +1444,7 @@
             "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
+            "AUTO_MIGRATE_ON_BOOT",
             "REDIS_PORT",
             "REDIS_CONNECT_TIMEOUT_MS",
             "LLM_PROVIDER",
@@ -1641,6 +1649,7 @@
             "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
+            "AUTO_MIGRATE_ON_BOOT",
             "REDIS_PORT",
             "REDIS_CONNECT_TIMEOUT_MS",
             "LLM_PROVIDER",
@@ -1843,6 +1852,7 @@
             "MAIA_CONFIG_STRICT_BOOT",
             "MAIA_REJECT_DEFAULT_LITERAL",
             "POSTGRES_PORT",
+            "AUTO_MIGRATE_ON_BOOT",
             "REDIS_PORT",
             "REDIS_CONNECT_TIMEOUT_MS",
             "LLM_PROVIDER",

@@ -72,8 +72,16 @@ COPY --from=build /app/tsconfig.json ./tsconfig.json
 # chown único para uid 1001 — ver docs/runbooks/deploy-prod.md.
 RUN mkdir -p /app/.baileys-auth /app/media /app/backups \
   && chown -R maia:maia /app/.baileys-auth /app/media /app/backups
+# Torna o entrypoint executável — sem isto o `exec` falha.
+RUN chmod +x /app/scripts/docker-entrypoint.sh
 ENV TZ=America/Sao_Paulo
 EXPOSE 3000
 USER maia
 ENTRYPOINT ["/sbin/tini", "--"]
-CMD ["node", "dist/index.js"]
+# O script docker-entrypoint.sh verifica AUTO_MIGRATE_ON_BOOT (default true,
+# fail-closed via gateFlag). Se ligado, roda `npm run release:migrate` antes de
+# `exec node dist/index.js`. Migration que falha impede o app de subir.
+# Compose multi-serviço seta AUTO_MIGRATE_ON_BOOT=false no app porque o job
+# migrate separado já aplica. Single-container (Coolify) deixa default true.
+# Ver docs/runbooks/deploy-prod.md §7 e issue #565.
+CMD ["sh", "/app/scripts/docker-entrypoint.sh"]

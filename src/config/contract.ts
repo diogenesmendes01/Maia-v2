@@ -335,6 +335,19 @@ export const ENV_CONTRACT = {
     restartRequired: true,
     commentedInExample: true,
   },
+  AUTO_MIGRATE_ON_BOOT: {
+    name: 'AUTO_MIGRATE_ON_BOOT',
+    description:
+      'Gate de auto-migração no boot do container (issue #565). Default true (LIGADO): se o container roda a imagem diretamente (Coolify, single-container deployment), ele aplica `npm run release:migrate` antes de iniciar o app, fail-closed — migration que falha impede o app de subir. Só false/0 explícitos desligam. Compose multi-serviço (compose.prod.yml) seta false no serviço app porque o job migrate separado já aplica; deploy single-container (Dockerfile direto) deixa true para que a imagem self-migrate.',
+    group: 'database',
+    secret: false,
+    services: ['runtime'],
+    schema: gateFlag(),
+    example: 'true',
+    fixture: 'true',
+    restartRequired: true,
+    commentedInExample: true,
+  },
 
   // ---- redis ------------------------------------------------------------
   REDIS_URL: {

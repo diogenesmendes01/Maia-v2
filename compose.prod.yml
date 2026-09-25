@@ -259,6 +259,11 @@ services:
       # o `.env.app.prod.example` manda explicitamente NÃO defini-la ali, para
       # que não existam duas fontes que possam divergir do migrator.
       MAIA_ENV: ${MAIA_ENV:?MAIA_ENV is required (production|staging) — declare-a no .env.infra; sem ela um staging assumiria o perfil de produção em silêncio}
+      # Issue #565 — desliga o auto-migrate gate do container porque o job
+      # `migrate` separado (acima) já aplica. Default do gateFlag é true
+      # (fail-closed): a imagem roda migrations antes do app quando esta env
+      # var está ausente. Aqui está PRESENTE e false: o app inicia direto.
+      AUTO_MIGRATE_ON_BOOT: false
       # Issue #513 — o papel deste container. Default `all`: o monólito de
       # hoje, que serve HTTP, drena a fila, agenda os crons e possui as
       # sessões.
