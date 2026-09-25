@@ -23,7 +23,7 @@ describe('docker-entrypoint.sh — execução REAL (#565)', () => {
   function makeFakeBinaries(dir: string, opts: { npmExitCode: number; withTrap?: boolean }) {
     // Fake npm que grava o que foi chamado e sai com o código configurado
     const npmScript = `#!/bin/sh
-echo "npm \$@" > "${join(dir, 'npm.called')}"
+echo "npm $@" > "${join(dir, 'npm.called')}"
 if [ "$1" = "run" ] && [ "$2" = "release:migrate" ]; then
   ${opts.withTrap ? `trap 'echo "GOT_TERM" > "${join(dir, 'npm.sigterm')}"; exit 143' TERM\n  sleep 5  # tempo para receber SIGTERM` : ''}
   exit ${opts.npmExitCode}
@@ -36,7 +36,7 @@ exit 127
     // Fake node que grava PID e args (prova do exec)
     const nodeScript = `#!/bin/sh
 echo "$$" > "${join(dir, 'node.pid')}"
-echo "\$@" > "${join(dir, 'node.args')}"
+echo "$@" > "${join(dir, 'node.args')}"
 sleep 0.1
 `;
     writeFileSync(join(dir, 'node'), nodeScript);
@@ -157,7 +157,7 @@ sleep 0.1
     }
   });
 
-  it('SIGTERM ao script → migrator recebe TERM, script sai 143, node nunca roda', (ctx) => {
+  it('SIGTERM ao script → migrator recebe TERM, script sai 143, node nunca roda', () => {
     const binDir = mkdtempSync(join(tmpdir(), 'entrypoint-sigterm-'));
     makeFakeBinaries(binDir, { npmExitCode: 0, withTrap: true });
 
@@ -192,7 +192,7 @@ sleep 0.1
         reject(new Error('timeout aguardando SIGTERM'));
       }, 8000);
 
-      child.on('close', (code, signal) => {
+      child.on('close', (code, _signal) => {
         clearTimeout(timeout);
         clearInterval(checkInterval);
 
@@ -219,7 +219,7 @@ sleep 0.1
     });
   }, 10_000);
 
-  it('SIGINT ao script → migrator recebe TERM, script sai 130, node nunca roda', (ctx) => {
+  it('SIGINT ao script → migrator recebe TERM, script sai 130, node nunca roda', () => {
     const binDir = mkdtempSync(join(tmpdir(), 'entrypoint-sigint-'));
     makeFakeBinaries(binDir, { npmExitCode: 0, withTrap: true });
 
@@ -253,7 +253,7 @@ sleep 0.1
         reject(new Error('timeout aguardando SIGINT'));
       }, 8000);
 
-      child.on('close', (code, signal) => {
+      child.on('close', (code, _signal) => {
         clearTimeout(timeout);
         clearInterval(checkInterval);
 
