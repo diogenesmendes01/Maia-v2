@@ -14,12 +14,29 @@
 # serviço app porque o job `migrate` separado já aplica. Deploy single-container
 # (Coolify, Dockerfile direto) deixa o default true, e a imagem self-migrates.
 #
-# Signal handling: o `exec` no final faz o node process substituir este shell e
-# virar PID 1 real (via tini ENTRYPOINT). SIGTERM/SIGINT propagam corretamente
-# para graceful shutdown (SHUTDOWN_GRACE_MS).
+# Signal handling: trap captura SIGTERM/SIGINT durante a migration e os repassa
+# ao processo do migrator, aguardando sua saída limpa. Após a migration, o exec
+# substitui o shell pelo node, e o tini (ENTRYPOINT) propaga sinais diretamente
+# ao node para graceful shutdown (SHUTDOWN_GRACE_MS). Ver runbook §7 sobre
+# SIGTERM no meio da migration (advisory lock, estado dirty, rerun).
 #
 # Ver docs/runbooks/deploy-prod.md §7 e src/migrations/release-gate.ts.
 set -e
+
+MIGRATOR_PID=""
+
+# Trap para repassar SIGTERM/SIGINT ao migrator durante a migration.
+# Após o exec, o trap deixa de existir e o tini manda sinais direto ao node.
+cleanup() {
+  if [ -n "$MIGRATOR_PID" ]; then
+    echo "docker-entrypoint: sinal recebido, repassando ao migrator PID $MIGRATOR_PID"
+    kill -TERM "$MIGRATOR_PID" 2>/dev/null || true
+    wait "$MIGRATOR_PID" 2>/dev/null || true
+  fi
+  exit 143  # 128 + 15 (SIGTERM)
+}
+
+trap cleanup TERM INT
 
 AUTO_MIGRATE="${AUTO_MIGRATE_ON_BOOT:-true}"
 
@@ -30,14 +47,24 @@ if [ "$AUTO_MIGRATE_NORM" = "false" ] || [ "$AUTO_MIGRATE_NORM" = "0" ]; then
   echo "docker-entrypoint: AUTO_MIGRATE_ON_BOOT desligado — pulando migration gate"
 else
   echo "docker-entrypoint: AUTO_MIGRATE_ON_BOOT ligado — rodando migration gate"
-  npm run release:migrate || {
+  
+  # Roda o migrator em background para capturar o PID e permitir trap
+  npm run release:migrate &
+  MIGRATOR_PID=$!
+  
+  # Aguarda o migrator. Se receber sinal, o trap acima dispara.
+  wait "$MIGRATOR_PID" || {
     EXIT_CODE=$?
+    MIGRATOR_PID=""  # já terminou, trap não deve matá-lo
     echo "docker-entrypoint: migration gate falhou com código $EXIT_CODE — app NÃO iniciará"
     exit $EXIT_CODE
   }
+  
+  MIGRATOR_PID=""  # migrator terminou com sucesso
   echo "docker-entrypoint: migration gate passou — iniciando app"
 fi
 
-# exec: substitui o shell pelo node process. O tini (ENTRYPOINT) vira pai direto
-# do node, e SIGTERM/SIGINT propagam corretamente.
+# exec: substitui o shell pelo node process. O trap deixa de existir aqui.
+# O tini (ENTRYPOINT) vira pai direto do node e propaga SIGTERM/SIGINT para
+# graceful shutdown.
 exec node dist/index.js
