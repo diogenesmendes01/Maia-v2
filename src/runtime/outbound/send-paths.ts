@@ -608,7 +608,7 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
   },
   {
     id: 'agent.react_loop_tool_reaction',
-    module: 'src/agent/react-loop.ts',
+    module: 'src/runtime/engines/reasoner-stage.ts',
     state: 'declared_exception',
     categories: ['reaction'],
     primitives: ['sendReaction'],
@@ -645,8 +645,22 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
     deadline: { kind: 'revisao_de_carve_out', review_on: '2027-03-31' },
     removal: {
       when:
-        'O CALLSITE de `src/agent/react-loop.ts` deixar de chamar a primitiva direta: ' +
-        '`sendReaction(` não existir mais no módulo. Os DOIS desfechos que o dono ' +
+        // SC01 (2026-09-25) — O CALLSITE MUDOU DE MÓDULO, e a sonda acompanha o
+        // módulo que HOJE envia. A extração do MaiaEngine tirou a emissão da
+        // reação de `src/agent/react-loop.ts` (hoje uma máscara que só delega ao
+        // stage) e a levou para `src/runtime/engines/reasoner-stage.ts`. A
+        // condição do DONO não mudou — continua sendo "`sendReaction(` não
+        // existir mais no módulo que envia"; o que mudou foi o arquivo onde ela
+        // pode ser conferida. Apontar a sonda para o módulo antigo a deixava ACESA
+        // com o sender VIVO, que é o defeito que
+        // `tests/unit/runtime/outbound-excecoes-dono-prazo-remocao.spec.ts`
+        // reprova ("sonda `some` sobre símbolo já ausente"). A extração NÃO
+        // eliminou a rota: a reação continua existindo em produção, no mesmo
+        // ponto do laço, e a exceção segue justificada.
+        'O CALLSITE de `src/runtime/engines/reasoner-stage.ts` (era ' +
+        '`src/agent/react-loop.ts` até a extração do SC01, que passou a delegar) ' +
+        'deixar de chamar a primitiva direta: `sendReaction(` não existir mais no ' +
+        'módulo. Os DOIS desfechos que o dono ' +
         'aceita (registro de 2026-09-03) passam por esse mesmo fato: (a) capability ' +
         'NATIVA — o provedor confirma reação com identificador, `reaction` vira ' +
         '`PROVIDER_IDEMPOTENCY_NATIVE` em `delivery-contract.ts` e a reação migra para ' +
@@ -657,7 +671,8 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
         'desfecho (a), e não provava a migração do callsite; foi corrigida a pedido do ' +
         'dono.',
       why_sufficient:
-        'Enquanto `sendReaction(` existir em `react-loop.ts`, existe sender direto — ' +
+        'Enquanto `sendReaction(` existir em ' +
+        '`src/runtime/engines/reasoner-stage.ts`, existe sender direto — ' +
         'com ou sem capability declarada no contrato — e a exceção continua sendo um ' +
         'fato. Quando sumir, o envio direto acabou e a entrada perde o objeto; a sonda ' +
         'acende e o revisor confere QUAL desfecho o fez sumir. Se foi (b), a revisão ' +
@@ -666,7 +681,13 @@ export const OUTBOUND_SEND_PATHS: readonly OutboundSendPath[] = Object.freeze([
         'na fila humana de #633. A sonda é deliberadamente sobre o CALLSITE e não ' +
         'sobre o contrato, para cobrir o OU inteiro: uma sonda no contrato faria do ' +
         'desfecho (a) condição necessária, e o dono aceitou (a) OU (b).',
-      probes: [{ module: 'src/agent/react-loop.ts', symbol: 'sendReaction(', kind: 'some' }],
+      probes: [
+        {
+          module: 'src/runtime/engines/reasoner-stage.ts',
+          symbol: 'sendReaction(',
+          kind: 'some',
+        },
+      ],
     },
   },
   {

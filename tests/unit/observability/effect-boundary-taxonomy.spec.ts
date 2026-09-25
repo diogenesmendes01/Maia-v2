@@ -78,7 +78,14 @@ describe('issue #601 — `boundary` é um vocabulário FECHADO espelhado do cód
   async function literaisNoCodigo(): Promise<string[]> {
     const arquivos = [
       'src/agent/core.ts',
-      'src/agent/react-loop.ts',
+      // SC01 (extração do MaiaEngine): os literais da reação saíram de
+      // `src/agent/react-loop.ts` — hoje uma máscara que delega ao stage — e
+      // vivem onde o laço REAL roda: `react_iteration`/`react_reasoner` em
+      // `maia-reasoning.ts` e `react_tool_refused` em `reasoner-stage.ts`. A
+      // varredura segue O MÓDULO QUE USA o literal; se a extração mover o
+      // laço de novo, é esta lista que muda junto.
+      'src/runtime/engines/maia-reasoning.ts',
+      'src/runtime/engines/reasoner-stage.ts',
       'src/agent/output-dispatch.ts',
       'src/cognition/role-selector/engine.ts',
       'src/runtime/decision/integration.ts',
