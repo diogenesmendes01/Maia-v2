@@ -339,6 +339,21 @@
         "0"
       ]
     },
+    "AUTO_MIGRATE_ON_BOOT": {
+      "type": "string",
+      "description": "Gate de auto-migração no boot do container (issue #565). Default true (LIGADO): se o container roda a imagem diretamente (Coolify, single-container deployment), ele aplica `npm run release:migrate` antes de iniciar o app, fail-closed — migration que falha impede o app de subir. Só false/0 explícitos desligam. Compose multi-serviço (compose.prod.yml) seta false no serviço app porque o job migrate separado já aplica; deploy single-container (Dockerfile direto) deixa true para que a imagem self-migrate.",
+      "x-maia-type": "string",
+      "x-maia-group": "database",
+      "x-maia-secret": false,
+      "x-maia-services": [
+        "runtime"
+      ],
+      "x-maia-restart-required": true,
+      "default": "true",
+      "examples": [
+        "true"
+      ]
+    },
     "REDIS_URL": {
       "type": "string",
       "description": "URL do Redis (filas BullMQ, dedup, debounce, rate limit).",

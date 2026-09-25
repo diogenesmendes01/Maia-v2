@@ -548,7 +548,63 @@ chegaram ao passo de migration porque o painel injeta um ambiente só.
 configuração que você acha ativa. O gate a retém (senão o migrator recusaria o
 boot), e por isso mesmo a nomeia.
 
-### 7.2 Duas formas de ligar o gate, e o que cada uma custa
+### 7.2 Self-migrate: a imagem roda o gate automaticamente (issue #565)
+
+**A partir da issue #565, a imagem Docker auto-migra por padrão.** O
+`docker-entrypoint.sh` verifica `AUTO_MIGRATE_ON_BOOT` (default true,
+fail-closed via `gateFlag()`): se ligado, executa `npm run release:migrate`
+ANTES de `exec node dist/index.js`. Migration que falha → app NÃO inicia.
+
+```dockerfile
+# Dockerfile, linha 79-85
+CMD ["sh", "/app/scripts/docker-entrypoint.sh"]
+```
+
+```bash
+# scripts/docker-entrypoint.sh (simplificado)
+if [ "$AUTO_MIGRATE_ON_BOOT" != "false" ] && [ "$AUTO_MIGRATE_ON_BOOT" != "0" ]; then
+  npm run release:migrate || exit $?
+fi
+exec node dist/index.js
+```
+
+**Topologias:**
+
+| Deploy | AUTO_MIGRATE_ON_BOOT | Quem migra |
+|---|---|---|
+| Single-container (Coolify, Dockerfile direto) | ausente (default **true**) | a imagem, no entrypoint |
+| Multi-serviço (compose.prod.yml) | **false** (setado no `app` service) | o job `migrate` separado |
+
+**Fail-closed no centro:** o default é **true**. Só `false` ou `0` explícitos
+desligam. Um typo (`AUTO_MIGRATE_ON_BOOT=flase`) mantém o gate ligado, não o
+desliga em silêncio.
+
+**Signal handling:** o `exec` no entrypoint faz o node process SUBSTITUIR o
+shell e virar PID correto sob o tini (ENTRYPOINT). SIGTERM/SIGINT propagam para
+o graceful shutdown (`SHUTDOWN_GRACE_MS`).
+
+**Compose multi-serviço não quebrou:** `compose.prod.yml` seta
+`AUTO_MIGRATE_ON_BOOT: false` no serviço `app` (linha 268), porque o job
+`migrate` separado já aplica. Não há migração dupla nem race condition — o
+container do app nem tenta.
+
+### 7.3 Coolify pre-deployment command NÃO é usável para isto
+
+A issue #565 investigou o `ApplicationDeploymentJob::run_pre_deployment_command`
+do Coolify 4.3.23. Ele executa via `docker exec` **no container ANTIGO**, antes
+do novo existir. Logo:
+
+- roda o migrator da build **anterior**;
+- não enxerga as migrations novas que motivaram o deploy;
+- sai 0 mesmo com o schema abaixo do mínimo que a nova build exige;
+- o novo container sobe, bate no `SCHEMA BOOT REFUSED — exit 94`, e morre.
+
+**Coolify post-deployment** roda DEPOIS do rollout (tarde demais — o novo
+container já tentou boot). A solução é o entrypoint auto-migrate documentado em
+§7.2: ele roda **da nova imagem**, com as migrations novas, ANTES do app
+iniciar.
+
+### 7.4 Duas formas de ligar o gate, e o que cada uma custa
 
 | | (A) campo de comando pré-deploy | (B) encadeado no comando de start |
 |---|---|---|
