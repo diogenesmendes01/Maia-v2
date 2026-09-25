@@ -95,9 +95,10 @@ sleep 0.1
     const nodeArgs = readFileSync(join(binDir, 'node.args'), 'utf8').trim();
     expect(nodeArgs).toBe('dist/index.js');
 
-    // PID do node deve ser o mesmo do script (prova do exec)
-    // (na prática o PID muda porque spawnSync vê o sh, não o entrypoint diretamente,
-    // mas podemos verificar que o node rodou)
+    // Prova do exec: PID do node (gravado pelo node falso em $$) deve ser o mesmo
+    // do processo spawnado (ran.pid). O exec substitui o shell pelo node.
+    const nodePid = readFileSync(join(binDir, 'node.pid'), 'utf8').trim();
+    expect(nodePid, 'exec deve substituir o shell, igualando PIDs').toBe(String(ran.pid));
 
     rmSync(binDir, { recursive: true, force: true });
   });
@@ -118,34 +119,35 @@ sleep 0.1
 
   describe('paridade TS/shell: cada valor executado vs gateFlag()', () => {
     const values = [
-      '', // ausente (default true no shell)
-      'true',
-      'TRUE',
-      'false',
-      'FALSE',
-      '  false  ',
-      '0',
-      '  0  ',
-      'flase', // typo
-      'no',
-      'off',
-      '1',
-      'yes',
-      'on',
+      { value: undefined, label: '(ausente)' }, // ausente (default true no shell)
+      { value: '', label: '(string vazia)' }, // vazia = true (não desliga)
+      { value: 'true', label: 'true' },
+      { value: 'TRUE', label: 'TRUE' },
+      { value: 'false', label: 'false' },
+      { value: 'FALSE', label: 'FALSE' },
+      { value: '  false  ', label: '  false  ' },
+      { value: '0', label: '0' },
+      { value: '  0  ', label: '  0  ' },
+      { value: 'flase', label: 'flase' }, // typo
+      { value: 'no', label: 'no' },
+      { value: 'off', label: 'off' },
+      { value: '1', label: '1' },
+      { value: 'yes', label: 'yes' },
+      { value: 'on', label: 'on' },
     ];
 
-    for (const value of values) {
-      it(`valor '${value || '(ausente)'}' → script e TS concordam`, () => {
+    for (const { value, label } of values) {
+      it(`valor '${label}' → script e TS concordam`, () => {
         const binDir = mkdtempSync(join(tmpdir(), 'entrypoint-parity-'));
         makeFakeBinaries(binDir, { npmExitCode: 0 });
 
-        const env = value === '' ? {} : { AUTO_MIGRATE_ON_BOOT: value };
+        const env = value === undefined ? {} : { AUTO_MIGRATE_ON_BOOT: value };
         const ran = runScript(env, binDir);
 
         expect(ran.status, `saída:\n${ran.output}`).toBe(0);
 
         const npmCalled = existsSync(join(binDir, 'npm.called'));
-        const tsResult = gateFlag().parse(value); // true = ligado, false = desligado
+        const tsResult = gateFlag().parse(value ?? ''); // true = ligado, false = desligado
 
         expect(
           npmCalled,
