@@ -101,6 +101,26 @@ the operator promotes this revision: the older installed launcher strips the
 two Hermes paths. Do not update the root-owned package from a project task.
 The installed `harness-test-run` remains the evidence wrapper.
 
+### Live two-worktree canary reservation
+
+The live canary requires the operator-owned reservation
+`/srv/agents/runtime/canary-redis-allocation.json`, explicitly selected with
+`TEST_CANARY_REDIS_ALLOCATION`. This rollout reserves **only** Redis
+`127.0.0.1:6382/3` and `/4` for owner
+`hermes-environment-integration-fixes/worktree-canary` (UID1006). Its persistent
+operator ledger is `rollout/canary-redis-allocation.json`; inventory must establish
+absence of another owner, not merely DBSIZE=0. Changing/releasing the allocation
+requires operator review, including updating the fail-closed fixture contract.
+Missing, single, duplicate, foreign or released allocations fail setup before
+connections or CREATE DATABASE. The launcher keeps `TEST_WORKTREE_SCOPE=off`
+for the main suite and the ordinary card endpoint unchanged. Only disposable
+probe repositories enable scope and seed their own registry with the reserved
+pair. The canary creates two OID-owned PostgreSQL databases, applies the canonical
+migrations to each, deletes only its UUID Redis keys, and never FLUSHDB/FLUSHALL.
+A missing reservation is a blocked hook with four unexecuted cases, not PASS.
+The versioned launcher passes this input; the installed launcher needs separate
+operator promotion and must not be silently replaced by project code.
+
 ## 3. Install dependencies (in this worktree only)
 
 Once doctor passes, run the project's normal install separately:
