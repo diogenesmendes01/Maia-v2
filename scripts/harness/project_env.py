@@ -41,6 +41,12 @@ def test_environment():
                 'HERMES_PIN_UPSTREAM', 'HERMES_PIN_PYTHON', 'HERMES_PIN_SHA'):
         if source.get(key):
             env[key] = source[key]
+    env['TEST_PG_MAINTENANCE_DB'] = 'maia_maintenance'
+    if source.get('HARNESS_PG_TEMPLATE'):
+        template = source['HARNESS_PG_TEMPLATE']
+        if not re.fullmatch(r'[a-z][a-z0-9_]{0,62}', template):
+            raise ValueError('fixture template')
+        env['TEST_PG_TEMPLATE'] = template
     return env
 
 
