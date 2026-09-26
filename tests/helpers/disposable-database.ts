@@ -9,8 +9,17 @@ export class DisposableDatabase {
   private readonly template: string;
   private ownedOid: number | undefined;
 
-  constructor(baseUrl: string, context: string, env = process.env) {
-    this.name = `card_fixture_${createHash('sha256').update(context).digest('hex').slice(0, 32)}`;
+  constructor(
+    baseUrl: string,
+    context: string,
+    env = process.env,
+    prefix = 'card_fixture',
+    name?: string,
+  ) {
+    if (!/^card_[a-z][a-z0-9_]{0,20}$/.test(prefix)) throw new Error('Invalid fixture prefix');
+    this.name =
+      name ?? `${prefix}_${createHash('sha256').update(context).digest('hex').slice(0, 32)}`;
+    if (!/^card_[a-z0-9_]{1,58}$/.test(this.name)) throw new Error('Invalid fixture name');
     const url = new URL(baseUrl);
     url.pathname = `/${this.name}`;
     this.url = url.toString();

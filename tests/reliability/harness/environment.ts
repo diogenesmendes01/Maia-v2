@@ -41,7 +41,8 @@
  * A faxina do Redis é por `SCAN`+`DEL` no prefixo, nunca `FLUSHDB`: o db lógico
  * é da WORKTREE, e outras suítes da mesma árvore podem estar rodando nele.
  */
-import { setTimeout as sleep } from 'node:timers/promises';
+import { randomUUID } from 'node:crypto';
+import { DisposableDatabase } from '../../helpers/disposable-database.js';
 import { arquivoDoPacote } from '../../helpers/pkg-path.js';
 import {
   databaseNameOf,
@@ -246,13 +247,6 @@ export function resolverAlvoDaSuite(
   };
 }
 
-/** Conexão de manutenção: o MESMO servidor, no banco `postgres`. */
-function urlDeManutencao(scopedUrl: string): string {
-  const url = new URL(scopedUrl);
-  url.pathname = '/postgres';
-  return url.toString();
-}
-
 /**
  * O ambiente vivo. Só existe quando há Postgres e Redis de verdade — em
  * máquina sem infra, `criar()` falha CEDO e com mensagem acionável, jamais
@@ -263,7 +257,7 @@ export class ReliabilityEnvironment {
   readonly estado: EstadoDoAmbiente;
   private readonly artefatos: ArtifactCollector | undefined;
   private derrubado = false;
-  private criado = false;
+  private fixture!: DisposableDatabase;
 
   private constructor(estado: EstadoDoAmbiente, artefatos: ArtifactCollector | undefined) {
     this.estado = estado;
@@ -272,6 +266,16 @@ export class ReliabilityEnvironment {
 
   static async criar(opts: OpcoesDoAmbiente): Promise<ReliabilityEnvironment> {
     const alvo = resolverAlvoDaSuite(opts.suite);
+    const run = randomUUID().replaceAll('-', '');
+    const fixture = new DisposableDatabase(
+      alvo.databaseUrl,
+      `${opts.suite}:${process.pid}:${run}`,
+      process.env,
+      'card_fi',
+    );
+    alvo.databaseUrl = fixture.url;
+    alvo.databaseName = fixture.name;
+    alvo.queuePrefix = `${alvo.queuePrefix}_${run}`;
     const tenants = opts.tenants ?? [
       { tenantId: `fi-${suiteSlug(opts.suite)}-a`, agentId: `fi-${suiteSlug(opts.suite)}-agent-a` },
       { tenantId: `fi-${suiteSlug(opts.suite)}-b`, agentId: `fi-${suiteSlug(opts.suite)}-agent-b` },
@@ -290,25 +294,18 @@ export class ReliabilityEnvironment {
       },
       opts.artefatos,
     );
-    await env.provisionar(opts.migrationTimeoutMs ?? 300_000);
+    env.fixture = fixture;
+    try {
+      await env.provisionar(opts.migrationTimeoutMs ?? 300_000);
+    } catch (error) {
+      await fixture.cleanup();
+      throw error;
+    }
     return env;
   }
 
   private async provisionar(migrationTimeoutMs: number): Promise<void> {
-    const pg = (await import('pg')).default;
-    const admin = new pg.Client({ connectionString: urlDeManutencao(this.estado.databaseUrl) });
-    await admin.connect();
-    try {
-      const { rowCount } = await admin.query('SELECT 1 FROM pg_database WHERE datname = $1', [
-        this.estado.databaseName,
-      ]);
-      if (rowCount === 0) {
-        await admin.query(`CREATE DATABASE "${this.estado.databaseName.replace(/"/g, '""')}"`);
-      }
-    } finally {
-      await admin.end();
-    }
-    this.criado = true;
+    await this.fixture.create();
     this.artefatos?.evento('env.database_ready', { database: this.estado.databaseName });
 
     await this.migrar(migrationTimeoutMs);
@@ -391,15 +388,13 @@ export class ReliabilityEnvironment {
   }
 
   /**
-   * Faxina IDEMPOTENTE. Segunda chamada é no-op; nenhuma chamada joga.
+   * Faxina IDEMPOTENTE. Segunda chamada é no-op após sucesso.
    *
-   * As falhas de teardown vão para a timeline do artefato em vez de reprovarem
-   * a suíte, porque um teardown que reprova esconde a causa real do vermelho —
-   * mas elas ficam REGISTRADAS, que é o que a issue pede.
+   * Falhas Redis ficam na timeline; recusa de ownership ou DROP sem sucesso
+   * reprova a suíte. Nunca forçamos conexões nem adotamos um banco existente.
    */
   async derrubar(): Promise<void> {
     if (this.derrubado) return;
-    this.derrubado = true;
 
     try {
       assertAlvoDestrutivo({
@@ -416,6 +411,7 @@ export class ReliabilityEnvironment {
 
     await this.limparRedis();
     await this.derrubarBanco();
+    this.derrubado = true;
   }
 
   private async limparRedis(): Promise<void> {
@@ -457,47 +453,8 @@ export class ReliabilityEnvironment {
   }
 
   private async derrubarBanco(): Promise<void> {
-    if (!this.criado) return;
-    try {
-      const pg = (await import('pg')).default;
-      const admin = new pg.Client({ connectionString: urlDeManutencao(this.estado.databaseUrl) });
-      await admin.connect();
-      try {
-        // `WITH (FORCE)` derruba conexões pendentes de um filho que morreu por
-        // SIGKILL sem fechar o pool — sem isso o DROP fica preso e a suíte
-        // seguinte herda o banco.
-        await admin.query(
-          `DROP DATABASE IF EXISTS "${this.estado.databaseName.replace(/"/g, '""')}" WITH (FORCE)`,
-        );
-      } finally {
-        await admin.end();
-      }
-      this.artefatos?.evento('env.database_dropped', { database: this.estado.databaseName });
-    } catch (erro) {
-      // Uma tentativa a mais: o `WITH (FORCE)` do Postgres 13+ costuma
-      // resolver, mas uma conexão nascendo na mesma janela ainda ganha a
-      // corrida. Uma retentativa curta cobre isso sem virar laço.
-      await sleep(250);
-      try {
-        const pg = (await import('pg')).default;
-        const admin = new pg.Client({ connectionString: urlDeManutencao(this.estado.databaseUrl) });
-        await admin.connect();
-        try {
-          await admin.query(
-            `DROP DATABASE IF EXISTS "${this.estado.databaseName.replace(/"/g, '""')}" WITH (FORCE)`,
-          );
-        } finally {
-          await admin.end();
-        }
-      } catch (erro2) {
-        this.artefatos?.evento('teardown.error', {
-          etapa: 'drop_database',
-          alvo: this.estado.databaseName,
-          erro: sanitizarTexto(erro2 instanceof Error ? erro2.message : String(erro2)),
-          primeiroErro: sanitizarTexto(erro instanceof Error ? erro.message : String(erro)),
-        });
-      }
-    }
+    await this.fixture.cleanup();
+    this.artefatos?.evento('env.database_dropped', { database: this.estado.databaseName });
   }
 
   /** Descrição sanitizada para o relatório do cenário. */

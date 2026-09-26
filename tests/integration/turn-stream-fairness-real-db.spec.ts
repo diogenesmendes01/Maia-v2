@@ -52,6 +52,11 @@ import pg from 'pg';
 import { randomUUID } from 'node:crypto';
 import { runWithTenantContext } from '@/db/tenant-context.js';
 import { moduloDeProducao } from '../helpers/modulo-de-producao.js';
+import {
+  startProvisionedPostgres,
+  stopPostgresContainer,
+  type StartedPostgres,
+} from './_fixtures/postgres-testcontainer.js';
 
 /** Jobs que a PROMOÇÃO devolve à fila. É o passo 4 do ciclo (ver cabeçalho). */
 const promovidos: string[] = [];
@@ -82,6 +87,12 @@ const inT = <X>(fn: () => Promise<X>): Promise<X> =>
 const streamKey = (): string => `v1:${randomUUID().replace(/-/g, '').repeat(2)}`;
 
 d('#629 — fairness e starvation sob carga (DB real)', () => {
+  let isolated: StartedPostgres;
+  const originalUrl = process.env.DATABASE_URL;
+  beforeAll(async () => {
+    isolated = await startProvisionedPostgres(process.env.TEST_DB_URL!);
+    process.env.DATABASE_URL = isolated.uri;
+  });
   const repos = moduloDeProducao(() => import('../../src/db/repositories.js'));
   const turns = moduloDeProducao(() => import('@/runtime/turns/lifecycle.js'));
   const metricas = moduloDeProducao(() => import('../../src/lib/metrics.js'));
@@ -120,7 +131,7 @@ d('#629 — fairness e starvation sob carga (DB real)', () => {
   }
 
   beforeAll(async () => {
-    pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: VAGAS + 4 });
+    pool = new pg.Pool({ connectionString: isolated.uri, max: VAGAS + 4 });
     await pool.query(`INSERT INTO tenants(id, nome) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING`, [
       T,
     ]);
@@ -139,6 +150,11 @@ d('#629 — fairness e starvation sob carga (DB real)', () => {
     await pool?.query(`DELETE FROM agents WHERE id = $1`, [A]);
     await pool?.query(`DELETE FROM tenants WHERE id = $1`, [T]);
     await pool?.end();
+    if (isolated) {
+      await (await import('@/db/client.js')).pool.end();
+      await stopPostgresContainer(isolated);
+    }
+    process.env.DATABASE_URL = originalUrl;
   });
 
   beforeEach(async () => {

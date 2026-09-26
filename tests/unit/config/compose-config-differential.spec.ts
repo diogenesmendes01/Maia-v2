@@ -149,7 +149,11 @@ function ambienteDoCompose(
   const r = spawnSync(
     'docker',
     ['compose', '--env-file', '.env.infra', '-f', 'compose.yml', 'config', '--format', 'json'],
-    { cwd: dir, encoding: 'utf8', env: { ...process.env, ...extraShell } },
+    {
+      cwd: dir,
+      encoding: 'utf8',
+      env: { PATH: process.env.PATH, HOME: process.env.HOME, ...extraShell },
+    },
   );
   expect(r.status, `docker compose config falhou:\n${r.stderr}`).toBe(0);
   const parsed = JSON.parse(r.stdout) as ComposeConfigJson;

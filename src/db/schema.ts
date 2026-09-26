@@ -5061,3 +5061,25 @@ export const agent_canary_policy = pgTable(
 
 export type AgentCanaryPolicyRow = typeof agent_canary_policy.$inferSelect;
 export type NewAgentCanaryPolicyRow = typeof agent_canary_policy.$inferInsert;
+
+/** Migration 149 is canonical for composite FK, CHECKs and immutable trigger. */
+export const hermes_runtime_manifests = pgTable(
+  'hermes_runtime_manifests',
+  {
+    tenant_id: text('tenant_id').notNull(),
+    agent_id: text('agent_id').notNull(),
+    run_id: uuid('run_id').notNull(),
+    digest: text('digest').notNull(),
+    evidence_class: text('evidence_class').notNull(),
+    manifest_json: jsonb('manifest_json').notNull(),
+    created_at: timestamp('created_at', { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => ({
+    pk: primaryKey({ columns: [t.tenant_id, t.agent_id, t.run_id] }),
+    digestUq: unique('hermes_runtime_manifests_tenant_id_agent_id_digest_key').on(
+      t.tenant_id,
+      t.agent_id,
+      t.digest,
+    ),
+  }),
+);
