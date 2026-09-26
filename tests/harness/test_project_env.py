@@ -68,6 +68,17 @@ class ProjectEnvironmentTests(unittest.TestCase):
         self.assertEqual(actual.get('TEST_PG_MAINTENANCE_DB'), 'maia_maintenance')
         self.assertEqual(actual.get('TEST_PG_TEMPLATE'), 'maia_template')
 
+    def test_preserves_explicit_canary_allocation_without_enabling_worktree_setup(self):
+        env = self.environment()
+        env['TEST_CANARY_REDIS_ALLOCATION'] = '/srv/agents/runtime/canary-redis-allocation.json'
+        result = subprocess.run([sys.executable, str(SCRIPT), '--', sys.executable,
+                                 '-c', 'import os,json; print(json.dumps(dict(os.environ)))'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual.get('TEST_CANARY_REDIS_ALLOCATION'), env['TEST_CANARY_REDIS_ALLOCATION'])
+        self.assertEqual(actual['TEST_WORKTREE_SCOPE'], 'off')
+
     def test_rejects_wrong_or_missing_endpoints_before_command(self):
         for key, value in [('DATABASE_URL', 'postgres://prod.example/production'),
                            ('TEST_DB_URL', ''), ('HARNESS_PG_PORT', ''),

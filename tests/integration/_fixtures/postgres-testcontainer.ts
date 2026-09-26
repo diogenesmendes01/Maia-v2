@@ -127,7 +127,7 @@ async function findMigrationsDir(): Promise<string> {
  *   - record each applied migration in `schema_migrations`
  * Returns the number of migrations applied.
  */
-async function applyMigrations(pool: pg.Pool): Promise<number> {
+export async function applyMigrations(pool: pg.Pool): Promise<number> {
   const dir = await findMigrationsDir();
   const files = (await readdir(dir))
     .filter((f) => f.endsWith('.sql') && !f.endsWith('_down.sql'))
