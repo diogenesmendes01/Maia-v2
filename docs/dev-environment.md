@@ -109,8 +109,16 @@ The live canary requires the operator-owned reservation
 `127.0.0.1:6382/3` and `/4` for owner
 `hermes-environment-integration-fixes/worktree-canary` (UID1006). Its persistent
 operator ledger is `rollout/canary-redis-allocation.json`; inventory must establish
-absence of another owner, not merely DBSIZE=0. Changing/releasing the allocation
-requires operator review, including updating the fail-closed fixture contract.
+absence of another owner, not merely DBSIZE=0. A second reservation was authorized
+for the WIP1 pilot: `/srv/agents/runtime/pilot-canary-redis-allocation.json`, owner
+`native-pilot-20260926/worktree-canary`, worktrees
+`/srv/agents/repos/Maia-v2/.worktrees/t_21fcbc0f` and its independent QA worktree
+`t_21fcbc0f-qa`, reserving `127.0.0.1:6382/7` and `/8` (main roles keep 5/6).
+Both reservations are fixed by this file and by the fixture contract in
+`tests/helpers/canary-redis-allocation.ts`: the runtime path is part of the
+reservation identity, so an authorized owner/pair at any other path is refused, and
+the two reservations never exchange owners, worktrees or slots. Changing or
+releasing an allocation requires operator review, including updating that contract.
 Missing, single, duplicate, foreign or released allocations fail setup before
 connections or CREATE DATABASE. The launcher keeps `TEST_WORKTREE_SCOPE=off`
 for the main suite and the ordinary card endpoint unchanged. Only disposable
