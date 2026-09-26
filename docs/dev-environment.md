@@ -114,10 +114,32 @@ for the WIP1 pilot: `/srv/agents/runtime/pilot-canary-redis-allocation.json`, ow
 `native-pilot-20260926/worktree-canary`, worktrees
 `/srv/agents/repos/Maia-v2/.worktrees/t_21fcbc0f` and its independent QA worktree
 `t_21fcbc0f-qa`, reserving `127.0.0.1:6382/7` and `/8` (main roles keep 5/6).
-Both reservations are fixed by this file and by the fixture contract in
+The third reservation is collective to the authorized WIP3 wave, **not borrowed
+from a card**: `/srv/agents/runtime/wip3-canary-redis-allocation.json`, version1,
+status `reserved`, owner `parallel-wave-20260926/worktree-canary`, UID1006, scope
+`test-only-worktree-canary`. It reserves exactly `redis://127.0.0.1:6383/9` and
+`redis://127.0.0.1:6383/10` on the separate test-only Redis instance (16 DBs).
+The primary manifest worktree is `/srv/agents/worktrees/wip3-environment-prep`;
+`allowed_worktrees` contains that path plus these independent DEV/QA trees:
+
+- `/srv/agents/repos/Maia-v2/.worktrees/t_f0a9f243-native`
+- `/srv/agents/repos/Maia-v2/.worktrees/t_f0a9f243-native-qa`
+- `/srv/agents/repos/Maia-v2/.worktrees/t_15d962a7`
+- `/srv/agents/repos/Maia-v2/.worktrees/t_15d962a7-qa`
+- `/srv/agents/repos/Maia-v2/.worktrees/t_f6773fda`
+- `/srv/agents/repos/Maia-v2/.worktrees/t_f6773fda-qa`
+
+The operator must serialize **all heavy/full/canary runs** in this wave with
+`flock /srv/agents/runtime/locks/wip3-heavy.lock <command>` for the entire run.
+The guard validates allocation identity; it does not acquire this operational lock.
+Main DEV/QA slots1–6 on6383 stay separate; canary9/10 must never replace the main
+card endpoint. Do not touch6382, borrow older reservations, or treat DBSIZE=0 as
+ownership. Root owns the manifest; group/world write is forbidden.
+
+All three reservations are fixed by this file and by the fixture contract in
 `tests/helpers/canary-redis-allocation.ts`: the runtime path is part of the
 reservation identity, so an authorized owner/pair at any other path is refused, and
-the two reservations never exchange owners, worktrees or slots. Changing or
+the reservations never exchange owners, worktrees, ports or slots. Changing or
 releasing an allocation requires operator review, including updating that contract.
 Missing, single, duplicate, foreign or released allocations fail setup before
 connections or CREATE DATABASE. The launcher keeps `TEST_WORKTREE_SCOPE=off`

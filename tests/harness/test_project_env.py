@@ -79,6 +79,26 @@ class ProjectEnvironmentTests(unittest.TestCase):
         self.assertEqual(actual.get('TEST_CANARY_REDIS_ALLOCATION'), env['TEST_CANARY_REDIS_ALLOCATION'])
         self.assertEqual(actual['TEST_WORKTREE_SCOPE'], 'off')
 
+    def test_wip3_launcher_preserves_card_slot_and_canary_manifest_on_6383(self):
+        env = self.environment()
+        env.update(HARNESS_REDIS_PORT='6383', HARNESS_REDIS_DB='1',
+                   REDIS_URL='redis://127.0.0.1:6383/1',
+                   TEST_CANARY_REDIS_ALLOCATION='/srv/agents/runtime/wip3-canary-redis-allocation.json')
+        result = subprocess.run([sys.executable, str(SCRIPT), '--', sys.executable,
+                                 '-c', 'import os,json; print(json.dumps(dict(os.environ)))'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual['REDIS_URL'], env['REDIS_URL'])
+        self.assertEqual(actual['TEST_CANARY_REDIS_ALLOCATION'], env['TEST_CANARY_REDIS_ALLOCATION'])
+        self.assertEqual(actual['TEST_WORKTREE_SCOPE'], 'off')
+        env['HARNESS_REDIS_PORT'] = '6382'
+        result = subprocess.run([sys.executable, str(SCRIPT), '--', sys.executable,
+                                 '-c', 'print("EXECUTED")'], env=env,
+                                capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotIn('EXECUTED', result.stdout)
+
     def test_rejects_wrong_or_missing_endpoints_before_command(self):
         for key, value in [('DATABASE_URL', 'postgres://prod.example/production'),
                            ('TEST_DB_URL', ''), ('HARNESS_PG_PORT', ''),
