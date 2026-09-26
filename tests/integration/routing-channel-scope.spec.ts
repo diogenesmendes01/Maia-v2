@@ -16,6 +16,8 @@
  */
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import pg from 'pg';
+import { randomUUID } from 'node:crypto';
+import { DisposableDatabase } from '../helpers/disposable-database.js';
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
@@ -309,20 +311,14 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
     const { readFile, readdir } = await import('node:fs/promises');
     const { NO_TX_MARKER, splitNoTxStatements } = await import('../../scripts/migrate.ts');
     const migrationsDir = new URL('../../migrations/', import.meta.url);
-    const RB_DB = 'maia_rollback_090_test';
-
-    const adminUrl = process.env.TEST_DB_URL!;
-    const admin = new pg.Client({ connectionString: adminUrl });
-    await admin.connect();
-    await admin.query(`DROP DATABASE IF EXISTS ${RB_DB} WITH (FORCE)`);
-    await admin.query(`CREATE DATABASE ${RB_DB}`);
-    await admin.end();
-
-    const rbUrl = new URL(adminUrl);
-    rbUrl.pathname = `/${RB_DB}`;
-    const c = new pg.Client({ connectionString: rbUrl.toString() });
-    await c.connect();
+    const fixture = new DisposableDatabase(
+      process.env.TEST_DB_URL!,
+      `${import.meta.url}:rollback-090:${process.pid}:${randomUUID()}`,
+    );
+    const c = new pg.Client({ connectionString: fixture.url });
     try {
+      await fixture.create();
+      await c.connect();
       // Forward completo, com as MESMAS regras do scripts/migrate.ts
       // (ordem lexicográfica; arquivos `-- maia:no-transaction` vão
       // statement a statement por causa do CONCURRENTLY).
@@ -458,10 +454,7 @@ d('fase 0 — escopo por canal no DB (constraints 090)', () => {
       expect(col.rows).toHaveLength(0);
     } finally {
       await c.end().catch(() => undefined);
-      const cleanup = new pg.Client({ connectionString: adminUrl });
-      await cleanup.connect();
-      await cleanup.query(`DROP DATABASE IF EXISTS ${RB_DB} WITH (FORCE)`).catch(() => undefined);
-      await cleanup.end();
+      await fixture.cleanup();
     }
   }, 120_000);
 });

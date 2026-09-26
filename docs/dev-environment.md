@@ -215,7 +215,17 @@ Without explicit test overrides, worktree helpers default to localhost ports
 synthetic provider values; NODE_ENV=test alone is **not** a network fence.
 
 The allowlisted recipe prevents inherited production environment and automatic
-root `.env` loading. It does not claim all test code is incapable of making
+root `.env` loading. Disposable rollback fixtures receive `TEST_PG_MAINTENANCE_DB=maia_maintenance`
+and `TEST_PG_TEMPLATE` from the operator's validated `HARNESS_PG_TEMPLATE`.
+Outside this recipe their compatible defaults remain `postgres`/`template1`.
+`DisposableDatabase` derives a bounded `card_*` name from a unique test context,
+never drops before CREATE, registers the successful creation's catalog OID,
+and refuses cleanup if that identity changes. Cleanup uses no FORCE and surfaces
+failures; a failed registration or interrupted process may retain an owned DB for
+inspection rather than risk deleting somebody else's resource. This is operational
+isolation, not a security fence against a malicious peer sharing the same role.
+
+It does not claim all test code is incapable of making
 network requests; use synthetic adapters and operator egress policy where
 required. No production configuration or application runtime was changed here.
 

@@ -57,6 +57,17 @@ class ProjectEnvironmentTests(unittest.TestCase):
         self.assertNotIn('HERMES_PIN_UNRECOGNIZED', actual)
         self.assertNotIn('ANTHROPIC_API_KEY', actual)
 
+    def test_pins_disposable_database_fixture_contract(self):
+        env = self.environment()
+        env['HARNESS_PG_TEMPLATE'] = 'maia_template'
+        result = subprocess.run([sys.executable, str(SCRIPT), '--', sys.executable,
+                                 '-c', 'import os,json; print(json.dumps(dict(os.environ)))'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        self.assertEqual(actual.get('TEST_PG_MAINTENANCE_DB'), 'maia_maintenance')
+        self.assertEqual(actual.get('TEST_PG_TEMPLATE'), 'maia_template')
+
     def test_rejects_wrong_or_missing_endpoints_before_command(self):
         for key, value in [('DATABASE_URL', 'postgres://prod.example/production'),
                            ('TEST_DB_URL', ''), ('HARNESS_PG_PORT', ''),
