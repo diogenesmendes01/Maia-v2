@@ -6,7 +6,7 @@ import {
   validateCanaryRedisAllocation,
 } from '../../helpers/canary-redis-allocation.js';
 
-/** As duas reservas test-only que o operador autorizou explicitamente. */
+/** Reservas test-only que o operador autorizou explicitamente. */
 const ORIGINAL_PATH = '/srv/agents/runtime/canary-redis-allocation.json';
 const PILOT_PATH = '/srv/agents/runtime/pilot-canary-redis-allocation.json';
 
@@ -36,7 +36,101 @@ const pilot = {
   destinations: ['redis://127.0.0.1:6382/7', 'redis://127.0.0.1:6382/8'],
 };
 
+const WIP3_PATH = '/srv/agents/runtime/wip3-canary-redis-allocation.json';
+const wip3 = {
+  version: 1,
+  status: 'reserved',
+  owner: 'parallel-wave-20260926/worktree-canary',
+  uid: 1006,
+  worktree: '/srv/agents/worktrees/wip3-environment-prep',
+  allowed_worktrees: [
+    '/srv/agents/worktrees/wip3-environment-prep',
+    '/srv/agents/repos/Maia-v2/.worktrees/t_f0a9f243-native',
+    '/srv/agents/repos/Maia-v2/.worktrees/t_f0a9f243-native-qa',
+    '/srv/agents/repos/Maia-v2/.worktrees/t_15d962a7',
+    '/srv/agents/repos/Maia-v2/.worktrees/t_15d962a7-qa',
+    '/srv/agents/repos/Maia-v2/.worktrees/t_f6773fda',
+    '/srv/agents/repos/Maia-v2/.worktrees/t_f6773fda-qa',
+  ],
+  scope: 'test-only-worktree-canary',
+  destinations: ['redis://127.0.0.1:6383/9', 'redis://127.0.0.1:6383/10'],
+};
+
 describe('explicit live canary Redis allocation guard', () => {
+  it.each(wip3.allowed_worktrees)(
+    'accepts the exact collective WIP3 reservation for %s',
+    (worktree) => {
+      expect(validateCanaryRedisAllocation({ ...wip3, worktree }, WIP3_PATH)).toEqual(
+        wip3.destinations,
+      );
+    },
+  );
+  it.each([
+    ['single slot', { destinations: [wip3.destinations[0]] }],
+    ['duplicate slots', { destinations: [wip3.destinations[0], wip3.destinations[0]] }],
+    ['reversed pair', { destinations: [...wip3.destinations].reverse() }],
+    ...[0, 1, 2, 3, 7, 11, 16].map(
+      (db) =>
+        [
+          `unallocated DB ${db}`,
+          { destinations: [`redis://127.0.0.1:6383/${db}`, wip3.destinations[1]] },
+        ] as const,
+    ),
+    ...[6382, 6384, 6379].map(
+      (port) =>
+        [
+          `port swap ${port}`,
+          { destinations: [`redis://127.0.0.1:${port}/9`, `redis://127.0.0.1:${port}/10`] },
+        ] as const,
+    ),
+    ['mixed ports', { destinations: [wip3.destinations[0], 'redis://127.0.0.1:6382/10'] }],
+    ['old owner', { owner: original.owner }],
+    ['pilot owner', { owner: pilot.owner }],
+    ['invented owner', { owner: 'invented/worktree-canary' }],
+    ['foreign worktree', { worktree: pilot.worktree }],
+    ['invented worktree', { worktree: '/worker/invented' }],
+    ['expanded worktrees', { allowed_worktrees: [...wip3.allowed_worktrees, pilot.worktree] }],
+    ['empty worktrees', { allowed_worktrees: [] }],
+    ['omitted primary worktree', { allowed_worktrees: wip3.allowed_worktrees.slice(1) }],
+    ['released', { status: 'released' }],
+    ['wrong uid', { uid: 0 }],
+    ['wrong version', { version: 2 }],
+    ['wrong scope', { scope: 'production' }],
+  ] as const)('rejects WIP3 %s', (_label, override) => {
+    expect(() => validateCanaryRedisAllocation({ ...wip3, ...override }, WIP3_PATH)).toThrow(
+      'BLOCKED',
+    );
+  });
+
+  it.each([ORIGINAL_PATH, PILOT_PATH, '/worker/wip3-canary-redis-allocation.json'])(
+    'rejects WIP3 content at another path %s',
+    (path) => {
+      expect(() => validateCanaryRedisAllocation(wip3, path)).toThrow('BLOCKED');
+    },
+  );
+
+  it.each([
+    [original, ORIGINAL_PATH],
+    [pilot, PILOT_PATH],
+  ] as const)(
+    'never lends WIP3 destinations or port to an older reservation %#',
+    (allocation, path) => {
+      expect(() => validateCanaryRedisAllocation(allocation, WIP3_PATH)).toThrow('BLOCKED');
+      expect(() =>
+        validateCanaryRedisAllocation({ ...allocation, destinations: wip3.destinations }, path),
+      ).toThrow('BLOCKED');
+      expect(() =>
+        validateCanaryRedisAllocation(
+          {
+            ...allocation,
+            destinations: allocation.destinations.map((url) => url.replace(':6382/', ':6383/')),
+          },
+          path,
+        ),
+      ).toThrow('BLOCKED');
+    },
+  );
+
   it('rejects absent operator reservation even when worktree scope is on', () => {
     expect(() => readCanaryRedisAllocation({ TEST_WORKTREE_SCOPE: 'on' })).toThrow('BLOCKED');
   });
@@ -104,10 +198,7 @@ describe('explicit live canary Redis allocation guard', () => {
       ),
     ).toThrow('BLOCKED');
     expect(() =>
-      validateCanaryRedisAllocation(
-        { ...pilot, destinations: original.destinations },
-        PILOT_PATH,
-      ),
+      validateCanaryRedisAllocation({ ...pilot, destinations: original.destinations }, PILOT_PATH),
     ).toThrow('BLOCKED');
     // Conteúdo autorizado de uma reserva no caminho da outra.
     expect(() => validateCanaryRedisAllocation(pilot, ORIGINAL_PATH)).toThrow('BLOCKED');
@@ -135,33 +226,36 @@ describe('explicit live canary Redis allocation guard', () => {
     ).toThrow('BLOCKED');
   });
 
-  it.each([original, pilot])('rejects absent, single, duplicate, unallocated or conflicting allocation %#', (valid) => {
-    const path = valid === original ? ORIGINAL_PATH : PILOT_PATH;
-    const [first, second] = valid.destinations;
-    const invalid = [
-      undefined,
-      null,
-      {},
-      { ...valid, destinations: [first] },
-      { ...valid, destinations: [first, first] },
-      { ...valid, destinations: ['redis://127.0.0.1:6382/0', second] },
-      { ...valid, destinations: ['redis://127.0.0.1:6382/1', second] },
-      { ...valid, destinations: ['redis://127.0.0.1:6382/2', second] },
-      { ...valid, destinations: ['redis://127.0.0.1:6382/5', second] },
-      { ...valid, destinations: ['redis://prod.example:6382/7', second] },
-      { ...valid, destinations: ['redis://127.0.0.1:6379/7', second] },
-      { ...valid, destinations: ['redis://127.0.0.1:6382/7 ', second] },
-      { ...valid, destinations: [first, 8] },
-      { ...valid, status: 'released' },
-      { ...valid, owner: 'another-card' },
-      { ...valid, scope: 'production' },
-      { ...valid, uid: 0 },
-      { ...valid, version: 2 },
-    ];
-    for (const allocation of invalid) {
-      expect(() => validateCanaryRedisAllocation(allocation, path)).toThrow('BLOCKED');
-    }
-  });
+  it.each([original, pilot])(
+    'rejects absent, single, duplicate, unallocated or conflicting allocation %#',
+    (valid) => {
+      const path = valid === original ? ORIGINAL_PATH : PILOT_PATH;
+      const [first, second] = valid.destinations;
+      const invalid = [
+        undefined,
+        null,
+        {},
+        { ...valid, destinations: [first] },
+        { ...valid, destinations: [first, first] },
+        { ...valid, destinations: ['redis://127.0.0.1:6382/0', second] },
+        { ...valid, destinations: ['redis://127.0.0.1:6382/1', second] },
+        { ...valid, destinations: ['redis://127.0.0.1:6382/2', second] },
+        { ...valid, destinations: ['redis://127.0.0.1:6382/5', second] },
+        { ...valid, destinations: ['redis://prod.example:6382/7', second] },
+        { ...valid, destinations: ['redis://127.0.0.1:6379/7', second] },
+        { ...valid, destinations: ['redis://127.0.0.1:6382/7 ', second] },
+        { ...valid, destinations: [first, 8] },
+        { ...valid, status: 'released' },
+        { ...valid, owner: 'another-card' },
+        { ...valid, scope: 'production' },
+        { ...valid, uid: 0 },
+        { ...valid, version: 2 },
+      ];
+      for (const allocation of invalid) {
+        expect(() => validateCanaryRedisAllocation(allocation, path)).toThrow('BLOCKED');
+      }
+    },
+  );
 });
 
 describe('operator-owned reservation file guard', () => {
