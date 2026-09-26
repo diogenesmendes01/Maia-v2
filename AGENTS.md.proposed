@@ -201,12 +201,12 @@ For the dedicated `hermes-sandbox` environment, follow
 Run the read-only `harness-doctor` at start/resume; block once with all failures.
 Setup/dependencies/migrations/tests are separate recipe steps, not doctor actions.
 Use `harness-test-run` for exit/log/count evidence; unknown counts stay unknown.
-DEV maintains the locally excluded `.agent/checkpoint.md` (maximum 30 lines),
+DEV maintains the locally excluded `.agent/checkpoint.md` (maximum30 lines),
 checks Git/card on continuation and puts reusable notes in `docs/dev-environment.md`;
 DEV does not edit AGENTS.md. QA does not write/use checkpoint as proof and must
 verify every AC independently. Required decision/block/handoff comments remain.
 The shared-infrastructure instructions below are a different environment: do not
-combine them with the explicit per-card DB/Redis recipe.
+combine them with the explicit per-card DB/Redis recipe or touch active SC01.
 
 `npm run test:integration` requires real Postgres + Redis:
 
