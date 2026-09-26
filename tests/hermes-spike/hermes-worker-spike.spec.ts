@@ -328,16 +328,29 @@ d('spike sintético — worker + AIAgent real contra provider STUB', () => {
   it('T54 — HERMES_HOME apontando para o perfil pessoal é RECUSADO antes de qualquer import', async () => {
     // O bootstrap recusa com código próprio (2). Nada pode ser escrito no
     // perfil pessoal — inclusive porque só o import já criaria state.db lá.
-    const perfilPessoal = join(process.env.LOCALAPPDATA ?? tmpdir(), 'hermes');
+    // Synthetic OS home: never inspect or touch the executor's real profile.
+    // The child environment is scrubbed, so pass its home explicitly too.
+    const userHome = novoHome();
+    const localAppData = join(userHome, 'AppData', 'Local');
+    const perfilPessoal =
+      process.platform === 'win32' ? join(localAppData, 'hermes') : join(userHome, '.hermes');
     const stub = await startStubProvider({ script: [{ kind: 'text', content: 'x' }] });
     stubs.push(stub);
-    const worker = spawnWorker(perfilPessoal);
+    const worker = spawnWorker(perfilPessoal, {
+      HOME: userHome,
+      USERPROFILE: userHome,
+      LOCALAPPDATA: localAppData,
+    });
+    const closed = new Promise<void>((done) => worker.child.once('close', () => done()));
     workers.push(worker);
 
     const code = await worker.exit();
+    await closed; // Drain stdout/stderr before asserting that no frames escaped.
     expect(code).toBe(2);
-    expect(worker.stderr.join('')).toMatch(/perfil pessoal|bootstrap recusado/i);
+    expect(worker.stderr.join('')).toMatch(/perfil pessoal/i);
     expect(worker.frames).toHaveLength(0);
+    expect(readdirSync(userHome)).toEqual([]);
+    expect(stub.requests).toHaveLength(0);
   });
 
   it('T55 — o home efêmero acumula estado do motor, e o inventário sai no log', async () => {

@@ -9,7 +9,8 @@ import { inferenceRepo } from '@/db/repositories/inference-repos.js';
 import { createChatCompletionsRelay } from '@/lib/llm/providers/chat-completions-relay.js';
 import { startStubProvider } from '../helpers/hermes-stub-provider.js';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
 import type { AddressInfo } from 'node:net';
 
@@ -172,7 +173,7 @@ d('SYNTHETIC core admission: real DB + AIAgent pin, STUB provider, FAKE channel'
     async (scenario) => {
       channel.sent = [];
       channel.beforeResolve = null;
-      const home = mkdtempSync('/root/maia-work/synthetic-hermes-');
+      const home = mkdtempSync(join(tmpdir(), 'synthetic-hermes-'));
       const stub = await startStubProvider({
         script: [{ kind: 'text', content: 'synthetic response' }],
       });
