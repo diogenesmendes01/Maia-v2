@@ -18,7 +18,7 @@ this lightweight harness doctor is a different, dependency-free command.
   Full permission and negative-access tests belong in operator preflight.
 - Root-managed localhost PostgreSQL instance **exclusively for tests**, sandbox
   role CREATEDB / NOSUPERUSER / NOCREATEROLE, explicit CONNECT to maintenance
-  database `postgres`. No production/Olympia databases or credentials.
+  database `maia_maintenance` on 127.0.0.1:5435 (role `hermes_sandbox`). No production/Olympia databases or credentials.
 - **Template prerequisite:** migrations 001/002 request `uuid-ossp`, `pgcrypto`,
   `vector`, `btree_gin`, `pg_trgm`. Operator supplies a test-only template containing
   these extensions (particularly pgvector, which a nonsuperuser cannot normally
@@ -38,7 +38,7 @@ cgroup quotas, template access and resource retention are operator acceptance.
 
 ## 2. Explicit local configuration and diagnostic-only doctor
 
-Use `/srv/agents/lib/harness-tools/scripts/harness/.env.example` as the **separate test-only template**. The
+Use the revision-owned `scripts/harness/.env.example` as the **separate test-only template**. The
 root `.env.example` is generated from the application contract and is intentionally
 unchanged. Fill a private, operator-approved file with only dedicated-test values;
 source only a trusted file, never pasted shell from a card. Do not copy production
@@ -70,6 +70,21 @@ do not fix host infrastructure. Missing `/srv/agents/...` or test services is
 **not configured**, not a passing pilot. Doctor uses the maintenance DB so it can
 pass before the card DB exists. A successful doctor does not validate migrations
 or claim the recipe below has executed.
+
+### Provisioned service handoff
+
+Source `/srv/agents/runtime/test-services.env` only when operator-provisioned. It
+provides the dedicated Redis endpoint and Hermes Python/upstream paths; do not
+substitute a pre-existing Redis or installed Hermes HEAD. Verify upstream SHA
+`5d59366010640c1d6b8f170d8a4ee109db2bbdef` and Python3.12. Keep
+`MAIA_HERMES_UPSTREAM` and `MAIA_HERMES_WORKER_PYTHON` explicit: missing pins can
+skip spike tests. Existing `.nvmrc` and `packageManager` own Node/npm versions.
+
+The revision-owned `python3 scripts/harness/project_env.py -- ...` is the
+project recipe launcher. Use it below in place of `harness-project-env` until
+the operator promotes this revision: the older installed launcher strips the
+two Hermes paths. Do not update the root-owned package from a project task.
+The installed `harness-test-run` remains the evidence wrapper.
 
 ## 3. Install dependencies (in this worktree only)
 
@@ -111,7 +126,7 @@ security sandbox for arbitrary commands or malicious tests.
 # Template must be verified by operator. Failure does not trigger a fallback.
 : "${HARNESS_PG_TEMPLATE:?operator must configure test template}"
 harness-project-env -- \
-  createdb --maintenance-db=postgres --template="$HARNESS_PG_TEMPLATE" "$HARNESS_CARD_DATABASE"
+  createdb --maintenance-db=maia_maintenance --template="$HARNESS_PG_TEMPLATE" "$HARNESS_CARD_DATABASE"
 # On resume, do not recreate/drop an existing database: inspect card ownership and
 # migration status, then continue only on the SAME card database.
 harness-project-env -- npm run db:migrate -- up

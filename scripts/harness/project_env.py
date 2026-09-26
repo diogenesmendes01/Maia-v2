@@ -36,6 +36,10 @@ def test_environment():
                 'PGHOST': pg.hostname, 'PGPORT': str(pg.port),
                 'PGUSER': unquote(pg.username), 'PGPASSWORD': unquote(pg.password),
                 'PGDATABASE': card, 'PGCONNECT_TIMEOUT': '3'})
+    # Explicit nonsecret test runtime paths; never inherit HERMES_HOME or keys.
+    for key in ('MAIA_HERMES_UPSTREAM', 'MAIA_HERMES_WORKER_PYTHON'):
+        if source.get(key):
+            env[key] = source[key]
     return env
 
 
