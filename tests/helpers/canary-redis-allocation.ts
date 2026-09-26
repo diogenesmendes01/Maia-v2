@@ -41,6 +41,23 @@ const OPERATOR_RESERVATIONS: readonly AuthorizedReservation[] = [
     scope: 'test-only-worktree-canary',
     destinations: ['redis://127.0.0.1:6382/7', 'redis://127.0.0.1:6382/8'],
   },
+  {
+    // WIP3: reserva coletiva da wave, serializada pelo lock operacional único.
+    path: '/srv/agents/runtime/wip3-canary-redis-allocation.json',
+    owner: 'parallel-wave-20260926/worktree-canary',
+    uid: 1006,
+    worktrees: [
+      '/srv/agents/worktrees/wip3-environment-prep',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_f0a9f243-native',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_f0a9f243-native-qa',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_15d962a7',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_15d962a7-qa',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_f6773fda',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_f6773fda-qa',
+    ],
+    scope: 'test-only-worktree-canary',
+    destinations: ['redis://127.0.0.1:6383/9', 'redis://127.0.0.1:6383/10'],
+  },
 ];
 
 const BLOCKED_SLOTS =
@@ -80,7 +97,9 @@ function assertReservedDestinationPair(destinations: unknown): readonly [string,
   const [first, second] = destinations as unknown[];
   for (const destination of [first, second]) {
     const match =
-      typeof destination === 'string' ? /^redis:\/\/127\.0\.0\.1:6382\/(\d+)$/.exec(destination) : null;
+      typeof destination === 'string'
+        ? /^redis:\/\/127\.0\.0\.1:638[23]\/(\d+)$/.exec(destination)
+        : null;
     if (!match) throw new Error(BLOCKED_SLOTS);
     // 0 é "quem não é worktree"; 1/2 já são de outros donos. Uma reserva só
     // começa em 3 e nunca passa dos 16 dbs do redis-server.
