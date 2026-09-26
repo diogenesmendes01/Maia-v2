@@ -51,7 +51,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
 import {
   startPostgresContainer,
   stopPostgresContainer,
-  isDockerAvailable,
+  isPostgresFixtureAvailable,
   type StartedPostgres,
 } from './_fixtures/postgres-testcontainer.js';
 
@@ -85,7 +85,7 @@ let previousDatabaseUrl: string | undefined;
 // uses testcontainers' own runtime-discovery helper so it honours the same
 // auto-detection as start() would — DOCKER_HOST, default sockets per OS,
 // Rancher/Colima/podman, etc. Setting SKIP_DOCKER_TESTS=1 forces skip.
-const SHOULD_RUN = await isDockerAvailable();
+const SHOULD_RUN = await isPostgresFixtureAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // Tenant slugs we seed. Distinct from the legacy 'default' tenant that

@@ -32,6 +32,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { randomUUID } from 'node:crypto';
 import IORedis from 'ioredis';
 import pg from 'pg';
+import { DisposableDatabase } from '../helpers/disposable-database.js';
 import { assertIntegrationDeps } from '../helpers/integrationSetup.js';
 import {
   criarRepoDeSonda,
@@ -49,42 +50,43 @@ const PRAZO = 120_000;
 let repo: RepoDeSonda;
 let sondas: RespostaDaSonda[];
 const clientes: pg.Client[] = [];
+const databases: DisposableDatabase[] = [];
 const redis: IORedis[] = [];
 const canario = randomUUID();
 
-function urlDeManutencao(url: string): string {
-  const u = new URL(url);
-  u.pathname = '/postgres';
-  return u.toString();
-}
-
-function nomeDoBanco(url: string): string {
-  return new URL(url).pathname.replace(/^\//, '');
-}
-
-async function comAdmin(url: string, sql: string): Promise<void> {
-  const admin = new pg.Client({ connectionString: urlDeManutencao(url) });
-  await admin.connect();
-  try {
-    await admin.query(sql);
-  } finally {
-    await admin.end();
-  }
-}
-
 d('#571 — duas worktrees não se enxergam (canários em Postgres e Redis)', () => {
   beforeAll(async () => {
+    // The dedicated recipe authorizes only its explicit logical Redis DB.
+    // This live cross-worktree proof needs two slots; never borrow DB1 or peers.
+    if (process.env.TEST_WORKTREE_SCOPE === 'off') {
+      throw new Error(
+        'BLOCKED: live worktree canary requires two explicitly allocated Redis DB slots; this recipe authorizes only REDIS_URL',
+      );
+    }
     await assertIntegrationDeps();
     repo = criarRepoDeSonda();
     const roots = [repo.criarWorktree('wt-canario-a'), repo.criarWorktree('wt-canario-b')];
     // As sondas herdam TEST_DB_URL/REDIS_URL desta rodada e devolvem o
     // ambiente que USARIAM — é contra esses destinos que os canários vão.
-    sondas = await rodarSondas(roots);
+    const baseUrl = new URL(process.env.TEST_DB_URL!);
+    baseUrl.pathname = '/card_canary';
+    sondas = await rodarSondas(roots, {
+      TEST_DB_URL: baseUrl.toString(),
+      DATABASE_URL: baseUrl.toString(),
+    });
 
     for (const s of sondas) {
       expect(s.escopo, 'a sonda caiu no caminho scope === null').not.toBeNull();
       const url = s.ambiente?.DATABASE_URL ?? '';
-      await comAdmin(url, `CREATE DATABASE "${nomeDoBanco(url).replace(/"/g, '""')}"`);
+      const database = new DisposableDatabase(
+        url,
+        `${canario}:${databases.length}`,
+        process.env,
+        'card_fixture',
+        new URL(url).pathname.slice(1),
+      );
+      databases.push(database);
+      await database.create();
       const cliente = new pg.Client({ connectionString: url });
       await cliente.connect();
       clientes.push(cliente);
@@ -102,14 +104,7 @@ d('#571 — duas worktrees não se enxergam (canários em Postgres e Redis)', ()
       r.disconnect();
     }
     for (const c of clientes) await c.end().catch(() => undefined);
-    for (const s of sondas ?? []) {
-      const url = s.ambiente?.DATABASE_URL ?? '';
-      if (!url) continue;
-      await comAdmin(
-        url,
-        `DROP DATABASE IF EXISTS "${nomeDoBanco(url).replace(/"/g, '""')}"`,
-      ).catch(() => undefined);
-    }
+    for (const database of databases) await database.cleanup();
     repo?.destruir();
   }, PRAZO);
 

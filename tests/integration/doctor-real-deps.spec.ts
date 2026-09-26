@@ -29,6 +29,7 @@
  */
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import pg from 'pg';
+import { createServer } from 'node:net';
 import { doctorPostgresPool, readOnlyPostgres, READ_ONLY_SQLSTATE } from '@/ops/doctor/postgres.js';
 import {
   SchemaEvaluationAbortedError,
@@ -42,12 +43,25 @@ import { main } from '../../scripts/doctor.js';
  * cair nele faria esta suíte TENTAR conectar em qualquer rodada só-unit.
  */
 const DB_URL = process.env.TEST_DB_URL;
-const REDIS_URL = process.env.TEST_REDIS_URL ?? 'redis://127.0.0.1:6379';
+const REDIS_URL = process.env.TEST_REDIS_URL ?? process.env.REDIS_URL ?? 'redis://127.0.0.1:6379';
 const d = DB_URL ? describe : describe.skip;
 
-/** Porta sem nada escutando — o alvo do caso negativo. */
-const DEAD_PG_PORT = 5433;
-const DEAD_REDIS_PORT = 6399;
+/** Ask the OS for an unused loopback port, then close it for refusal probes. */
+async function closedPort(): Promise<number> {
+  const server = createServer();
+  await new Promise<void>((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === 'string') throw new Error('Missing probe port');
+  await new Promise<void>((resolve, reject) =>
+    server.close((error) => (error ? reject(error) : resolve())),
+  );
+  return address.port;
+}
+let DEAD_PG_PORT: number;
+let DEAD_REDIS_PORT: number;
 
 const SCHEMA = `maia_doctor_${Math.random().toString(36).slice(2, 10)}`;
 
@@ -84,6 +98,8 @@ async function runCli(
 
 d('maia doctor · dependências reais', () => {
   beforeAll(async () => {
+    DEAD_PG_PORT = await closedPort();
+    DEAD_REDIS_PORT = await closedPort();
     admin = new pg.Pool({ connectionString: DB_URL, max: 2 });
     await admin.query(`CREATE SCHEMA IF NOT EXISTS ${SCHEMA}`);
     await admin.query(`CREATE TABLE ${SCHEMA}.probe (id TEXT PRIMARY KEY)`);

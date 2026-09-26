@@ -225,6 +225,25 @@ failures; a failed registration or interrupted process may retain an owned DB fo
 inspection rather than risk deleting somebody else's resource. This is operational
 isolation, not a security fence against a malicious peer sharing the same role.
 
+Reliability and release-gate fixtures also use this ownership helper. Reliability
+queue prefixes include a per-creation UUID; database cleanup failures fail the
+suite rather than forcing sessions closed. The real-Postgres fixture supports an
+explicit provisioned-server lane (`TEST_DB_URL` plus `TEST_PG_MAINTENANCE_DB`):
+it creates a fresh owned database and runs the same migration chain as the
+Testcontainers lane. It does not simulate Docker or alter Docker availability.
+The fairness metrics fixture uses a fresh database because its production
+snapshot is a global operational aggregate, not an ALS-scoped request query.
+
+The live worktree Redis canary needs two logical Redis databases. This manual
+single-slot recipe blocks that setup **before any canary connection or CREATE**.
+Do not borrow other slots or replace the two-DB assertion with key prefixes.
+An operator must allocate a separate two-slot test lane to exercise it; four
+blocked cases are not successful tests. PostgreSQL canary cleanup is still
+ownership-checked, including an explicitly derived `card_*` name.
+
+File-only Compose differential subprocesses inherit only PATH/HOME and the
+case's explicit overrides, not recipe database credentials/interpolation vars.
+
 It does not claim all test code is incapable of making
 network requests; use synthetic adapters and operator egress policy where
 required. No production configuration or application runtime was changed here.

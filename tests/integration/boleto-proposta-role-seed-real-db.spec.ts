@@ -25,7 +25,7 @@ import { readFile } from 'node:fs/promises';
 import {
   startPostgresContainer,
   stopPostgresContainer,
-  isDockerAvailable,
+  isPostgresFixtureAvailable,
   type StartedPostgres,
 } from './_fixtures/postgres-testcontainer.js';
 
@@ -39,7 +39,7 @@ let dbClientMod: DbClientModule;
 let pg: StartedPostgres;
 let previousDatabaseUrl: string | undefined;
 
-const SHOULD_RUN = await isDockerAvailable();
+const SHOULD_RUN = await isPostgresFixtureAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // Migration 079 seeds the role + role-specific skills under the bootstrap tenant

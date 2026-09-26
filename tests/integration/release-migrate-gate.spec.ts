@@ -40,6 +40,8 @@ import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import pg from 'pg';
+import { randomUUID } from 'node:crypto';
+import { DisposableDatabase } from '../helpers/disposable-database.js';
 
 const REPO_ROOT = resolve(__dirname, '../..');
 const ADMIN_URL = process.env.TEST_DB_URL;
@@ -55,7 +57,10 @@ const d = ADMIN_URL ? describe : describe.skip;
 const CASE_TIMEOUT_MS = 60_000;
 
 /** Nome único: o banco `maia_test` é compartilhado e não pode ser tocado. */
-const DISPOSABLE_DB = `maia_relgate_${process.pid}_${Date.now()}`;
+const fixture = ADMIN_URL
+  ? new DisposableDatabase(ADMIN_URL, `release:${process.pid}:${randomUUID()}`)
+  : undefined;
+const DISPOSABLE_DB = fixture?.name ?? '';
 
 function disposableUrl(): string {
   const url = new URL(ADMIN_URL as string);
@@ -124,15 +129,13 @@ const GATE = ['npm', 'run', 'release:migrate'] as const;
 const RAW = ['npm', 'run', 'db:migrate'] as const;
 
 d('release gate (#565) — executado contra um Postgres real', () => {
-  let admin: pg.Pool;
   // Há uma única conexão de asserção. `Client.end()` espera o socket fechar;
   // `Pool.end()` pode resolver antes e disputar com o terminate abaixo.
   let disposable: pg.Client | null = null;
   let markerDir = '';
 
   beforeAll(async () => {
-    admin = new pg.Pool({ connectionString: ADMIN_URL });
-    await admin.query(`CREATE DATABASE "${DISPOSABLE_DB}"`);
+    await fixture!.create();
     disposable = new pg.Client({ connectionString: disposableUrl() });
     await disposable.connect();
     markerDir = mkdtempSync(join(tmpdir(), 'maia-relgate-'));
@@ -140,15 +143,7 @@ d('release gate (#565) — executado contra um Postgres real', () => {
 
   afterAll(async () => {
     await disposable?.end().catch(() => undefined);
-    // Sem isto o DROP falha com "is being accessed by other users" e o banco
-    // descartável fica para trás num Postgres compartilhado.
-    await admin
-      .query(`SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1`, [
-        DISPOSABLE_DB,
-      ])
-      .catch(() => undefined);
-    await admin.query(`DROP DATABASE IF EXISTS "${DISPOSABLE_DB}"`).catch(() => undefined);
-    await admin.end().catch(() => undefined);
+    await fixture?.cleanup();
     if (markerDir) rmSync(markerDir, { recursive: true, force: true });
   });
 

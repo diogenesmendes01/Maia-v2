@@ -79,6 +79,24 @@ describe('disposable database ownership (SQL boundary double)', () => {
     expect(boundary.urls).toHaveLength(0);
   });
 
+  it('validates explicit canary names and preserves ownership on collisions', async () => {
+    for (const name of ['postgres', 'card_x";DROP', `card_${'x'.repeat(59)}`]) {
+      expect(() => new DisposableDatabase(base, 'canary', {}, 'card_fixture', name)).toThrow(
+        'name',
+      );
+    }
+    expect(() => new DisposableDatabase(base, 'fi', {}, 'foreign')).toThrow('prefix');
+    expect(boundary.urls).toHaveLength(0);
+    const first = new DisposableDatabase(base, 'first', {}, 'card_fixture', 'card_canary_a');
+    const collision = new DisposableDatabase(base, 'different', {}, 'card_fixture', first.name);
+    await first.create();
+    await expect(collision.create()).rejects.toMatchObject({ code: '42P04' });
+    await collision.cleanup();
+    expect(boundary.existing).toBe(true);
+    await first.cleanup();
+    expect(boundary.existing).toBe(false);
+  });
+
   it('refuses a preexisting foreign database without DROP or cleanup adoption', async () => {
     boundary.existing = true;
     const fixture = new DisposableDatabase(base, 'collision');
