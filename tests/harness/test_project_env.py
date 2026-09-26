@@ -34,6 +34,22 @@ class ProjectEnvironmentTests(unittest.TestCase):
         for forbidden in ['MAIA_ENV', 'ANTHROPIC_API_KEY', 'NODE_OPTIONS', 'DOTENV_CONFIG_OVERRIDE']:
             self.assertNotIn(forbidden, env)
 
+    def test_preserves_explicit_hermes_test_runtime_without_provider_secrets(self):
+        env = self.environment()
+        pins = {'MAIA_HERMES_UPSTREAM': '/srv/agents/runtime/maia-hermes-upstream',
+                'MAIA_HERMES_WORKER_PYTHON': '/srv/agents/runtime/maia-hermes-venv/bin/python'}
+        env.update(pins)
+        env['HERMES_HOME'] = '/root/.hermes'
+        result = subprocess.run([sys.executable, str(SCRIPT), '--', sys.executable,
+                                 '-c', 'import os,json; print(json.dumps(dict(os.environ)))'],
+                                env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        actual = json.loads(result.stdout)
+        for key, value in pins.items():
+            self.assertEqual(actual.get(key), value)
+        self.assertNotIn('HERMES_HOME', actual)
+        self.assertNotIn('ANTHROPIC_API_KEY', actual)
+
     def test_rejects_wrong_or_missing_endpoints_before_command(self):
         for key, value in [('DATABASE_URL', 'postgres://prod.example/production'),
                            ('TEST_DB_URL', ''), ('HARNESS_PG_PORT', ''),

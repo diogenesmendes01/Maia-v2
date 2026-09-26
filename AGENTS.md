@@ -193,6 +193,21 @@ npm run backup                    # DB backup
 
 ## 7. Integration test setup
 
+### 7.0 Dedicated local harness (code-dev / code-qa)
+
+For the dedicated `hermes-sandbox` environment, follow
+[`docs/dev-environment.md`](docs/dev-environment.md) (compatibility entry:
+[`docs/ai/harness-test-environment.md`](docs/ai/harness-test-environment.md)).
+Run the read-only `harness-doctor` at start/resume; block once with all failures.
+Setup/dependencies/migrations/tests are separate recipe steps, not doctor actions.
+Use `harness-test-run` for exit/log/count evidence; unknown counts stay unknown.
+DEV maintains the locally excluded `.agent/checkpoint.md` (maximum 30 lines),
+checks Git/card on continuation and puts reusable notes in `docs/dev-environment.md`;
+DEV does not edit AGENTS.md. QA does not write/use checkpoint as proof and must
+verify every AC independently. Required decision/block/handoff comments remain.
+The shared-infrastructure instructions below are a different environment: do not
+combine them with the explicit per-card DB/Redis recipe.
+
 `npm run test:integration` requires real Postgres + Redis:
 
 ```bash
