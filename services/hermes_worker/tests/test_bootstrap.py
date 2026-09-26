@@ -143,12 +143,25 @@ def test_home_dentro_do_perfil_pessoal_e_recusado(tmp_path: Path) -> None:
         )
 
 
-def test_home_posix_pessoal_e_recusado(tmp_path: Path, monkeypatch) -> None:
+@pytest.mark.parametrize("relative", [".hermes", ".hermes/runs/child"])
+@pytest.mark.parametrize("exists", [False, True])
+def test_home_posix_pessoal_e_recusado(tmp_path: Path, monkeypatch, relative: str, exists: bool) -> None:
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
-    pessoal = tmp_path / ".hermes"
-    pessoal.mkdir()
+    pessoal = tmp_path / relative
+    if exists:
+        pessoal.mkdir(parents=True)
+    before = sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*"))
+    # Refuse before mkdir, even for a nonexistent descendant of the profile.
     with pytest.raises(BootstrapError, match="perfil pessoal"):
         require_ephemeral_home({"HERMES_HOME": str(pessoal)}, platform="linux")
+    assert sorted(str(p.relative_to(tmp_path)) for p in tmp_path.rglob("*")) == before
+
+
+def test_home_posix_irmao_do_perfil_e_permitido(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path))
+    home = tmp_path / ".hermes-worker"
+    assert require_ephemeral_home({"HERMES_HOME": str(home)}, platform="linux") == home
+    assert list(home.iterdir()) == []
 
 
 def test_home_existente_com_conteudo_e_recusado(tmp_path: Path) -> None:

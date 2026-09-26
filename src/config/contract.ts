@@ -110,6 +110,32 @@ export const ENV_CONTRACT = {
     requiredIn: ['staging', 'production'],
     restartRequired: true,
   },
+  MAIA_HERMES_UPSTREAM: {
+    name: 'MAIA_HERMES_UPSTREAM',
+    description:
+      'Checkout Hermes pinado para os spikes locais. Opcional no boot; não habilita o motor nem substitui a configuração homologada de deployment.',
+    group: 'core',
+    secret: false,
+    services: ['runtime'],
+    schema: z.string().trim().min(1).optional(),
+    example: '/opt/test/hermes-upstream',
+    fixture: '/opt/test/hermes-upstream',
+    restartRequired: true,
+    commentedInExample: true,
+  },
+  MAIA_HERMES_WORKER_PYTHON: {
+    name: 'MAIA_HERMES_WORKER_PYTHON',
+    description:
+      'Executável Python do venv Hermes pinado para os spikes locais. Opcional no boot; o launcher deve fornecer o pin explicitamente, sem herdar credenciais ou HERMES_HOME.',
+    group: 'core',
+    secret: false,
+    services: ['runtime'],
+    schema: z.string().trim().min(1).optional(),
+    example: '/opt/test/hermes-upstream/.venv/bin/python',
+    fixture: '/opt/test/hermes-upstream/.venv/bin/python',
+    restartRequired: true,
+    commentedInExample: true,
+  },
   MAIA_BUILD_COMMIT: {
     name: 'MAIA_BUILD_COMMIT',
     description:

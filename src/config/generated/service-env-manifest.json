@@ -18,6 +18,20 @@
           "restartRequired": true
         },
         {
+          "name": "MAIA_HERMES_UPSTREAM",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
+          "name": "MAIA_HERMES_WORKER_PYTHON",
+          "secret": false,
+          "required": false,
+          "group": "core",
+          "restartRequired": true
+        },
+        {
           "name": "MAIA_BUILD_COMMIT",
           "secret": false,
           "required": false,
@@ -1430,6 +1444,8 @@
           "optional": [
             "NODE_ENV",
             "MAIA_ENV",
+            "MAIA_HERMES_UPSTREAM",
+            "MAIA_HERMES_WORKER_PYTHON",
             "MAIA_BUILD_COMMIT",
             "TZ",
             "APP_PORT",
@@ -1634,6 +1650,8 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_HERMES_UPSTREAM",
+            "MAIA_HERMES_WORKER_PYTHON",
             "MAIA_BUILD_COMMIT",
             "TZ",
             "APP_PORT",
@@ -1836,6 +1854,8 @@
           ],
           "optional": [
             "NODE_ENV",
+            "MAIA_HERMES_UPSTREAM",
+            "MAIA_HERMES_WORKER_PYTHON",
             "MAIA_BUILD_COMMIT",
             "TZ",
             "APP_PORT",

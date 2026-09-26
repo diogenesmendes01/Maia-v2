@@ -21,7 +21,8 @@ import { createChatCompletionsRelay } from '@/lib/llm/providers/chat-completions
 import { startStubProvider } from '../helpers/hermes-stub-provider.js';
 import { runWithTurnExecution } from '@/runtime/turns/execution-context.js';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
 import type { AddressInfo } from 'node:net';
 import type { EnginePinV1 } from '@/runtime/engines/contracts.js';
@@ -300,7 +301,7 @@ d('Hermes launch context — real PostgreSQL', () => {
   it.skipIf(!process.env.HERMES_PIN_PYTHON || !process.env.HERMES_PIN_UPSTREAM)(
     'prepared run → real AIAgent → real inference ledger → terminal (provider STUB)',
     async () => {
-      const home = mkdtempSync('/root/maia-work/synthetic-hermes-');
+      const home = mkdtempSync(join(tmpdir(), 'synthetic-hermes-'));
       const stub = await startStubProvider({
         script: [{ kind: 'text', content: 'synthetic response' }],
       });

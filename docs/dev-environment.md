@@ -78,7 +78,22 @@ provides the dedicated Redis endpoint and Hermes Python/upstream paths; do not
 substitute a pre-existing Redis or installed Hermes HEAD. Verify upstream SHA
 `5d59366010640c1d6b8f170d8a4ee109db2bbdef` and Python3.12. Keep
 `MAIA_HERMES_UPSTREAM` and `MAIA_HERMES_WORKER_PYTHON` explicit: missing pins can
-skip spike tests. Existing `.nvmrc` and `packageManager` own Node/npm versions.
+skip spike tests. The real-DB core fixtures use separate explicit names; after
+verifying the pin, set these before running either the core target or full suite:
+
+```bash
+export HERMES_PIN_PYTHON="$MAIA_HERMES_WORKER_PYTHON"
+export HERMES_PIN_UPSTREAM="$MAIA_HERMES_UPSTREAM"
+export HERMES_PIN_SHA=5d59366010640c1d6b8f170d8a4ee109db2bbdef
+```
+
+The versioned launcher retains only these five nonsecret pin inputs; it never
+inherits HERMES_HOME or provider keys. The canonical config contract recognizes
+the two MAIA_* paths without disabling strict boot or enabling the engine.
+Keep TMPDIR writable and **outside the repository** (migration drill fixtures
+reject overlays inside the checkout). Hermes fixtures use it rather than a root
+home; never grant `/root` access to make a fixture pass.
+Existing `.nvmrc` and `packageManager` own Node/npm versions.
 
 The revision-owned `python3 scripts/harness/project_env.py -- ...` is the
 project recipe launcher. Use it below in place of `harness-project-env` until

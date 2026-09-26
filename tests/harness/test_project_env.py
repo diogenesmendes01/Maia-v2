@@ -37,9 +37,14 @@ class ProjectEnvironmentTests(unittest.TestCase):
     def test_preserves_explicit_hermes_test_runtime_without_provider_secrets(self):
         env = self.environment()
         pins = {'MAIA_HERMES_UPSTREAM': '/srv/agents/runtime/maia-hermes-upstream',
-                'MAIA_HERMES_WORKER_PYTHON': '/srv/agents/runtime/maia-hermes-venv/bin/python'}
+                'MAIA_HERMES_WORKER_PYTHON': '/srv/agents/runtime/maia-hermes-venv/bin/python',
+                'HERMES_PIN_PYTHON': '/srv/agents/runtime/maia-hermes-venv/bin/python',
+                'HERMES_PIN_UPSTREAM': '/srv/agents/runtime/maia-hermes-upstream',
+                'HERMES_PIN_SHA': '5d59366010640c1d6b8f170d8a4ee109db2bbdef'}
         env.update(pins)
         env['HERMES_HOME'] = '/root/.hermes'
+        env['HERMES_API_KEY'] = 'SHOULD_NOT_INHERIT'
+        env['HERMES_PIN_UNRECOGNIZED'] = 'SHOULD_NOT_INHERIT'
         result = subprocess.run([sys.executable, str(SCRIPT), '--', sys.executable,
                                  '-c', 'import os,json; print(json.dumps(dict(os.environ)))'],
                                 env=env, capture_output=True, text=True)
@@ -48,6 +53,8 @@ class ProjectEnvironmentTests(unittest.TestCase):
         for key, value in pins.items():
             self.assertEqual(actual.get(key), value)
         self.assertNotIn('HERMES_HOME', actual)
+        self.assertNotIn('HERMES_API_KEY', actual)
+        self.assertNotIn('HERMES_PIN_UNRECOGNIZED', actual)
         self.assertNotIn('ANTHROPIC_API_KEY', actual)
 
     def test_rejects_wrong_or_missing_endpoints_before_command(self):
