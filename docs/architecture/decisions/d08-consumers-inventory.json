@@ -1,0 +1,563 @@
+{
+  "metadata": {
+    "artifact": "docs/architecture/decisions/d08-consumers-inventory.json",
+    "spec": "SC12-A",
+    "adr": "docs/architecture/decisions/ADR-D08-proposal.md",
+    "revalidated_at_sha": "d9553dec5b7b43338b6dd62dbbf047001a1924cc",
+    "branch": "harness/sc12-a-native-20260926",
+    "seed": "consumers-v3.json (base df135a4c72538f2c3ad6f6093a0967a7f7da0b48)",
+    "method": "inspeção textual revalidada item a item (path/linha/texto) no SHA efetivo",
+    "evidence_item_status": {
+      "confirmed": 60
+    },
+    "decision_status": "D08 PENDENTE DE REVIEWER — proposta apenas; nenhum DDL/ALTER nesta PR",
+    "limitations": "Consumidores dinâmicos/externos não são certificados por inspeção textual."
+  },
+  "consumers": [
+    {
+      "path": "src/memory/semantic.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/memory/semantic.ts",
+          "line": 6,
+          "text": "return factsRepo.listForScopes(escopos);",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/memory/semantic.ts",
+          "line": 16,
+          "text": "return factsRepo.upsert({",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "indirect_caller",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/memory/vector.ts",
+      "exists": true,
+      "owner": "SC14-A",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/memory/vector.ts",
+          "line": 58,
+          "text": "export async function writeMemory(input: {",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "vector_index_writer",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/memory/recall-authorized.ts",
+      "exists": true,
+      "owner": "SC14-A",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [],
+      "mechanism": "memory_reader",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/tools/recall-memory.ts",
+      "exists": true,
+      "owner": "SC14-A",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [],
+      "mechanism": "tool_caller",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/tools/classify-transaction.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/tools/classify-transaction.ts",
+          "line": 49,
+          "text": "const rules = await rulesRepo.listActive('classificacao');",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "tool_caller",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 4,
+          "text": "agent_facts,",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 29,
+          "text": ".from(agent_facts)",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 32,
+          "text": "eq(agent_facts.tenant_id, tenant_id),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 33,
+          "text": "eq(agent_facts.agent_id, agent_id),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 34,
+          "text": "eq(agent_facts.escopo, escopo),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 35,
+          "text": "eq(agent_facts.chave, chave),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 56,
+          "text": ".insert(agent_facts)",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 64,
+          "text": "agent_facts.tenant_id,",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 65,
+          "text": "agent_facts.agent_id,",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 66,
+          "text": "agent_facts.escopo,",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 67,
+          "text": "agent_facts.chave,",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 90,
+          "text": ".from(agent_facts)",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 93,
+          "text": "eq(agent_facts.tenant_id, tenant_id),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 94,
+          "text": "eq(agent_facts.agent_id, agent_id),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 95,
+          "text": "inArray(agent_facts.escopo, escopos),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 96,
+          "text": "inArray(agent_facts.lifecycle_status, [",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 145,
+          "text": "FROM agent_facts af",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 529,
+          "text": "async findRelevant(opts: {",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/cognitive-repos.ts",
+          "line": 650,
+          "text": "`memoryEntryRepo.markReviewed matched ${updated.length} rows for memory ${id} ` +",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "orm_repository",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/user-layer/resolvers/facts-resolver.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/user-layer/resolvers/facts-resolver.ts",
+          "line": 7,
+          "text": "* facts-resolver — facade over agent_facts.",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/user-layer/resolvers/facts-resolver.ts",
+          "line": 12,
+          "text": "*   `agent_facts.valor` may carry raw candidate text whose underlying",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/user-layer/resolvers/facts-resolver.ts",
+          "line": 16,
+          "text": "*   KnowledgeSlice. We replicate `factsRepo.listMentionableForScopes` (see",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/user-layer/resolvers/facts-resolver.ts",
+          "line": 87,
+          "text": "FROM agent_facts af",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "user_layer_consumer",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/user-layer/resolvers/memory-resolver.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/user-layer/resolvers/memory-resolver.ts",
+          "line": 14,
+          "text": "*   The prompt-builder path (memoryEntryRepo.findRelevant in repositories.ts)",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/user-layer/resolvers/memory-resolver.ts",
+          "line": 51,
+          "text": "* When provided, the disjunct mirrors `memoryEntryRepo.findRelevant`:",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/user-layer/resolvers/memory-resolver.ts",
+          "line": 140,
+          "text": "// Scope disjunct (matches memoryEntryRepo.findRelevant in repositories.ts).",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "user_layer_consumer",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/user-layer/resolvers/rules-resolver.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/user-layer/resolvers/rules-resolver.ts",
+          "line": 22,
+          "text": "*   `only_active = true` (matches `rulesRepo.listActive`'s contract — the",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/user-layer/resolvers/rules-resolver.ts",
+          "line": 30,
+          "text": "*   `tipo='classificacao'` to match `rulesRepo.listActive('classificacao')`",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "user_layer_consumer",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/user-layer/resolvers/hints-resolver.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [],
+      "mechanism": "user_layer_consumer",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/user-layer/knowledge-slice-builder.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/user-layer/knowledge-slice-builder.ts",
+          "line": 65,
+          "text": "// PR #94 Codex review high #4: mirror rulesRepo.listActive('classificacao')",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "user_layer_consumer",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/user-layer/internal/cache-keys.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [],
+      "mechanism": "user_layer_consumer",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/runtime/context-assembly/slice-builders/knowledge-slice-builder.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/runtime/context-assembly/slice-builders/knowledge-slice-builder.ts",
+          "line": 4,
+          "text": "* Reads `agent_facts` + `learned_rules` and exposes only lifecycle statuses",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "runtime_reader",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/runtime/context-assembly/slice-builders/skill-slice-builder.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [],
+      "mechanism": "runtime_reader",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/agent/turn-context/loader.ts",
+      "exists": true,
+      "owner": "SC14-B",
+      "policy": "Canonical current revision authorization before LIMIT/cache; private scope mandatory",
+      "evidence": [
+        {
+          "path": "src/agent/turn-context/loader.ts",
+          "line": 446,
+          "text": "factsRepo.listMentionableForScopes([",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/agent/turn-context/loader.ts",
+          "line": 452,
+          "text": "gate(() => rulesRepo.listActive('classificacao')),",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "turn_context_reader",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "exists": true,
+      "owner": "SC25-C",
+      "policy": "Operational internal-only; preserve cost/settings compatibility, exclude namespaces from client recall",
+      "evidence": [
+        {
+          "path": "src/lib/cost-ledger.ts",
+          "line": 129,
+          "text": "* `agent_facts.valor` (a linha travada pelo próprio upsert) em vez de um valor",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/cost-ledger.ts",
+          "line": 159,
+          "text": "INSERT INTO agent_facts (tenant_id, agent_id, escopo, chave, valor, fonte, confianca)",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/cost-ledger.ts",
+          "line": 167,
+          "text": "COALESCE((agent_facts.valor->>'tokens_input')::numeric, 0) + ${args.delta.tokens_input}::numeric,",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/cost-ledger.ts",
+          "line": 169,
+          "text": "COALESCE((agent_facts.valor->>'tokens_output')::numeric, 0) + ${args.delta.tokens_output}::numeric,",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/cost-ledger.ts",
+          "line": 171,
+          "text": "ROUND(COALESCE((agent_facts.valor->>'usd_cents')::numeric, 0) + ${args.delta.usd_cents}::numeric, 2),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/cost-ledger.ts",
+          "line": 184,
+          "text": "const f = await factsRepo.getByKey('pessoa', `cost.daily.llm.${day}.${pessoa_id}`);",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/cost-ledger.ts",
+          "line": 191,
+          "text": "const f = await factsRepo.getByKey('global', `cost.daily.llm.${day}`);",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "raw_sql_operational",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "exists": true,
+      "owner": "SC12-A",
+      "policy": "Operational internal-only; preserve cost/settings compatibility, exclude namespaces from client recall",
+      "evidence": [
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 13,
+          "text": "* Storage: PR #188 / issue #183 — moved from `agent_facts` (per-tenant /",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 73,
+          "text": "* agent_facts fallback so both honor the same `{ \"model\": \"<slug>\" }`",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 105,
+          "text": "* legacy storage in `agent_facts (tenant_id=<founder>, agent_id=<founder>,",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 115,
+          "text": "* The fallback queries `agent_facts` directly via raw SQL — NOT through",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 141,
+          "text": "* `agent_facts.escopo='global' AND chave LIKE 'llm.model.%'` cleanup.",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 151,
+          "text": "FROM agent_facts",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 175,
+          "text": "FROM agent_facts",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 186,
+          "text": "logger.warn({ source: 'agent_facts', key }, 'llm_settings.legacy_fallback_used');",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 247,
+          "text": "*   - 'legacy' — value came from the agent_facts dual-read fallback.",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/lib/llm-settings.ts",
+          "line": 337,
+          "text": "// (2) Rolling-deploy / pre-062 fallback: legacy agent_facts. Source",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "settings_dual_read",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/admin-ui/trpc/routers/knowledge.ts",
+      "exists": true,
+      "owner": "SC18",
+      "policy": "Administrative fan-out with session ACL; not customer runtime API",
+      "evidence": [
+        {
+          "path": "src/admin-ui/trpc/routers/knowledge.ts",
+          "line": 7,
+          "text": "*   - agent_facts   — declarative facts with lifecycle",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/admin-ui/trpc/routers/knowledge.ts",
+          "line": 44,
+          "text": "async () => ctx.repos.memoryEntryRepo.listNeedsReview(input.limit),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/admin-ui/trpc/routers/knowledge.ts",
+          "line": 53,
+          "text": "async () => ctx.repos.factsRepo.listForScopes(input.scopes),",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/admin-ui/trpc/routers/knowledge.ts",
+          "line": 62,
+          "text": "async () => ctx.repos.rulesRepo.listActive(input.tipo),",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "admin_consumer",
+      "exists_at_sha": true
+    },
+    {
+      "path": "src/db/repositories/admin-repos.ts",
+      "exists": true,
+      "owner": "SC18",
+      "policy": "Administrative fan-out with session ACL; not customer runtime API",
+      "evidence": [
+        {
+          "path": "src/db/repositories/admin-repos.ts",
+          "line": 97,
+          "text": "{ nome: 'agent_facts', kind: 'fact', descritor: 'chave' },",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/admin-repos.ts",
+          "line": 321,
+          "text": "// ainda). `available.includes(t.nome)` para 'agent_facts',",
+          "status": "confirmed"
+        },
+        {
+          "path": "src/db/repositories/admin-repos.ts",
+          "line": 1551,
+          "text": "*   The previous storage in `agent_facts (tenant_id, agent_id, escopo, chave)`",
+          "status": "confirmed"
+        }
+      ],
+      "mechanism": "admin_consumer",
+      "exists_at_sha": true
+    }
+  ]
+}

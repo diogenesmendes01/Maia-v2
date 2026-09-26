@@ -1,0 +1,1661 @@
+{
+  "metadata": {
+    "artifact": "docs/architecture/decisions/d08-writers-inventory.json",
+    "spec": "SC12-A",
+    "adr": "docs/architecture/decisions/ADR-D08-proposal.md",
+    "revalidated_at_sha": "d9553dec5b7b43338b6dd62dbbf047001a1924cc",
+    "branch": "harness/sc12-a-native-20260926",
+    "seed": "writers-inventory-v3.json (base df135a4c72538f2c3ad6f6093a0967a7f7da0b48)",
+    "method": "inspeção textual revalidada item a item (path/linha/texto, faixa e símbolo) no SHA efetivo; nenhuma execução de runtime para o inventário em si",
+    "evidence_item_status": {
+      "confirmed": 163,
+      "confirmed_substring": 5
+    },
+    "writer_range_or_symbol_issues": [],
+    "decision_status": "D08 PENDENTE DE REVIEWER — proposta apenas; nenhum DDL/ALTER nesta PR",
+    "limitations": "SQL dinâmico/externo, writers fora do checkout e configuração viva não são certificados por inspeção textual. Comentário não é call site.",
+    "mechanism_legend": {
+      "src/db/repositories/cognitive-repos.ts": "orm_repository",
+      "src/lib/cost-ledger.ts": "raw_sql_operational",
+      "src/control-plane/knowledge-state-machine/repos.ts": "ksm_facade_orm",
+      "src/cognition/persister.ts": "indirect_caller_legacy",
+      "src/memory/semantic.ts": "indirect_caller",
+      "src/memory/vector.ts": "vector_index_writer",
+      "src/tools/save-fact.ts": "indirect_caller",
+      "src/tools/remember-safe-fact.ts": "indirect_caller",
+      "src/tools/propose-fact.ts": "caller_reference",
+      "src/workers/knowledge-state-promoter.ts": "ksm_promoter",
+      "src/workers/legacy-memory-reclassifier.ts": "worker_derived_writer",
+      "src/workers/reflection-batch.ts": "worker_indirect",
+      "src/agent/reflection.ts": "worker_vector_path",
+      "scripts/turn-context-benchmark.ts": "benchmark_fixture",
+      "migrations/062_global_settings_down.sql": "historical_migration",
+      "src/lib/llm-settings.ts": "settings_dual_read",
+      "src/db/schema.ts": "schema_definition",
+      "src/db/repositories/admin-repos.ts": "admin_consumer"
+    }
+  },
+  "fact_writers": [
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "lines": [
+        41,
+        76
+      ],
+      "operation": "factsRepo.upsert ORM ON CONFLICT 4-column unique",
+      "callers": [
+        "src/memory/semantic.ts:9-22",
+        "src/cognition/persister.ts:83-98"
+      ],
+      "action": "SC13 migrate governed writes; SC12-B guard prevents legacy overwrite; operational namespace unchanged",
+      "mechanism": "orm_repository",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "onConflictDoUpdate"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "lines": [
+        137,
+        194
+      ],
+      "operation": "upsertCostFact raw SQL atomic increment; readers getByKey global/pessoa",
+      "action": "Keep unique and existing cents contract; SC12-A/B characterize, SC25-C sums Hermes events only once",
+      "mechanism": "raw_sql_operational",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "ON CONFLICT (tenant_id, agent_id, escopo, chave)"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "lines": [
+        134,
+        174
+      ],
+      "operation": "knowledgeRepos.create fact INSERT; second same logical key conflicts under old unique",
+      "action": "SC12-B adapts governed fact revisions; InTx in SC12-C; no suffix hack",
+      "mechanism": "ksm_facade_orm",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": ".insert(agent_facts)"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "lines": [
+        475,
+        518
+      ],
+      "operation": "CAS lifecycle update/read fact",
+      "action": "SC12-B/SC12-C revision-aware KSM without resurrecting revoked",
+      "mechanism": "ksm_facade_orm",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "expected_previous_status"
+    },
+    {
+      "path": "src/tools/remember-safe-fact.ts",
+      "lines": [
+        65,
+        74
+      ],
+      "operation": "handler→saveFact→factsRepo.upsert",
+      "action": "SC13 governed intake; permission alone not safe payload screening",
+      "mechanism": "indirect_caller",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "saveFact("
+    },
+    {
+      "path": "src/tools/save-fact.ts",
+      "lines": [
+        62,
+        78
+      ],
+      "operation": "legacy wrapper→proposeFactTool.handler→KSM",
+      "action": "SC13 strict compatibility, provenance and identity; remains outside Hermes allowlist",
+      "mechanism": "indirect_caller",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "proposeFact"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "lines": [
+        70,
+        220
+      ],
+      "operation": "legacy direct fact/rule/memory branches in addition to KSM",
+      "action": "SC13 route all governed writes; preserve source/subject",
+      "mechanism": "indirect_caller_legacy",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "factsRepo.upsert"
+    },
+    {
+      "path": "src/workers/knowledge-state-promoter.ts",
+      "lines": [
+        89,
+        124
+      ],
+      "operation": "listEligible→KSM transition, memory needs_review guard only",
+      "action": "SC13 privacy/human decision guard for all kinds and revision",
+      "mechanism": "ksm_promoter",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "listEligible"
+    },
+    {
+      "path": "src/workers/legacy-memory-reclassifier.ts",
+      "lines": [
+        43,
+        85
+      ],
+      "operation": "markReviewed + derived behavioralHintRepo.create with DB defaults",
+      "action": "SC13 govern/restrict derived hints, never detector-only dequarantine",
+      "mechanism": "worker_derived_writer",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "markReviewed"
+    },
+    {
+      "path": "src/agent/reflection.ts",
+      "lines": [
+        104,
+        150
+      ],
+      "operation": "summary/self_state/vector path",
+      "action": "SC13 private proposal/lineage; no global raw summary",
+      "mechanism": "worker_vector_path",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "writeMemory"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "lines": [
+        454,
+        540
+      ],
+      "operation": "existing proposal path and dedupe; old create active appears in comments",
+      "action": "Do not report commented old code as live writer; finish subject/purpose/evidence transaction in SC13",
+      "mechanism": "worker_indirect",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "rulesRepo.findByContext"
+    },
+    {
+      "path": "scripts/turn-context-benchmark.ts",
+      "lines": [
+        2183,
+        2190,
+        2350
+      ],
+      "operation": "synthetic direct SQL fixtures",
+      "action": "SC12-A fixture compatibility, never source of approved knowledge",
+      "mechanism": "benchmark_fixture",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "INSERT INTO agent_facts"
+    },
+    {
+      "path": "migrations/062_global_settings_down.sql",
+      "lines": [
+        39,
+        66
+      ],
+      "operation": "historical down copies settings to agent_facts",
+      "action": "Append-only preservation; characterize reverse path; never edit historical migration",
+      "mechanism": "historical_migration",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "symbol_status": "symbol_present_at_sha",
+      "symbol_declared": "INSERT INTO agent_facts"
+    }
+  ],
+  "raw_search_hits_including_comments": [
+    {
+      "path": "src/tools/cancel-reminder.ts",
+      "line": 24,
+      "text": "* Replaces both the old `cancel_reminder` (which acted on agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "tool_caller"
+    },
+    {
+      "path": "src/tools/save-fact.ts",
+      "line": 63,
+      "text": "// (it's the same UUID — agent_facts.id).",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "indirect_caller"
+    },
+    {
+      "path": "src/tools/propose-fact.ts",
+      "line": 147,
+      "text": "// so factsRepo.listForScopes / listMentionableForScopes (which look",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "caller_reference"
+    },
+    {
+      "path": "src/tools/classify-transaction.ts",
+      "line": 49,
+      "text": "const rules = await rulesRepo.listActive('classificacao');",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "tool_caller"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "line": 129,
+      "text": "* `agent_facts.valor` (a linha travada pelo próprio upsert) em vez de um valor",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "raw_sql_operational"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "line": 159,
+      "text": "INSERT INTO agent_facts (tenant_id, agent_id, escopo, chave, valor, fonte, confianca)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "raw_sql_operational"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "line": 167,
+      "text": "COALESCE((agent_facts.valor->>'tokens_input')::numeric, 0) + ${args.delta.tokens_input}::numeric,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "raw_sql_operational"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "line": 169,
+      "text": "COALESCE((agent_facts.valor->>'tokens_output')::numeric, 0) + ${args.delta.tokens_output}::numeric,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "raw_sql_operational"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "line": 171,
+      "text": "ROUND(COALESCE((agent_facts.valor->>'usd_cents')::numeric, 0) + ${args.delta.usd_cents}::numeric, 2),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "raw_sql_operational"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "line": 184,
+      "text": "const f = await factsRepo.getByKey('pessoa', `cost.daily.llm.${day}.${pessoa_id}`);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "raw_sql_operational"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "line": 191,
+      "text": "const f = await factsRepo.getByKey('global', `cost.daily.llm.${day}`);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "raw_sql_operational"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 13,
+      "text": "* Storage: PR #188 / issue #183 — moved from `agent_facts` (per-tenant /",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 73,
+      "text": "* agent_facts fallback so both honor the same `{ \"model\": \"<slug>\" }`",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 105,
+      "text": "* legacy storage in `agent_facts (tenant_id=<founder>, agent_id=<founder>,",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 115,
+      "text": "* The fallback queries `agent_facts` directly via raw SQL — NOT through",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 141,
+      "text": "* `agent_facts.escopo='global' AND chave LIKE 'llm.model.%'` cleanup.",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 151,
+      "text": "FROM agent_facts",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 175,
+      "text": "FROM agent_facts",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 186,
+      "text": "logger.warn({ source: 'agent_facts', key }, 'llm_settings.legacy_fallback_used');",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 247,
+      "text": "*   - 'legacy' — value came from the agent_facts dual-read fallback.",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/lib/llm-settings.ts",
+      "line": 337,
+      "text": "// (2) Rolling-deploy / pre-062 fallback: legacy agent_facts. Source",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "settings_dual_read"
+    },
+    {
+      "path": "src/agent/reflection.ts",
+      "line": 132,
+      "text": "await writeMemory({",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "worker_vector_path"
+    },
+    {
+      "path": "src/agent/reflection-clustering.ts",
+      "line": 172,
+      "text": "* O worker usava `rulesRepo.findByContext` para decidir se já havia proposto",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "turn_context_reader"
+    },
+    {
+      "path": "src/workers/cost-monitor.ts",
+      "line": 15,
+      "text": "// `readDailyLLMUsd` → `factsRepo.getByKey('global', …)` filters `agent_facts`",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker"
+    },
+    {
+      "path": "src/workers/cost-monitor.ts",
+      "line": 30,
+      "text": "body: `Daily LLM spend exceeded the configured threshold.\\nDate: ${yesterday}\\nUSD: ${usd.toFixed(2)}\\nThreshold: ${threshold}\\n\\nCheck agent_facts['cost.daily.llm.${yesterday}'] for breakdown.`,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "worker"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 118,
+      "text": "*   2. `rulesRepo.findByContext('classificacao', cluster.descricao)` → null",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 120,
+      "text": "*   3. `rulesRepo.create` em ambos → DUAS regras duplicadas, mesma descricao",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 134,
+      "text": "* (`db.execute`, `rulesRepo.*`, `writeMemory`) ainda usam o pool — o lock é",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 238,
+      "text": "*   - `rulesRepo.findByContext` / `rulesRepo.create` já são tenant-aware",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 454,
+      "text": "* `rulesRepo.findByContext` procura só entre regras VISÍVEIS. Uma proposta",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 474,
+      "text": "const existing = await rulesRepo.findByContext('classificacao', cluster.descricao_normalized);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 500,
+      "text": "* REGRA ATIVA (`rulesRepo.create({ …, ativa: true })`) que passava a",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 502,
+      "text": "* modelo como memória GLOBAL (`writeMemory({ escopo: 'global' })`).",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/reflection-batch.ts",
+      "line": 510,
+      "text": "* A `writeMemory(escopo:'global')` saiu e NÃO foi substituída. O item 6",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "worker_indirect"
+    },
+    {
+      "path": "src/workers/legacy-memory-reclassifier.ts",
+      "line": 35,
+      "text": "const pending = await memoryEntryRepo.listNeedsReview(100);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "worker_derived_writer"
+    },
+    {
+      "path": "src/workers/legacy-memory-reclassifier.ts",
+      "line": 55,
+      "text": "await memoryEntryRepo.markReviewed(entry.id, {",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "worker_derived_writer"
+    },
+    {
+      "path": "src/learning/service.ts",
+      "line": 6,
+      "text": "* `src/workers/reflection-batch.ts` chama `rulesRepo.create({ …, ativa: true })`",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "src_other"
+    },
+    {
+      "path": "src/learning/service.ts",
+      "line": 7,
+      "text": "* e, logo depois, `writeMemory({ …, escopo: 'global' })`. Lidas juntas, as duas",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "src_other"
+    },
+    {
+      "path": "src/learning/service.ts",
+      "line": 123,
+      "text": "* Substitui `rulesRepo.create({ ativa: true })` + `writeMemory('global')` do",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "src_other"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 475,
+      "text": "export const agent_facts = pgTable(",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 476,
+      "text": "'agent_facts',",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 501,
+      "text": "uniq: unique('agent_facts_tenant_agent_escopo_chave_key').on(",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 516,
+      "text": "lifecycleInflightIdx: index('idx_agent_facts_lifecycle_inflight')",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 524,
+      "text": "lifecycleActiveIdx: index('idx_agent_facts_lifecycle_active')",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 566,
+      "text": "// `listEligible` (see agent_facts above for the full rationale).",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 1455,
+      "text": "// dropped as redundant with the PK. See agent_facts for the full",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 1514,
+      "text": "// PK. See agent_facts for the full rationale. Created via migration",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 2871,
+      "text": "// in agent_facts (scoped by tenant_id+agent_id) silently meant the",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/db/schema.ts",
+      "line": 3042,
+      "text": "export type AgentFact = typeof agent_facts.$inferSelect;",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "schema_definition"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 42,
+      "text": "*  - `fato`        → agent_facts (legacy upsert) + memory_entry (P2: classifica e",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 83,
+      "text": "// Legacy: agent_facts (upsert por escopo+chave)",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 85,
+      "text": "// agent_facts.escopo é text; mantemos o literal do candidato como escopo.",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 88,
+      "text": "const fact = await factsRepo.upsert({",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 98,
+      "text": "// Try/catch wrapper — falha aqui não derruba o agent_facts.",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 103,
+      "text": "const memEntry = await memoryEntryRepo.create({",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 132,
+      "text": "// legível por outros caminhos (ex.: memoryEntryRepo.findRelevant).",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 134,
+      "text": "await writeMemory({",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 192,
+      "text": "persisted_to: memoryEntryId ? 'agent_facts+memory_entry' : 'agent_facts',",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/cognition/persister.ts",
+      "line": 200,
+      "text": "const rule = await rulesRepo.create({",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller_legacy"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 32,
+      "text": "return rulesRepo.listActive(tipo);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 36,
+      "text": "await rulesRepo.incrementAcerto(rule_id);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 38,
+      "text": "const r = await rulesRepo.byId(rule_id);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 42,
+      "text": "await rulesRepo.setStatus(rule_id, { confianca: 0.8 });",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 44,
+      "text": "await rulesRepo.setStatus(rule_id, { confianca: Math.max(Number(r.confianca), 0.8) });",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 49,
+      "text": "await rulesRepo.incrementErro(rule_id);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 50,
+      "text": "const r = await rulesRepo.byId(rule_id);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 53,
+      "text": "await rulesRepo.setStatus(rule_id, { ativa: false });",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 58,
+      "text": "await rulesRepo.setStatus(rule_id, { ativa: true, confianca: 1.0 });",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/procedural.ts",
+      "line": 62,
+      "text": "await rulesRepo.setStatus(rule_id, { ativa: false, confianca: 0.0 });",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "memory_reader"
+    },
+    {
+      "path": "src/memory/vector.ts",
+      "line": 58,
+      "text": "export async function writeMemory(input: {",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "vector_index_writer"
+    },
+    {
+      "path": "src/memory/semantic.ts",
+      "line": 6,
+      "text": "return factsRepo.listForScopes(escopos);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller"
+    },
+    {
+      "path": "src/memory/semantic.ts",
+      "line": 16,
+      "text": "return factsRepo.upsert({",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller"
+    },
+    {
+      "path": "src/user-layer/knowledge-slice-builder.ts",
+      "line": 65,
+      "text": "// PR #94 Codex review high #4: mirror rulesRepo.listActive('classificacao')",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/runtime/context-assembly/slice-builders/knowledge-slice-builder.ts",
+      "line": 4,
+      "text": "* Reads `agent_facts` + `learned_rules` and exposes only lifecycle statuses",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "runtime_reader"
+    },
+    {
+      "path": "src/agent/turn-context/loader.ts",
+      "line": 446,
+      "text": "factsRepo.listMentionableForScopes([",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "turn_context_reader"
+    },
+    {
+      "path": "src/agent/turn-context/loader.ts",
+      "line": 452,
+      "text": "gate(() => rulesRepo.listActive('classificacao')),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "turn_context_reader"
+    },
+    {
+      "path": "src/agent/turn-context/types.ts",
+      "line": 62,
+      "text": "* (`facts.slice(0, 20)`, `topSkills.slice(0, 5)`, `findRelevant({limit: 30})`,",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "turn_context_reader"
+    },
+    {
+      "path": "src/agent/turn-context/types.ts",
+      "line": 120,
+      "text": "*   factsRepo.listMentionableForScopes                                   1",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "turn_context_reader"
+    },
+    {
+      "path": "src/agent/turn-context/types.ts",
+      "line": 121,
+      "text": "*   rulesRepo.listActive                                                 1",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "turn_context_reader"
+    },
+    {
+      "path": "src/agent/turn-context/types.ts",
+      "line": 122,
+      "text": "*   memoryEntryRepo.findRelevant                                         1",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "turn_context_reader"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 7,
+      "text": "*   - agent_facts       (kind='fact')",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 25,
+      "text": "import { agent_facts, behavioral_hint, learned_rules, memory_entry } from '@/db/schema.js';",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 141,
+      "text": "// agent_facts.escopo. The previous facade wrote",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 142,
+      "text": "// `user:<id>` / `agent:<id>`, breaking factsRepo.listForScopes.",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 160,
+      "text": ".insert(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 173,
+      "text": ".returning({ id: agent_facts.id });",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 182,
+      "text": "// is the source of truth for visibility, and rulesRepo.listActive",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 325,
+      "text": "// Issue #254 — cross-tenant guard. `agent_facts` reads via the",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 337,
+      "text": "eq(agent_facts.id, id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 338,
+      "text": "eq(agent_facts.tenant_id, tenant_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 339,
+      "text": "eq(agent_facts.agent_id, agent_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 342,
+      "text": "? await exec.select().from(agent_facts).where(where).for('update').limit(1)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 343,
+      "text": ": await exec.select().from(agent_facts).where(where).limit(1);",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 351,
+      "text": "// context. Reads through `rulesRepo.byId` already enforce this",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 482,
+      "text": "eq(agent_facts.id, id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 483,
+      "text": "eq(agent_facts.tenant_id, tenant_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 484,
+      "text": "eq(agent_facts.agent_id, agent_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 485,
+      "text": "eq(agent_facts.lifecycle_status, expected),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 488,
+      "text": "eq(agent_facts.id, id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 489,
+      "text": "eq(agent_facts.tenant_id, tenant_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 490,
+      "text": "eq(agent_facts.agent_id, agent_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 493,
+      "text": ".update(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 496,
+      "text": ".returning({ id: agent_facts.id });",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 508,
+      "text": "id: agent_facts.id,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 509,
+      "text": "lifecycle_status: agent_facts.lifecycle_status,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 511,
+      "text": ".from(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 514,
+      "text": "eq(agent_facts.id, id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 515,
+      "text": "eq(agent_facts.tenant_id, tenant_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 516,
+      "text": "eq(agent_facts.agent_id, agent_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 772,
+      "text": "id: agent_facts.id,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 773,
+      "text": "tenant_id: agent_facts.tenant_id,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 774,
+      "text": "agent_id: agent_facts.agent_id,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 776,
+      "text": ".from(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 777,
+      "text": ".where(and(eq(agent_facts.lifecycle_status, fromVal), args.extraFilter))",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/types.ts",
+      "line": 94,
+      "text": "* essa referência (`rulesRepo.create({ exemplo_origem_id })`), e sem ela a",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "src_other"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/types.ts",
+      "line": 149,
+      "text": "* read paths (factsRepo.listForScopes, memoryEntryRepo.findRelevant,",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "src_other"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/types.ts",
+      "line": 150,
+      "text": "* rulesRepo.listActive) match against. If omitted, the facade falls",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "src_other"
+    },
+    {
+      "path": "src/admin-ui/trpc/routers/llmSettings.ts",
+      "line": 27,
+      "text": "*   `agent_facts`. The old storage was silently scoped to the founder's",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/admin-ui/trpc/routers/llmSettings.ts",
+      "line": 255,
+      "text": "* ('global'), the legacy `agent_facts` fallback ('legacy'), or the",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/admin-ui/trpc/routers/knowledge.ts",
+      "line": 7,
+      "text": "*   - agent_facts   — declarative facts with lifecycle",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/admin-ui/trpc/routers/knowledge.ts",
+      "line": 44,
+      "text": "async () => ctx.repos.memoryEntryRepo.listNeedsReview(input.limit),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/admin-ui/trpc/routers/knowledge.ts",
+      "line": 53,
+      "text": "async () => ctx.repos.factsRepo.listForScopes(input.scopes),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/admin-ui/trpc/routers/knowledge.ts",
+      "line": 62,
+      "text": "async () => ctx.repos.rulesRepo.listActive(input.tipo),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/ops/retention/data-classes.ts",
+      "line": 218,
+      "text": "source_of_truth: 'postgres.agent_memories / agent_facts',",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ops_metadata"
+    },
+    {
+      "path": "src/ops/privacy/adapters.ts",
+      "line": 57,
+      "text": "*    titular no schema (`agent_memories`/`agent_facts` são escopo de agente",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "ops_metadata"
+    },
+    {
+      "path": "src/db/repositories/admin-repos.ts",
+      "line": 97,
+      "text": "{ nome: 'agent_facts', kind: 'fact', descritor: 'chave' },",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/db/repositories/admin-repos.ts",
+      "line": 321,
+      "text": "// ainda). `available.includes(t.nome)` para 'agent_facts',",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/db/repositories/admin-repos.ts",
+      "line": 1551,
+      "text": "*   The previous storage in `agent_facts (tenant_id, agent_id, escopo, chave)`",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "admin_consumer"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 4,
+      "text": "agent_facts,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 29,
+      "text": ".from(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 32,
+      "text": "eq(agent_facts.tenant_id, tenant_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 33,
+      "text": "eq(agent_facts.agent_id, agent_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 34,
+      "text": "eq(agent_facts.escopo, escopo),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 35,
+      "text": "eq(agent_facts.chave, chave),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 56,
+      "text": ".insert(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 64,
+      "text": "agent_facts.tenant_id,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 65,
+      "text": "agent_facts.agent_id,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 66,
+      "text": "agent_facts.escopo,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 67,
+      "text": "agent_facts.chave,",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 90,
+      "text": ".from(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 93,
+      "text": "eq(agent_facts.tenant_id, tenant_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 94,
+      "text": "eq(agent_facts.agent_id, agent_id),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 95,
+      "text": "inArray(agent_facts.escopo, escopos),",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 96,
+      "text": "inArray(agent_facts.lifecycle_status, [",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 145,
+      "text": "FROM agent_facts af",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 529,
+      "text": "async findRelevant(opts: {",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 650,
+      "text": "`memoryEntryRepo.markReviewed matched ${updated.length} rows for memory ${id} ` +",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "src/user-layer/internal/visibility.ts",
+      "line": 27,
+      "text": "* agent_facts, learned_rules, behavioral_hint).",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/facts-resolver.ts",
+      "line": 7,
+      "text": "* facts-resolver — facade over agent_facts.",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/facts-resolver.ts",
+      "line": 12,
+      "text": "*   `agent_facts.valor` may carry raw candidate text whose underlying",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/facts-resolver.ts",
+      "line": 16,
+      "text": "*   KnowledgeSlice. We replicate `factsRepo.listMentionableForScopes` (see",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/facts-resolver.ts",
+      "line": 87,
+      "text": "FROM agent_facts af",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/memory-resolver.ts",
+      "line": 14,
+      "text": "*   The prompt-builder path (memoryEntryRepo.findRelevant in repositories.ts)",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/memory-resolver.ts",
+      "line": 51,
+      "text": "* When provided, the disjunct mirrors `memoryEntryRepo.findRelevant`:",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/memory-resolver.ts",
+      "line": 140,
+      "text": "// Scope disjunct (matches memoryEntryRepo.findRelevant in repositories.ts).",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/rules-resolver.ts",
+      "line": 22,
+      "text": "*   `only_active = true` (matches `rulesRepo.listActive`'s contract — the",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    },
+    {
+      "path": "src/user-layer/resolvers/rules-resolver.ts",
+      "line": 30,
+      "text": "*   `tipo='classificacao'` to match `rulesRepo.listActive('classificacao')`",
+      "status": "confirmed",
+      "kind_hit": "comment_or_reference",
+      "mechanism": "user_layer_consumer"
+    }
+  ],
+  "additional_direct_writer_hits": [
+    {
+      "path": "src/tools/remember-safe-fact.ts",
+      "line": 68,
+      "text": "saveFact({",
+      "status": "confirmed_substring",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller"
+    },
+    {
+      "path": "src/lib/cost-ledger.ts",
+      "line": 159,
+      "text": "INSERT INTO agent_facts (tenant_id, agent_id, escopo, chave, valor, fonte, confianca)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "raw_sql_operational"
+    },
+    {
+      "path": "src/memory/semantic.ts",
+      "line": 9,
+      "text": "saveFact(input: {",
+      "status": "confirmed_substring",
+      "kind_hit": "code",
+      "mechanism": "indirect_caller"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 160,
+      "text": ".insert(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/control-plane/knowledge-state-machine/repos.ts",
+      "line": 493,
+      "text": ".update(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "ksm_facade_orm"
+    },
+    {
+      "path": "src/db/repositories/cognitive-repos.ts",
+      "line": 56,
+      "text": ".insert(agent_facts)",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "orm_repository"
+    },
+    {
+      "path": "scripts/turn-context-benchmark.ts",
+      "line": 2183,
+      "text": "INSERT INTO agent_facts(tenant_id, agent_id, escopo, chave, valor, confianca, fonte)",
+      "status": "confirmed_substring",
+      "kind_hit": "code",
+      "mechanism": "benchmark_fixture"
+    },
+    {
+      "path": "scripts/turn-context-benchmark.ts",
+      "line": 2190,
+      "text": "INSERT INTO agent_facts(tenant_id, agent_id, escopo, chave, valor, confianca, fonte)",
+      "status": "confirmed_substring",
+      "kind_hit": "code",
+      "mechanism": "benchmark_fixture"
+    },
+    {
+      "path": "scripts/turn-context-benchmark.ts",
+      "line": 2350,
+      "text": "INSERT INTO agent_facts(tenant_id, agent_id, escopo, chave, valor, confianca, fonte)",
+      "status": "confirmed_substring",
+      "kind_hit": "code",
+      "mechanism": "benchmark_fixture"
+    },
+    {
+      "path": "migrations/062_global_settings_down.sql",
+      "line": 39,
+      "text": "INSERT INTO agent_facts (",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "historical_migration"
+    },
+    {
+      "path": "migrations/062_global_settings_down.sql",
+      "line": 66,
+      "text": "INSERT INTO agent_facts (",
+      "status": "confirmed",
+      "kind_hit": "code",
+      "mechanism": "historical_migration"
+    }
+  ],
+  "tests_read_statically": [
+    {
+      "path": "tests/unit/cost-ledger-pessoa.spec.ts",
+      "lines": [
+        63,
+        160
+      ],
+      "covers": "global/pessoa, atomic statement, ALS, cents→USD",
+      "does_not_prove": "concurrent sums real DB or recall exclusion",
+      "exists_at_sha": true,
+      "line_range_status": "range_beyond_eof",
+      "mechanism": "test_static_inspection"
+    },
+    {
+      "path": "tests/unit/cost-ledger-pricing.spec.ts",
+      "lines": [
+        66,
+        150
+      ],
+      "covers": "pricing fallback and write params",
+      "does_not_prove": "revision migration compatibility",
+      "exists_at_sha": true,
+      "line_range_status": "range_beyond_eof",
+      "mechanism": "test_static_inspection"
+    },
+    {
+      "path": "tests/unit/ksm-round2-finding1-persister-ksm.spec.ts",
+      "lines": [
+        101,
+        177
+      ],
+      "covers": "KSM routing under flag",
+      "does_not_prove": "legacy flag-off branch eliminated",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "mechanism": "test_static_inspection"
+    },
+    {
+      "path": "tests/unit/ksm-round2-finding2-native-fields.spec.ts",
+      "lines": [
+        75,
+        180
+      ],
+      "covers": "native payload mapping",
+      "does_not_prove": "second revision preservation",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "mechanism": "test_static_inspection"
+    },
+    {
+      "path": "tests/unit/learning-service-lineage.spec.ts",
+      "lines": [
+        65,
+        96
+      ],
+      "covers": "primary example reaches KSM / missing lineage refused",
+      "does_not_prove": "full evidence/lineage/outbox single transaction",
+      "exists_at_sha": true,
+      "line_range_status": "range_beyond_eof",
+      "mechanism": "test_static_inspection"
+    },
+    {
+      "path": "tests/unit/recall-authorized.spec.ts",
+      "lines": [
+        60,
+        125
+      ],
+      "covers": "query shape and canonical content; currently error returns ZERO test",
+      "does_not_prove": "typed unavailable vs empty or all readers",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "mechanism": "test_static_inspection"
+    },
+    {
+      "path": "tests/unit/ksm-visibility-filter-on-reads.spec.ts",
+      "lines": [
+        82,
+        140
+      ],
+      "covers": "lifecycle predicates",
+      "does_not_prove": "subject/revision/privacy/publish/TOCTOU",
+      "exists_at_sha": true,
+      "line_range_status": "range_present",
+      "mechanism": "test_static_inspection"
+    }
+  ]
+}
