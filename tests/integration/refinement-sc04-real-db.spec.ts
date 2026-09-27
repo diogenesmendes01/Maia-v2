@@ -115,9 +115,15 @@ vi.mock('@/tools/_registry.js', () => {
 });
 
 import { dispatchToolDurable, BeforeHandlerError } from '@/tools/_dispatcher.js';
+import { createEngineToolGateway } from '@/integrations/hermes/tool-gateway.js';
 import { runWithTurnExecution } from '@/runtime/turns/execution-context.js';
 import type { TurnExecutionContext } from '@/runtime/turns/claim.js';
-import type { DurableDispatchResultV1 } from '@/runtime/engines/contracts.js';
+import type {
+  DurableDispatchResultV1,
+  EngineToolCallV1,
+  EngineToolReplyV1,
+} from '@/runtime/engines/contracts.js';
+import type { ToolGatewayDepsV1 } from '@/integrations/hermes/tool-gateway.js';
 import type { Pessoa, Conversa } from '@/db/schema.js';
 
 let pool: pg.Pool;
@@ -996,5 +1002,227 @@ d('SC04 — despacho durável contra Postgres real', () => {
       }),
     );
     expect(regressao.ok).toBe(false);
+  });
+});
+
+/**
+ * ─── O CAMINHO OBSERVÁVEL DO CARD, ponta a ponta ────────────────────────────
+ *
+ * O bloco acima exercita o CORPO do despacho com um controle montado pelo
+ * teste. O contrato do card (SC04, "interface observável") nomeia uma fronteira
+ * mais larga: EngineToolGateway → dispatchToolDurable → corpo único →
+ * repos. Sem atravessá-la, um defeito de COSTURA — o gateway congelar a
+ * identidade de idempotência ANTES do corpo e o corpo congelar de novo com a
+ * chave real — fica invisível: cada lado passa o próprio teste enquanto o
+ * caminho real não despacha nada (a segunda trava responde `identity_conflict`
+ * e a chamada morre em `dispatching`, com zero handlers).
+ *
+ * Aqui não há dublê de costura: o gateway é o de PRODUÇÃO
+ * (`createEngineToolGateway`), os repositórios são os reais e `dispatchDurable`
+ * é o `dispatchToolDurable` real. O único double continua sendo o REGISTRY com
+ * a tool contadora, como no bloco anterior.
+ */
+type EventosGateway = {
+  freezes: Array<{ idempotency_key: string; idempotency_payload_hash: string }>;
+  marcadores: Array<{ reservation_token: string; dispatch_token: string }>;
+  settles: Array<{ kind: string; receipt?: unknown }>;
+};
+
+/**
+ * O gateway de produção ligado aos repos reais.
+ *
+ * `over` existe para os cenários de FALHA de hook (o gateway continua sendo o
+ * real; quem é substituído é o `dispatchDurable`/a dep sob sabotagem), nunca
+ * para atalhar a costura que este bloco mede.
+ */
+function gatewayReal(
+  turno: Turno,
+  run_id: string,
+  over: Partial<ToolGatewayDepsV1> = {},
+): { invoke: (call: EngineToolCallV1) => Promise<EngineToolReplyV1>; eventos: EventosGateway } {
+  const eventos: EventosGateway = { freezes: [], marcadores: [], settles: [] };
+
+  const deps: ToolGatewayDepsV1 = {
+    decide: () => ({ kind: 'admit', tool: {} as never }),
+    classify: () => CLASSIFICACAO,
+    admit: (i) => noEscopo(() => engineRunsRepo.admitToolCall(i)),
+    markDispatching: (i) => noEscopo(() => engineRunsRepo.markToolDispatching(i)) as never,
+    freezeToolIdentity: async (i) => {
+      eventos.freezes.push({
+        idempotency_key: i.idempotency_key,
+        idempotency_payload_hash: i.idempotency_payload_hash,
+      });
+      return noEscopo(() => engineRunsRepo.freezeToolIdentity(i));
+    },
+    markToolHandlerStarted: async (i) => {
+      eventos.marcadores.push({
+        reservation_token: i.reservation_token,
+        dispatch_token: i.dispatch_token,
+      });
+      return noEscopo(() => engineRunsRepo.markToolHandlerStarted(i));
+    },
+    settle: async (i) => {
+      eventos.settles.push(i.outcome as { kind: string; receipt?: unknown });
+      return noEscopo(() => engineRunsRepo.settleToolCall(i)) as never;
+    },
+    dispatch: async () => ({ error: 'caminho_legado_nao_esperado' }),
+    buildToolContext: async () => ctx as never,
+    recordToolApproval: (i) => noEscopo(() => engineRunsRepo.recordToolCallApproval(i)) as never,
+    dispatchDurable: (input, control) =>
+      noEscopo(() =>
+        runWithTurnExecution(turnContext(new AbortController().signal, 60_000), () =>
+          dispatchToolDurable(input, control),
+        ),
+      ),
+    ...over,
+  };
+
+  const invoke = createEngineToolGateway(
+    {
+      run_id,
+      turn_id: turno.turn_id,
+      origin_claim_token: turno.claim_token,
+      request_id: randomUUID(),
+    },
+    deps,
+  );
+
+  return { invoke, eventos };
+}
+
+function chamadaGw(run_id: string, call_id: string, args: Record<string, unknown>): EngineToolCallV1 {
+  return { version: 1, run_id, call_id, ordinal: 0, iteration: 1, name: 'sc04_fixture', args } as EngineToolCallV1;
+}
+
+d('SC04 — o gateway de produção ponta a ponta (Postgres real)', () => {
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 4 });
+    await seedTenant();
+  });
+
+  afterAll(async () => {
+    await pool?.end();
+  });
+
+  beforeEach(async () => {
+    fixture.chamadas = 0;
+    fixture.resultado = { ok: true, eco: 'oi' };
+    fixture.deveLancar = false;
+    await concederTool(['sc04_fixture']);
+  });
+
+  it('AC01/AC03/AC04/AC07 — o corpo despacha pelo gateway: 1 handler, receipt e tokens reais', async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = await runRodando(turno, control_id);
+    // Resultado com material INTERNO (`path`/`fileName`): é o que separa o
+    // `result` protegido do `result_for_engine` projetado.
+    fixture.resultado = { ok: true, path: '/interno/boleto.pdf', fileName: 'boleto.pdf' };
+    const args = { texto: 'gateway-e2e', nonce: randomUUID() };
+    const call_id = `sc04:gw:${randomUUID().slice(0, 8)}`;
+    const { invoke, eventos } = gatewayReal(turno, run_id);
+
+    const reply = await invoke(chamadaGw(run_id, call_id, args));
+
+    // ── a chamada FOI despachada (o defeito de costura matava isso aqui) ────
+    expect(reply, JSON.stringify(reply)).toMatchObject({
+      kind: 'result',
+      call_id,
+      is_error: false,
+    });
+    expect(fixture.chamadas).toBe(1);
+
+    // ── a identidade é a REAL, congelada UMA vez, pelo CORPO ───────────────
+    // Um segundo congelamento com outra chave (o `(4a)` do gateway) é
+    // exatamente o defeito que esta asserção prende.
+    expect(eventos.freezes).toHaveLength(1);
+    expect(eventos.freezes[0]!.idempotency_key).not.toBe(call_id);
+    // A chave é o sha256 de `computeIdempotencyKey` (com bucket de tempo) e o
+    // payload hash é o de `computePayloadHash` — o versionado `v2:`. Nenhum dos
+    // dois é o `call_id`/`canonicalDigest(args)` do passo legado.
+    expect(eventos.freezes[0]!.idempotency_key).toMatch(/^[0-9a-f]{64}$/);
+    expect(eventos.freezes[0]!.idempotency_payload_hash).toMatch(/^v2:[0-9a-f]{64}$/);
+
+    // ── o marcador recebeu a RESERVA real, não `res-<call_id>` ─────────────
+    expect(eventos.marcadores).toHaveLength(1);
+    expect(eventos.marcadores[0]!.reservation_token).not.toBe(`res-${call_id}`);
+
+    const row = await lerCall(run_id, call_id);
+    expect(row.state).toBe('completed');
+    expect(row.effect_evidence).toBe('committed');
+    expect(row.handler_started_at).not.toBeNull();
+    expect(row.finished_at).not.toBeNull();
+    expect(row.idempotency_key).toBe(eventos.freezes[0]!.idempotency_key);
+    expect(row.reservation_token).toBe(eventos.marcadores[0]!.reservation_token);
+    expect(row.reservation_token).not.toMatch(/^res-/);
+
+    // A chave e o token do journal são os MESMOS do ledger: o journal do
+    // despacho e o ledger de idempotência apontam para a mesma reserva.
+    const reserva = await lerReserva(row.idempotency_key!);
+    expect(reserva?.state).toBe('completed');
+    expect(reserva?.reservation_token).toBe(row.reservation_token);
+
+    // ── o receipt ficou no journal; o motor recebeu só a PROJEÇÃO ──────────
+    const receipt = row.receipt_json as {
+      call_id: string;
+      status: string;
+      effect_evidence: string;
+      result: Record<string, unknown>;
+      result_for_engine: Record<string, unknown>;
+    };
+    expect(receipt).toMatchObject({
+      call_id,
+      status: 'success',
+      effect_evidence: 'committed',
+    });
+    expect(receipt.result).toEqual(fixture.resultado);
+    expect(receipt.result_for_engine).toEqual({ ok: true });
+    expect(row.receipt_hash).toBe(canonicalDigest(row.receipt_json));
+    expect(reply.kind === 'result' ? reply.result : null).toEqual(receipt.result_for_engine);
+    expect(JSON.stringify(reply)).not.toContain('/interno/boleto.pdf');
+
+    // A liquidação foi a do GATEWAY, com o receipt — não uma recusa.
+    expect(eventos.settles).toHaveLength(1);
+    expect(eventos.settles[0]!.kind).toBe('completed');
+  });
+
+  it('AC05/AC08 — recusa comprovada ANTES do handler não deixa a call presa em `dispatching`', async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = await runRodando(turno, control_id);
+    const args = { texto: 'gateway-marcador-recusado', nonce: randomUUID() };
+    const call_id = `sc04:gw:${randomUUID().slice(0, 8)}`;
+
+    // O hook do marcador recusa ANTES do efeito (`BeforeHandlerError(false)`):
+    // é o desfecho `journal_unavailable` com `handler_may_have_started: false`
+    // que o corpo produz para uma recusa tipada de fence.
+    const { invoke, eventos } = gatewayReal(turno, run_id, {
+      dispatchDurable: (input, control) =>
+        noEscopo(() =>
+          runWithTurnExecution(turnContext(new AbortController().signal, 60_000), () =>
+            dispatchToolDurable(input, {
+              ...control,
+              beforeHandler: async () => {
+                throw new BeforeHandlerError(false);
+              },
+            }),
+          ),
+        ),
+    });
+
+    const reply = await invoke(chamadaGw(run_id, call_id, args));
+
+    expect(reply).toEqual({ kind: 'refused', call_id, code: 'run_not_authorized' });
+    expect(fixture.chamadas).toBe(0);
+
+    // A call NÃO fica em `dispatching`: sem isso ela ocupa a vaga sequencial do
+    // run para sempre, e o desfecho honesto do que não rodou é `denied`/`none`.
+    const row = await lerCall(run_id, call_id);
+    expect(row.state).toBe('denied');
+    expect(row.effect_evidence).toBe('none');
+    expect(row.handler_started_at).toBeNull();
+    expect(row.receipt_json).toBeNull();
+    expect(eventos.settles).toHaveLength(1);
+    expect(eventos.settles[0]!.kind).toBe('denied');
   });
 });

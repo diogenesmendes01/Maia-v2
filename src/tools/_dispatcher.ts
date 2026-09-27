@@ -1138,20 +1138,40 @@ async function runDispatcher(
         notify,
       });
       if (run !== null) {
-        // Mesmo regime do `pending` acima: sem handler, sem efeito. O que
-        // difere é que aqui o pedido acabou de ser ABERTO — e o UUID real dele
-        // existe (`ensured.request.id`), então é ele que o journal guarda. O
-        // `ref` que o motor recebe continua sendo o identificador de UX.
-        await run.control.recordApproval({
-          approval: {
-            request_id: ensured.request.id,
-            ref: ensured.ref,
-            intent_hash,
-            approval_class,
-          },
-          state: 'pending',
-          claim_token: null,
-        });
+        /**
+         * Mesmo regime do `pending` acima: sem handler, sem efeito. O que
+         * difere é que aqui o pedido acabou de ser ABERTO — e o UUID real dele
+         * existe (`ensured.request.id`), então é ele que o journal guarda. O
+         * `ref` que o motor recebe continua sendo o identificador de UX.
+         *
+         * `try/catch` porque a falha daqui é da MESMA classe das outras duas
+         * janelas de `recordApproval` (claim reclamado e pedido pendente): o
+         * journal não registrou o que existe no banco, e o desfecho conservador
+         * é `journal_unavailable` — não uma exceção crua saindo de
+         * `dispatchToolDurable`. O contrato do corpo é nunca lançar por falha
+         * de journal; deixar esta janela de fora era a única que escapava, e
+         * uma exceção ali não vira desfecho nenhum para o gateway liquidar: o
+         * run recebe um erro de transporte no lugar de uma recusa tipada.
+         */
+        try {
+          await run.control.recordApproval({
+            approval: {
+              request_id: ensured.request.id,
+              ref: ensured.ref,
+              intent_hash,
+              approval_class,
+            },
+            state: 'pending',
+            claim_token: null,
+          });
+        } catch (err) {
+          flags.journal_unavailable = { handler_may_have_started: false };
+          logger.error(
+            { err, tool: tool.name, call_id: run.control.call_id, ops_alert: true },
+            'tool.record_approval_failed',
+          );
+          return { error: 'journal_unavailable', details: { tool: tool.name } };
+        }
       }
       return {
         error:

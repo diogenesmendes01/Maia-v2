@@ -668,23 +668,13 @@ function gatewayComDurable(
     freezeToolIdentity: async (input) => {
       ledger.freezes.push(input as unknown as Record<string, unknown>);
       /**
-       * Duas chamadas passam por aqui, e elas NÃO são a mesma coisa:
-       *
-       *  - `(4a)`, a releitura de admissão, que usa o `call_id` como chave;
-       *  - o hook do despacho durável, que usa a chave CANDIDATA do corpo.
-       *
-       * O cenário sob teste é o do hook; a etapa `(4a)` responde verde para que
-       * o caminho chegue até ele.
+       * NO caminho durável há UM único congelamento, e é o do CORPO, com a
+       * chave candidata (`computeIdempotencyKey`, com bucket). O `(4a)` do
+       * gateway — que congelava `call_id` antes do corpo — só existe no caminho
+       * LEGADO: o dublê abaixo recusaria essa segunda passagem, que é
+       * exatamente o defeito de costura que a suíte de banco prende ponta a
+       * ponta (`tests/integration/refinement-sc04-real-db.spec.ts`).
        */
-      if (input.idempotency_key === 'call-gw-1') {
-        return {
-          ok: true,
-          frozen: true,
-          key: input.idempotency_key,
-          payload_hash: input.idempotency_payload_hash,
-          row_version: 7,
-        };
-      }
       if (ledger.conflito === 'bucket') {
         return {
           ok: false,
@@ -869,15 +859,14 @@ describe('SC04-gateway — o caminho durável ligado pelos hooks', () => {
     expect(ledger.settles).toHaveLength(1);
     // A candidata é a que o corpo propôs (`K-candidata`, no dublê) e a
     // persistida (`K-congelada`) é a que vale — sem a adoção, este despacho
-    // nem chegaria ao marcador.
-    expect(ledger.freezes.map((f) => f['idempotency_key'])).toEqual([
-      'call-gw-1',
-      'K-candidata',
-    ]);
+    // nem chegaria ao marcador. UM único congelamento: o do corpo.
+    expect(ledger.freezes.map((f) => f['idempotency_key'])).toEqual(['K-candidata']);
     expect(ledger.marcadores).toHaveLength(1);
 
-    // Payload divergente: o conflito é real e o despacho para, sem liquidar
-    // nada sobre um efeito que não foi despachado.
+    // Payload divergente: o conflito é real e o despacho para, sem handler. O
+    // que resta é a recusa — e, como ela PROVA que nada rodou
+    // (`handler_may_have_started: false`), a call é encerrada como
+    // `denied`/`none` para não ocupar a vaga sequencial do run.
     ledger.settles = [];
     ledger.conflito = 'intencao';
     const recusado = await gatewayComDurable()(chamadaGw());
@@ -889,7 +878,8 @@ describe('SC04-gateway — o caminho durável ligado pelos hooks', () => {
     // O motivo TIPADO do repo viaja na mensagem do hook: é com ele que quem for
     // reconciliar separa "a intenção mudou" de "o journal recusou a versão".
     expect(ledger.hookRecusou).toBe('freeze_identity:identity_conflict');
-    expect(ledger.settles).toHaveLength(0);
+    expect(ledger.settles).toHaveLength(1);
+    expect(ledger.settles[0]!.outcome).toMatchObject({ kind: 'denied' });
   });
 
   it('`journal_unavailable` com o handler já começado NÃO liquida e devolve `effect_unknown`', async () => {
@@ -900,6 +890,24 @@ describe('SC04-gateway — o caminho durável ligado pelos hooks', () => {
     expect(out).toEqual({ kind: 'refused', call_id: 'call-gw-1', code: 'effect_unknown' });
     // Sem receipt não existe desfecho para gravar: liquidar aqui seria inventar.
     expect(ledger.settles).toHaveLength(0);
+  });
+
+  it('`journal_unavailable` ANTES do handler encerra a call como `denied` (a vaga sequencial não fica presa)', async () => {
+    // Recusa tipada do hook do marcador: o dublê do corpo devolve
+    // `handler_may_have_started: false` — nada rodou, e isso é PROVADO.
+    ledger.conflito = 'intencao';
+    const out = await gatewayComDurable()(chamadaGw());
+
+    expect(out).toEqual({ kind: 'refused', call_id: 'call-gw-1', code: 'run_not_authorized' });
+    // Sem encerrar, a linha ficaria em `dispatching` — o estado que OCUPA a
+    // vaga sequencial do run — e o run nunca mais andaria.
+    expect(ledger.settles).toHaveLength(1);
+    const settle = ledger.settles[0]!;
+    expect(settle).toMatchObject({
+      call_id: 'call-gw-1',
+      dispatch_token: 'tok-dispatch',
+      outcome: { kind: 'denied' },
+    });
   });
 
   it('`ownership_lost` devolve recusa de autorização, sem liquidar', async () => {

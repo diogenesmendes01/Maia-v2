@@ -454,22 +454,41 @@ export function createEngineToolGateway(
     }
 
     // ── (4a) IDENTIDADE DE IDEMPOTÊNCIA CONGELADA (§5.6.3) ──────────────
-    // Antes de marcar que o handler começou, é preciso congelar a identidade
-    // de idempotência. Isso garante que a chamada é determinística.
-    const congelada = await deps.freezeToolIdentity({
-      ...base,
-      call_id: admissao.call_id,
-      idempotency_key: call.call_id,
-      idempotency_payload_hash: canonicalDigest(call.args),
-      normalized_args: call.args,
-    });
+    //
+    // SÓ no caminho LEGADO. No caminho durável (4d), quem congela a identidade
+    // é o CORPO do dispatcher — `freezeIdentity` é o primeiro hook que ele
+    // chama, ANTES do lookup da cache, da aprovação e da reserva atômica.
+    //
+    // Congelar aqui TAMBÉM era um defeito real, não uma redundância inofensiva:
+    // este passo grava `idempotency_key = call_id` e
+    // `payload_hash = canonicalDigest(args)`, e o corpo chega logo depois com a
+    // chave REAL (`computeIdempotencyKey`, com bucket) e o hash `v2:`. O
+    // journal tem UM dono para a identidade (§5.6.3), então a segunda gravação
+    // responde `identity_conflict` — e, como o payload persistido
+    // (`canonicalDigest`) difere do candidato (`v2:`), nem a regra de adoção
+    // por virada de bucket se aplica: o hook falha, o corpo devolve
+    // `journal_unavailable{handler_may_have_started:false}` e a chamada morre
+    // em `dispatching` com ZERO handlers. O caminho durável não despachava
+    // nada, e o journal ficava com uma identidade que o despacho não usa.
+    //
+    // O caminho legado mantém este passo byte a byte (é o que a API de SC01
+    // espera: `idempotency_key`/`payload_hash` congelados antes do marcador).
+    if (deps.dispatchDurable === undefined) {
+      const congelada = await deps.freezeToolIdentity({
+        ...base,
+        call_id: admissao.call_id,
+        idempotency_key: call.call_id,
+        idempotency_payload_hash: canonicalDigest(call.args),
+        normalized_args: call.args,
+      });
 
-    if (!congelada.ok) {
-      logger.warn(
-        { run_id: identity.run_id, call_id: call.call_id, reason: congelada.reason },
-        'engine.tool_gateway.freeze_identity_refused',
-      );
-      return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
+      if (!congelada.ok) {
+        logger.warn(
+          { run_id: identity.run_id, call_id: call.call_id, reason: congelada.reason },
+          'engine.tool_gateway.freeze_identity_refused',
+        );
+        return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
+      }
     }
 
     // ── (4b) CONTEXTO DO HANDLER — ANTES DO MARCADOR ────────────────────
@@ -499,7 +518,10 @@ export function createEngineToolGateway(
     //
     // O que NÃO muda: a releitura do banco (3), o congelamento da classificação
     // (4) e o contexto (4b) continuam aqui, porque são gates de ADMISSÃO. O que
-    // sai daqui é a orquestração do efeito.
+    // sai daqui é a orquestração do efeito — e, junto com ela, a IDENTIDADE de
+    // idempotência (4a), que passa a ser congelada pelo próprio corpo, uma vez
+    // só, com a chave real. Dois congelamentos = nenhum dono para a identidade;
+    // ver o comentário do passo (4a).
     if (deps.dispatchDurable !== undefined) {
       const despachar = deps.dispatchDurable;
       const gravarAprovacao = deps.recordToolApproval;
@@ -676,6 +698,60 @@ export function createEngineToolGateway(
           },
           'engine.tool_gateway.journal_unavailable',
         );
+
+        /**
+         * §5.6.2 / AC08 — recusa PROVADA antes do efeito ENCERRA a call.
+         *
+         * `handler_may_have_started: false` é uma afirmação verificável: o
+         * carimbo de início não existe, então nada rodou e nenhum efeito pode
+         * ter ficado. Sem encerrar, a linha fica em `dispatching` — e
+         * `dispatching` é justamente o estado que OCUPA a vaga sequencial do
+         * run (§6.9.1). A recusa não é lenta, é definitiva: o run não anda mais
+         * e o desfecho honesto do que nunca começou é `denied` com evidência
+         * `none` (não `completed`, que afirmaria um resultado sem prova; não
+         * `effect_unknown`, que mandaria reconciliar um efeito inexistente).
+         *
+         * O `settle` aqui é o MESMO caminho que o corpo usa para uma recusa de
+         * governança antes do handler: um dono só para o desfecho. Se a
+         * liquidação não gravar — recusa de CAS, estado já terminal por um
+         * registro de aprovação que sobreviveu à falha, fence vencido —, ela
+         * NÃO muda o que o motor ouve (a recusa já é conservadora) nem pode
+         * escapar como exceção: o log fica, e quem reconciliar sabe que o
+         * journal pode não refletir isto.
+         */
+        if (!desfecho.handler_may_have_started) {
+          try {
+            const encerrou = await deps.settle({
+              ...base,
+              call_id: admissao.call_id,
+              expected_row_version: rowVersion,
+              dispatch_token: congelou.dispatch_token,
+              outcome: { kind: 'denied', result: { error: 'journal_unavailable' } },
+            });
+            if (!encerrou.ok) {
+              logger.error(
+                {
+                  run_id: identity.run_id,
+                  call_id: call.call_id,
+                  reason: encerrou.reason,
+                  ops_alert: true,
+                },
+                'engine.tool_gateway.settle_not_persisted_after_refusal',
+              );
+            }
+          } catch (settleErr) {
+            logger.error(
+              {
+                run_id: identity.run_id,
+                call_id: call.call_id,
+                err: (settleErr as Error).message,
+                ops_alert: true,
+              },
+              'engine.tool_gateway.settle_rejected_after_refusal',
+            );
+          }
+        }
+
         return {
           kind: 'refused',
           call_id: call.call_id,
