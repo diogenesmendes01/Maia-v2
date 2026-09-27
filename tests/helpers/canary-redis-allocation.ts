@@ -1,4 +1,10 @@
-import { readFileSync, statSync } from 'node:fs';
+import { readFileSync, realpathSync, statSync } from 'node:fs';
+import {
+  CI_CANARY_PATH,
+  ciCanaryReservation,
+  readRootOwnedCiAllocation,
+  type RunnerEnv,
+} from '../../scripts/ci-canary-contract.js';
 
 /**
  * Reserva test-only explicitamente autorizada pelo operador.
@@ -67,7 +73,11 @@ const BLOCKED_SLOTS =
  * O caminho é parte da identidade da reserva, não um detalhe de leitura. Um
  * caminho ausente ou alternativo é bloqueio — nunca um slot derivado.
  */
-export function resolveAuthorizedReservationPath(path: string | undefined): AuthorizedReservation {
+export function resolveAuthorizedReservationPath(
+  path: string | undefined,
+  env: RunnerEnv = {},
+): AuthorizedReservation {
+  if (path === CI_CANARY_PATH) return ciCanaryReservation(env, process.getuid?.() ?? -1);
   const authorized = OPERATOR_RESERVATIONS.find((reservation) => reservation.path === path);
   if (!authorized) {
     throw new Error('BLOCKED: canary allocation must use the operator runtime reservation');
@@ -92,13 +102,19 @@ export function assertOperatorOwnedAllocationFile(stat: {
 }
 
 /** Dois destinos, distintos, no host/porta de teste, fora de 0/1/2. */
-function assertReservedDestinationPair(destinations: unknown): readonly [string, string] {
+function assertReservedDestinationPair(
+  destinations: unknown,
+  ci: boolean,
+): readonly [string, string] {
   if (!Array.isArray(destinations) || destinations.length !== 2) throw new Error(BLOCKED_SLOTS);
   const [first, second] = destinations as unknown[];
   for (const destination of [first, second]) {
     const match =
       typeof destination === 'string'
-        ? /^redis:\/\/127\.0\.0\.1:638[23]\/(\d+)$/.exec(destination)
+        ? (ci
+            ? /^redis:\/\/127\.0\.0\.1:6379\/(\d+)$/
+            : /^redis:\/\/127\.0\.0\.1:638[23]\/(\d+)$/
+          ).exec(destination)
         : null;
     if (!match) throw new Error(BLOCKED_SLOTS);
     // 0 é "quem não é worktree"; 1/2 já são de outros donos. Uma reserva só
@@ -139,10 +155,11 @@ function assertAllowedWorktrees(
 export function validateCanaryRedisAllocation(
   allocation: unknown,
   path?: string,
+  env: RunnerEnv = {},
 ): readonly [string, string] {
-  const authorized = resolveAuthorizedReservationPath(path);
+  const authorized = resolveAuthorizedReservationPath(path, env);
   const a = allocation as Record<string, unknown> | null;
-  const [first, second] = assertReservedDestinationPair(a?.destinations);
+  const [first, second] = assertReservedDestinationPair(a?.destinations, path === CI_CANARY_PATH);
   if (
     a?.version !== 1 ||
     a.status !== 'reserved' ||
@@ -160,8 +177,14 @@ export function validateCanaryRedisAllocation(
   return [first, second];
 }
 
-export function readCanaryRedisAllocation(env = process.env): readonly [string, string] {
-  const authorized = resolveAuthorizedReservationPath(env.TEST_CANARY_REDIS_ALLOCATION);
+export function readCanaryRedisAllocation(env: RunnerEnv = process.env): readonly [string, string] {
+  const authorized = resolveAuthorizedReservationPath(env.TEST_CANARY_REDIS_ALLOCATION, env);
+  if (authorized.path === CI_CANARY_PATH) {
+    if (realpathSync(process.cwd()) !== env.GITHUB_WORKSPACE) {
+      throw new Error('BLOCKED: CI reservation is for another workspace');
+    }
+    return validateCanaryRedisAllocation(readRootOwnedCiAllocation(), authorized.path, env);
+  }
   assertOperatorOwnedAllocationFile(statSync(authorized.path));
   return validateCanaryRedisAllocation(
     JSON.parse(readFileSync(authorized.path, 'utf8')),
