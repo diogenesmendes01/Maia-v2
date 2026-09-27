@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, claude/hermes-core-wiring]
     # `edited` está aqui de propósito. O job roda `pr:body:check`, que valida o
     # CORPO do PR — e os tipos default (`opened`, `synchronize`, `reopened`) não
     # incluem edição de descrição. Sem isto o check é insatisfazível: ele reprova
