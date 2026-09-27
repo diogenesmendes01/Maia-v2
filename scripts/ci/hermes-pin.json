@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/NousResearch/hermes-agent.git",
+  "sha": "5d59366010640c1d6b8f170d8a4ee109db2bbdef",
+  "python": "3.12",
+  "uv": "0.12.13"
+}

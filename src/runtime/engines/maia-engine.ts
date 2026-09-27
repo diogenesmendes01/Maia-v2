@@ -30,6 +30,7 @@
  */
 import { randomUUID } from 'node:crypto';
 import { canonicalDigest } from '@/integrations/hermes/canonical-json.js';
+import { incCounter } from '@/lib/metrics.js';
 import type {
   AgentEnginePortV1,
   EngineIOV1,
@@ -139,6 +140,23 @@ export function createMaiaEngine(deps: {
     pin,
 
     async start(request: EngineRequestV1, io: EngineIOV1): Promise<EngineStartResultV1> {
+      /**
+       * SC01 — o contador do `start`, e ele é a TESTEMUNHA das fronteiras.
+       *
+       * `maia_engine_start_total` responde a uma pergunta que nenhuma outra
+       * série responde: o motor foi ACIONADO neste turno? Os gates
+       * determinísticos (pendência, aprovação, skill, bloqueio) e a rota de
+       * recovery terminam ANTES do reasoner, e um turno gated tem de terminar
+       * com este contador em ZERO — senão a extração moveu o seam para o lado
+       * errado dos gates sem que ninguém percebesse (§5.10.3, aceite "Fronteira
+       * reasoner"). É também o denominador do caminho local: sem ele, "o motor
+       * local rodou" fica indistinguível de "o motor local nunca foi chamado".
+       *
+       * Conta a ENTRADA, não o sucesso: um `start` que devolve o mesmo handle de
+       * um reenvio idêntico ainda é uma chamada, e um `start` recusado por
+       * conflito de chave também — os dois são fatos sobre o acionamento.
+       */
+      incCounter('maia_engine_start_total', { engine: pin.engine });
       const digest = canonicalDigest(request as unknown as Record<string, unknown>);
       const existente = execucoes.get(request.run_id);
       if (existente) {

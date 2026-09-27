@@ -27,7 +27,7 @@ import { readFile } from 'node:fs/promises';
 import {
   startPostgresContainer,
   stopPostgresContainer,
-  isDockerAvailable,
+  isPostgresFixtureAvailable,
   type StartedPostgres,
 } from './_fixtures/postgres-testcontainer.js';
 import {
@@ -43,7 +43,7 @@ let dbClientMod: DbClientModule;
 let pg: StartedPostgres;
 let previousDatabaseUrl: string | undefined;
 
-const SHOULD_RUN = await isDockerAvailable();
+const SHOULD_RUN = await isPostgresFixtureAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // Migration 077 backfills usage_policy on the baseline skills while they live

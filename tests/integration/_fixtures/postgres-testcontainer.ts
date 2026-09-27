@@ -1,5 +1,7 @@
 /**
- * Real-Postgres test fixture backed by testcontainers-node.
+ * Real-Postgres fixture: disposable database on an explicitly provisioned
+ * test server, or testcontainers-node when no provisioned fixture is configured.
+ * Both paths apply the identical migration chain to a fresh database.
  *
  * Boots an ephemeral Postgres (pgvector/pgvector:pg16 — same image production
  * uses, see docker-compose.yml) for tests that need to prove behaviour on
@@ -33,6 +35,8 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { PostgreSqlContainer, type StartedPostgreSqlContainer } from '@testcontainers/postgresql';
 import pg from 'pg';
+import { randomUUID } from 'node:crypto';
+import { DisposableDatabase } from '../../helpers/disposable-database.js';
 
 /**
  * Same image production uses (docker-compose.yml). pgvector is required by
@@ -80,7 +84,8 @@ function splitNoTxStatements(sql: string): string[] {
 
 export interface StartedPostgres {
   /** Started testcontainer handle; pass to `stopPostgresContainer` to tear down. */
-  container: StartedPostgreSqlContainer;
+  container?: StartedPostgreSqlContainer;
+  database?: DisposableDatabase;
   /** Connection string for the started container (postgres://user:pwd@host:port/db). */
   uri: string;
   /** Open pool against the container. Caller owns its lifecycle. */
@@ -122,7 +127,7 @@ async function findMigrationsDir(): Promise<string> {
  *   - record each applied migration in `schema_migrations`
  * Returns the number of migrations applied.
  */
-async function applyMigrations(pool: pg.Pool): Promise<number> {
+export async function applyMigrations(pool: pg.Pool): Promise<number> {
   const dir = await findMigrationsDir();
   const files = (await readdir(dir))
     .filter((f) => f.endsWith('.sql') && !f.endsWith('_down.sql'))
@@ -184,7 +189,24 @@ async function applyMigrations(pool: pg.Pool): Promise<number> {
  *
  * Throws with an actionable message if Docker isn't reachable.
  */
+export async function startProvisionedPostgres(baseUrl: string): Promise<StartedPostgres> {
+  const database = new DisposableDatabase(baseUrl, `pg-fixture:${process.pid}:${randomUUID()}`);
+  await database.create();
+  const pool = new pg.Pool({ connectionString: database.url, max: 5 });
+  try {
+    await applyMigrations(pool);
+    return { database, uri: database.url, pool };
+  } catch (error) {
+    await pool.end();
+    await database.cleanup();
+    throw error;
+  }
+}
+
 export async function startPostgresContainer(): Promise<StartedPostgres> {
+  if (process.env.TEST_DB_URL && process.env.TEST_PG_MAINTENANCE_DB) {
+    return startProvisionedPostgres(process.env.TEST_DB_URL);
+  }
   let container: StartedPostgreSqlContainer;
   try {
     container = await new PostgreSqlContainer(POSTGRES_IMAGE)
@@ -235,7 +257,8 @@ export async function startPostgresContainer(): Promise<StartedPostgres> {
  */
 export async function stopPostgresContainer(handle: StartedPostgres): Promise<void> {
   await handle.pool.end().catch(() => undefined);
-  await handle.container.stop().catch(() => undefined);
+  if (handle.database) await handle.database.cleanup();
+  else await handle.container?.stop();
 }
 
 /**
@@ -252,6 +275,13 @@ export async function stopPostgresContainer(handle: StartedPostgres): Promise<vo
  * Used to gate `describe(...)` vs `describe.skip(...)` so testcontainer
  * specs run on machines with Docker but cleanly skip on Docker-less runners.
  */
+export async function isPostgresFixtureAvailable(): Promise<boolean> {
+  // An explicitly provisioned test server supplies the same fresh DB contract.
+  // Setup errors still fail the suite; configuration is not a successful probe.
+  if (process.env.TEST_DB_URL && process.env.TEST_PG_MAINTENANCE_DB) return true;
+  return isDockerAvailable();
+}
+
 let _dockerProbed: boolean | undefined;
 export async function isDockerAvailable(): Promise<boolean> {
   if (_dockerProbed !== undefined) return _dockerProbed;

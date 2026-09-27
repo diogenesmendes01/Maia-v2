@@ -23,7 +23,8 @@ import { createChatCompletionsRelay } from '@/lib/llm/providers/chat-completions
 import { startStubProvider } from '../helpers/hermes-stub-provider.js';
 import { runWithTurnExecution } from '@/runtime/turns/execution-context.js';
 import { mkdtempSync, rmSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { join, resolve } from 'node:path';
+import { tmpdir } from 'node:os';
 import Fastify from 'fastify';
 import type { AddressInfo } from 'node:net';
 import type { EnginePinV1 } from '@/runtime/engines/contracts.js';
@@ -323,7 +324,7 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
       channel.sent = [];
       channel.loseAck = scenario === 'outbound_unknown';
       channel.beforeResolve = null;
-      const home = mkdtempSync('/root/maia-work/synthetic-hermes-');
+      const home = mkdtempSync(join(tmpdir(), 'synthetic-hermes-'));
       const stub = await startStubProvider({
         script: [{ kind: 'text', content: 'synthetic response' }],
       });
@@ -350,7 +351,7 @@ d('SYNTHETIC core recovery: real DB + AIAgent pin, STUB provider, FAKE channel',
         python_path: [process.env.HERMES_PIN_UPSTREAM!, resolve('.')],
         hermes_sha: process.env.HERMES_PIN_SHA!,
         expected_bridge_revision: null,
-        platform_env: { PATH: process.env.PATH!, TMPDIR: process.env.TMPDIR! },
+        platform_env: { PATH: process.env.PATH!, TMPDIR: tmpdir() },
         home_root: home,
         ready_timeout_ms: 60000,
         cancel_grace_ms: 1000,

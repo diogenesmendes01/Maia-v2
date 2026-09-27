@@ -22,7 +22,7 @@
  * made for the same reason.)
  *
  * ---------------------------------------------------------------------------
- * RUNTIME REQUIREMENT — DOCKER DAEMON. Gated behind isDockerAvailable(); set
+ * RUNTIME REQUIREMENT — DOCKER DAEMON. Gated behind isPostgresFixtureAvailable(); set
  * SKIP_DOCKER_TESTS=1 to force-skip. Run via:
  *   npm run test:integration:real-db
  *
@@ -35,13 +35,13 @@ import { readFile } from 'node:fs/promises';
 import {
   startPostgresContainer,
   stopPostgresContainer,
-  isDockerAvailable,
+  isPostgresFixtureAvailable,
   type StartedPostgres,
 } from './_fixtures/postgres-testcontainer.js';
 
 let pg: StartedPostgres;
 
-const SHOULD_RUN = await isDockerAvailable();
+const SHOULD_RUN = await isPostgresFixtureAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // After the full forward chain the single-tenant runtime home is 'primary'

@@ -49,7 +49,7 @@ Os dois opt-ins são separados de propósito: `--allow-placeholders` (usado no `
 
 | Serviço | Variáveis | Segredos |
 |---|---:|---:|
-| `runtime` | 196 | 20 |
+| `runtime` | 198 | 20 |
 | `admin-ui` | 28 | 6 |
 | `migrator` | 15 | 2 |
 | `backup` | 44 | 7 |
@@ -65,6 +65,8 @@ O manifest completo (por serviço e por profile) é gerado em [`src/config/gener
 |---|---|---|---|---|---|---|
 | `NODE_ENV` | `development` \| `test` \| `production` | `development` | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Modo da plataforma Node (otimizações do runtime). NÃO é o profile da Maia — use MAIA_ENV. |
 | `MAIA_ENV` | `development` \| `staging` \| `production` | — | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Profile da Maia: development \| staging \| production. Decide quais regras de validação são obrigatórias. Quando ausente, é derivado de NODE_ENV. Obrigatória em: staging, production. |
+| `MAIA_HERMES_UPSTREAM` | string | — | não | `runtime` | sim | Checkout Hermes pinado para os spikes locais. Opcional no boot; não habilita o motor nem substitui a configuração homologada de deployment. |
+| `MAIA_HERMES_WORKER_PYTHON` | string | — | não | `runtime` | sim | Executável Python do venv Hermes pinado para os spikes locais. Opcional no boot; o launcher deve fornecer o pin explicitamente, sem herdar credenciais ou HERMES_HOME. |
 | `MAIA_BUILD_COMMIT` | string | — | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Commit desta build, injetado pelo pipeline de deploy. Vira provenance do manifesto de backup (issue #520), respondendo "qual código este artefato representa". Ausente = null no manifesto. |
 | `TZ` | string | `America/Sao_Paulo` | não | `runtime`, `admin-ui`, `migrator`, `backup`, `maintenance` | sim | Timezone IANA usada em toda formatação/agendamento. |
 | `APP_PORT` | number | `3000` | não | `runtime` | sim | Porta HTTP do servidor Fastify. |

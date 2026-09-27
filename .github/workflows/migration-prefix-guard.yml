@@ -13,7 +13,7 @@ name: Migration prefix guard
 # in ci.yml.
 on:
   pull_request:
-    branches: [main]
+    branches: [main, claude/hermes-core-wiring]
     paths:
       - 'migrations/**'
       - 'scripts/check-migration-reservations.ts'

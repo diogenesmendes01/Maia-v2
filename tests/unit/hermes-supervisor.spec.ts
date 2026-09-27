@@ -193,6 +193,7 @@ describe('buildWorkerEnv — allowlist do ambiente do filho', () => {
       'PYTHONNOUSERSITE',
       'HERMES_HOME',
       'MAIA_HERMES_SHA',
+      'NODE_ENV', // supervisor-owned constant, never a host passthrough
       WORKER_INFERENCE_KEY_ENV,
     ]);
     for (const k of Object.keys(env)) expect(permitidas.has(k)).toBe(true);

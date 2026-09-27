@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, claude/hermes-core-wiring]
     # `edited` está aqui de propósito. O job roda `pr:body:check`, que valida o
     # CORPO do PR — e os tipos default (`opened`, `synchronize`, `reopened`) não
     # incluem edição de descrição. Sem isto o check é insatisfazível: ele reprova
@@ -483,8 +483,36 @@ jobs:
         continue-on-error: true
         run: npm run doctor -- --online
 
+      - name: Reserve this ephemeral runner's canary Redis pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo env \
+            CI="$CI" GITHUB_ACTIONS="$GITHUB_ACTIONS" \
+            RUNNER_ENVIRONMENT="$RUNNER_ENVIRONMENT" \
+            GITHUB_REPOSITORY="$GITHUB_REPOSITORY" \
+            GITHUB_RUN_ID="$GITHUB_RUN_ID" GITHUB_RUN_ATTEMPT="$GITHUB_RUN_ATTEMPT" \
+            GITHUB_JOB="$GITHUB_JOB" GITHUB_WORKSPACE="$GITHUB_WORKSPACE" \
+            "$(command -v node)" node_modules/tsx/dist/cli.mjs scripts/setup-ci-canary.ts
+          export TEST_CANARY_REDIS_ALLOCATION=/run/maia-ci-canary/allocation.json
+          node node_modules/tsx/dist/cli.mjs -e \
+            'import { readCanaryRedisAllocation } from "./tests/helpers/canary-redis-allocation.ts"; console.log(readCanaryRedisAllocation());'
+          printf 'TEST_CANARY_REDIS_ALLOCATION=%s\n' "$TEST_CANARY_REDIS_ALLOCATION" >> "$GITHUB_ENV"
+
+      - name: Set up Python for the Hermes pin
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Provision the real Hermes pin
+        id: hermes-pin
+        run: python scripts/ci/setup-hermes-pin.py "$RUNNER_TEMP/maia-hermes-pin"
+
       - name: Run integration tests
         env:
+          HERMES_PIN_PYTHON: ${{ steps.hermes-pin.outputs.python }}
+          HERMES_PIN_UPSTREAM: ${{ steps.hermes-pin.outputs.upstream }}
+          HERMES_PIN_SHA: ${{ steps.hermes-pin.outputs.sha }}
           VITEST_SUMMARY_FILE: .ci-test-summary/integration.txt
         run: npm run test:integration
 

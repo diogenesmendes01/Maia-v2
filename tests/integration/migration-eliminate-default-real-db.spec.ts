@@ -42,7 +42,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import {
   startPostgresContainer,
   stopPostgresContainer,
-  isDockerAvailable,
+  isPostgresFixtureAvailable,
   type StartedPostgres,
 } from './_fixtures/postgres-testcontainer.js';
 
@@ -58,7 +58,7 @@ let tenantContextMod: TenantContextModule;
 let pg: StartedPostgres;
 let previousDatabaseUrl: string | undefined;
 
-const SHOULD_RUN = await isDockerAvailable();
+const SHOULD_RUN = await isPostgresFixtureAvailable();
 const d = SHOULD_RUN ? describe : describe.skip;
 
 // The legacy literal being eliminated. Intentionally a hardcoded string (there
