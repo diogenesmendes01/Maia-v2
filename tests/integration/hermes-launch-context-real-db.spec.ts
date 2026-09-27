@@ -328,7 +328,7 @@ d('Hermes launch context — real PostgreSQL', () => {
         python_path: [process.env.HERMES_PIN_UPSTREAM!, resolve('.')],
         hermes_sha: process.env.HERMES_PIN_SHA!,
         expected_bridge_revision: null,
-        platform_env: { PATH: process.env.PATH!, TMPDIR: process.env.TMPDIR! },
+        platform_env: { PATH: process.env.PATH!, TMPDIR: tmpdir() },
         home_root: home,
         ready_timeout_ms: 60000,
         cancel_grace_ms: 1000,
