@@ -954,6 +954,7 @@ describe('SC04-gateway — o caminho durável ligado pelos hooks', () => {
         state: 'completed',
         result: { protegido: 'path/interno.pdf' },
         result_for_engine: { tipo: 'extrato' },
+        receipt_status: 'success',
       }),
     })(chamadaGw());
 
@@ -979,6 +980,7 @@ describe('SC04-gateway — o caminho durável ligado pelos hooks', () => {
         state: 'denied',
         result: { protegido: 'path/interno.pdf', error: 'falha simulada' },
         result_for_engine: { error: 'falha simulada' },
+        receipt_status: 'error',
       }),
     })(chamadaGw());
 

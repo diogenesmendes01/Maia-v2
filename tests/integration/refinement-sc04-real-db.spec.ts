@@ -88,6 +88,11 @@ vi.mock('@/governance/rules.js', () => ({ constitutionalCheck: vi.fn(() => null)
 
 vi.mock('@/tools/_registry.js', () => {
   const passthrough = { safeParse: (v: unknown) => ({ success: true as const, data: v }) };
+  const handler = async () => {
+    fixture.chamadas += 1;
+    if (fixture.deveLancar) throw new Error('handler fixture explodiu');
+    return fixture.resultado;
+  };
   return {
     REGISTRY: {
       sc04_fixture: {
@@ -103,11 +108,29 @@ vi.mock('@/tools/_registry.js', () => {
         operation_type: 'create',
         audit_action: 'fact_saved',
         feature_flag: undefined,
-        handler: async () => {
-          fixture.chamadas += 1;
-          if (fixture.deveLancar) throw new Error('handler fixture explodiu');
-          return fixture.resultado;
-        },
+        handler,
+      },
+      /**
+       * §5.3.2/T30 — a MESMA fixture sob um nome que o CATÁLOGO de operações
+       * críticas do backend (`requiresDualApproval`, `@/governance/dual-approval`)
+       * classifica como exigindo aprovação DUPLA. É o que faz o corpo do
+       * dispatcher — já admitido pelo broker — parar em `approval_required` no
+       * journal, com o pedido real aberto.
+       */
+      create_contraparte: {
+        name: 'create_contraparte',
+        description: 'fixture SC04 — operação crítica com aprovação dupla',
+        input_schema: passthrough,
+        output_schema: passthrough,
+        required_actions: [],
+        side_effect: 'write',
+        effect_class: 'non_interruptible',
+        sensitive: false,
+        redis_required: false,
+        operation_type: 'create',
+        audit_action: 'fact_saved',
+        feature_flag: undefined,
+        handler,
       },
     },
     isToolEnabled: () => true,
@@ -1099,8 +1122,13 @@ function gatewayReal(
   return { invoke, eventos };
 }
 
-function chamadaGw(run_id: string, call_id: string, args: Record<string, unknown>): EngineToolCallV1 {
-  return { version: 1, run_id, call_id, ordinal: 0, iteration: 1, name: 'sc04_fixture', args } as EngineToolCallV1;
+function chamadaGw(
+  run_id: string,
+  call_id: string,
+  args: Record<string, unknown>,
+  nome = 'sc04_fixture',
+): EngineToolCallV1 {
+  return { version: 1, run_id, call_id, ordinal: 0, iteration: 1, name: nome, args } as EngineToolCallV1;
 }
 
 // ─── T30 — a tool que EXIGE aprovação, decidida pelo broker REAL ─────────────
@@ -1120,7 +1148,12 @@ const HEX40 = 'd'.repeat(40);
  * desconhecido e morre na de campo RESERVADO — que é o que prova que o modelo
  * não consegue conceder a aprovação por argumento.
  */
-function manifestoT30(run_id: string) {
+function manifestoT30(
+  run_id: string,
+  opts: { nome?: string; approval_mode?: 'none' | 'single' | 'dual' } = {},
+) {
+  const nome = opts.nome ?? 'sc04_fixture';
+  const approval_mode = opts.approval_mode ?? 'dual';
   const r = parseRuntimeManifest({
     schema: 'maia-hermes-runtime-manifest/v1',
     run_id,
@@ -1138,8 +1171,8 @@ function manifestoT30(run_id: string) {
     },
     tools: [
       {
-        name: 'sc04_fixture',
-        maia_tool_name: 'sc04_fixture',
+        name: nome,
+        maia_tool_name: nome,
         input_schema: {
           type: 'object',
           additionalProperties: false,
@@ -1160,7 +1193,7 @@ function manifestoT30(run_id: string) {
         output_projection_id: 'turn_context_v1',
         audit_action: 'fact_saved',
         limits: { max_calls: 4, result_limit_chars: 8_000, timeout_ms: 5_000 },
-        approval_mode: 'dual',
+        approval_mode,
       },
     ],
     limits: {
@@ -1230,20 +1263,22 @@ function bindingT30(
   return r.binding;
 }
 
-/** A superfície EFETIVA do run: a fixture sobrevive aos sete eixos. */
-const SUPERFICIE_T30: ToolSurfaceInputV1 = {
-  run_kind: 'scoped',
-  axes: {
-    deployment: { kind: 'allow', names: ['sc04_fixture'] },
-    manifest: { kind: 'allow', names: ['sc04_fixture'] },
-    agent_grant: { kind: 'allow', names: ['sc04_fixture'] },
-    role: { kind: 'allow', names: ['sc04_fixture'] },
-    skill: { kind: 'allow', names: ['sc04_fixture'] },
-    subject: { kind: 'allow', names: ['sc04_fixture'] },
-    policy: { kind: 'allow', names: ['sc04_fixture'] },
-  },
-  denies: [],
-};
+/** A superfície EFETIVA do run: a tool pedida sobrevive aos sete eixos. */
+function superficieCom(nome: string): ToolSurfaceInputV1 {
+  return {
+    run_kind: 'scoped',
+    axes: {
+      deployment: { kind: 'allow', names: [nome] },
+      manifest: { kind: 'allow', names: [nome] },
+      agent_grant: { kind: 'allow', names: [nome] },
+      role: { kind: 'allow', names: [nome] },
+      skill: { kind: 'allow', names: [nome] },
+      subject: { kind: 'allow', names: [nome] },
+      policy: { kind: 'allow', names: [nome] },
+    },
+    denies: [],
+  };
+}
 
 /** O pedido de aprovação aberto para a fixture, lido do BANCO. */
 type PedidoRow = {
@@ -1256,16 +1291,19 @@ type PedidoRow = {
   approval_class: string;
 };
 
-async function lerPedidosDeAprovacao(nonce: string): Promise<Array<PedidoRow & { decisoes: number }>> {
+async function lerPedidosDeAprovacao(
+  nonce: string,
+  tool = 'sc04_fixture',
+): Promise<Array<PedidoRow & { decisoes: number }>> {
   const r = await pool.query<PedidoRow & { decisoes: string }>(
     `SELECT ar.id::text AS id, ar.status, ar.required_approvals, ar.intent_hash, ar.intent_payload,
             ar.expires_at, ar.approval_class,
             (SELECT count(*) FROM approval_decisions d WHERE d.request_id = ar.id) AS decisoes
        FROM approval_requests ar
-      WHERE ar.tenant_id = $1 AND ar.agent_id = $2 AND ar.tool = 'sc04_fixture'
-        AND ar.intent_payload->>'nonce' = $3
+      WHERE ar.tenant_id = $1 AND ar.agent_id = $2 AND ar.tool = $3
+        AND ar.intent_payload->>'nonce' = $4
       ORDER BY ar.created_at`,
-    [TENANT, AGENT, nonce],
+    [TENANT, AGENT, tool, nonce],
   );
   return r.rows.map((p) => ({ ...p, decisoes: Number(p.decisoes) }));
 }
@@ -1488,7 +1526,7 @@ d('SC04 — o gateway de produção ponta a ponta (Postgres real)', () => {
           binding,
           manifest,
           frame: { run_id, name: call.name, args: call.args as Record<string, unknown>, call_seq: 0 },
-          surface: SUPERFICIE_T30,
+          surface: superficieCom('sc04_fixture'),
           selectors: {},
         });
       },
@@ -1570,5 +1608,91 @@ d('SC04 — o gateway de produção ponta a ponta (Postgres real)', () => {
     expect(depois[0]!.id).toBe(pedido.id);
     expect(depois[0]!.status).toBe('pending');
     expect(depois[0]!.decisoes).toBe(1);
+  });
+
+  it('T30 — o gate Maia no DESPACHO DURÁVEL: a call fica `approval_required` com UUID real e 0 handlers', async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = await runRodando(turno, control_id);
+    await concederTool(['create_contraparte']);
+
+    /**
+     * O broker ADMITE (no MANIFEST esta tool não pede aprovação): quem exige a
+     * aprovação é o BACKEND, no corpo do dispatcher, pelo catálogo de operações
+     * críticas (`requiresDualApproval`). É ESTE o caminho em que o journal
+     * registra `approval_required` com o UUID COMPLETO do pedido — e o único em
+     * que o pedido nasce da máquina REAL do dispatcher (`ensureApprovalRequest`),
+     * sem nenhuma dep injetada pelo teste. Nenhum caminho paralelo de aprovação
+     * existe aqui: é a mesma `claimExecutableApproval` do gate legado.
+     */
+    const manifest = manifestoT30(run_id, { nome: 'create_contraparte', approval_mode: 'none' });
+    const binding = bindingT30(run_id, turno, control_id, manifest);
+    const nonce = randomUUID();
+    const args = { texto: 'operacao-critica', nonce };
+    const call_id = `sc04:gw:${randomUUID().slice(0, 8)}`;
+
+    const { invoke, eventos } = gatewayReal(turno, run_id, {
+      decide: (call: EngineToolCallV1) =>
+        decideToolCall({
+          binding,
+          manifest,
+          frame: {
+            run_id,
+            name: call.name,
+            args: call.args as Record<string, unknown>,
+            call_seq: 0,
+          },
+          surface: superficieCom('create_contraparte'),
+          selectors: {},
+        }),
+    });
+
+    const r1 = await invoke(chamadaGw(run_id, call_id, args, 'create_contraparte'));
+
+    // Nada rodou, nada foi liquidado: aprovação pendente não é autorização.
+    expect(fixture.chamadas).toBe(0);
+    expect(eventos.marcadores).toHaveLength(0);
+    expect(eventos.settles).toHaveLength(0);
+
+    // A call está TERMINAL em `approval_required` — não em `dispatching`, que
+    // ocuparia a vaga sequencial do run — e guarda o UUID COMPLETO do pedido,
+    // que o `ref` (`AP-xxxxxxxx`) do wire não permite reconstruir.
+    const row = await lerCall(run_id, call_id);
+    expect(row.state).toBe('approval_required');
+    expect(row.approval_request_id).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    expect(row.approval_claim_token).toBeNull();
+    expect(row.handler_started_at).toBeNull();
+    expect(row.receipt_json).toBeNull();
+
+    // O pedido existe no BANCO, pendente, exigindo DUAS assinaturas e com
+    // NENHUMA registrada — o modelo não assinou nada, e não tem como assinar.
+    const pedidos = await lerPedidosDeAprovacao(nonce, 'create_contraparte');
+    expect(pedidos).toHaveLength(1);
+    expect(pedidos[0]!.id).toBe(row.approval_request_id);
+    expect(pedidos[0]!.status).toBe('pending');
+    expect(pedidos[0]!.required_approvals).toBe(2);
+    expect(pedidos[0]!.decisoes).toBe(0);
+
+    // O motor ouve o desfecho como erro (o handler não rodou), sem material
+    // interno.
+    expect(r1, JSON.stringify(r1)).toMatchObject({ kind: 'result', call_id, is_error: true });
+    expect(JSON.stringify(r1)).not.toContain('/interno/');
+
+    // O repolling da MESMA call não emite efeito, não abre outro pedido e não
+    // inventa outro desfecho. O que o replay devolve é o MARCADOR do journal
+    // (`{error:'approval_required', ref:'AP-…'}`), e não o objeto de erro da
+    // primeira entrega: divergência que existe IGUAL no caminho legado e que
+    // não é material protegido — registrada como limitação, não como igualdade.
+    const r2 = await invoke(chamadaGw(run_id, call_id, args, 'create_contraparte'));
+    expect(r2).toMatchObject({ kind: 'result', call_id });
+    expect(JSON.stringify(r2)).not.toContain('/interno/');
+    expect(fixture.chamadas).toBe(0);
+    expect(eventos.settles).toHaveLength(0);
+    expect(await lerPedidosDeAprovacao(nonce, 'create_contraparte')).toHaveLength(1);
+    const rowDepois = await lerCall(run_id, call_id);
+    expect(rowDepois.state).toBe('approval_required');
+    expect(rowDepois.approval_request_id).toBe(row.approval_request_id);
   });
 });

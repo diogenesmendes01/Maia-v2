@@ -589,28 +589,36 @@ const ESTADOS_QUE_OCUPAM_A_VAGA = new Set([
 ]);
 
 /**
- * §5.3.2 (SC04) — a PROJEÇÃO para o motor que ficou PERSISTIDA no receipt.
+ * §5.3.2 (SC04) — o que o receipt PERSISTIDO entrega de volta ao motor.
  *
  * `result_json` guarda o resultado PROTEGIDO do backend (o caminho interno do
  * arquivo, por exemplo) — é o que a reconciliação lê. O motor não pode receber
  * isso: ele recebe `receipt_json.result_for_engine`, a MESMA projeção que a
- * primeira entrega devolveu. Sem receipt persistido (caminho legado, ou recusa
- * que não produziu receipt), a chave fica AUSENTE e quem chamou decide — o
- * gateway cai no `result_json`, que é exatamente o que o legado sempre
- * devolveu, byte a byte.
+ * primeira entrega devolveu, e o `receipt_json.status` que decide o `is_error`
+ * da resposta. Sem receipt persistido (caminho legado, ou recusa que não
+ * produziu receipt), as duas chaves ficam AUSENTES e quem chamou decide — o
+ * gateway cai no `result_json` e no estado da linha, que é exatamente o que o
+ * legado sempre devolveu, byte a byte.
  *
- * A ausência é expressa pela CHAVE AUSENTE (`{}`), e não por
- * `result_for_engine: undefined`: `exactOptionalPropertyTypes` distingue as
- * duas, e um receipt que declare `result_for_engine: null` (JSON) está
- * declarando uma projeção legítima — não a falta dela.
+ * A ausência é expressa pela CHAVE AUSENTE, e não por `undefined` explícito:
+ * `exactOptionalPropertyTypes` distingue as duas coisas, e um receipt que
+ * declare `result_for_engine: null` (JSON) está declarando uma projeção
+ * legítima — não a falta dela.
  */
-function projecaoDoReceipt(
-  receipt: Json | null,
-): { result_for_engine: Json } | Record<string, never> {
+function entregaDoReceipt(receipt: Json | null): {
+  result_for_engine?: Json;
+  receipt_status?: 'success' | 'error';
+} {
   if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) return {};
   const bag = receipt as { [key: string]: Json };
-  if (!Object.prototype.hasOwnProperty.call(bag, "result_for_engine")) return {};
-  return { result_for_engine: bag["result_for_engine"] as Json };
+  const entrega: { result_for_engine?: Json; receipt_status?: 'success' | 'error' } = {};
+  if (Object.prototype.hasOwnProperty.call(bag, "result_for_engine")) {
+    entrega.result_for_engine = bag["result_for_engine"] as Json;
+  }
+  if (bag["status"] === "success" || bag["status"] === "error") {
+    entrega.receipt_status = bag["status"];
+  }
+  return entrega;
 }
 
 export type ToolCallAdmission =
@@ -632,6 +640,13 @@ export type ToolCallAdmission =
        * persistido: quem chama cai no `result` (comportamento legado).
        */
       result_for_engine?: Json;
+      /**
+       * §5.3.2 (SC04) — o `status` do receipt persistido. É a fonte do
+       * `is_error` da resposta repetida: o mesmo `receipt.status` que decidiu o
+       * `is_error` da primeira entrega. AUSENTE quando não há receipt — e aí a
+       * resposta sai do ESTADO da linha, como antes.
+       */
+      receipt_status?: 'success' | 'error';
     }
   | TurnFenceConflict
   | ControlConflict
@@ -1904,7 +1919,7 @@ export const engineRunsRepo = {
             call_id: existente.call_id,
             state: existente.state as EngineToolCallStateV1,
             result: existente.result_json,
-            ...projecaoDoReceipt(existente.receipt_json),
+            ...entregaDoReceipt(existente.receipt_json),
           };
         }
         conta("admit_call", "in_progress");

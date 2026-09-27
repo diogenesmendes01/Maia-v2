@@ -445,14 +445,24 @@ export function createEngineToolGateway(
        * Quando NÃO há receipt persistido (caminho legado, ou recusa que não
        * produziu receipt) a chave da projeção vem ausente e o `result_json` é
        * devolvido: no legado, o `result_json` É o que a primeira entrega
-       * devolveu, e trocar isso mudaria a resposta de quem já depende dela.
+       * devolveu, e trocar isso mudaria a resposta de quem já depende dela. O
+       * `is_error` segue a MESMA régua: o `status` do receipt persistido quando
+       * ele existe, o estado da linha quando não — assim o replay e a primeira
+       * entrega nunca discordam sobre o desfecho.
        */
       const projecao = admissao.result_for_engine;
+      const statusPersistido = admissao.receipt_status;
       return {
         kind: 'result',
         call_id: call.call_id,
         result: projecao === undefined ? admissao.result : projecao,
-        is_error: admissao.state === 'denied' || admissao.state === 'effect_unknown',
+        // O `is_error` vem do MESMO receipt que decidiu o `is_error` da
+        // primeira entrega. Sem receipt (legado), ele sai do estado da linha —
+        // que é como o legado sempre respondeu.
+        is_error:
+          statusPersistido !== undefined
+            ? statusPersistido === 'error'
+            : admissao.state === 'denied' || admissao.state === 'effect_unknown',
       };
     }
 
