@@ -18,7 +18,7 @@ const PROTOCOL = 'maia.hermes.worker.v1';
 const ALLOWED = new Set([
   'SYSTEMROOT', 'WINDIR', 'PATH', 'TEMP', 'TMP', 'TMPDIR', 'LANG', 'LC_ALL',
   'PYTHONPATH', 'PYTHONIOENCODING', 'PYTHONUTF8', 'PYTHONDONTWRITEBYTECODE', 'PYTHONNOUSERSITE',
-  'HERMES_HOME', 'MAIA_HERMES_SHA', 'MAIA_HERMES_INFERENCE_KEY',
+  'HERMES_HOME', 'MAIA_HERMES_SHA', 'MAIA_HERMES_INFERENCE_KEY', 'NODE_ENV',
 ]);
 // No Windows o libuv copia estas do pai quando o env do spawn não as traz
 // (`required_vars` em uv/src/win/process.c). Identidade do usuário do SO, não

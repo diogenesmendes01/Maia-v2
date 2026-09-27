@@ -123,13 +123,17 @@ export type HermesSupervisorConfigV1 = z.infer<typeof hermesSupervisorConfigV1Sc
  * o env do spawn não as traz. São identidade do usuário do SO, não segredo, e o
  * launcher de produção (D01) não é Windows.
  */
+// Explicit child contract, also compatible with Next's ProcessEnv augmentation.
+// NODE_ENV is controlled by the supervisor, not inherited from the host.
+export type WorkerEnv = Record<string, string> & { NODE_ENV: 'production' };
+
 export function buildWorkerEnv(input: {
   platform_env: Readonly<Record<string, string>>;
   python_path: readonly string[];
   home: string;
   hermes_sha: string;
   inference_key: string;
-}): Record<string, string> {
+}): WorkerEnv {
   if (!INFERENCE_KEY_RE.test(input.inference_key)) {
     throw new TypeError('buildWorkerEnv: credencial de inferência ausente ou com caractere proibido');
   }
@@ -139,7 +143,7 @@ export function buildWorkerEnv(input: {
   if (!isAbsolute(input.home)) {
     throw new TypeError('buildWorkerEnv: HERMES_HOME precisa ser absoluto');
   }
-  const env: Record<string, string> = {};
+  const env: WorkerEnv = { NODE_ENV: 'production' };
   const byUpper = new Map(PLATFORM_ENV_ALLOWLIST.map((k) => [k.toUpperCase(), k] as const));
   for (const [key, value] of Object.entries(input.platform_env)) {
     const canonical = byUpper.get(key.toUpperCase());
@@ -523,7 +527,7 @@ export function createHermesSupervisor(
     if (shuttingDown) return refuse('shutting_down', home);
     if (ownershipLost()) return refuse('ownership_lost', home);
 
-    let env: Record<string, string>;
+    let env: WorkerEnv;
     try {
       env = buildWorkerEnv({
         platform_env: config.platform_env,
