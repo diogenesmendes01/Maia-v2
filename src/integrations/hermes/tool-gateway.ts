@@ -430,10 +430,28 @@ export function createEngineToolGateway(
     // Já conciliada: devolve o que está PERSISTIDO. O resultado vem do banco,
     // nunca de reexecutar — mesmo que reexecutar fosse barato, o efeito não é.
     if (admissao.kind === 'receipt') {
+      /**
+       * §5.3.2 (SC04) — o replay devolve a PROJEÇÃO, exatamente como a 1ª
+       * entrega.
+       *
+       * `admissao.result` é o `result_json` do journal. No caminho durável o
+       * `settle` grava ali o `receipt.result` — o resultado PROTEGIDO do
+       * backend, com caminho de arquivo e metadado interno —, porque é isso que
+       * quem reconcilia precisa ler. O motor não pode receber esse material nem
+       * no primeiro retorno nem no callback repetido (SPEC-L1403/T26): as duas
+       * entregas têm de ser a MESMA coisa, e a coisa que pode ir ao motor é
+       * `receipt_json.result_for_engine`.
+       *
+       * Quando NÃO há receipt persistido (caminho legado, ou recusa que não
+       * produziu receipt) a chave da projeção vem ausente e o `result_json` é
+       * devolvido: no legado, o `result_json` É o que a primeira entrega
+       * devolveu, e trocar isso mudaria a resposta de quem já depende dela.
+       */
+      const projecao = admissao.result_for_engine;
       return {
         kind: 'result',
         call_id: call.call_id,
-        result: admissao.result,
+        result: projecao === undefined ? admissao.result : projecao,
         is_error: admissao.state === 'denied' || admissao.state === 'effect_unknown',
       };
     }
@@ -779,6 +797,25 @@ export function createEngineToolGateway(
       const deveLiquidar = handlerComecou || !aprovacaoJaJournalada;
       if (deveLiquidar) {
         /**
+         * O receipt acompanha os TRÊS desfechos, não só `completed` (§5.3.2).
+         *
+         * Ele é o registro do que o despacho produziu — o resultado PROTEGIDO
+         * (`result`) e a projeção que pode ir ao motor (`result_for_engine`) —,
+         * e é dele que o REPLAY do gateway tira a projeção. Guardá-lo só no
+         * sucesso deixava `denied`/`effect_unknown` sem de onde projetar: o
+         * callback repetido caía no `result_json` protegido e devolvia ao motor
+         * o material interno que a primeira entrega tinha filtrado
+         * (SPEC-L1403/T26, AC05).
+         *
+         * O hash é o do conteúdo canônico do receipt: é o que permite a quem
+         * reconciliar detectar que o receipt lido não é o que foi gravado. O
+         * cast é de forma, não de conteúdo — `ToolReceiptV1` é uma interface com
+         * campos nomeados e `Json` é o tipo de payload serializável, e o valor
+         * gravado é o mesmo objeto que o hash cobriu.
+         */
+        const receita = { json: receipt as unknown as Json, hash: canonicalDigest(receipt) };
+
+        /**
          * A ORDEM importa, e `unknown` vem primeiro.
          *
          * O receipt pode ter `status: 'error'` com `effect_evidence: 'unknown'`
@@ -791,23 +828,13 @@ export function createEngineToolGateway(
          */
         const outcome: ToolSettlement =
           receipt.effect_evidence === 'unknown'
-            ? { kind: 'effect_unknown', result: receipt.result }
+            ? { kind: 'effect_unknown', result: receipt.result, receipt: receita }
             : erroDoReceipt
-              ? { kind: 'denied', result: receipt.result }
+              ? { kind: 'denied', result: receipt.result, receipt: receita }
               : {
                   kind: 'completed',
                   result: receipt.result,
-                  /**
-                   * O receipt vai para o journal com o hash do seu conteúdo
-                   * canônico. É o que permite a quem reconciliar detectar que o
-                   * receipt lido não é o que foi gravado.
-                   *
-                   * O cast é de forma, não de conteúdo: `ToolReceiptV1` é uma
-                   * interface com campos nomeados e `Json` é o tipo de payload
-                   * serializável. O valor gravado é o objeto do receipt — o mesmo
-                   * que o hash acima cobriu.
-                   */
-                  receipt: { json: receipt as unknown as Json, hash: canonicalDigest(receipt) },
+                  receipt: receita,
                 };
 
         try {

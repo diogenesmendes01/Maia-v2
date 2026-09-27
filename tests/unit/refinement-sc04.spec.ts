@@ -842,12 +842,29 @@ describe('SC04-gateway — o caminho durável ligado pelos hooks', () => {
 
     const out = await gatewayComDurable()(chamadaGw());
 
-    const outcome = ledger.settles[0]!.outcome as { kind: string; receipt?: unknown };
+    const outcome = ledger.settles[0]!.outcome as {
+      kind: string;
+      result: unknown;
+      receipt?: { json: unknown; hash: string };
+    };
     expect(outcome.kind).toBe('effect_unknown');
     // `denied` afirmaria "nada rodou" sobre um efeito que pode ter acontecido —
     // e a linha ficaria incoerente com o próprio receipt.
-    expect(outcome.receipt).toBeUndefined();
-    expect(out).toMatchObject({ kind: 'result', is_error: true });
+    expect(outcome.result).toEqual({ protegido: 'path/interno.pdf' });
+    // O receipt acompanha o desfecho mesmo aqui: é dele que o REPLAY tira a
+    // projeção (`result_for_engine`), em vez de devolver o `result_json`
+    // protegido ao motor. Sem ele, `effect_unknown` não teria de onde projetar.
+    expect(outcome.receipt?.json).toMatchObject({
+      call_id: 'call-gw-1',
+      effect_evidence: 'unknown',
+    });
+    expect(outcome.receipt?.hash).toBe(canonicalDigest(outcome.receipt?.json));
+    expect(out).toMatchObject({
+      kind: 'result',
+      is_error: true,
+      result: { tipo: 'extrato' },
+    });
+    expect(JSON.stringify(out)).not.toContain('path/interno.pdf');
   });
 
   it('virada de BUCKET adota a identidade congelada; intenção diferente é recusa', async () => {
@@ -916,6 +933,81 @@ describe('SC04-gateway — o caminho durável ligado pelos hooks', () => {
     const out = await gatewayComDurable()(chamadaGw());
 
     expect(out).toEqual({ kind: 'refused', call_id: 'call-gw-1', code: 'run_not_authorized' });
+    expect(ledger.settles).toHaveLength(0);
+  });
+
+  /**
+   * REPLAY pelo ramo `receipt` do gateway (§5.3.2/AC02/AC05, SPEC-L1403/T26).
+   *
+   * O `admit` de uma call já conciliada devolve o `result_json` do journal — no
+   * caminho durável, o resultado PROTEGIDO do backend — e, ao lado, a projeção
+   * que ficou no receipt. O motor tem de receber a SEGUNDA em toda entrega
+   * repetida: antes, o replay devolvia o `result_json` e o callback repetido do
+   * motor recebia de volta o caminho interno do arquivo.
+   */
+  it('replay: `admit` conciliado devolve a PROJEÇÃO do receipt, não o `result_json` protegido', async () => {
+    const out = await gatewayComDurable({
+      admit: async (input: { call: EngineToolCallV1 }) => ({
+        ok: true,
+        kind: 'receipt',
+        call_id: input.call.call_id,
+        state: 'completed',
+        result: { protegido: 'path/interno.pdf' },
+        result_for_engine: { tipo: 'extrato' },
+      }),
+    })(chamadaGw());
+
+    expect(out).toMatchObject({
+      kind: 'result',
+      call_id: 'call-gw-1',
+      result: { tipo: 'extrato' },
+      is_error: false,
+    });
+    expect(JSON.stringify(out)).not.toContain('path/interno.pdf');
+    // Replay é LEITURA: nenhum handler, nenhuma liquidação, nenhum hook.
+    expect(ledger.settles).toHaveLength(0);
+    expect(ledger.controles).toHaveLength(0);
+    expect(ledger.marcadores).toHaveLength(0);
+  });
+
+  it('replay de `denied` durável também entrega a projeção, com `is_error`', async () => {
+    const out = await gatewayComDurable({
+      admit: async (input: { call: EngineToolCallV1 }) => ({
+        ok: true,
+        kind: 'receipt',
+        call_id: input.call.call_id,
+        state: 'denied',
+        result: { protegido: 'path/interno.pdf', error: 'falha simulada' },
+        result_for_engine: { error: 'falha simulada' },
+      }),
+    })(chamadaGw());
+
+    expect(out).toMatchObject({
+      kind: 'result',
+      result: { error: 'falha simulada' },
+      is_error: true,
+    });
+    expect(JSON.stringify(out)).not.toContain('path/interno.pdf');
+  });
+
+  it('replay SEM receipt persistido (caminho legado) devolve o `result_json`, como sempre devolveu', async () => {
+    // Nada de projeção persistida ⇒ a chave vem AUSENTE do `admit`. Trocar isso
+    // mudaria a resposta de quem já depende do caminho legado.
+    const out = await gatewayComDurable({
+      admit: async (input: { call: EngineToolCallV1 }) => ({
+        ok: true,
+        kind: 'receipt',
+        call_id: input.call.call_id,
+        state: 'completed',
+        result: { ok: true, eco: 'oi' },
+      }),
+    })(chamadaGw());
+
+    expect(out).toMatchObject({
+      kind: 'result',
+      result: { ok: true, eco: 'oi' },
+      is_error: false,
+    });
     expect(ledger.settles).toHaveLength(0);
   });
 });

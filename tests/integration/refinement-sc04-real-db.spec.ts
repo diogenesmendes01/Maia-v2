@@ -117,6 +117,13 @@ vi.mock('@/tools/_registry.js', () => {
 import { dispatchToolDurable, BeforeHandlerError } from '@/tools/_dispatcher.js';
 import { createEngineToolGateway } from '@/integrations/hermes/tool-gateway.js';
 import { runWithTurnExecution } from '@/runtime/turns/execution-context.js';
+import { ensureApprovalRequest } from '@/governance/approval-requests.js';
+import {
+  decideToolCall,
+  type ToolSurfaceInputV1,
+} from '@/integrations/hermes/tool-broker.js';
+import { parseRuntimeManifest, computeManifestDigest } from '@/integrations/hermes/manifest.js';
+import { parseRunBinding } from '@/integrations/hermes/run-binding.js';
 import type { TurnExecutionContext } from '@/runtime/turns/claim.js';
 import type {
   DurableDispatchResultV1,
@@ -491,11 +498,13 @@ async function liquidar(
       call_id: chamada.call_id,
       expected_row_version: estado.rowVersion(),
       dispatch_token: chamada.dispatch_token,
+      // O receipt acompanha os três desfechos, como no gateway de produção: é
+      // dele que o replay tira a projeção (`result_for_engine`).
       outcome:
         receipt.effect_evidence === 'unknown'
-          ? { kind: 'effect_unknown', result: receipt.result }
+          ? { kind: 'effect_unknown', result: receipt.result, receipt: { json: receipt as never, hash: canonicalDigest(receipt) } }
           : receipt.status === 'error'
-            ? { kind: 'denied', result: receipt.result }
+            ? { kind: 'denied', result: receipt.result, receipt: { json: receipt as never, hash: canonicalDigest(receipt) } }
             : {
                 kind: 'completed',
                 result: receipt.result,
@@ -1094,6 +1103,173 @@ function chamadaGw(run_id: string, call_id: string, args: Record<string, unknown
   return { version: 1, run_id, call_id, ordinal: 0, iteration: 1, name: 'sc04_fixture', args } as EngineToolCallV1;
 }
 
+// ─── T30 — a tool que EXIGE aprovação, decidida pelo broker REAL ─────────────
+
+const HEX64 = 'c'.repeat(64);
+const HEX40 = 'd'.repeat(40);
+
+/**
+ * Manifest REAL (`parseRuntimeManifest`) da MESMA fixture, com UMA diferença que
+ * é o sujeito do T30: `approval_mode: 'dual'`.
+ *
+ * O broker (`decideToolCall`, §6.9.1 item 7) responde `defer` para
+ * `approval_mode !== 'none'` — é essa a única origem honesta de um
+ * `approval_required`: ou a ferramenta DECLARA que precisa de aprovação, ou o
+ * teste estaria inventando o requisito. E o `input_schema` declara `approved`
+ * entre as propriedades de propósito: o campo passa pela peneira de campo
+ * desconhecido e morre na de campo RESERVADO — que é o que prova que o modelo
+ * não consegue conceder a aprovação por argumento.
+ */
+function manifestoT30(run_id: string) {
+  const r = parseRuntimeManifest({
+    schema: 'maia-hermes-runtime-manifest/v1',
+    run_id,
+    policy_revision: 'rev-sc04',
+    mode: 'live',
+    bundle_digest: HEX64,
+    context_digest: HEX64,
+    control_epoch: '12',
+    exposure_epoch: '3',
+    runtime_pin: {
+      hermes_sha: HEX40,
+      adapter_revision: 'hermes-adapter-0.1.0',
+      image_digest: HEX64,
+      dependency_lock_digest: HEX64,
+    },
+    tools: [
+      {
+        name: 'sc04_fixture',
+        maia_tool_name: 'sc04_fixture',
+        input_schema: {
+          type: 'object',
+          additionalProperties: false,
+          properties: {
+            texto: { type: 'string' },
+            nonce: { type: 'string' },
+            approved: { type: 'boolean' },
+          },
+        },
+        output_schema: { type: 'object', additionalProperties: false, properties: {} },
+        input_schema_hash: HEX64,
+        output_schema_hash: HEX64,
+        implementation_version: '1.0.0',
+        side_effect: 'write',
+        effect_class: 'non_interruptible',
+        required_actions: [],
+        authorization_target: 'current_turn',
+        output_projection_id: 'turn_context_v1',
+        audit_action: 'fact_saved',
+        limits: { max_calls: 4, result_limit_chars: 8_000, timeout_ms: 5_000 },
+        approval_mode: 'dual',
+      },
+    ],
+    limits: {
+      deadline_at: '2026-12-31T12:00:00.000Z',
+      max_tool_calls: 8,
+      max_inference_calls: 12,
+      max_context_tokens: 100_000,
+      max_output_tokens: 1_024,
+      max_payload_bytes: 262_144,
+      max_json_depth: 32,
+      budget: { amount_microusd: '250000', unit: 'microusd' },
+    },
+    data_policy: { ref: 'dp-sc04', version: '2' },
+    publication_refs: [],
+    retention_policy_ref: 'ret-sc04-30d',
+    denies: {
+      native_memory: true,
+      generic_filesystem: true,
+      code_execution: true,
+      browsing: true,
+      mcp: true,
+      delegation: true,
+      background_review: true,
+      cron: true,
+      messaging: true,
+      discovery_expanding_tools: true,
+    },
+  });
+  if (r.kind !== 'ok') throw new Error(`fixture de manifest inválida: ${r.code} ${r.detail}`);
+  return r.manifest;
+}
+
+function bindingT30(
+  run_id: string,
+  turno: Turno,
+  control_id: string,
+  manifest: ReturnType<typeof manifestoT30>,
+) {
+  const r = parseRunBinding({
+    version: 1,
+    run_id,
+    execution_id: run_id,
+    task_id: 'task-sc04',
+    initial_session_id: 'sess-sc04',
+    tenant_id: TENANT,
+    agent_id: AGENT,
+    pessoa_id: PESSOA_ID,
+    conversa_id: ctx.conversa.id,
+    mensagem_id: ctx.mensagem_id,
+    turn_id: turno.turn_id,
+    turn_attempt: turno.attempt,
+    origin_claim_token: turno.claim_token,
+    control_id,
+    control_epoch: '0',
+    mode: 'live',
+    manifest_digest: computeManifestDigest(manifest),
+    context_digest: HEX64,
+    bundle_digest: HEX64,
+    deadline_at: '2026-12-31T12:00:00.000Z',
+    acl: {
+      pessoa_ids: [PESSOA_ID],
+      conversa_ids: [ctx.conversa.id],
+      entidade_ids: [ENTIDADE_ID],
+    },
+  });
+  if (r.kind !== 'ok') throw new Error(`fixture de binding inválida: ${r.code} ${r.detail}`);
+  return r.binding;
+}
+
+/** A superfície EFETIVA do run: a fixture sobrevive aos sete eixos. */
+const SUPERFICIE_T30: ToolSurfaceInputV1 = {
+  run_kind: 'scoped',
+  axes: {
+    deployment: { kind: 'allow', names: ['sc04_fixture'] },
+    manifest: { kind: 'allow', names: ['sc04_fixture'] },
+    agent_grant: { kind: 'allow', names: ['sc04_fixture'] },
+    role: { kind: 'allow', names: ['sc04_fixture'] },
+    skill: { kind: 'allow', names: ['sc04_fixture'] },
+    subject: { kind: 'allow', names: ['sc04_fixture'] },
+    policy: { kind: 'allow', names: ['sc04_fixture'] },
+  },
+  denies: [],
+};
+
+/** O pedido de aprovação aberto para a fixture, lido do BANCO. */
+type PedidoRow = {
+  id: string;
+  status: string;
+  required_approvals: number;
+  intent_hash: string;
+  intent_payload: unknown;
+  expires_at: Date;
+  approval_class: string;
+};
+
+async function lerPedidosDeAprovacao(nonce: string): Promise<Array<PedidoRow & { decisoes: number }>> {
+  const r = await pool.query<PedidoRow & { decisoes: string }>(
+    `SELECT ar.id::text AS id, ar.status, ar.required_approvals, ar.intent_hash, ar.intent_payload,
+            ar.expires_at, ar.approval_class,
+            (SELECT count(*) FROM approval_decisions d WHERE d.request_id = ar.id) AS decisoes
+       FROM approval_requests ar
+      WHERE ar.tenant_id = $1 AND ar.agent_id = $2 AND ar.tool = 'sc04_fixture'
+        AND ar.intent_payload->>'nonce' = $3
+      ORDER BY ar.created_at`,
+    [TENANT, AGENT, nonce],
+  );
+  return r.rows.map((p) => ({ ...p, decisoes: Number(p.decisoes) }));
+}
+
 d('SC04 — o gateway de produção ponta a ponta (Postgres real)', () => {
   beforeAll(async () => {
     pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 4 });
@@ -1224,5 +1400,175 @@ d('SC04 — o gateway de produção ponta a ponta (Postgres real)', () => {
     expect(row.receipt_json).toBeNull();
     expect(eventos.settles).toHaveLength(1);
     expect(eventos.settles[0]!.kind).toBe('denied');
+  });
+
+  it('AC02/AC05/T26 — o REPLAY pelo gateway devolve a projeção persistida, não o resultado protegido', async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = await runRodando(turno, control_id);
+    // Resultado com material INTERNO: `path`/`fileName` existem no `result`
+    // protegido (que fica no journal) e NÃO podem sair para o motor.
+    fixture.resultado = { ok: true, path: '/interno/boleto.pdf', fileName: 'boleto.pdf' };
+    const args = { texto: 'gateway-replay', nonce: randomUUID() };
+    const call_id = `sc04:gw:${randomUUID().slice(0, 8)}`;
+    const { invoke, eventos } = gatewayReal(turno, run_id);
+
+    const r1 = await invoke(chamadaGw(run_id, call_id, args));
+    // O replay é o caminho do callback REPETIDO (SPEC-L1403/T26): a MESMA call
+    // com os MESMOS args volta pelo ramo `receipt` do gateway.
+    const r2 = await invoke(chamadaGw(run_id, call_id, args));
+
+    // 1ª entrega: a projeção (`result_for_engine`), como já era.
+    expect(r1, JSON.stringify(r1)).toMatchObject({ kind: 'result', call_id, is_error: false });
+    expect(r1.kind === 'result' ? r1.result : null).toEqual({ ok: true });
+
+    // REPLAY: EXATAMENTE o que a 1ª entrega devolveu. Antes da correção este
+    // ramo devolvia `result_json` (o resultado PROTEGIDO gravado por `settle`),
+    // e o motor recebia de volta o caminho interno do arquivo.
+    expect(r2, JSON.stringify(r2)).toEqual(r1);
+    expect(JSON.stringify(r2)).not.toContain('/interno/boleto.pdf');
+    expect(JSON.stringify(r2)).not.toContain('fileName');
+
+    // Um único efeito, uma única liquidação: o replay é LEITURA do journal.
+    expect(fixture.chamadas).toBe(1);
+    expect(eventos.freezes).toHaveLength(1);
+    expect(eventos.marcadores).toHaveLength(1);
+    expect(eventos.settles).toHaveLength(1);
+
+    const row = await lerCall(run_id, call_id);
+    expect(row.state).toBe('completed');
+    const receipt = row.receipt_json as { result: unknown; result_for_engine: unknown };
+    // O journal guarda os DOIS: o protegido e a projeção. O motor só vê o segundo.
+    expect(receipt.result).toEqual(fixture.resultado);
+    expect(receipt.result_for_engine).toEqual({ ok: true });
+    expect(r2.kind === 'result' ? r2.result : null).toEqual(receipt.result_for_engine);
+  });
+
+  it('AC05 — o replay de uma call durável com ERRO também devolve a projeção, não o `result_json` cru', async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = await runRodando(turno, control_id);
+    // Erro de handler carregando material interno: `denied` no journal, com o
+    // resultado protegido em `result_json`.
+    fixture.resultado = { error: 'falha simulada', path: '/interno/segredo.pdf' };
+    const args = { texto: 'gateway-replay-erro', nonce: randomUUID() };
+    const call_id = `sc04:gw:${randomUUID().slice(0, 8)}`;
+    const { invoke } = gatewayReal(turno, run_id);
+
+    const r1 = await invoke(chamadaGw(run_id, call_id, args));
+    const r2 = await invoke(chamadaGw(run_id, call_id, args));
+
+    expect(r1).toMatchObject({ kind: 'result', call_id, is_error: true });
+    expect(r1.kind === 'result' ? r1.result : null).toEqual({ error: 'falha simulada' });
+    expect(r2, JSON.stringify(r2)).toEqual(r1);
+    expect(JSON.stringify(r2)).not.toContain('/interno/segredo.pdf');
+    expect(fixture.chamadas).toBe(1);
+
+    const row = await lerCall(run_id, call_id);
+    expect(row.state).toBe('denied');
+    expect(row.result_json).toEqual(fixture.resultado);
+    const receipt = row.receipt_json as { result_for_engine: unknown };
+    expect(receipt.result_for_engine).toEqual({ error: 'falha simulada' });
+  });
+
+  it('T30 — a tool que EXIGE aprovação abre o pedido REAL no banco, e o modelo não libera o handler sozinho', async () => {
+    const turno = await mkTurnoVivo();
+    const control_id = await mkControle();
+    const run_id = await runRodando(turno, control_id);
+
+    // O BROKER REAL decide: `approval_mode: 'dual'` ⇒ `defer`, não `admit`.
+    const manifest = manifestoT30(run_id);
+    const binding = bindingT30(run_id, turno, control_id, manifest);
+    const chamadasDecididas: string[] = [];
+
+    const { invoke, eventos } = gatewayReal(turno, run_id, {
+      decide: (call) => {
+        chamadasDecididas.push(call.call_id);
+        return decideToolCall({
+          binding,
+          manifest,
+          frame: { run_id, name: call.name, args: call.args as Record<string, unknown>, call_seq: 0 },
+          surface: SUPERFICIE_T30,
+          selectors: {},
+        });
+      },
+      // O canal REAL de aprovação que o gateway documenta: a MESMA máquina do
+      // dispatcher (`ensureApprovalRequest`), com o mesmo `intent_hash`.
+      // O solicitante é a pessoa REAL do contexto; `tipo` é o que decide o
+      // `approval_class` na assinatura automática de criação, e vem do cadastro
+      // (a fixture do `ctx` não carrega esse campo).
+      ensureApproval: async (input: { call: EngineToolCallV1; run_id: string }) => {
+        const requisitante = { ...ctx.pessoa, tipo: 'dono' } as unknown as Pessoa;
+        const ensured = await noEscopo(() =>
+          ensureApprovalRequest({
+            tenant_id: TENANT,
+            agent_id: AGENT,
+            requester: requisitante,
+            entidade_id: null,
+            conversa_id: null,
+            mensagem_id: null,
+            request_id: ctx.request_id,
+            tool: input.call.name,
+            operation_type: 'create',
+            args: input.call.args,
+            approval_class: 'requester_plus_one_owner',
+            reason: `${input.call.name}: aprovação durável via gateway`,
+            notify: async () => ({ ok: true }),
+          }),
+        );
+        return { ref: ensured.ref, created: ensured.created };
+      },
+    });
+
+    const nonce = randomUUID();
+    const args = { texto: 'aprovacao-duravel', nonce };
+    const call_id = `sc04:gw:${randomUUID().slice(0, 8)}`;
+
+    const r1 = await invoke(chamadaGw(run_id, call_id, args));
+
+    // O wire diz a única verdade que sabe expressar (ainda não há desfecho), e
+    // o handler NÃO roda: aprovação pendente não é autorização.
+    expect(r1).toMatchObject({ kind: 'in_progress', call_id });
+    expect(fixture.chamadas).toBe(0);
+    expect(eventos.freezes).toHaveLength(0);
+    expect(eventos.marcadores).toHaveLength(0);
+    expect(eventos.settles).toHaveLength(0);
+
+    // O pedido existe no BANCO, com UUID REAL, e a classe exige DUAS
+    // assinaturas (a do solicitante + uma de outro dono).
+    const pedidos = await lerPedidosDeAprovacao(nonce);
+    expect(pedidos).toHaveLength(1);
+    const pedido = pedidos[0]!;
+    expect(pedido.id).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/);
+    expect(pedido.status).toBe('pending');
+    expect(pedido.approval_class).toBe('requester_plus_one_owner');
+    expect(pedido.required_approvals).toBe(2);
+    expect(pedido.intent_hash).toMatch(/^(v1:)?[0-9a-f]{64}$/);
+    expect(pedido.intent_payload).toEqual(args);
+    expect(pedido.expires_at).not.toBeNull();
+    // Só a assinatura do PRÓPRIO solicitante (na criação): falta a segunda.
+    expect(pedido.decisoes).toBe(1);
+
+    // ── o modelo tentando APROVAR pelos args não libera nada ────────────────
+    // `approved` está DECLARADO no schema da tool (não é campo desconhecido) e
+    // ainda assim morre na peneira de campo RESERVADO do broker (§6.9.1 item 4)
+    // — ANTES da aprovação (item 7).
+    const r2 = await invoke(
+      chamadaGw(run_id, `sc04:gw:${randomUUID().slice(0, 8)}`, { ...args, approved: true }),
+    );
+    expect(r2, JSON.stringify(r2)).toMatchObject({ kind: 'refused' });
+    expect(fixture.chamadas).toBe(0);
+    expect(chamadasDecididas).toHaveLength(2); // decidiu e recusou; não admitiu
+
+    // ── o repolling do MESMO intent reencontra o MESMO pedido ───────────────
+    const r3 = await invoke(chamadaGw(run_id, `sc04:gw:${randomUUID().slice(0, 8)}`, args));
+    expect(r3).toMatchObject({ kind: 'in_progress' });
+    expect(fixture.chamadas).toBe(0);
+    const depois = await lerPedidosDeAprovacao(nonce);
+    // UM pedido, o mesmo UUID, ainda pendente e ainda com uma única assinatura.
+    expect(depois).toHaveLength(1);
+    expect(depois[0]!.id).toBe(pedido.id);
+    expect(depois[0]!.status).toBe('pending');
+    expect(depois[0]!.decisoes).toBe(1);
   });
 });

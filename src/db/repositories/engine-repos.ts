@@ -588,6 +588,31 @@ const ESTADOS_QUE_OCUPAM_A_VAGA = new Set([
   "effect_unknown",
 ]);
 
+/**
+ * §5.3.2 (SC04) — a PROJEÇÃO para o motor que ficou PERSISTIDA no receipt.
+ *
+ * `result_json` guarda o resultado PROTEGIDO do backend (o caminho interno do
+ * arquivo, por exemplo) — é o que a reconciliação lê. O motor não pode receber
+ * isso: ele recebe `receipt_json.result_for_engine`, a MESMA projeção que a
+ * primeira entrega devolveu. Sem receipt persistido (caminho legado, ou recusa
+ * que não produziu receipt), a chave fica AUSENTE e quem chamou decide — o
+ * gateway cai no `result_json`, que é exatamente o que o legado sempre
+ * devolveu, byte a byte.
+ *
+ * A ausência é expressa pela CHAVE AUSENTE (`{}`), e não por
+ * `result_for_engine: undefined`: `exactOptionalPropertyTypes` distingue as
+ * duas, e um receipt que declare `result_for_engine: null` (JSON) está
+ * declarando uma projeção legítima — não a falta dela.
+ */
+function projecaoDoReceipt(
+  receipt: Json | null,
+): { result_for_engine: Json } | Record<string, never> {
+  if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) return {};
+  const bag = receipt as { [key: string]: Json };
+  if (!Object.prototype.hasOwnProperty.call(bag, "result_for_engine")) return {};
+  return { result_for_engine: bag["result_for_engine"] as Json };
+}
+
 export type ToolCallAdmission =
   /** Chamada nova journalada em `received`, com o run já em `running`. */
   | { ok: true; kind: "admitted"; call_id: string; ordinal: number }
@@ -599,7 +624,14 @@ export type ToolCallAdmission =
       kind: "receipt";
       call_id: string;
       state: EngineToolCallStateV1;
+      /** O resultado PROTEGIDO gravado por `settle` (`result_json`). */
       result: Json;
+      /**
+       * §5.3.2 (SC04) — a projeção que pode ir ao motor
+       * (`receipt_json.result_for_engine`). AUSENTE quando não há receipt
+       * persistido: quem chama cai no `result` (comportamento legado).
+       */
+      result_for_engine?: Json;
     }
   | TurnFenceConflict
   | ControlConflict
@@ -711,6 +743,14 @@ export type HandlerStartedResult =
  * `classifyToolCancellation`, e só `abort_safe` pode terminar cancelada. Para as
  * demais classes a resposta honesta é `effect_unknown` — e a operação recusa a
  * tentativa em vez de aceitar uma afirmação de ausência de efeito.
+ *
+ * §5.3.2 (SC04) — `receipt` deixa de ser exclusivo de `completed`. Ele é o
+ * registro do DESPACHO (resultado protegido + projeção para o motor), e um
+ * desfecho que o carrega é justamente o que permite ao replay devolver a
+ * PROJEÇÃO em vez do `result_json` cru. Sem ele, uma call durável liquidada
+ * como `denied`/`effect_unknown` não teria de onde tirar a projeção, e o
+ * callback repetido entregaria ao motor o resultado protegido (§5.6.2/AC05).
+ * O caminho legado não passa receipt nesses desfechos — segue como estava.
  */
 export type ToolSettlement =
   | {
@@ -718,9 +758,9 @@ export type ToolSettlement =
       result: Json;
       receipt: { json: Json; hash: string } | null;
     }
-  | { kind: "denied"; result: Json }
-  | { kind: "cancelled"; result: Json }
-  | { kind: "effect_unknown"; result: Json };
+  | { kind: "denied"; result: Json; receipt?: { json: Json; hash: string } | null }
+  | { kind: "cancelled"; result: Json; receipt?: { json: Json; hash: string } | null }
+  | { kind: "effect_unknown"; result: Json; receipt?: { json: Json; hash: string } | null };
 
 export type SettleToolCallResult =
   | {
@@ -1823,9 +1863,10 @@ export const engineRunsRepo = {
         args_hash: string;
         state: string;
         result_json: Json | null;
+        receipt_json: Json | null;
       }>(
         await tx.execute(sql`
-          SELECT call_id, ordinal, iteration, tool_name, args_hash, state, result_json
+          SELECT call_id, ordinal, iteration, tool_name, args_hash, state, result_json, receipt_json
             FROM ${engine_tool_calls}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
              AND run_id = ${input.run_id} AND call_id = ${input.call.call_id}
@@ -1863,6 +1904,7 @@ export const engineRunsRepo = {
             call_id: existente.call_id,
             state: existente.state as EngineToolCallStateV1,
             result: existente.result_json,
+            ...projecaoDoReceipt(existente.receipt_json),
           };
         }
         conta("admit_call", "in_progress");
@@ -2738,12 +2780,21 @@ export const engineRunsRepo = {
   }): Promise<SettleToolCallResult> {
     const { tenant_id, agent_id } = scope();
 
-    if (input.outcome.kind === "completed") {
-      const r = input.outcome.receipt;
-      if (r !== null && !/^[0-9a-f]{64}$/.test(r.hash)) {
-        conta("settle", "invalid_receipt");
-        return { ok: false, reason: "invalid_receipt" };
-      }
+    /**
+     * §5.3.2 (SC04) — o receipt é aceito em QUALQUER desfecho, e a validação do
+     * hash deixou de ser exclusiva de `completed`.
+     *
+     * Quem decide se há receipt é o CHAMADOR (o gateway durável o constrói a
+     * partir do receipt do despacho); o journal só exige o par
+     * `receipt_json`/`receipt_hash` coerente, que a 140 já impõe. Validar o
+     * formato do hash aqui, e não só no ramo `completed`, evita gravar um
+     * `receipt_hash` que a própria constraint derrubaria depois — no meio da TX
+     * do desfecho.
+     */
+    const receipt = input.outcome.receipt ?? null;
+    if (receipt !== null && !/^[0-9a-f]{64}$/.test(receipt.hash)) {
+      conta("settle", "invalid_receipt");
+      return { ok: false, reason: "invalid_receipt" };
     }
 
     return withTx(async (tx): Promise<SettleToolCallResult> => {
@@ -2903,9 +2954,6 @@ export const engineRunsRepo = {
             : comEfeito
               ? "possible"
               : "none";
-
-      const receipt =
-        input.outcome.kind === "completed" ? input.outcome.receipt : null;
 
       const atualizado = linhas<{ row_version: string | number }>(
         await tx.execute(sql`
