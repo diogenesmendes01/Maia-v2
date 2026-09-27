@@ -68,6 +68,7 @@ export const DISPATCHER_ERROR_CODES = [
   // efeito, e a ferramenta não é `abort_safe`. A resposta honesta é "não sei".
   'effect_unknown',
   'execution_failed',
+  'journal_unavailable',
 ] as const;
 
 /** Every code `src/tools/mcp-bridge.ts` can return. */
@@ -150,6 +151,8 @@ export const TOOL_INVALID_CODES: readonly ToolErrorCode[] = Object.freeze([
  */
 export const TOOL_FAILURE_CODES: readonly ToolErrorCode[] = Object.freeze([
   'execution_failed',
+  // Durable dispatch could not persist its journal; fail-closed, but an outage.
+  'journal_unavailable',
   'mcp_call_failed',
   'idempotency_payload_hash_collision',
   'idempotency_prior_failed',

@@ -26,6 +26,13 @@
  * LOCAIS, que nunca são serializados.
  */
 import type { LLMMessage, ToolSchema } from '@/lib/llm/types.js';
+import type { ToolExecutionSummary } from '@/agent/tool-execution-summary.js';
+/**
+ * Mídia DURÁVEL no sentido do contrato de outbound (§5.9): `local_path` ou
+ * `storage_object`, nunca uma URL assinada. Reutilizado aqui em vez de um tipo
+ * paralelo — dois tipos para o mesmo fato divergiriam na primeira mudança.
+ */
+import type { MediaRef } from '@/runtime/outbound/contract.js';
 
 /** Representações textuais. A restrição real é dos validadores Zod. */
 export type UUID = string;
@@ -213,6 +220,162 @@ export type EngineToolReplyV1 =
         | 'effect_unknown'
         | 'protocol_error';
     };
+
+// ─── §5.3.2 — chamada de ferramenta e evidência produzida pela Maia ─────────
+//
+// Estes tipos são EXCLUSIVAMENTE da Maia. Nenhum deles atravessa o wire: o
+// `EngineToolReplyV1` acima é o único que o motor vê, e ele não tem campo para
+// receipt, evidência de efeito, classificação ou token. É a mesma fronteira de
+// `EngineTerminalProposalV1`: o motor AFIRMA, a Maia REGISTRA.
+
+/** Efeito declarado no registry da casa. `'none'` é valor REAL, não ausência. */
+export type SideEffect = 'none' | 'read' | 'write' | 'communication';
+
+/** As mesmas quatro classes de `src/tools/effect-class.ts` (§5.7.4 item 9). */
+export type ToolEffectClassV1 =
+  | 'abort_safe'
+  | 'idempotent'
+  | 'non_interruptible'
+  | 'compensatable';
+
+/**
+ * Quanto se sabe sobre o efeito no momento do receipt.
+ *
+ * `possible`/`unknown` NUNCA regridem para `none` (§5.6.2, T13): uma vez que o
+ * marcador de início existe, "não houve efeito" deixa de ser uma afirmação
+ * disponível. `committed` exige prova de ledger/outbox — uma resposta de handler
+ * não é prova, porque o handler pode ter emitido o efeito e falhado ao gravar.
+ */
+export type ToolEffectEvidenceV1 = 'none' | 'possible' | 'committed' | 'unknown';
+
+/**
+ * A aprovação HUMANA que uma chamada exigiu. `ref` é o identificador de UX
+ * (`AP-xxxxxxxx`), truncado e NÃO autorizador; quem autoriza é o `request_id`
+ * completo, que é o que o journal persiste.
+ */
+export interface ApprovalBindingV1 {
+  request_id: UUID;
+  ref: string;
+  intent_hash: string;
+  approval_class: 'single_confirmation' | 'requester_plus_one_owner' | 'two_distinct_owners';
+}
+
+/**
+ * O receipt de uma chamada: o que a Maia GRAVOU ao despachar, não o que o
+ * motor relatou.
+ *
+ * `result` é o resultado protegido do backend (o passo pós-turno consome este);
+ * `result_for_engine` é a PROJEÇÃO que pode ser devolvida ao motor — sem caminho
+ * de arquivo, sem segredo, sem metadado interno. Os dois campos existem porque
+ * são dois destinatários com autorizações diferentes.
+ *
+ * `side_effect`/`effect_class` são `null` APENAS em recusa anterior à resolução
+ * do registry: sem spec conhecida não há classe, e inventar `abort_safe` para
+ * uma ferramenta desconhecida seria afirmar ausência de efeito sobre o
+ * desconhecido.
+ */
+export interface ToolReceiptV1 {
+  call_id: string;
+  ordinal: number;
+  name: string;
+  /** Resultado backend protegido, serializável. */
+  result: Json;
+  /** Projeção para o motor: sem paths, segredos ou metadados internos. */
+  result_for_engine: Json;
+  status: 'success' | 'error';
+  side_effect: SideEffect | null;
+  effect_class: ToolEffectClassV1 | null;
+  legacy_irreversible_invoked: boolean;
+  effect_evidence: ToolEffectEvidenceV1;
+  sensitive: boolean;
+  started_at: IsoInstant | null;
+  finished_at: IsoInstant;
+  summary: ToolExecutionSummary;
+  approval: ApprovalBindingV1 | null;
+  pending_question_id: UUID | null;
+  report: {
+    media: MediaRef;
+    file_name: string;
+    mimetype: string;
+    tipo: 'extrato' | 'comparativo';
+  } | null;
+}
+
+/**
+ * A classificação CONGELADA no journal, entregue ao caminho durável.
+ *
+ * Ela mora no control porque é o próprio journal que a congela
+ * (`markToolDispatching`) e porque o receipt precisa dela para não ter de
+ * reclassificar a ferramenta com uma regra que pode ter mudado desde a
+ * admissão. Estruturalmente idêntica a `ToolClassification` de
+ * `engine-repos.ts`, sem criar dependência de `runtime/engines` para `db`.
+ */
+export type ToolClassificationSnapshotV1 = {
+  side_effect: SideEffect;
+  effect_class: ToolEffectClassV1 | null;
+  sensitive: boolean;
+  legacy_irreversible_invoked: boolean;
+};
+
+/**
+ * Desfecho do caminho durável (§5.3.2).
+ *
+ * `journal_unavailable` existe para o caso em que o journal pode não ter
+ * registrado o início: sem essa informação o run não pode ser fechado nem o
+ * resultado devolvido — `handler_may_have_started` diz se há efeito a
+ * reconciliar.
+ */
+export type DurableDispatchResultV1 =
+  | { kind: 'settled'; receipt: ToolReceiptV1 }
+  | { kind: 'ownership_lost' }
+  | { kind: 'journal_unavailable'; handler_may_have_started: boolean };
+
+/**
+ * Controle LOCAL do dispatcher durável. Nunca aceito de args HTTP — o
+ * §5.3.2 é explícito sobre isso: o engine não fornece identidade.
+ *
+ * Três métodos e três momentos, cada um no ponto em que a informação existe:
+ *
+ *   `freezeIdentity`  — antes de lookup/aprovação/reserva. Persiste a chave e o
+ *     hash atuais e, no replay, devolve os JÁ PERSISTIDOS: recalcular a chave
+ *     depois de uma virada de bucket produziria uma identidade diferente para a
+ *     mesma intenção, que é o defeito que o congelamento existe para impedir.
+ *   `recordApproval`  — imediatamente ao conhecer o UUID/claim real. Depois do
+ *     claim não há outro momento: ou a evidência é gravada aqui, ou o humano
+ *     aprova de novo uma chamada que já consumiu o "sim".
+ *   `beforeHandler`   — imediatamente antes de `tool.handler`. Marca
+ *     `handler_started` e persiste reserva/aprovação em TX curta, fenced. Falha
+ *     aqui significa que o handler NÃO começa.
+ *
+ * `call_id`/`call_ordinal`: o §5.3.2 esboça `call_row_id`, mas a API de
+ * journal desta casa é endereçada por `call_id` (texto estável do wire) — e é
+ * ela que o receipt precisa publicar. Ver a nota em `engine-repos.ts`.
+ */
+export interface DurableDispatchControlV1 {
+  /** Chave de identidade da chamada no journal (`engine_tool_calls.call_id`). */
+  call_id: string;
+  /** `ordinal` 0-based do run, o mesmo que o receipt publica. */
+  call_ordinal: number;
+  /** Token do `dispatching`; o fence de TODA transição da chamada. */
+  dispatch_token: string;
+  /** Classificação congelada no journal, para o receipt. */
+  classification: ToolClassificationSnapshotV1;
+  freezeIdentity(candidate: {
+    key: string;
+    payload_hash: string;
+    normalized_args: Json;
+  }): Promise<{ key: string; payload_hash: string }>;
+  recordApproval(input: {
+    approval: ApprovalBindingV1;
+    state: 'pending' | 'claimed';
+    claim_token: string | null;
+  }): Promise<void>;
+  beforeHandler(input: {
+    reservation_token: string;
+    approval_request_id: UUID | null;
+    approval_claim_token: string | null;
+  }): Promise<void>;
+}
 
 /** Objetos LOCAIS: nunca serializar `signal` nem função (§5.3.1). */
 export interface EngineIOV1 {

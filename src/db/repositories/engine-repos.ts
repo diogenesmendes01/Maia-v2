@@ -588,6 +588,39 @@ const ESTADOS_QUE_OCUPAM_A_VAGA = new Set([
   "effect_unknown",
 ]);
 
+/**
+ * §5.3.2 (SC04) — o que o receipt PERSISTIDO entrega de volta ao motor.
+ *
+ * `result_json` guarda o resultado PROTEGIDO do backend (o caminho interno do
+ * arquivo, por exemplo) — é o que a reconciliação lê. O motor não pode receber
+ * isso: ele recebe `receipt_json.result_for_engine`, a MESMA projeção que a
+ * primeira entrega devolveu, e o `receipt_json.status` que decide o `is_error`
+ * da resposta. Sem receipt persistido (caminho legado, ou recusa que não
+ * produziu receipt), as duas chaves ficam AUSENTES e quem chamou decide — o
+ * gateway cai no `result_json` e no estado da linha, que é exatamente o que o
+ * legado sempre devolveu, byte a byte.
+ *
+ * A ausência é expressa pela CHAVE AUSENTE, e não por `undefined` explícito:
+ * `exactOptionalPropertyTypes` distingue as duas coisas, e um receipt que
+ * declare `result_for_engine: null` (JSON) está declarando uma projeção
+ * legítima — não a falta dela.
+ */
+function entregaDoReceipt(receipt: Json | null): {
+  result_for_engine?: Json;
+  receipt_status?: 'success' | 'error';
+} {
+  if (receipt === null || typeof receipt !== "object" || Array.isArray(receipt)) return {};
+  const bag = receipt as { [key: string]: Json };
+  const entrega: { result_for_engine?: Json; receipt_status?: 'success' | 'error' } = {};
+  if (Object.prototype.hasOwnProperty.call(bag, "result_for_engine")) {
+    entrega.result_for_engine = bag["result_for_engine"] as Json;
+  }
+  if (bag["status"] === "success" || bag["status"] === "error") {
+    entrega.receipt_status = bag["status"];
+  }
+  return entrega;
+}
+
 export type ToolCallAdmission =
   /** Chamada nova journalada em `received`, com o run já em `running`. */
   | { ok: true; kind: "admitted"; call_id: string; ordinal: number }
@@ -599,7 +632,21 @@ export type ToolCallAdmission =
       kind: "receipt";
       call_id: string;
       state: EngineToolCallStateV1;
+      /** O resultado PROTEGIDO gravado por `settle` (`result_json`). */
       result: Json;
+      /**
+       * §5.3.2 (SC04) — a projeção que pode ir ao motor
+       * (`receipt_json.result_for_engine`). AUSENTE quando não há receipt
+       * persistido: quem chama cai no `result` (comportamento legado).
+       */
+      result_for_engine?: Json;
+      /**
+       * §5.3.2 (SC04) — o `status` do receipt persistido. É a fonte do
+       * `is_error` da resposta repetida: o mesmo `receipt.status` que decidiu o
+       * `is_error` da primeira entrega. AUSENTE quando não há receipt — e aí a
+       * resposta sai do ESTADO da linha, como antes.
+       */
+      receipt_status?: 'success' | 'error';
     }
   | TurnFenceConflict
   | ControlConflict
@@ -641,20 +688,46 @@ export type ToolDispatchingResult =
   | { ok: false; reason: "version_conflict"; current_row_version: number };
 
 export type FreezeIdentityResult =
-  /** `frozen: false` = já estava congelada com os MESMOS valores (replay). */
-  | { ok: true; frozen: boolean }
+  /**
+   * `frozen: false` = já estava congelada com os MESMOS valores (replay).
+   *
+   * §5.3.2 (SC04) — `key`/`payload_hash`/`row_version` são a identidade
+   * PERSISTIDA, e é ela que o despacho durável tem de usar: no replay a
+   * candidata pode divergir da gravada (foi para isso que o congelamento
+   * existe). Opcionais na forma para não quebrar o contrato legado de SC01,
+   * mas o caminho durável RECUSA seguir sem elas — ver `tool-gateway.ts`.
+   */
+  | { ok: true; frozen: boolean; key?: string; payload_hash?: string; row_version?: number }
   | TurnFenceConflict
   | ControlConflict
   | NotFound
   | { ok: false; reason: "state_conflict"; current_state: string }
-  /** A identidade não muda em replay (§5.6.3). */
-  | { ok: false; reason: "identity_conflict"; current_idempotency_key: string }
+  /** A identidade não muda em replay (§5.6.3).
+   *
+   * §5.3.2 (SC04) — `current_idempotency_payload_hash` é aditivo e existe para
+   * separar "o relógio andou" (bucket novo, MESMA intenção: adotar a identidade
+   * congelada) de "a intenção mudou" (recusar). Ver `tool-gateway.ts`. */
+  | {
+      ok: false;
+      reason: "identity_conflict";
+      current_idempotency_key: string;
+      current_idempotency_payload_hash?: string | null;
+    }
   /** Invariante C15: o objeto gravado tem de reproduzir o `args_hash`. */
   | {
       ok: false;
       reason: "normalized_args_mismatch";
       expected_args_hash: string;
     };
+
+export type RecordToolApprovalResult =
+  | { ok: true; state: EngineToolCallStateV1; row_version: number }
+  | TurnFenceConflict
+  | ControlConflict
+  | NotFound
+  | { ok: false; reason: "state_conflict"; current_state: string }
+  | { ok: false; reason: "dispatch_token_mismatch" }
+  | { ok: false; reason: "version_conflict"; current_row_version: number };
 
 export type HandlerStartedResult =
   | { ok: true; effect_evidence: "none" | "possible"; row_version: number }
@@ -685,6 +758,14 @@ export type HandlerStartedResult =
  * `classifyToolCancellation`, e só `abort_safe` pode terminar cancelada. Para as
  * demais classes a resposta honesta é `effect_unknown` — e a operação recusa a
  * tentativa em vez de aceitar uma afirmação de ausência de efeito.
+ *
+ * §5.3.2 (SC04) — `receipt` deixa de ser exclusivo de `completed`. Ele é o
+ * registro do DESPACHO (resultado protegido + projeção para o motor), e um
+ * desfecho que o carrega é justamente o que permite ao replay devolver a
+ * PROJEÇÃO em vez do `result_json` cru. Sem ele, uma call durável liquidada
+ * como `denied`/`effect_unknown` não teria de onde tirar a projeção, e o
+ * callback repetido entregaria ao motor o resultado protegido (§5.6.2/AC05).
+ * O caminho legado não passa receipt nesses desfechos — segue como estava.
  */
 export type ToolSettlement =
   | {
@@ -692,9 +773,9 @@ export type ToolSettlement =
       result: Json;
       receipt: { json: Json; hash: string } | null;
     }
-  | { kind: "denied"; result: Json }
-  | { kind: "cancelled"; result: Json }
-  | { kind: "effect_unknown"; result: Json };
+  | { kind: "denied"; result: Json; receipt?: { json: Json; hash: string } | null }
+  | { kind: "cancelled"; result: Json; receipt?: { json: Json; hash: string } | null }
+  | { kind: "effect_unknown"; result: Json; receipt?: { json: Json; hash: string } | null };
 
 export type SettleToolCallResult =
   | {
@@ -1797,9 +1878,10 @@ export const engineRunsRepo = {
         args_hash: string;
         state: string;
         result_json: Json | null;
+        receipt_json: Json | null;
       }>(
         await tx.execute(sql`
-          SELECT call_id, ordinal, iteration, tool_name, args_hash, state, result_json
+          SELECT call_id, ordinal, iteration, tool_name, args_hash, state, result_json, receipt_json
             FROM ${engine_tool_calls}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
              AND run_id = ${input.run_id} AND call_id = ${input.call.call_id}
@@ -1837,6 +1919,7 @@ export const engineRunsRepo = {
             call_id: existente.call_id,
             state: existente.state as EngineToolCallStateV1,
             result: existente.result_json,
+            ...entregaDoReceipt(existente.receipt_json),
           };
         }
         conta("admit_call", "in_progress");
@@ -2167,11 +2250,12 @@ export const engineRunsRepo = {
       const calls = linhas<{
         state: string;
         args_hash: string;
+        row_version: string | number;
         idempotency_key: string | null;
         idempotency_payload_hash: string | null;
       }>(
         await tx.execute(sql`
-          SELECT state, args_hash, idempotency_key, idempotency_payload_hash
+          SELECT state, args_hash, row_version, idempotency_key, idempotency_payload_hash
             FROM ${engine_tool_calls}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
              AND run_id = ${input.run_id} AND call_id = ${input.call_id}
@@ -2206,30 +2290,254 @@ export const engineRunsRepo = {
           call.idempotency_key === input.idempotency_key &&
           call.idempotency_payload_hash === input.idempotency_payload_hash;
         if (!igual) {
+          /**
+           * §5.3.2 (SC04) — o conflito vem com o PAYLOAD persistido.
+           *
+           * A chave de idempotência carrega o BUCKET TEMPORAL
+           * (`computeIdempotencyKey`): um retry depois da virada de bucket
+           * recalcula uma chave DIFERENTE para a MESMA intenção. Sem o
+           * payload_hash persistido, quem chama não tem como distinguir
+           * "a intenção mudou" (recusar) de "o relógio andou" (adotar a
+           * identidade congelada) — e as duas exigem respostas opostas. O
+           * campo é aditivo: o motivo e o comportamento continuam os mesmos
+           * para quem já comparava só a chave.
+           */
           conta("freeze_identity", "identity_conflict");
           return {
             ok: false,
             reason: "identity_conflict",
             current_idempotency_key: call.idempotency_key,
+            current_idempotency_payload_hash: call.idempotency_payload_hash,
           };
         }
         conta("freeze_identity", "replay");
-        return { ok: true, frozen: false };
+        /**
+         * Replay: a identidade devolvida é a PERSISTIDA, não a candidata.
+         *
+         * É a razão de ser do congelamento (§5.3.2): depois de uma virada de
+         * bucket, recalcular a chave produziria uma identidade diferente para a
+         * mesma intenção. Devolver a candidata aqui faria o despacho seguir com
+         * uma chave que o journal não reconhece — e o efeito seria duplicado
+         * fora do cache que existe para impedir isso.
+         */
+        return {
+          ok: true,
+          frozen: false,
+          key: call.idempotency_key,
+          payload_hash: call.idempotency_payload_hash as string,
+          row_version: Number(call.row_version),
+        };
       }
 
-      await tx.execute(sql`
-        UPDATE ${engine_tool_calls}
-           SET idempotency_key = ${input.idempotency_key},
-               idempotency_payload_hash = ${input.idempotency_payload_hash},
-               normalized_args_json = ${JSON.stringify(input.normalized_args)}::jsonb,
-               row_version = row_version + 1,
-               updated_at = clock_timestamp()
-         WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
-           AND run_id = ${input.run_id} AND call_id = ${input.call_id}
-           AND idempotency_key IS NULL`);
+      const gravado = linhas<{ row_version: string | number }>(
+        await tx.execute(sql`
+          UPDATE ${engine_tool_calls}
+             SET idempotency_key = ${input.idempotency_key},
+                 idempotency_payload_hash = ${input.idempotency_payload_hash},
+                 normalized_args_json = ${JSON.stringify(input.normalized_args)}::jsonb,
+                 row_version = row_version + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+             AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+             AND idempotency_key IS NULL
+           RETURNING row_version`),
+      );
 
       conta("freeze_identity", "ok");
-      return { ok: true, frozen: true };
+      return {
+        ok: true,
+        frozen: true,
+        key: input.idempotency_key,
+        payload_hash: input.idempotency_payload_hash,
+        row_version: Number(gravado[0]?.row_version ?? call.row_version),
+      };
+    });
+  },
+
+  /**
+   * §5.3.2 / §5.6.3 (SC04) — REGISTRA A APROVAÇÃO REAL da chamada.
+   *
+   * O `DurableDispatchControlV1` chama isto no INSTANTE em que o UUID e o claim
+   * existem, e não depois: o `ref` que o motor recebe é o identificador de UX
+   * (`AP-xxxxxxxx`, truncado), e o UUID completo — que é o que a FK de
+   * `engine_tool_calls` exige — não é reconstruível a partir dele. Adiar esta
+   * gravação para o marcador significaria perder a evidência de qualquer
+   * desfecho que aconteça antes dele.
+   *
+   * Dois estados, duas semânticas:
+   *
+   *   `claimed` — a evidência humana foi consumida; o despacho CONTINUA
+   *     (`dispatching`), e o marcador vai gravar o `reservation_token`. Aqui só
+   *     o UUID/claim ficam.
+   *   `pending` — não há autorização e não haverá efeito NESTE despacho. A
+   *     chamada vai para `approval_required`, que é terminal: o CHECK da 140
+   *     exige `approval_request_id` e `result_json` nesse estado, e a vaga
+   *     sequencial do piloto precisa ser LIBERADA (o índice parcial conta
+   *     `received/dispatching/handler_started/effect_unknown`, não
+   *     `approval_required`). O "resultado" é o próprio estado — nada foi
+   *     executado, e inventar um payload de sucesso seria mentira.
+   *
+   * O fence é o mesmo das outras transições: `dispatch_token` + `row_version`,
+   * com o turno ATUAL validado sob lock. O token da call sozinho não autoriza.
+   */
+  async recordToolCallApproval(input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    call_id: string;
+    expected_row_version: number;
+    dispatch_token: string;
+    approval_request_id: string;
+    approval_claim_token: string | null;
+    state: "pending" | "claimed";
+  }): Promise<RecordToolApprovalResult> {
+    const { tenant_id, agent_id } = scope();
+    return withTx(async (tx): Promise<RecordToolApprovalResult> => {
+      const controle = await lockControl(tx, { run_id: input.run_id });
+      if (!controle) {
+        conta("record_approval", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const fence = await lockTurnAndCheckFence(tx, {
+        turn_id: input.turn_id,
+        origin_claim_token: input.origin_claim_token,
+      });
+      if (!fence.ok) {
+        conta("record_approval", fence.reason);
+        return fence;
+      }
+      const rows = linhas<RunSnapshotRow & RunFenceRow>(
+        await tx.execute(sql`
+          SELECT ${SNAPSHOT_COLS}, ${FENCE_COLS} FROM ${engine_runs}
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           FOR UPDATE`),
+      );
+      const run = rows[0];
+      if (!run) {
+        conta("record_approval", "not_found");
+        return { ok: false, reason: "not_found" };
+      }
+      const recusa = checarFenceDoRun({
+        run,
+        turno: fence.turno,
+        origin_claim_token: input.origin_claim_token,
+        controle,
+      });
+      if (recusa) {
+        conta("record_approval", recusa.reason);
+        return recusa;
+      }
+
+      // O UPDATE é o mesmo em estrutura nos dois estados; o que muda é se a
+      // call continua viva ou termina aqui. `state = 'dispatching'` é
+      // pré-condição dos dois: registrar aprovação não é transição a partir de
+      // terminal.
+      const atualizado =
+        input.state === "claimed"
+          ? linhas<{ state: string; row_version: string | number }>(
+              await tx.execute(sql`
+                UPDATE ${engine_tool_calls}
+                   SET approval_request_id = ${input.approval_request_id}::uuid,
+                       approval_claim_token = ${input.approval_claim_token},
+                       row_version = row_version + 1,
+                       updated_at = clock_timestamp()
+                 WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+                   AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+                   AND state = 'dispatching'
+                   AND dispatch_token = ${input.dispatch_token}::uuid
+                   AND row_version = ${input.expected_row_version}
+                 RETURNING state, row_version`),
+            )
+          : linhas<{ state: string; row_version: string | number }>(
+              await tx.execute(sql`
+                UPDATE ${engine_tool_calls}
+                   SET state = 'approval_required',
+                       approval_request_id = ${input.approval_request_id}::uuid,
+                       approval_claim_token = ${input.approval_claim_token},
+                       result_json = jsonb_build_object(
+                         'error', 'approval_required',
+                         'ref', 'AP-' || substr(${input.approval_request_id}::text, 1, 8)),
+                       finished_at = clock_timestamp(),
+                       row_version = row_version + 1,
+                       updated_at = clock_timestamp()
+                 WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+                   AND run_id = ${input.run_id} AND call_id = ${input.call_id}
+                   AND state = 'dispatching'
+                   AND dispatch_token = ${input.dispatch_token}::uuid
+                   AND row_version = ${input.expected_row_version}
+                 RETURNING state, row_version`),
+            );
+
+      const linha = atualizado[0];
+      if (!linha) {
+        const atual = linhas<{
+          state: string;
+          row_version: string | number;
+          dispatch_token: string | null;
+        }>(
+          await tx.execute(sql`
+            SELECT state, row_version, dispatch_token::text AS dispatch_token
+              FROM ${engine_tool_calls}
+             WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+               AND run_id = ${input.run_id} AND call_id = ${input.call_id}`),
+        );
+        const existente = atual[0];
+        if (!existente) {
+          conta("record_approval", "not_found");
+          return { ok: false, reason: "not_found" };
+        }
+        if (existente.state !== "dispatching") {
+          conta("record_approval", "state_conflict");
+          return {
+            ok: false,
+            reason: "state_conflict",
+            current_state: existente.state,
+          };
+        }
+        if (existente.dispatch_token !== input.dispatch_token) {
+          conta("record_approval", "dispatch_token_mismatch");
+          return { ok: false, reason: "dispatch_token_mismatch" };
+        }
+        conta("record_approval", "version_conflict");
+        return {
+          ok: false,
+          reason: "version_conflict",
+          current_row_version: Number(existente.row_version),
+        };
+      }
+
+      const seq = linhas<{ last_event_sequence: string | number }>(
+        await tx.execute(sql`
+          UPDATE ${engine_runs}
+             SET last_event_sequence = last_event_sequence + 1,
+                 updated_at = clock_timestamp()
+           WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id} AND id = ${input.run_id}
+           RETURNING last_event_sequence`),
+      );
+      await appendEvent(tx, {
+        run_id: input.run_id,
+        sequence_no: Number(seq[0]?.last_event_sequence ?? 1),
+        dedupe_key:
+          input.state === "claimed"
+            ? `tool_state:${input.call_id}:approval_claimed`
+            : `tool_state:${input.call_id}:approval_required`,
+        event_type: "tool_state",
+        actor_kind: "turn_owner",
+        actor_turn_attempt: Number(fence.turno.attempt_count),
+        metadata: {
+          call_id: input.call_id,
+          state: input.state === "claimed" ? "dispatching" : "approval_required",
+          approval_state: input.state,
+          approval_request_id: input.approval_request_id,
+        },
+      });
+
+      conta("record_approval", input.state);
+      return {
+        ok: true,
+        state: linha.state as EngineToolCallStateV1,
+        row_version: Number(linha.row_version),
+      };
     });
   },
 
@@ -2258,6 +2566,17 @@ export const engineRunsRepo = {
     dispatch_token: string;
     reservation_token: string;
     approval_claim_token?: string | null;
+    /**
+     * §5.3.2 / §5.6.4 (SC04) — o UUID COMPLETO do pedido de aprovação.
+     *
+     * `approval_claim_token` sozinho não identifica o pedido: o FK
+     * `engine_tool_calls_approval_fk` e o CHECK
+     * `engine_tool_calls_approval_chk` exigem o UUID, e o `ref` que o motor vê
+     * é truncado. `COALESCE` no UPDATE de propósito — o UUID pode já ter sido
+     * gravado por `recordToolCallApproval` no momento do claim, e o marcador
+     * não pode apagá-lo.
+     */
+    approval_request_id?: string | null;
   }): Promise<HandlerStartedResult> {
     const { tenant_id, agent_id } = scope();
     return withTx(async (tx): Promise<HandlerStartedResult> => {
@@ -2342,6 +2661,8 @@ export const engineRunsRepo = {
                  handler_started_at = clock_timestamp(),
                  reservation_token = ${input.reservation_token},
                  approval_claim_token = ${input.approval_claim_token ?? null},
+                 approval_request_id = COALESCE(
+                   ${input.approval_request_id ?? null}::uuid, approval_request_id),
                  effect_evidence = ${evidencia},
                  row_version = row_version + 1,
                  updated_at = clock_timestamp()
@@ -2474,12 +2795,21 @@ export const engineRunsRepo = {
   }): Promise<SettleToolCallResult> {
     const { tenant_id, agent_id } = scope();
 
-    if (input.outcome.kind === "completed") {
-      const r = input.outcome.receipt;
-      if (r !== null && !/^[0-9a-f]{64}$/.test(r.hash)) {
-        conta("settle", "invalid_receipt");
-        return { ok: false, reason: "invalid_receipt" };
-      }
+    /**
+     * §5.3.2 (SC04) — o receipt é aceito em QUALQUER desfecho, e a validação do
+     * hash deixou de ser exclusiva de `completed`.
+     *
+     * Quem decide se há receipt é o CHAMADOR (o gateway durável o constrói a
+     * partir do receipt do despacho); o journal só exige o par
+     * `receipt_json`/`receipt_hash` coerente, que a 140 já impõe. Validar o
+     * formato do hash aqui, e não só no ramo `completed`, evita gravar um
+     * `receipt_hash` que a própria constraint derrubaria depois — no meio da TX
+     * do desfecho.
+     */
+    const receipt = input.outcome.receipt ?? null;
+    if (receipt !== null && !/^[0-9a-f]{64}$/.test(receipt.hash)) {
+      conta("settle", "invalid_receipt");
+      return { ok: false, reason: "invalid_receipt" };
     }
 
     return withTx(async (tx): Promise<SettleToolCallResult> => {
@@ -2518,9 +2848,13 @@ export const engineRunsRepo = {
         return recusa;
       }
 
-      const calls = linhas<{ effect_class: string | null; state: string }>(
+      const calls = linhas<{
+        effect_class: string | null;
+        state: string;
+        handler_started_at: string | null;
+      }>(
         await tx.execute(sql`
-          SELECT effect_class, state FROM ${engine_tool_calls}
+          SELECT effect_class, state, handler_started_at FROM ${engine_tool_calls}
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
              AND run_id = ${input.run_id} AND call_id = ${input.call_id}
            FOR UPDATE`),
@@ -2529,6 +2863,74 @@ export const engineRunsRepo = {
       if (!call) {
         conta("settle", "not_found");
         return { ok: false, reason: "not_found" };
+      }
+
+      /**
+       * §5.3.2 (SC04) — o que a liquidação EXIGE do estado.
+       *
+       * Uma recusa de GOVERNANÇA (grant ausente, `forbidden`, args inválidos,
+       * aprovação pendente) acontece depois do `dispatching` e ANTES do
+       * marcador: o handler não é chamado e nada foi consumido. Sem poder
+       * liquidar esse desfecho, a call ficaria presa em `dispatching` — e, como
+       * a vaga sequencial do piloto é ocupada por `dispatching`, uma recusa
+       * travaria o run inteiro.
+       *
+       * Mas o estado manda mais que a intenção do chamador: só `denied` pode
+       * partir de `dispatching`. `completed`/`cancelled`/`effect_unknown` a
+       * partir de uma call sem carimbo de início afirmariam algo sobre um
+       * handler que nunca rodou — e é exatamente o tipo de afirmação que esta
+       * operação existe para recusar.
+       */
+      const handlerComecou = call.handler_started_at !== null;
+
+      /**
+       * §5.6.2 / ADR-11 (SC04) — ESTADO TERMINAL não se reescreve.
+       *
+       * Sem esta guarda, uma segunda liquidação por cima de `effect_unknown`
+       * gravava `denied` (ou `completed`) e a call deixava de ser bloqueadora —
+       * exatamente o "retry automático" que a ADR-11 proíbe sobre um efeito que
+       * pode ter acontecido. A 140 tem CHECK para a evidência; o estado precisa
+       * da mesma dureza, e `effect_unknown` é o caso que importa: só a porta
+       * operacional auditada encerra aquele risco (§12.1).
+       */
+      const TERMINAIS = new Set([
+        "completed",
+        "denied",
+        "approval_required",
+        "effect_unknown",
+        "cancelled",
+      ]);
+      if (TERMINAIS.has(call.state)) {
+        conta("settle", "state_conflict");
+        return { ok: false, reason: "state_conflict", current_state: call.state };
+      }
+
+      /**
+       * ADOÇÃO DO LEDGER (T26) — a única forma de `completed` sem carimbo.
+       *
+       * A call repetida cujo efeito o LEDGER já provou não roda handler nenhum:
+       * o dispatcher adota o resultado cacheado e o receipt sai com
+       * `effect_evidence: 'committed'` e `started_at: null`. Recusar essa
+       * liquidação deixaria a linha presa em `dispatching` e travaria a vaga
+       * sequencial do run para sempre. O que autoriza a escrita é a PROVA: só
+       * passa `completed` que traz receipt (json + hash) — o mesmo par que vai
+       * para o journal para quem for reconciliar. Sem receipt, `completed` a
+       * partir de `dispatching` segue recusado, porque aí seria afirmar
+       * resultado sem nada que o sustente.
+       */
+      const adocaoComProva =
+        input.outcome.kind === "completed" && input.outcome.receipt !== null;
+      if (
+        !handlerComecou &&
+        input.outcome.kind !== "denied" &&
+        !adocaoComProva
+      ) {
+        conta("settle", "state_conflict");
+        return {
+          ok: false,
+          reason: "state_conflict",
+          current_state: call.state,
+        };
       }
 
       const classe = call.effect_class as ToolEffectClass;
@@ -2549,18 +2951,24 @@ export const engineRunsRepo = {
       // A evidência NUNCA regride (a 140 tem trigger para isso): `completed`
       // numa classe com efeito sobe para `committed`; `effect_unknown` vai para
       // `unknown`, que o CHECK da tabela exige; `abort_safe` fica onde está.
+      //
+      // §5.3.2 (SC04) — SEM carimbo de início, `none` é a única resposta certa,
+      // e ela vem do ESTADO, não da classe: nada foi executado, então nenhuma
+      // classe pode afirmar `possible`. Para as classes que carregam efeito,
+      // este é o desfecho de uma recusa de governança — que é justamente o que
+      // o §5.6.2 separa de "pode ter havido".
       const comEfeito = veredito.outcome === "effect_unknown";
-      const evidencia =
-        input.outcome.kind === "effect_unknown"
+      const evidencia = !handlerComecou
+        ? adocaoComProva
+          ? "committed"
+          : "none"
+        : input.outcome.kind === "effect_unknown"
           ? "unknown"
           : input.outcome.kind === "completed" && comEfeito
             ? "committed"
             : comEfeito
               ? "possible"
               : "none";
-
-      const receipt =
-        input.outcome.kind === "completed" ? input.outcome.receipt : null;
 
       const atualizado = linhas<{ row_version: string | number }>(
         await tx.execute(sql`
@@ -2575,7 +2983,7 @@ export const engineRunsRepo = {
                  updated_at = clock_timestamp()
            WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
              AND run_id = ${input.run_id} AND call_id = ${input.call_id}
-             AND state = 'handler_started'
+             AND state = ${call.state}
              AND dispatch_token = ${input.dispatch_token}::uuid
              AND row_version = ${input.expected_row_version}
            RETURNING row_version`),
@@ -2598,7 +3006,7 @@ export const engineRunsRepo = {
           conta("settle", "not_found");
           return { ok: false, reason: "not_found" };
         }
-        if (linha.state !== "handler_started") {
+        if (linha.state !== call.state) {
           conta("settle", "state_conflict");
           return {
             ok: false,

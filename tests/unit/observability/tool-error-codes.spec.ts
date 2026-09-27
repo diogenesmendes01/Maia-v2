@@ -143,6 +143,8 @@ const EXPECTED: Readonly<Record<ToolErrorCode, ToolDispatchOutcome>> = {
   unknown_tool: 'invalid',
   // --- the platform broke: this is what pages ------------------------------
   execution_failed: 'error',
+  // Durable journal failure is infrastructure failure, not a policy refusal.
+  journal_unavailable: 'error',
   mcp_call_failed: 'error',
   idempotency_payload_hash_collision: 'error',
   idempotency_prior_failed: 'error',

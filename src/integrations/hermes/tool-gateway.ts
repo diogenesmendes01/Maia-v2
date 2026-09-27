@@ -32,7 +32,14 @@
  * estes argumentos?", e o dispatcher pergunta "esta tentativa ainda é dona do
  * turno no instante do efeito?". A segunda continua sendo a última palavra.
  */
-import type { EngineToolCallV1, EngineToolReplyV1, Json } from '@/runtime/engines/contracts.js';
+import type {
+  DurableDispatchControlV1,
+  DurableDispatchResultV1,
+  EngineToolCallV1,
+  EngineToolReplyV1,
+  Json,
+  ToolReceiptV1,
+} from '@/runtime/engines/contracts.js';
 import type { ToolAdmissionV1 } from './tool-broker.js';
 import type {
   ToolCallAdmission,
@@ -42,6 +49,7 @@ import type {
   HandlerStartedResult,
 } from '@/db/repositories/engine-repos.js';
 import type { ToolContext, DispatchResult } from '@/tools/_dispatcher.js';
+import { BeforeHandlerError } from '@/tools/_dispatcher.js';
 import { logger } from '@/lib/logger.js';
 import { canonicalDigest } from './canonical-json.js';
 
@@ -104,6 +112,8 @@ export type ToolGatewayDepsV1 = {
     dispatch_token: string;
     reservation_token: string;
     approval_claim_token?: string | null;
+    /** §5.3.2 (SC04): o UUID COMPLETO do pedido de aprovação, quando houve. */
+    approval_request_id?: string | null;
   }) => Promise<HandlerStartedResult>;
   /** Liquida a chamada com o desfecho observado (§5.7.4). */
   settle: (input: {
@@ -160,6 +170,45 @@ export type ToolGatewayDepsV1 = {
     call: EngineToolCallV1;
     run_id: string;
   }) => Promise<{ ref: string; created: boolean }>;
+  /**
+   * §5.3.2 (SC04) — O CAMINHO DURÁVEL.
+   *
+   * Quando presente, o gateway deixa de orquestrar handler/marcador à mão e
+   * passa a chamar `dispatchToolDurable`, que roda o MESMO corpo do dispatcher
+   * legado acrescentando os três hooks do controle. Isso importa por dois
+   * motivos que o caminho anterior não conseguia cumprir:
+   *
+   *  1. A identidade de idempotência era congelada com `call_id` como chave,
+   *     ANTES do corpo — e o corpo recalcula a chave real (com bucket) para o
+   *     lookup/reserva. Dois donos para a mesma identidade, e o journal ficava
+   *     com a que o despacho não usava.
+   *  2. O `reservation_token` era `res-<call_id>`, inventado aqui: não é o
+   *     token da reserva de idempotência (que nasce dentro do corpo), e
+   *     "inventado" é o oposto de "real" para quem for reconciliar.
+   *
+   * Opcional para que o caminho anterior continue válido para os callers que
+   * ainda não têm os hooks — e é o que mantém as regressões do gateway
+   * intactas. Quem liga o durável assume o contrato inteiro.
+   */
+  dispatchDurable?: (
+    input: { tool: string; args: Json; ctx: ToolContext },
+    control: DurableDispatchControlV1,
+  ) => Promise<DurableDispatchResultV1>;
+  /**
+   * Grava a aprovação REAL da chamada no instante em que o UUID/claim existem
+   * (§5.3.2). Ligado a `recordToolCallApproval`.
+   */
+  recordToolApproval?: (input: {
+    run_id: string;
+    turn_id: string;
+    origin_claim_token: string;
+    call_id: string;
+    expected_row_version: number;
+    dispatch_token: string;
+    approval_request_id: string;
+    approval_claim_token: string | null;
+    state: 'pending' | 'claimed';
+  }) => Promise<{ ok: true; row_version: number } | { ok: false; reason: string }>;
 };
 
 const RETRY_PADRAO_MS = 30_000;
@@ -381,11 +430,39 @@ export function createEngineToolGateway(
     // Já conciliada: devolve o que está PERSISTIDO. O resultado vem do banco,
     // nunca de reexecutar — mesmo que reexecutar fosse barato, o efeito não é.
     if (admissao.kind === 'receipt') {
+      /**
+       * §5.3.2 (SC04) — o replay devolve a PROJEÇÃO, exatamente como a 1ª
+       * entrega.
+       *
+       * `admissao.result` é o `result_json` do journal. No caminho durável o
+       * `settle` grava ali o `receipt.result` — o resultado PROTEGIDO do
+       * backend, com caminho de arquivo e metadado interno —, porque é isso que
+       * quem reconcilia precisa ler. O motor não pode receber esse material nem
+       * no primeiro retorno nem no callback repetido (SPEC-L1403/T26): as duas
+       * entregas têm de ser a MESMA coisa, e a coisa que pode ir ao motor é
+       * `receipt_json.result_for_engine`.
+       *
+       * Quando NÃO há receipt persistido (caminho legado, ou recusa que não
+       * produziu receipt) a chave da projeção vem ausente e o `result_json` é
+       * devolvido: no legado, o `result_json` É o que a primeira entrega
+       * devolveu, e trocar isso mudaria a resposta de quem já depende dela. O
+       * `is_error` segue a MESMA régua: o `status` do receipt persistido quando
+       * ele existe, o estado da linha quando não — assim o replay e a primeira
+       * entrega nunca discordam sobre o desfecho.
+       */
+      const projecao = admissao.result_for_engine;
+      const statusPersistido = admissao.receipt_status;
       return {
         kind: 'result',
         call_id: call.call_id,
-        result: admissao.result,
-        is_error: admissao.state === 'denied' || admissao.state === 'effect_unknown',
+        result: projecao === undefined ? admissao.result : projecao,
+        // O `is_error` vem do MESMO receipt que decidiu o `is_error` da
+        // primeira entrega. Sem receipt (legado), ele sai do estado da linha —
+        // que é como o legado sempre respondeu.
+        is_error:
+          statusPersistido !== undefined
+            ? statusPersistido === 'error'
+            : admissao.state === 'denied' || admissao.state === 'effect_unknown',
       };
     }
 
@@ -405,22 +482,41 @@ export function createEngineToolGateway(
     }
 
     // ── (4a) IDENTIDADE DE IDEMPOTÊNCIA CONGELADA (§5.6.3) ──────────────
-    // Antes de marcar que o handler começou, é preciso congelar a identidade
-    // de idempotência. Isso garante que a chamada é determinística.
-    const congelada = await deps.freezeToolIdentity({
-      ...base,
-      call_id: admissao.call_id,
-      idempotency_key: call.call_id,
-      idempotency_payload_hash: canonicalDigest(call.args),
-      normalized_args: call.args,
-    });
+    //
+    // SÓ no caminho LEGADO. No caminho durável (4d), quem congela a identidade
+    // é o CORPO do dispatcher — `freezeIdentity` é o primeiro hook que ele
+    // chama, ANTES do lookup da cache, da aprovação e da reserva atômica.
+    //
+    // Congelar aqui TAMBÉM era um defeito real, não uma redundância inofensiva:
+    // este passo grava `idempotency_key = call_id` e
+    // `payload_hash = canonicalDigest(args)`, e o corpo chega logo depois com a
+    // chave REAL (`computeIdempotencyKey`, com bucket) e o hash `v2:`. O
+    // journal tem UM dono para a identidade (§5.6.3), então a segunda gravação
+    // responde `identity_conflict` — e, como o payload persistido
+    // (`canonicalDigest`) difere do candidato (`v2:`), nem a regra de adoção
+    // por virada de bucket se aplica: o hook falha, o corpo devolve
+    // `journal_unavailable{handler_may_have_started:false}` e a chamada morre
+    // em `dispatching` com ZERO handlers. O caminho durável não despachava
+    // nada, e o journal ficava com uma identidade que o despacho não usa.
+    //
+    // O caminho legado mantém este passo byte a byte (é o que a API de SC01
+    // espera: `idempotency_key`/`payload_hash` congelados antes do marcador).
+    if (deps.dispatchDurable === undefined) {
+      const congelada = await deps.freezeToolIdentity({
+        ...base,
+        call_id: admissao.call_id,
+        idempotency_key: call.call_id,
+        idempotency_payload_hash: canonicalDigest(call.args),
+        normalized_args: call.args,
+      });
 
-    if (!congelada.ok) {
-      logger.warn(
-        { run_id: identity.run_id, call_id: call.call_id, reason: congelada.reason },
-        'engine.tool_gateway.freeze_identity_refused',
-      );
-      return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
+      if (!congelada.ok) {
+        logger.warn(
+          { run_id: identity.run_id, call_id: call.call_id, reason: congelada.reason },
+          'engine.tool_gateway.freeze_identity_refused',
+        );
+        return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
+      }
     }
 
     // ── (4b) CONTEXTO DO HANDLER — ANTES DO MARCADOR ────────────────────
@@ -440,6 +536,372 @@ export function createEngineToolGateway(
     // `freezeToolIdentity`): nenhuma delas é envolvida em `try/catch` aqui,
     // porque nenhuma tem como ter produzido efeito ainda.
     const ctx = await deps.buildToolContext(call);
+
+    // ── (4d) DESPACHO DURÁVEL (§5.3.2) ───────────────────────────────────
+    //
+    // A partir daqui o caminho muda de dono: quem orquestra marcador, reserva
+    // de idempotência e handler é o CORPO do dispatcher, não este módulo. O
+    // gateway entrega os três hooks (identidade, aprovação, marcador) e recebe
+    // um RECEIPT — ou um dos dois desfechos que não são receipt.
+    //
+    // O que NÃO muda: a releitura do banco (3), o congelamento da classificação
+    // (4) e o contexto (4b) continuam aqui, porque são gates de ADMISSÃO. O que
+    // sai daqui é a orquestração do efeito — e, junto com ela, a IDENTIDADE de
+    // idempotência (4a), que passa a ser congelada pelo próprio corpo, uma vez
+    // só, com a chave real. Dois congelamentos = nenhum dono para a identidade;
+    // ver o comentário do passo (4a).
+    if (deps.dispatchDurable !== undefined) {
+      const despachar = deps.dispatchDurable;
+      const gravarAprovacao = deps.recordToolApproval;
+
+      /**
+       * O fence da linha é uma CORRENTE, não uma constante.
+       *
+       * Cada transição devolve a versão nova e a próxima exige exatamente
+       * aquela. Chumbar `ROW_VERSION_DA_ADMISSAO` aqui — como o caminho
+       * anterior fazia — só funciona enquanto o número de escritas entre a
+       * admissão e o marcador for exatamente o previsto; qualquer transição
+       * acrescentada no meio (uma aprovação registrada, por exemplo) faria o
+       * marcador falhar com `version_conflict`, e a leitura errada seria "o
+       * journal está quebrado".
+       */
+      let rowVersion = congelou.row_version;
+      let handlerComecou = false;
+      let aprovacaoJaJournalada = false;
+
+      const control: DurableDispatchControlV1 = {
+        call_id: admissao.call_id,
+        call_ordinal: call.ordinal,
+        dispatch_token: congelou.dispatch_token,
+        classification: classificacao,
+
+        freezeIdentity: async (candidate) => {
+          const congeladaAgora = await deps.freezeToolIdentity({
+            ...base,
+            call_id: admissao.call_id,
+            idempotency_key: candidate.key,
+            idempotency_payload_hash: candidate.payload_hash,
+            normalized_args: candidate.normalized_args,
+          });
+          if (!congeladaAgora.ok) {
+            /**
+             * §5.3.2 / AC02 — "o relógio andou" NÃO é "a intenção mudou".
+             *
+             * `computeIdempotencyKey` carrega o bucket temporal: um retry
+             * depois da virada de bucket recalcula uma chave DIFERENTE para a
+             * MESMA intenção. Recusar ali quebraria o retry legítimo — e o
+             * T26/T27 proibiram as duas saídas fáceis: reexecutar (efeito
+             * duplicado) e recalcular a identidade (chave que o journal não
+             * reconhece).
+             *
+             * O que autoriza adotar a identidade PERSISTIDA é prova de que a
+             * intenção é a mesma, e ela existe: `freezeToolIdentity` já
+             * verificou a invariante C15 (`normalized_args` reproduz o
+             * `args_hash` gravado na admissão) ANTES de comparar as chaves, e o
+             * `payload_hash` persistido é devolvido junto do conflito. Os dois
+             * batendo, a diferença de chave só pode vir do bucket — e a
+             * identidade que vale é a CONGELADA.
+             *
+             * Sem essa prova, o conflito é real e o despacho para: mesmo
+             * `call_id` com outro payload é o T27, e ali nenhum handler roda.
+             */
+            if (
+              congeladaAgora.reason === 'identity_conflict' &&
+              typeof congeladaAgora.current_idempotency_payload_hash === 'string' &&
+              congeladaAgora.current_idempotency_payload_hash === candidate.payload_hash
+            ) {
+              logger.warn(
+                {
+                  run_id: identity.run_id,
+                  call_id: call.call_id,
+                  tool: call.name,
+                  // O motivo é operacionalmente relevante: se isto aparecer
+                  // com frequência, a janela de bucket está curta para o
+                  // intervalo de retry do engine.
+                  bucket_rollover: true,
+                },
+                'engine.tool_gateway.identity_frozen_adopted',
+              );
+              return {
+                key: congeladaAgora.current_idempotency_key,
+                payload_hash: congeladaAgora.current_idempotency_payload_hash,
+              };
+            }
+            /**
+             * Fail-closed, e o motivo TIPADO vai na mensagem de propósito: o
+             * corpo trata isto como `journal_unavailable`, e quem for
+             * reconciliar precisa saber se a causa foi `identity_conflict`
+             * (args divergentes na mesma call) ou `normalized_args_mismatch`
+             * (o objeto gravado não reproduz o `args_hash`).
+             */
+            throw new Error(`freeze_identity:${congeladaAgora.reason}`);
+          }
+          /**
+           * A identidade REAL é a PERSISTIDA. Sem ela não se segue: aceitar a
+           * candidata "porque é igual" seria reintroduzir, no caminho novo, o
+           * defeito que o congelamento existe para corrigir (chave recalculada
+           * depois de virada de bucket). Ver `FreezeIdentityResult`.
+           */
+          if (congeladaAgora.key === undefined || congeladaAgora.payload_hash === undefined) {
+            throw new Error('freeze_identity:identidade_persistida_ausente');
+          }
+          if (congeladaAgora.row_version !== undefined) rowVersion = congeladaAgora.row_version;
+          return { key: congeladaAgora.key, payload_hash: congeladaAgora.payload_hash };
+        },
+
+        recordApproval: async (input) => {
+          if (gravarAprovacao === undefined) {
+            throw new Error('record_approval:sem_canal');
+          }
+          const gravou = await gravarAprovacao({
+            ...base,
+            call_id: admissao.call_id,
+            expected_row_version: rowVersion,
+            dispatch_token: congelou.dispatch_token,
+            approval_request_id: input.approval.request_id,
+            approval_claim_token: input.claim_token,
+            state: input.state,
+          });
+          if (!gravou.ok) {
+            throw new Error(`record_approval:${gravou.reason}`);
+          }
+          rowVersion = gravou.row_version;
+          // A chamada já está TERMINAL no journal (`approval_required`): quem
+          // liquidar por cima disso recebe `state_conflict`, e o run ficaria
+          // com um erro de CAS no lugar do fato. Registrar que ela já foi
+          // journalada evita o settle redundante.
+          if (input.state === 'pending') aprovacaoJaJournalada = true;
+        },
+
+        beforeHandler: async (input) => {
+          const marcou = await deps.markToolHandlerStarted({
+            ...base,
+            call_id: admissao.call_id,
+            expected_row_version: rowVersion,
+            dispatch_token: congelou.dispatch_token,
+            reservation_token: input.reservation_token,
+            approval_claim_token: input.approval_claim_token,
+            approval_request_id: input.approval_request_id,
+          });
+          if (!marcou.ok) {
+            /**
+             * `already_started` é o único motivo que NÃO prova ausência de
+             * início: a call já tem carimbo, então o marcador existe e o efeito
+             * pode ter acontecido. Marcar `handler_may_have_started: true` nele
+             * manda o run para reconciliação em vez de fechar o turno como se
+             * nada tivesse rodado.
+             */
+            throw new BeforeHandlerError(marcou.reason === 'already_started');
+          }
+          rowVersion = marcou.row_version;
+          handlerComecou = true;
+        },
+      };
+
+      const desfecho = await despachar(
+        { tool: call.name, args: call.args, ctx },
+        control,
+      );
+
+      if (desfecho.kind === 'ownership_lost') {
+        // O dispatcher perdeu a posse NO INSTANTE do efeito. Não há receipt
+        // para liquidar nem resultado a devolver: o turno não é mais dono.
+        return { kind: 'refused', call_id: call.call_id, code: 'run_not_authorized' };
+      }
+
+      if (desfecho.kind === 'journal_unavailable') {
+        /**
+         * O journal pode não ter registrado o início. Seja qual for o caso,
+         * NÃO existe receipt de sucesso para devolver: `effect_unknown` quando
+         * o handler pode ter começado (o run vai para reconciliação),
+         * `run_not_authorized` quando o hook recusou ANTES do efeito — e a
+         * diferença é exatamente `handler_may_have_started`.
+         */
+        logger.error(
+          {
+            run_id: identity.run_id,
+            call_id: call.call_id,
+            handler_may_have_started: desfecho.handler_may_have_started,
+            ops_alert: true,
+          },
+          'engine.tool_gateway.journal_unavailable',
+        );
+
+        /**
+         * §5.6.2 / AC08 — recusa PROVADA antes do efeito ENCERRA a call.
+         *
+         * `handler_may_have_started: false` é uma afirmação verificável: o
+         * carimbo de início não existe, então nada rodou e nenhum efeito pode
+         * ter ficado. Sem encerrar, a linha fica em `dispatching` — e
+         * `dispatching` é justamente o estado que OCUPA a vaga sequencial do
+         * run (§6.9.1). A recusa não é lenta, é definitiva: o run não anda mais
+         * e o desfecho honesto do que nunca começou é `denied` com evidência
+         * `none` (não `completed`, que afirmaria um resultado sem prova; não
+         * `effect_unknown`, que mandaria reconciliar um efeito inexistente).
+         *
+         * O `settle` aqui é o MESMO caminho que o corpo usa para uma recusa de
+         * governança antes do handler: um dono só para o desfecho. Se a
+         * liquidação não gravar — recusa de CAS, estado já terminal por um
+         * registro de aprovação que sobreviveu à falha, fence vencido —, ela
+         * NÃO muda o que o motor ouve (a recusa já é conservadora) nem pode
+         * escapar como exceção: o log fica, e quem reconciliar sabe que o
+         * journal pode não refletir isto.
+         */
+        if (!desfecho.handler_may_have_started) {
+          try {
+            const encerrou = await deps.settle({
+              ...base,
+              call_id: admissao.call_id,
+              expected_row_version: rowVersion,
+              dispatch_token: congelou.dispatch_token,
+              outcome: { kind: 'denied', result: { error: 'journal_unavailable' } },
+            });
+            if (!encerrou.ok) {
+              logger.error(
+                {
+                  run_id: identity.run_id,
+                  call_id: call.call_id,
+                  reason: encerrou.reason,
+                  ops_alert: true,
+                },
+                'engine.tool_gateway.settle_not_persisted_after_refusal',
+              );
+            }
+          } catch (settleErr) {
+            logger.error(
+              {
+                run_id: identity.run_id,
+                call_id: call.call_id,
+                err: (settleErr as Error).message,
+                ops_alert: true,
+              },
+              'engine.tool_gateway.settle_rejected_after_refusal',
+            );
+          }
+        }
+
+        return {
+          kind: 'refused',
+          call_id: call.call_id,
+          code: desfecho.handler_may_have_started ? 'effect_unknown' : 'run_not_authorized',
+        };
+      }
+
+      const receipt: ToolReceiptV1 = desfecho.receipt;
+      const erroDoReceipt = receipt.status === 'error';
+
+      /**
+       * Quando liquidar, e por quê.
+       *
+       *  - O handler começou: o desfecho PERTENCE ao journal, sempre — inclusive
+       *    (e principalmente) quando é erro. `denied` porque nada de bom saiu
+       *    do handler, `completed` quando saiu.
+       *  - Não começou e a aprovação já foi journalada como pendente: a linha
+       *    está TERMINAL em `approval_required`. Liquidar por cima seria um
+       *    segundo desfecho para a mesma call.
+       *  - Não começou e não houve aprovação pendente: é uma recusa de
+       *    governança ANTES do efeito (grant, regra, args). A linha está em
+       *    `dispatching` e precisa terminar — senão ocupa a vaga sequencial do
+       *    run para sempre. `denied` é o desfecho honesto: nada rodou.
+       */
+      const deveLiquidar = handlerComecou || !aprovacaoJaJournalada;
+      if (deveLiquidar) {
+        /**
+         * O receipt acompanha os TRÊS desfechos, não só `completed` (§5.3.2).
+         *
+         * Ele é o registro do que o despacho produziu — o resultado PROTEGIDO
+         * (`result`) e a projeção que pode ir ao motor (`result_for_engine`) —,
+         * e é dele que o REPLAY do gateway tira a projeção. Guardá-lo só no
+         * sucesso deixava `denied`/`effect_unknown` sem de onde projetar: o
+         * callback repetido caía no `result_json` protegido e devolvia ao motor
+         * o material interno que a primeira entrega tinha filtrado
+         * (SPEC-L1403/T26, AC05).
+         *
+         * O hash é o do conteúdo canônico do receipt: é o que permite a quem
+         * reconciliar detectar que o receipt lido não é o que foi gravado. O
+         * cast é de forma, não de conteúdo — `ToolReceiptV1` é uma interface com
+         * campos nomeados e `Json` é o tipo de payload serializável, e o valor
+         * gravado é o mesmo objeto que o hash cobriu.
+         */
+        const receita = { json: receipt as unknown as Json, hash: canonicalDigest(receipt) };
+
+        /**
+         * A ORDEM importa, e `unknown` vem primeiro.
+         *
+         * O receipt pode ter `status: 'error'` com `effect_evidence: 'unknown'`
+         * — é o caso do handler que lançou DEPOIS do marcador (§5.6.2/ADR-11).
+         * Liquidar isso como `denied` gravaria a afirmação "nada rodou" sobre
+         * uma call que pode ter emitido efeito, e ainda deixaria a linha
+         * incoerente com o próprio receipt (`state='denied'` +
+         * `effect_evidence='unknown'`). A migração 140 tem CHECK justamente
+         * para o `effect_unknown`; o mapeamento tem de chegar nele.
+         */
+        const outcome: ToolSettlement =
+          receipt.effect_evidence === 'unknown'
+            ? { kind: 'effect_unknown', result: receipt.result, receipt: receita }
+            : erroDoReceipt
+              ? { kind: 'denied', result: receipt.result, receipt: receita }
+              : {
+                  kind: 'completed',
+                  result: receipt.result,
+                  receipt: receita,
+                };
+
+        try {
+          const liquidou = await deps.settle({
+            ...base,
+            call_id: admissao.call_id,
+            expected_row_version: rowVersion,
+            dispatch_token: congelou.dispatch_token,
+            outcome,
+          });
+          if (!liquidou.ok) {
+            logger.error(
+              {
+                run_id: identity.run_id,
+                call_id: call.call_id,
+                reason: liquidou.reason,
+                handler_started: handlerComecou,
+                ops_alert: true,
+              },
+              'engine.tool_gateway.settle_failed_durable',
+            );
+            // Liquidar falhou DEPOIS do efeito: o journal não registra o
+            // desfecho, então o desfecho não pode ser devolvido como certo.
+            if (handlerComecou) {
+              return { kind: 'refused', call_id: call.call_id, code: 'effect_unknown' };
+            }
+          }
+        } catch (settleErr) {
+          logger.error(
+            {
+              run_id: identity.run_id,
+              call_id: call.call_id,
+              err: (settleErr as Error).message,
+              handler_started: handlerComecou,
+              ops_alert: true,
+            },
+            'engine.tool_gateway.settle_rejected_durable',
+          );
+          if (handlerComecou) {
+            return { kind: 'refused', call_id: call.call_id, code: 'effect_unknown' };
+          }
+        }
+      }
+
+      /**
+       * O motor recebe a PROJEÇÃO, nunca o resultado cru do handler
+       * (`result_for_engine`): caminhos de arquivo, nome de arquivo interno e
+       * resumo de relatório são material do backend. O protegido
+       * (`receipt.result`) fica no receipt/jornal, para o step-evaluator.
+       */
+      return {
+        kind: 'result',
+        call_id: call.call_id,
+        result: receipt.result_for_engine,
+        is_error: erroDoReceipt,
+      };
+    }
 
     // ── (4c) MARCADOR DO HANDLER (§5.6.4) ───────────────────────────────
     // Depois de congelar a identidade E resolver o contexto, marca que o
