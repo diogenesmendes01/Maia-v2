@@ -25,7 +25,22 @@ interface AuthorizedReservation {
   readonly destinations: readonly [string, string];
 }
 
+const GLOBAL_RESERVATION_PATH = '/srv/agents/runtime/global-canary-redis-allocation.json';
 const OPERATOR_RESERVATIONS: readonly AuthorizedReservation[] = [
+  {
+    path: GLOBAL_RESERVATION_PATH,
+    owner: 'global-release-20260927/worktree-canary',
+    uid: 1006,
+    worktrees: [
+      '/srv/agents/worktrees/global-release-environment',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_87c1dacb',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_87c1dacb-qa',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_2285d249',
+      '/srv/agents/repos/Maia-v2/.worktrees/t_2285d249-qa',
+    ],
+    scope: 'test-only-worktree-canary',
+    destinations: ['redis://127.0.0.1:6384/87', 'redis://127.0.0.1:6384/88'],
+  },
   {
     // Reserva original, inalterada: outro dono, par 3/4.
     path: '/srv/agents/runtime/canary-redis-allocation.json',
@@ -159,7 +174,17 @@ export function validateCanaryRedisAllocation(
 ): readonly [string, string] {
   const authorized = resolveAuthorizedReservationPath(path, env);
   const a = allocation as Record<string, unknown> | null;
-  const [first, second] = assertReservedDestinationPair(a?.destinations, path === CI_CANARY_PATH);
+  // The new 128-DB service admits this exact pair only; old range/port guards
+  // remain untouched for every previous reservation and for CI.
+  const globalPair =
+    path === GLOBAL_RESERVATION_PATH &&
+    Array.isArray(a?.destinations) &&
+    a.destinations.length === 2 &&
+    a.destinations[0] === authorized.destinations[0] &&
+    a.destinations[1] === authorized.destinations[1];
+  const [first, second] = globalPair
+    ? authorized.destinations
+    : assertReservedDestinationPair(a?.destinations, path === CI_CANARY_PATH);
   if (
     a?.version !== 1 ||
     a.status !== 'reserved' ||

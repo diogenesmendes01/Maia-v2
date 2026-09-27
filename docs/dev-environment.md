@@ -6,6 +6,28 @@ They do not migrate a board, change profiles, start infrastructure, merge or dep
 Do not use them to alter the active SC01 checkout or its DB/Redis. DEV does not edit AGENTS.md; reusable environment notes belong here. The existing `npm run doctor` is the application doctor;
 this lightweight harness doctor is a different, dependency-free command.
 
+## Global queue preparation (2026-09-27)
+
+The new operator reservation `/srv/agents/runtime/global-canary-redis-allocation.json`
+adds **only** owner `global-release-20260927/worktree-canary`, UID1006,
+worktree `/srv/agents/worktrees/global-release-environment`, scope
+`test-only-worktree-canary`, pair `redis://127.0.0.1:6384/87` and `/88`.
+This is a dedicated serialized canary checkout, not a transfer of WIP3 ownership.
+Old reservations, their port/range guards and CI remain unchanged. Main dedicated
+canary fixture DBs use separate own slots89/90. Queue cards reserve pairs1..86.
+The operator-owned manifest and service must be promoted separately; code alone
+never starts Redis. Run the installed `global-smoke.sh <code-dev|code-qa>
+global_canary canary` under UID1006; it checks service availability before fixture
+creation and holds the existing heavy lock for the complete canary.
+
+The same newly owned pair is explicitly allocated to the SC02 and SC05 DEV/QA
+worktrees (`t_87c1dacb`, `t_2285d249`, each with optional `-qa`), always under
+that same exclusive lock. No other card path is inferred or admitted.
+**Pending integration gate:** parent must promote the local guard commit to the
+exact priority-card revisions before their full suites, then rerun the guard and
+live canary on each delivered SHA. Future cards require an explicit reviewed
+manifest/guard worktree addition on demand. No test is disabled or skipped.
+
 ## 1. Operator prerequisites (not actions for DEV/QA)
 
 - Clone based on `claude/hermes-core-wiring`; each card/QA revision gets a writable
