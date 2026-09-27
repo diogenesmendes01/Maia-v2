@@ -12,6 +12,8 @@
  * continuaria dizendo uma coisa enquanto a validação faz outra.
  */
 import { z } from 'zod';
+import { mediaRefSchema } from '@/runtime/outbound/contract.js';
+import type { ToolExecutionSummary } from '@/agent/tool-execution-summary.js';
 import type {
   Json,
   EngineKind,
@@ -29,6 +31,12 @@ import type {
   EngineRunLocatorV1,
   HostContextSnapshotV1,
   ReportedUsageV1,
+  ApprovalBindingV1,
+  DurableDispatchResultV1,
+  SideEffect,
+  ToolEffectClassV1,
+  ToolEffectEvidenceV1,
+  ToolReceiptV1,
 } from './contracts.js';
 
 // ─── vocabulários fechados ──────────────────────────────────────────────────
@@ -356,6 +364,124 @@ export const engineObservationV1Schema = z.discriminatedUnion('kind', [
     .strict(),
 ]);
 
+// ─── SC04 (§5.3.2) — chamada de ferramenta e evidência da Maia ──────────────
+//
+// Estes três objetos NÃO atravessam o wire: o receipt é produzido pela Maia e
+// consumido pela Maia (journal, step-evaluator). Eles vivem aqui, ao lado dos
+// do wire, porque é aqui que mora a checagem de equivalência schema ↔ tipo — e
+// é ela que impede o receipt do journal divergir do tipo que o resto do código
+// já usa.
+
+export const SIDE_EFFECTS = ['none', 'read', 'write', 'communication'] as const;
+export const TOOL_EFFECT_CLASSES = [
+  'abort_safe',
+  'idempotent',
+  'non_interruptible',
+  'compensatable',
+] as const;
+export const TOOL_EFFECT_EVIDENCES = ['none', 'possible', 'committed', 'unknown'] as const;
+export const APPROVAL_CLASSES = [
+  'single_confirmation',
+  'requester_plus_one_owner',
+  'two_distinct_owners',
+] as const;
+
+export const approvalBindingV1Schema = z
+  .object({
+    request_id: uuid(),
+    /**
+     * `AP-xxxxxxxx` — identificador de UX, TRUNCADO. Não é autorizador: quem
+     * autoriza é `request_id`. A validação de forma aqui existe para o caso
+     * oposto do `request_id`: um `ref` que pareça um UUID completo seria
+     * confundido com o identificador real por quem lê o console.
+     */
+    ref: z.string().min(1).max(64),
+    intent_hash: z.string().min(1).max(256),
+    approval_class: z.enum(APPROVAL_CLASSES),
+  })
+  .strict();
+
+const resultKeyValueSchema = z.union([
+  z.string(),
+  z.number(),
+  z.boolean(),
+  z.array(z.string()),
+  z.array(z.number()),
+]);
+
+export const toolExecutionSummarySchema = z
+  .object({
+    tool_call_id: z.string().min(1).max(256),
+    tool_name: z.string().min(1).max(256),
+    status: z.enum(['success', 'error']),
+    side_effect: z.enum(['read', 'write', 'communication']).nullable(),
+    result_summary: z.string(),
+    error_summary: z.string().optional(),
+    result_keys: z.record(resultKeyValueSchema).optional(),
+    occurred_at: z.string().min(1),
+  })
+  .strict();
+
+const receiptReportV1Schema = z
+  .object({
+    media: mediaRefSchema,
+    file_name: z.string().min(1).max(512),
+    mimetype: z.string().min(1).max(128),
+    tipo: z.enum(['extrato', 'comparativo']),
+  })
+  .strict();
+
+export const toolReceiptV1Schema = z
+  .object({
+    call_id: z.string().min(1).max(256),
+    ordinal: z.number().int().min(0).max(10_000),
+    name: z.string().min(1).max(256),
+    result: jsonValue,
+    result_for_engine: jsonValue,
+    status: z.enum(['success', 'error']),
+    side_effect: z.enum(SIDE_EFFECTS).nullable(),
+    effect_class: z.enum(TOOL_EFFECT_CLASSES).nullable(),
+    legacy_irreversible_invoked: z.boolean(),
+    effect_evidence: z.enum(TOOL_EFFECT_EVIDENCES),
+    sensitive: z.boolean(),
+    started_at: isoInstant().nullable(),
+    finished_at: isoInstant(),
+    summary: toolExecutionSummarySchema,
+    approval: approvalBindingV1Schema.nullable(),
+    pending_question_id: uuid().nullable(),
+    report: receiptReportV1Schema.nullable(),
+  })
+  .strict()
+  /**
+   * AC06 — `null` SÓ em recusa anterior à resolução de spec.
+   *
+   * As duas colunas andam juntas porque medem a mesma coisa: se o registry
+   * resolveu a ferramenta, a classe É conhecida (e uma classe `null` não
+   * autoriza handler — §4.1); se não resolveu, não há spec para descrever o
+   * efeito, e aí as duas são `null`. Uma combinação mista é um receipt que
+   * afirma saber a classe de uma ferramenta cujo efeito não sabe descrever.
+   */
+  .refine(
+    (r) => (r.side_effect === null) === (r.effect_class === null),
+    'side_effect e effect_class só podem ser nulos JUNTOS (recusa antes do registry)',
+  );
+
+export const durableDispatchResultV1Schema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('settled'), receipt: toolReceiptV1Schema }).strict(),
+  z.object({ kind: z.literal('ownership_lost') }).strict(),
+  z
+    .object({
+      kind: z.literal('journal_unavailable'),
+      /**
+       * Conservador por construção: `true` significa "o marcador pode ter
+       * sido gravado", e é o que manda o run para reconciliação em vez de
+       * fechar o turno como se nada tivesse rodado.
+       */
+      handler_may_have_started: z.boolean(),
+    })
+    .strict(),
+]);
+
 // ─── equivalência schema ↔ tipo, conferida pelo compilador ──────────────────
 
 /** Falha de compilação se um lado ganhar ou perder campo em relação ao outro. */
@@ -377,6 +503,16 @@ const _phases: Exato<(typeof ENGINE_RUN_PHASES)[number], EngineRunPhaseV1> = tru
 const _states: Exato<(typeof ENGINE_TOOL_CALL_STATES)[number], EngineToolCallStateV1> = true;
 const _closes: Exato<(typeof ENGINE_CLOSE_REASONS)[number], EngineCloseReasonV1> = true;
 const _kinds: Exato<(typeof ENGINE_KINDS)[number], EngineKind> = true;
+const _receipt: Exato<z.infer<typeof toolReceiptV1Schema>, ToolReceiptV1> = true;
+const _approvalBinding: Exato<z.infer<typeof approvalBindingV1Schema>, ApprovalBindingV1> = true;
+const _durableResult: Exato<
+  z.infer<typeof durableDispatchResultV1Schema>,
+  DurableDispatchResultV1
+> = true;
+const _summary: Exato<z.infer<typeof toolExecutionSummarySchema>, ToolExecutionSummary> = true;
+const _sideEffects: Exato<(typeof SIDE_EFFECTS)[number], SideEffect> = true;
+const _effectClasses: Exato<(typeof TOOL_EFFECT_CLASSES)[number], ToolEffectClassV1> = true;
+const _evidences: Exato<(typeof TOOL_EFFECT_EVIDENCES)[number], ToolEffectEvidenceV1> = true;
 
 /**
  * `EngineRequestV1.context.messages` e `EngineToolCallV1.args` usam tipos da

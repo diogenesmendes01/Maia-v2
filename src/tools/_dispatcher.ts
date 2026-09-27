@@ -43,6 +43,17 @@ import {
 } from '@/runtime/turns/execution-context.js';
 import type { EffectBoundary } from '@/observability/taxonomy.js';
 import { classifyToolCancellation, minimumBudgetMs } from './effect-class.js';
+import { buildToolSummary } from '@/agent/tool-execution-summary.js';
+import type {
+  ApprovalBindingV1,
+  DurableDispatchControlV1,
+  DurableDispatchResultV1,
+  Json,
+  ToolClassificationSnapshotV1,
+  ToolEffectClassV1,
+  ToolEffectEvidenceV1,
+  ToolReceiptV1,
+} from '@/runtime/engines/contracts.js';
 
 /**
  * Issue #535 §2 — the dispatcher OWNS its refusal vocabulary; the observer
@@ -200,19 +211,269 @@ function turnDeadlineExceededResult(
   };
 }
 
+/**
+ * §5.3.2 (SC04) — ESTADO DURÁVEL de UMA chamada despachada pelo caminho novo.
+ *
+ * Ele existe porque o receipt precisa de fatos que só aparecem DURANTE o
+ * despacho — o instante em que o marcador de início foi gravado, o
+ * `reservation_token` REAL da reserva de idempotência, a aprovação que foi
+ * consumida e quanta evidência de efeito o desfecho deixou. Reconstruí-los
+ * depois, a partir do `{error}` devolvido ao motor, seria inferência: o wrapper
+ * sozinho NÃO consegue recuperar o UUID de aprovação de um `ref` truncado
+ * (`AP-xxxxxxxx`), nem distinguir "o handler não rodou" de "o handler rodou e a
+ * liquidação falhou".
+ *
+ * `evidence` NUNCA regride (T13): começa em `none` e só sobe. Um caminho que
+ * seria rebaixado por uma resposta tardia ou por uma expiração não tem, aqui,
+ * como escrever `none` de volta.
+ */
+type DurableRunState = {
+  control: DurableDispatchControlV1;
+  /** Instante ISO do marcador de início; `null` = o handler NÃO começou. */
+  handler_started_at: string | null;
+  reservation_token: string | null;
+  approval: ApprovalBindingV1 | null;
+  evidence: ToolEffectEvidenceV1;
+  /** `false` só quando a ferramenta não foi resolvida no registry. */
+  tool_known: boolean;
+};
+
+/** Erro do hook `beforeHandler` que sabe se o marcador pode ter sido gravado. */
+export class BeforeHandlerError extends Error {
+  constructor(readonly handler_may_have_started: boolean) {
+    super('beforeHandler recusou o início do handler');
+    this.name = 'BeforeHandlerError';
+  }
+}
+
+/**
+ * A classe CARREGA efeito? `null` conta como "sim": sem spec conhecida não se
+ * afirma ausência de efeito (§4.1). Uma classe fora do vocabulário cai no ramo
+ * conservador do próprio contrato de classes.
+ */
+function classCarriesEffect(effect_class: ToolEffectClassV1 | null): boolean {
+  return effect_class === null || classifyToolCancellation(effect_class).outcome === 'effect_unknown';
+}
+
+/**
+ * PROJEÇÃO para o motor (§5.3.2): o que pode atravessar para o lado que
+ * raciocina.
+ *
+ * A regra é por CAMINHO, não por ferramenta: `path`, `fileName` e `summary` de
+ * um relatório apontam para arquivo no filesystem do backend e são material
+ * interno. O motor recebe tipo/nome/MIME — o suficiente para falar do documento
+ * — e nunca o caminho. Um ID opaco de mídia NÃO existe hoje
+ * (`MediaRef.local_path` não tem identificador durável), e inventar um aqui
+ * seria pior que omiti-lo: ver limitação registrada no card.
+ */
+function projectForEngine(value: unknown): Json {
+  const json = toJson(value);
+  if (typeof json !== 'object' || json === null || Array.isArray(json)) return json;
+  const bag = { ...(json as { [k: string]: Json }) };
+  const report = recordOf(bag['report']);
+  if (report && ('path' in report || 'fileName' in report || 'tipo' in report)) {
+    bag['report'] = {
+      tipo: report['tipo'] ?? null,
+      file_name: report['fileName'] ?? null,
+      mimetype: report['mimetype'] ?? null,
+    };
+  }
+  delete bag['path'];
+  delete bag['fileName'];
+  delete bag['summary'];
+  return bag;
+}
+
+function recordOf(value: Json | undefined): { [k: string]: Json } | null {
+  if (value === undefined || value === null || typeof value !== 'object') return null;
+  if (Array.isArray(value)) return null;
+  return value as { [k: string]: Json };
+}
+
+/**
+ * O resultado protegido, na forma que o journal aceita. `JSON.stringify` é
+ * round-trip de propósito: um `undefined`/função que o schema do output deixou
+ * passar viraria coluna jsonb inválida DENTRO da TX do journal, trocando uma
+ * recusa tipada por uma exceção de persistência.
+ */
+function toJson(value: unknown): Json {
+  return JSON.parse(JSON.stringify(value ?? null)) as Json;
+}
+
+/**
+ * O relatório materializado por esta chamada, quando houve (§5.3.2, `report`).
+ *
+ * O predicado é o MESMO que o laço local usa para decidir o envio de documento
+ * (`react-loop.ts`): `path` + `fileName` + `mimetype` + `tipo`. Reusar a régua
+ * evita que o journal e a entrega discordem sobre o que é um relatório.
+ */
+function extractReport(value: unknown): ToolReceiptV1['report'] {
+  const json = toJson(value);
+  if (typeof json !== 'object' || json === null || Array.isArray(json)) return null;
+  const r = json as { [k: string]: Json };
+  const path = r['path'];
+  const fileName = r['fileName'];
+  const mimetype = r['mimetype'];
+  const tipo = r['tipo'];
+  if (typeof path !== 'string' || typeof fileName !== 'string' || typeof mimetype !== 'string') {
+    return null;
+  }
+  if (tipo !== 'extrato' && tipo !== 'comparativo') return null;
+  return { media: { kind: 'local_path', path }, file_name: fileName, mimetype, tipo };
+}
+
+/**
+ * MATERIALIZA o `ToolReceiptV1` (§5.3.2).
+ *
+ * Três decisões que este construtor torna explícitas:
+ *
+ *  1. `side_effect`/`effect_class` são `null` SOMENTE quando o registry não
+ *     resolveu a ferramenta. O receipt de uma recusa pós-registry carrega a
+ *     classe REAL — uma ferramenta de escrita recusada por grant continua sendo
+ *     uma ferramenta de escrita.
+ *  2. `effect_evidence` vem do ESTADO do despacho, nunca do payload devolvido
+ *     pelo handler: uma resposta `{ok:true}` não prova que o efeito commitou.
+ *     `committed` só aparece quando o despacho registrou a prova (completion de
+ *     idempotência/outbox).
+ *  3. `started_at` `null` é a diferença entre "não começou" e "pode ter
+ *     começado" — o mesmo eixo que o marcador de handler do journal separa.
+ */
+function buildReceipt(
+  run: DurableRunState,
+  toolName: string,
+  value: DispatchResult,
+  startedAtMs: number,
+): ToolReceiptV1 {
+  const { control } = run;
+  const classSnapshot: ToolClassificationSnapshotV1 | null = run.tool_known
+    ? control.classification
+    : null;
+  const error = ehErro(value);
+  const finishedAt = new Date().toISOString();
+  /**
+   * Depois do marcador, `none` deixa de ser uma afirmação disponível para uma
+   * classe que CARREGA efeito (T13): o handler pode ter emitido o efeito e
+   * falhado ao gravar. Para uma classe que declara não haver efeito
+   * (`abort_safe`), `none` continua sendo a verdade — e é o que o journal
+   * grava. O piso `possible` é derivado do ESTADO, não do payload.
+   */
+  const evidence: ToolEffectEvidenceV1 =
+    run.handler_started_at !== null &&
+    run.evidence === 'none' &&
+    classCarriesEffect(classSnapshot?.effect_class ?? null)
+      ? 'possible'
+      : run.evidence;
+  const summary = buildToolSummary({
+    tool_call_id: control.call_id,
+    tool_name: toolName,
+    side_effect: classSnapshot?.side_effect ?? 'none',
+    args: null,
+    result: value,
+    status: error ? 'error' : 'success',
+    dispatched_at: startedAtMs,
+  });
+  return {
+    call_id: control.call_id,
+    ordinal: control.call_ordinal,
+    name: toolName,
+    result: toJson(value),
+    result_for_engine: projectForEngine(value),
+    status: error ? 'error' : 'success',
+    side_effect: classSnapshot?.side_effect ?? null,
+    effect_class: classSnapshot?.effect_class ?? null,
+    legacy_irreversible_invoked: classSnapshot?.legacy_irreversible_invoked ?? false,
+    effect_evidence: evidence,
+    sensitive: classSnapshot?.sensitive ?? false,
+    started_at: run.handler_started_at,
+    finished_at: finishedAt,
+    summary,
+    approval: run.approval,
+    pending_question_id: null,
+    report: extractReport(value),
+  };
+}
+
+function ehErro(value: DispatchResult): boolean {
+  return typeof value === 'object' && value !== null && 'error' in value;
+}
+
+/**
+ * `dispatchTool` — o caminho LEGADO, preservado byte a byte para SC01.
+ *
+ * Ele passa pelo MESMO corpo do despacho durável (`runDispatcher`), o que é o
+ * ponto: uma cópia dos gates divergiria na primeira correção aplicada a um só
+ * lado, e a divergência seria silenciosa até virar incidente. Sem `control`, o
+ * corpo não chama hook nenhum e devolve exatamente o que devolvia antes.
+ */
 export async function dispatchTool(input: {
   tool: string;
   args: unknown;
   ctx: ToolContext;
 }): Promise<DispatchResult> {
-  return instrumentToolDispatch(input.tool, () => dispatchToolInner(input));
+  return instrumentToolDispatch(input.tool, () => runDispatcher(input, null, EMPTY_FLAGS));
 }
 
-async function dispatchToolInner(input: {
-  tool: string;
-  args: unknown;
-  ctx: ToolContext;
-}): Promise<DispatchResult> {
+const EMPTY_FLAGS: DispatcherFlags = { ownership_lost: false, journal_unavailable: null };
+
+type DispatcherFlags = {
+  ownership_lost: boolean;
+  journal_unavailable: { handler_may_have_started: boolean } | null;
+};
+
+/**
+ * `dispatchToolDurable` — o caminho NOVO (§5.3.2).
+ *
+ * Ele compartilha `runDispatcher` com o legado e ADICIONA três hooks
+ * aguardados, todos fail-closed:
+ *
+ *   * `freezeIdentity`, antes de lookup/aprovação/reserva — a identidade usada
+ *     dali em diante é a CONGELADA, não a recalculada;
+ *   * `recordApproval`, no instante em que o claim humano existe;
+ *   * `beforeHandler`, imediatamente antes de `tool.handler`. Falha aqui é
+ *     recusa: o handler não começa.
+ */
+export async function dispatchToolDurable(
+  input: { tool: string; args: unknown; ctx: ToolContext },
+  control: DurableDispatchControlV1,
+): Promise<DurableDispatchResultV1> {
+  const run: DurableRunState = {
+    control,
+    handler_started_at: null,
+    reservation_token: null,
+    approval: null,
+    evidence: 'none',
+    tool_known: false,
+  };
+  const flags: DispatcherFlags = { ownership_lost: false, journal_unavailable: null };
+  // `dispatched_at` é o instante do PEDIDO, capturado antes de qualquer gate —
+  // é o referencial que o sumário publica (mesma régua de `buildToolSummary`).
+  const startedAtMs = Date.now();
+  const outcome = await instrumentToolDispatch(input.tool, () =>
+    runDispatcher(input, run, flags),
+  );
+
+  if (flags.ownership_lost) return { kind: 'ownership_lost' };
+  if (flags.journal_unavailable !== null) {
+    return {
+      kind: 'journal_unavailable',
+      handler_may_have_started: flags.journal_unavailable.handler_may_have_started,
+    };
+  }
+  return {
+    kind: 'settled',
+    receipt: buildReceipt(run, input.tool, outcome, startedAtMs),
+  };
+}
+
+async function runDispatcher(
+  input: {
+    tool: string;
+    args: unknown;
+    ctx: ToolContext;
+  },
+  run: DurableRunState | null,
+  flags: DispatcherFlags,
+): Promise<DispatchResult> {
   // Issue #504 §Fencing — LIMITE DE EFEITO. Antes de qualquer coisa: esta
   // tentativa ainda é dona do turno?
   //
@@ -229,7 +490,31 @@ async function dispatchToolInner(input: {
   //
   // Fora de um turno reivindicado (`FEATURE_TURN_CLAIM` OFF, worker de agenda,
   // playground) o guard é no-op — ver `runtime/turns/execution-context.ts`.
-  if (turnOwnershipLost()) return turnOwnershipLostResult(input.tool, 'tool_dispatch');
+  if (turnOwnershipLost()) {
+    flags.ownership_lost = true;
+    return turnOwnershipLostResult(input.tool, 'tool_dispatch');
+  }
+
+  /**
+   * Eleva (nunca rebaixa) a evidência de efeito do receipt (§5.6.2).
+   *
+   * A ordem de severidade é `none < possible < committed < unknown`. Depois
+   * que existe a POSSIBILIDADE de efeito, `none` deixa de ser uma afirmação
+   * verdadeira e nunca volta atrás — nem por expiração, nem por um HTTP 200
+   * tardio. Uma adoção de resultado alheio (`completed` no ledger) PROVA
+   * efeito; um desfecho duvidoso (`failed`, `timeout`, fence perdida) para em
+   * `possible`/`unknown`.
+   */
+  const markEvidence = (level: ToolEffectEvidenceV1): void => {
+    if (run === null) return;
+    const ordem: Record<ToolEffectEvidenceV1, number> = {
+      none: 0,
+      possible: 1,
+      committed: 2,
+      unknown: 3,
+    };
+    if (ordem[level] > ordem[run.evidence]) run.evidence = level;
+  };
 
   // Issue #478 — tools MCP (`mcp:<server>:<tool>`) são dinâmicas (DB), não
   // vivem no REGISTRY. O bridge revalida TODAS as guardas server-side (flag,
@@ -254,6 +539,10 @@ async function dispatchToolInner(input: {
 
   const tool = REGISTRY[input.tool] as AnyTool | undefined;
   if (!tool) return { error: 'unknown_tool', details: { tool: input.tool } };
+  // §5.3.2 — o registry RESOLVEU a ferramenta. Só a partir daqui o receipt pode
+  // carregar `side_effect`/`effect_class`: antes disso não há spec conhecida, e
+  // a classe `null` é a verdade (nunca `abort_safe` inventado).
+  if (run !== null) run.tool_known = true;
 
   // Codex review #105 (medium): kill-switch em runtime. `REGISTRY` é
   // construído no module-load; quando um flag é killado depois, processos
@@ -547,7 +836,7 @@ async function dispatchToolInner(input: {
   const file_sha256 =
     pickToolField<'string'>(args, 'file_sha256', 'string') ??
     pickToolField<'string'>(args, 'attachment_id', 'string');
-  const idempotency_key = computeIdempotencyKey({
+  const candidate_idempotency_key = computeIdempotencyKey({
     pessoa_id: input.ctx.pessoa.id,
     entity_id: entityForIdentity,
     tool_name: tool.name,
@@ -563,7 +852,7 @@ async function dispatchToolInner(input: {
   // hit happened in `idempotencyRepo.lookup`; #298 moved the dispatcher onto
   // the atomic `tryReserve` path, so the revalidation now lives there (and
   // in `waitForCompletion` for the loser-of-the-race branch below).
-  const payload_hash = computePayloadHash({
+  const candidate_payload_hash = computePayloadHash({
     pessoa_id: input.ctx.pessoa.id,
     entity_id: entityForIdentity,
     tool_name: tool.name,
@@ -571,6 +860,64 @@ async function dispatchToolInner(input: {
     payload: args,
     file_sha256,
   });
+
+  /**
+   * §5.3.2 / §5.6.3 (SC04) — A IDENTIDADE É CONGELADA ANTES DE SER USADA.
+   *
+   * Pontos exatos, e cada um importa:
+   *
+   *  * ANTES do lookup da cache, da exigência/claim de aprovação e da reserva
+   *    atômica. Congelar depois seria decorativo: a chave já teria sido usada
+   *    para decidir o desfecho, e uma segunda passagem com bucket virado
+   *    executaria sob uma identidade DIFERENTE da que o journal guardou.
+   *  * Com os args como o WIRE os entregou (`input.args`), não com o
+   *    `parsed.data` do Zod: o `args_hash` que a admissão gravou foi computado
+   *    sobre o payload cru (`admitToolCall`, `canonicalDigest`), e
+   *    `freezeToolIdentity` recusa uma forma que não reproduza esse hash (C15).
+   *
+   * A chave/hash ADOTADAS abaixo vêm do congelamento, não do cálculo local:
+   * é isso que torna "replay usa a identidade congelada" comportamento em vez
+   * de intenção. Um congelamento recusado NÃO tem caminho alternativo — o
+   * despacho para, e nenhum handler roda sob identidade não comprovada.
+   */
+  let idempotency_key = candidate_idempotency_key;
+  let payload_hash = candidate_payload_hash;
+  if (run !== null) {
+    /**
+     * FAIL-CLOSED, e com a mesma régua do `beforeHandler`: um congelamento que
+     * não se completa — recusa do repo ou hook que lança — para o despacho com
+     * `journal_unavailable`, e o handler NÃO começa.
+     *
+     * As duas checagens de forma abaixo não são paranoia de tipo: a identidade
+     * é o que o LEDGER vai usar para reconhecer a chamada. Um `key` vazio ou
+     * ausente reservaria sob uma identidade que o journal não guardou, e a
+     * reserva deixaria de ser o registro que impede a duplicação.
+     */
+    try {
+      const congelada = await run.control.freezeIdentity({
+        key: candidate_idempotency_key,
+        payload_hash: candidate_payload_hash,
+        normalized_args: input.args as Json,
+      });
+      if (
+        typeof congelada.key !== 'string' ||
+        congelada.key.length === 0 ||
+        typeof congelada.payload_hash !== 'string' ||
+        congelada.payload_hash.length === 0
+      ) {
+        throw new Error('freeze_identity:identidade_persistida_ausente');
+      }
+      idempotency_key = congelada.key;
+      payload_hash = congelada.payload_hash;
+    } catch (err) {
+      flags.journal_unavailable = { handler_may_have_started: false };
+      logger.error(
+        { err: (err as Error).message, tool: tool.name, ops_alert: true },
+        'tool.freeze_identity_failed',
+      );
+      return { error: 'journal_unavailable', details: { tool: tool.name } };
+    }
+  }
 
   // Fase 0 cap. 3 — pré-check READ-ONLY do cache de idempotência ANTES da
   // exigência de aprovação: um intent idêntico JÁ EXECUTADO dentro da janela
@@ -582,6 +929,17 @@ async function dispatchToolInner(input: {
     .catch(() => null);
   if (cachedResult !== null) {
     logger.debug({ tool: tool.name, idempotency_key }, 'tool.idempotency_precheck_hit');
+    /**
+     * §5.6.2 (SC04) — o cache autoritativo é PROVA, não promessa.
+     *
+     * `lookup` só devolve linha com `payload_hash` conferido, e o ledger guarda
+     * o resultado do desfecho já concluído: o efeito aconteceu (foi este dono ou
+     * outro, com a MESMA intenção). Sem elevar a evidência aqui, o receipt da
+     * adoção sairia `none` — afirmando que nada foi executado justamente na
+     * chamada que devolve o resultado de um efeito —, e o `settle` não teria
+     * como gravar `completed` com prova (T26).
+     */
+    markEvidence('committed');
     return cachedResult;
   }
 
@@ -660,7 +1018,80 @@ async function dispatchToolInner(input: {
     });
     if (claim.outcome === 'claimed') {
       claimedApproval = { request: claim.request, claim_token: claim.claim_token };
+      /**
+       * §5.3.2 (SC04) — `recordApproval` no INSTANTE em que o claim existe.
+       *
+       * Aqui, e não antes de terminar: o UUID completo do request e o claim
+       * token são o que autoriza a execução, e o `ref` (`AP-xxxxxxxx`) que o
+       * motor vê é truncado — não dá para reconstruir o UUID a partir dele
+       * depois. Gravar a evidência agora é o que mantém auditável uma execução
+       * que ainda pode falhar antes do marcador.
+       */
+      if (run !== null) {
+        const binding: ApprovalBindingV1 = {
+          request_id: claim.request.id,
+          ref: `AP-${claim.request.id.slice(0, 8)}`,
+          intent_hash,
+          approval_class,
+        };
+        run.approval = binding;
+        /**
+         * FAIL-CLOSED: se a evidência humana não puder ser gravada, o handler
+         * NÃO começa.
+         *
+         * A evidência foi CONSUMIDA (`claimed`); executar sem registrá-la
+         * deixaria um efeito real sem a aprovação que o autoriza — o pior
+         * desfecho possível aqui. O claim é devolvido (`fail`) para que o
+         * humano não tenha de aprovar de novo uma chamada que não rodou, e o
+         * desfecho vira `journal_unavailable`, que é o que impede um receipt de
+         * sucesso sobre um journal que não sabe disto.
+         */
+        try {
+          await run.control.recordApproval({
+            approval: binding,
+            state: 'claimed',
+            claim_token: claim.claim_token,
+          });
+        } catch (err) {
+          flags.journal_unavailable = { handler_may_have_started: false };
+          await failClaimedApproval({
+            request: claim.request,
+            claim_token: claim.claim_token,
+            cause: 'journal_unavailable',
+          });
+          logger.error(
+            { err, tool: tool.name, call_id: run.control.call_id, ops_alert: true },
+            'tool.record_approval_failed',
+          );
+          return { error: 'journal_unavailable', details: { tool: tool.name } };
+        }
+      }
     } else if (claim.outcome === 'pending') {
+      if (run !== null) {
+        // Aprovação ainda PENDENTE: não houve efeito e não haverá neste
+        // despacho. O journal precisa saber disso — a chamada fica
+        // `approval_required` com o UUID real, e o run deixa de considerar a
+        // vaga sequencial ocupada por uma call que nunca vai terminar aqui.
+        try {
+          await run.control.recordApproval({
+            approval: {
+              request_id: claim.request.id,
+              ref: `AP-${claim.request.id.slice(0, 8)}`,
+              intent_hash,
+              approval_class,
+            },
+            state: 'pending',
+            claim_token: null,
+          });
+        } catch (err) {
+          flags.journal_unavailable = { handler_may_have_started: false };
+          logger.error(
+            { err, tool: tool.name, call_id: run.control.call_id, ops_alert: true },
+            'tool.record_approval_failed',
+          );
+          return { error: 'journal_unavailable', details: { tool: tool.name } };
+        }
+      }
       return {
         error: 'approval_pending',
         details: {
@@ -706,6 +1137,22 @@ async function dispatchToolInner(input: {
         reason: `${tool.name}: ${approvalReason}`,
         notify,
       });
+      if (run !== null) {
+        // Mesmo regime do `pending` acima: sem handler, sem efeito. O que
+        // difere é que aqui o pedido acabou de ser ABERTO — e o UUID real dele
+        // existe (`ensured.request.id`), então é ele que o journal guarda. O
+        // `ref` que o motor recebe continua sendo o identificador de UX.
+        await run.control.recordApproval({
+          approval: {
+            request_id: ensured.request.id,
+            ref: ensured.ref,
+            intent_hash,
+            approval_class,
+          },
+          state: 'pending',
+          claim_token: null,
+        });
+      }
       return {
         error:
           approvalRequirement === 'single' ? 'requires_confirmation' : 'requires_dual_approval',
@@ -810,6 +1257,9 @@ async function dispatchToolInner(input: {
     // return the cached output.
     await releaseClaimIfHeld();
     logger.debug({ tool: tool.name, idempotency_key }, 'tool.idempotency_hit');
+    // A reserva já está `completed` no ledger: para uma classe com efeito, o
+    // efeito FOI emitido por quem venceu — e a linha completed é a prova.
+    markEvidence('committed');
     return reservation.resultado;
   }
 
@@ -822,6 +1272,9 @@ async function dispatchToolInner(input: {
     // idempotency_key and re-enter here — still fenced by the 'failed' row
     // until it ages out of the cache).
     logger.warn({ tool: tool.name, idempotency_key }, 'tool.idempotency_prior_failed');
+    // O handler do OUTRO dono rodou e falhou: um efeito parcial PODE ter
+    // ficado. `possible`, nunca `none` — a classe carrega efeito.
+    markEvidence('possible');
     return {
       error: 'idempotency_prior_failed',
       details: { tool: tool.name, idempotency_key },
@@ -869,6 +1322,9 @@ async function dispatchToolInner(input: {
         { tool: tool.name, idempotency_key, wait_status: waited.status },
         'tool.idempotency_owner_failed',
       );
+      // `failed`/`released`: um efeito parcial PODE ter ficado — `possible`, e
+      // nunca `none`.
+      markEvidence('possible');
       return {
         error: 'idempotency_owner_failed',
         details: { tool: tool.name, idempotency_key },
@@ -877,6 +1333,8 @@ async function dispatchToolInner(input: {
     // status === 'timeout': owner is still working (or hung). Surface a
     // retry-friendly error rather than block the caller indefinitely.
     logger.warn({ tool: tool.name, idempotency_key }, 'tool.idempotency_wait_timeout');
+    // O dono segue trabalhando: pode ter emitido o efeito.
+    markEvidence('possible');
     return {
       error: 'idempotency_wait_timeout',
       details: { tool: tool.name, idempotency_key, waited_ms: WAIT_TIMEOUT_MS },
@@ -933,6 +1391,7 @@ async function dispatchToolInner(input: {
   };
 
   if (turnOwnershipLost()) {
+    flags.ownership_lost = true;
     await abandonReservationQuietly();
     await releaseClaimIfHeld();
     return turnOwnershipLostResult(tool.name, 'tool_handler');
@@ -979,14 +1438,21 @@ async function dispatchToolInner(input: {
    * nosso não incorpora resposta, não completa reserva e não dispara outbound.
    */
   const settleCancelledAfterStart = async (
-    cause: 'signal_aborted' | 'late_result_discarded',
+    cause: 'signal_aborted' | 'late_result_discarded' | 'handler_threw',
   ): Promise<DispatchResult> => {
     const verdict = classifyToolCancellation(tool.effect_class);
     if (verdict.outcome === 'cancelled') {
+      // Só o CANCELAMENTO chega aqui: o call site de `handler_threw` exige
+      // `effect_unknown`, então o ramo não é alcançável por uma exceção comum
+      // de um `abort_safe` — que segue pelo desfecho legado.
+      flags.ownership_lost = true;
       await abandonReservationQuietly();
       await releaseClaimIfHeld();
       return turnOwnershipLostResult(tool.name, 'tool_handler');
     }
+    // §5.6.2 (T13) — o efeito NÃO é mais uma afirmação disponível: o handler
+    // pode ter rodado. `unknown` é o único valor honesto, e ele nunca regride.
+    if (run !== null) run.evidence = 'unknown';
     await failReservationQuietly();
     if (claimedApproval) {
       await failClaimedApproval({
@@ -1050,6 +1516,66 @@ async function dispatchToolInner(input: {
     };
   };
 
+  /**
+   * §5.3.2 / §5.6.4 (SC04) — `beforeHandler`, imediatamente antes do handler.
+   *
+   * ESTE é o ponto, e não outro, por três razões:
+   *
+   *  1. Ele é o limite do EFEITO. Tudo o que veio antes (grant, regras,
+   *     aprovação, reserva) só decidiu se a chamada PODE rodar; aqui o journal
+   *     grava `handler_started` com o `reservation_token` REAL da reserva de
+   *     idempotência e com o UUID/token da aprovação. O §5.6.4 exige que o
+   *     marcador exista ANTES da chamada física — depois, "não começou" e "pode
+   *     ter começado" deixariam de ser distinguíveis.
+   *  2. Os três tokens protegem coisas DIFERENTES: o `dispatch_token` protege a
+   *     chamada, o `reservation_token` protege a reserva de idempotência e o
+   *     claim protege a evidência humana. Nenhum substitui o outro, e é por
+   *     isso que os três são persistidos juntos.
+   *  3. Falha aqui é RECUSA, não erro tolerável: o hook é fail-closed. Se o
+   *     marcador não foi gravado, o handler NÃO começa — começar sem o journal
+   *     saber é fabricar `effect_unknown` de propósito.
+   *
+   * O intervalo entre o COMMIT do marcador e a chamada física NÃO é resolvido
+   * aqui, e não se finge resolver: é o limite que o §5.6.4 nomeia (segurar TX
+   * durante I/O externo não é opção). O que existe é a rechecagem de posse e
+   * prazo logo acima, e a evidência `possible` gravada pelo marcador.
+   */
+  if (run !== null) {
+    try {
+      await run.control.beforeHandler({
+        reservation_token,
+        approval_request_id: claimedApproval?.request.id ?? null,
+        approval_claim_token: claimedApproval?.claim_token ?? null,
+      });
+      run.reservation_token = reservation_token;
+      run.handler_started_at = new Date().toISOString();
+      // O marcador já elevou `effect_evidence` para `possible` nas classes com
+      // efeito; registrar aqui mantém o receipt alinhado com o journal.
+      if (classifyToolCancellation(tool.effect_class).outcome === 'effect_unknown') {
+        run.evidence = 'possible';
+      }
+    } catch (err) {
+      const podeTerComecado =
+        err instanceof BeforeHandlerError ? err.handler_may_have_started : true;
+      flags.journal_unavailable = { handler_may_have_started: podeTerComecado };
+      // O handler NÃO começou (recusa tipada) → a reserva é ABANDONADA, não
+      // marcada 'failed': 'failed' é terminal e negaria serviço ao dono
+      // legítimo por uma execução que não existiu. Na dúvida (exceção de
+      // persistência), a reserva vira 'failed' e o efeito é `unknown`.
+      if (podeTerComecado) {
+        await failReservationQuietly();
+      } else {
+        await abandonReservationQuietly();
+      }
+      await releaseClaimIfHeld();
+      logger.error(
+        { err, tool: tool.name, handler_may_have_started: podeTerComecado, ops_alert: true },
+        'tool.before_handler_refused',
+      );
+      return { error: 'journal_unavailable', details: { tool: tool.name } };
+    }
+  }
+
   let result: unknown;
   try {
     // Issue #535 — span `handler.execute`, o quarto portão e a ÚNICA linha
@@ -1085,6 +1611,28 @@ async function dispatchToolInner(input: {
     // distinção que importa e ainda contaria um cancelamento deliberado no
     // numerador do error rate.
     if (turnOwnershipLost()) return await settleCancelledAfterStart('signal_aborted');
+    /**
+     * §5.6.2 / ADR-11 (SC04) — o handler LANÇOU depois do marcador.
+     *
+     * A posse NÃO foi perdida: o que existe é um efeito de desfecho
+     * desconhecido. Tratar isto como `execution_failed` genérico convida
+     * exatamente o retry que a ADR-11 proíbe — a tool pode ter emitido o boleto
+     * e falhado ao gravar o retorno —, e a evidência do receipt pararia em
+     * `possible` quando o honesto é `unknown`.
+     *
+     * A régua é a da CLASSE, não a da exceção: `abort_safe` (leitura, MCP
+     * read-only) segue pelo desfecho legado — nada a reconciliar —, enquanto
+     * quem CARREGA efeito termina em `effect_unknown`, com a mesma trilha de
+     * auditoria do cancelamento e a reserva marcada `failed` (o que também
+     * fecha a porta do re-run silencioso no ledger).
+     */
+    if (
+      run !== null &&
+      run.handler_started_at !== null &&
+      classifyToolCancellation(tool.effect_class).outcome === 'effect_unknown'
+    ) {
+      return await settleCancelledAfterStart('handler_threw');
+    }
     // Mark the reservation 'failed' (B3) so a higher-level retry doesn't
     // get stuck waiting, and the same key isn't silently re-run while the
     // failed marker stands.
@@ -1178,6 +1726,25 @@ async function dispatchToolInner(input: {
         resultado: out.data,
         reservation_token,
       });
+  /**
+   * §5.3.2 (SC04/AC07) — `committed` SÓ com a prova gravada.
+   *
+   * A prova é a própria completion: o `in_progress → completed` da reserva de
+   * idempotência — e, no caminho de efeito externo, a linha de outbox que a
+   * MESMA transação inseriu (`markCompletedWithEffect`). Sem isso, o receipt
+   * afirmaria efeito a partir de uma resposta de handler, que é exatamente o
+   * que não é prova: o handler pode ter emitido o efeito e falhado ao gravar, ou
+   * ter devolvido sucesso sem ter emitido nada.
+   *
+   * Uma completion FENCED (abaixo) NÃO grava prova — e por isso NÃO marca
+   * `committed`; a evidência vai para `unknown`, que não regride.
+   */
+  if (completed && run !== null) {
+    run.evidence =
+      classifyToolCancellation(tool.effect_class).outcome === 'effect_unknown'
+        ? 'committed'
+        : 'none';
+  }
   if (!completed) {
     // Fenced out (B2): our lease expired and another worker reclaimed the
     // reservation while our handler was still running. We do NOT cache our
@@ -1198,6 +1765,9 @@ async function dispatchToolInner(input: {
     // tem classificação —, mas o rastro de reconciliação é o mesmo, senão um
     // efeito possivelmente consumado ficaria sem linha para reconciliar.
     const fencedVerdict = classifyToolCancellation(tool.effect_class);
+    // O handler rodou inteiro e o resultado não virou o cache autoritativo:
+    // "houve efeito?" segue sem resposta — `unknown`, e nunca para baixo.
+    if (run !== null && fencedVerdict.outcome === 'effect_unknown') run.evidence = 'unknown';
     if (fencedVerdict.outcome === 'effect_unknown') {
       const fencedTurn = getTurnExecutionContext();
       incCounter('maia_tool_effect_unknown_total', {
