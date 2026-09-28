@@ -546,6 +546,17 @@ export async function claimExecutableApproval(input: {
      * comprometido ao perdedor sem rodar handler. Devolver a evidência aqui não
      * cria segundo efeito; o que ela não pode fazer é escolher "pending" por
      * relógio, que é exatamente o defeito que o AC04 proíbe.
+     *
+     * E existe um caso em que a devolução é simplesmente ERRADA, porque não há
+     * journal nenhum a consultar: o caminho LEGADO (`dispatchTool`,
+     * `run === null`), que é o que roda em produção neste SHA e não abre call em
+     * `engine_tool_calls`. Ali `handler_started` e os dois sinais de vitalidade
+     * são falsos por ausência de FONTE, enquanto o dono do claim pode estar vivo
+     * dentro do handler — e devolver entregava a mesma autorização a dois
+     * executores (o QA-P6/F3). A política responde `hold` nesse caso: sem prova
+     * positiva, a evidência não circula. É a resposta que a base já dava, por
+     * outro motivo (lá `claimed` nunca devolvia), e a única segura aqui — um
+     * claim preso se resolve com decisão humana; um efeito duplicado, não.
      */
     const recuperacao = await recoverClaimedApproval({ request: open });
     if (recuperacao === 'execution_failed') return { outcome: 'none' };
@@ -749,7 +760,13 @@ export async function recoverClaimedApproval(input: {
   // token (CHECK da migration 095), e é ele que o CAS exige.
   if (request.status !== 'claimed' || request.claim_token === null) return 'held';
 
-  let journal: ApprovalClaimJournal = { handler_started: false, effect_class: null };
+  let journal: ApprovalClaimJournal = {
+    handler_started: false,
+    effect_class: null,
+    // Sem leitura NÃO existe journal: o default é o vazio explícito, e a
+    // política o trata como "não há prova de não início" (segura o claim).
+    journal_call_linked: false,
+  };
   /**
    * A VITALIDADE do executor (§5.5.1): os dois sinais que o status do pedido não
    * carrega — o fence do turno ainda autoriza esta tentativa a cruzar o marcador
@@ -785,6 +802,7 @@ export async function recoverClaimedApproval(input: {
     approval_status: request.status,
     handler_started: journal.handler_started,
     effect_class: journal.effect_class,
+    journal_call_linked: journal.journal_call_linked,
     start_uncertain,
     can_still_start: liveness.can_still_start,
     execution_in_flight: liveness.execution_in_flight,

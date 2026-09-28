@@ -274,9 +274,24 @@ export function classifyRecovery(s: RecoverySnapshotV1): RecoveryDisposition {
  *    (caso 7) — e leva a `execution_failed`.
  *
  * Quando a lease vence e a reserva cai, a evidência volta a circular pela regra
- * 5 (prova de não início) ou é fechada pela 7 (início sem prova de não efeito).
+ * 6 (prova de não início) ou é fechada pela 8 (início sem prova de não efeito).
  * A idade do pedido continua não decidindo nada: quem decide é o fence do turno
  * ou a reserva do efeito — nunca o relógio do pedido.
+ *
+ * ─── E há um SEXTO campo: o journal pode NÃO TER O QUE DIZER ────────────────
+ *
+ * Os cinco campos acima pressupõem que existe journal para o pedido. O caminho
+ * LEGADO (`dispatchTool`, `run === null`, o que roda em produção neste SHA) não
+ * abre call nenhuma: o pedido vive só no `approval_requests`. Ali
+ * `handler_started` e os dois sinais de vitalidade são falsos por AUSÊNCIA DE
+ * FONTE, não por observação — e ler esse vazio como "ninguém começou" devolvia a
+ * autorização de um executor VIVO no handler (o QA-P6/F3, que terminava com a
+ * MESMA aprovação autorizando dois efeitos).
+ *
+ * Por isso `journal_call_linked` é o campo que a política consulta ANTES de
+ * aceitar qualquer resposta negativa: sem call ligada ao pedido, "não há prova"
+ * — e sem prova a evidência é SEGURADA (regra 5), nunca devolvida. Devolver uma
+ * evidência que pode ter dono vivo é o único erro irreversível aqui.
  *
  * ─── A mesma regra vive no banco ────────────────────────────────────────────
  *
@@ -298,6 +313,17 @@ export interface ApprovalClaimSnapshotV1 {
   handler_started: boolean;
   /** `engine_tool_calls.effect_class` da call que carrega o pedido. */
   effect_class: string | null;
+  /**
+   * O journal TEM ao menos uma call carregando este pedido.
+   *
+   * Sem esta resposta, todo o resto do instantâneo é ambíguo: `handler_started`
+   * falso e os dois sinais de vitalidade falsos podem significar "ninguém
+   * começou e ninguém pode começar" OU "não há journal para este pedido" — e o
+   * caminho LEGADO (`dispatchTool`, `run === null`, o que roda em produção
+   * neste SHA) é o segundo caso, com um executor VIVO no handler. `false` ⇒
+   * não há prova de não início ⇒ segurar.
+   */
+  journal_call_linked: boolean;
   /** O instantâneo do journal NÃO pôde ser lido — "não começou" não é prova. */
   start_uncertain: boolean;
   /**
@@ -326,7 +352,7 @@ export function classifyApprovalClaimRecovery(
 
   // 3. SEM carimbo, mas com o dono ainda autorizado a começar: não é prova de
   //    não início — é a corrida do QA-P4. A evidência é SEGURADA até que o dono
-  //    cruze o marcador (aí a regra 4 assume) ou perca o fence (aí a regra 5
+  //    cruze o marcador (aí a regra 4 assume) ou perca o fence (aí a regra 6
   //    prova o não início de verdade).
   if (!s.handler_started && s.can_still_start) return "hold";
 
@@ -335,16 +361,34 @@ export function classifyApprovalClaimRecovery(
   //    `execution_failed` sobre um efeito que está acontecendo — o P5 do QA.
   if (s.handler_started && s.execution_in_flight) return "hold";
 
-  // 5. PROVA de não início: nenhuma call deste pedido tem carimbo de início, e o
-  //    fence que autorizaria uma a cruzar o marcador já não vale.
+  // 5. SEM carimbo e SEM journal: não há fonte, não há prova.
+  //
+  //    Esta é a regra que o F3 da rodada 3 do QA obrigou a existir. Quando o
+  //    pedido não tem NENHUMA call que o carregue, `handler_started` e os dois
+  //    sinais de vitalidade são falsos por AUSÊNCIA DE FONTE — não porque algo
+  //    foi observado. O caminho LEGADO (`dispatchTool`, `run === null`) é
+  //    exatamente isso: o pedido existe, o journal não o conhece, e o dono pode
+  //    estar VIVO dentro do handler. Devolver aqui (a regra 6 abaixo) entregava
+  //    a autorização de um efeito em curso ao turno concorrente, e a MESMA
+  //    aprovação acabava autorizando dois efeitos (o QA-P6).
+  //
+  //    `hold` é a resposta que a base já dava por outro motivo (lá `claimed`
+  //    nunca devolvia): sem prova positiva, a evidência não circula. Ela também
+  //    é a resposta SEGURA em toda a família: um claim preso é recuperável por
+  //    decisão humana; um efeito duplicado não é.
+  if (!s.handler_started && !s.journal_call_linked) return "hold";
+
+  // 6. PROVA de não início: existe call do pedido no journal, nenhuma delas tem
+  //    carimbo de início, e o fence que autorizaria uma a cruzar o marcador já
+  //    não vale. Aqui a ausência do carimbo é um FATO LIDO, não um vazio.
   if (!s.handler_started) return "release_claim";
 
-  // 6. Carimbo existe, mas a classe declara AUSÊNCIA de efeito
+  // 7. Carimbo existe, mas a classe declara AUSÊNCIA de efeito
   //    (`abort_safe` em `classifyToolCancellation`): não há efeito a reconciliar,
   //    e segurar a evidência aqui prenderia o claim para sempre.
   if (s.effect_class === "abort_safe") return "release_claim";
 
-  // 7. Início (ou carimbo de classe com efeito): TERMINAL. Nova execução exige
+  // 8. Início (ou carimbo de classe com efeito): TERMINAL. Nova execução exige
   //    NOVA aprovação humana — o INV-09 não admite retomada automática.
   return "execution_failed";
 }

@@ -33,10 +33,20 @@ const OPEN_STATUSES: ApprovalStatus[] = ['pending', 'approved', 'claimed'];
  * recovery do claim consome. Contagens e uma classe, não conteúdo de chamada: a
  * decisão não precisa saber QUAL operação foi tentada, só se algo pode ter
  * começado no mundo.
+ *
+ * `journal_call_linked` não é uma contagem a mais, é a diferença entre LER e
+ * NÃO TER ONDE LER. Todo o resto do instantâneo é respondido por linhas de
+ * `engine_tool_calls` do pedido: sem nenhuma linha, `handler_started` e os dois
+ * sinais de vitalidade são falsos por AUSÊNCIA DE FONTE, não por ausência de
+ * início — e o caminho LEGADO (`dispatchTool`, `run === null`, o que roda em
+ * produção) é exatamente esse caso. Quem decide precisa saber que o journal não
+ * tem o que dizer.
  */
 export interface ApprovalClaimJournal {
   handler_started: boolean;
   effect_class: string | null;
+  /** Existe ao menos UMA call do journal carregando este `approval_request_id`. */
+  journal_call_linked: boolean;
 }
 
 function scope() {
@@ -249,6 +259,14 @@ export const approvalRequestsRepo = {
    *     Qualquer outra coisa — inclusive classe nula, que é "não sei" — sai
    *     como a classe observada, e a política trata o resto como terminal.
    *
+   *   * `journal_call_linked` — existe ALGUMA call deste pedido? É a pergunta
+   *     anterior a todas as outras, e a única que a ausência total de linhas
+   *     responde. No caminho LEGADO (`dispatchTool`, `run === null`) o pedido
+   *     vive só no `approval_requests` e o journal não tem linha nenhuma para
+   *     ele; sem esta resposta, "não há call carimbada" seria lido como prova
+   *     de não início e a evidência de um executor VIVO voltaria a circular
+   *     (o QA-P6/F3).
+   *
    * ─── O que esta leitura NÃO é ───────────────────────────────────────────────
    *
    * Não é reconciliação e não decide nada: devolve contagens, sem o conteúdo de
@@ -259,6 +277,7 @@ export const approvalRequestsRepo = {
     const { tenant_id, agent_id } = scope();
     const rows = await db
       .select({
+        chamadas: sql<string>`count(*)`,
         iniciadas: sql<string>`count(*) FILTER (WHERE ${engine_tool_calls.handler_started_at} IS NOT NULL)`,
         com_efeito: sql<string>`count(*) FILTER (WHERE ${engine_tool_calls.handler_started_at} IS NOT NULL
           AND ${engine_tool_calls.effect_class} IS DISTINCT FROM 'abort_safe')`,
@@ -275,13 +294,17 @@ export const approvalRequestsRepo = {
         ),
       );
     const linha = rows[0];
+    // A PRIMEIRA resposta é se o journal tem o que dizer sobre este pedido. Ela
+    // entra em TODOS os ramos: sem call ligada, "não começou" não é um fato
+    // observado, é um vazio — e a política não troca um vazio por prova.
+    const journal_call_linked = Number(linha?.chamadas ?? 0) > 0;
     if (Number(linha?.iniciadas ?? 0) === 0) {
-      return { handler_started: false, effect_class: null };
+      return { journal_call_linked, handler_started: false, effect_class: null };
     }
     if (Number(linha?.com_efeito ?? 0) === 0) {
-      return { handler_started: true, effect_class: 'abort_safe' };
+      return { journal_call_linked, handler_started: true, effect_class: 'abort_safe' };
     }
-    return { handler_started: true, effect_class: linha?.classe ?? null };
+    return { journal_call_linked, handler_started: true, effect_class: linha?.classe ?? null };
   },
 
   /**
