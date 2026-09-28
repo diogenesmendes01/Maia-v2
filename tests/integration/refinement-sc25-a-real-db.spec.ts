@@ -25,11 +25,14 @@
  * ─── Tier dos doubles, declarado ───────────────────────────────────────────
  *
  * O provider é stub de loopback (não é modelo). O cliente de inferência é o
- * `AIAgent` REAL do checkout pinado quando `MAIA_HERMES_WORKER_PYTHON`/
- * `MAIA_HERMES_UPSTREAM` estão presentes; sem eles, o cenário ponta a ponta
- * PULA e aparece como pulado no relatório. Nenhuma alegria de integração com
- * doubles é reportada: os cenários de ledger usam o repositório real e leem
- * rows; os cenários que usam double dizem QUAL fronteira foi dobrada.
+ * `AIAgent` REAL do checkout pinado: `HERMES_PIN_PYTHON`/`HERMES_PIN_UPSTREAM`
+ * (o que o CI provisiona para ESTA lane) ou, no dev local, os equivalentes
+ * `MAIA_HERMES_WORKER_PYTHON`/`MAIA_HERMES_UPSTREAM`. O pin é OBRIGATÓRIO aqui:
+ * a lane reprova com `--max-pulados 0`, e `describe.skip` condicionado a
+ * ambiente que o job não define é verde vazio permanente — então a ausência do
+ * pin FALHA com mensagem, não pula. Nenhuma alegria de integração com doubles é
+ * reportada: os cenários de ledger usam o repositório real e leem rows; os
+ * cenários que usam double dizem QUAL fronteira foi dobrada.
  *
  * Skipped sem `TEST_DB_URL` (padrão das fatias de DB real).
  */
@@ -64,8 +67,13 @@ const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
 const d = SHOULD_RUN ? describe : describe.skip;
 
-const PYTHON = process.env.MAIA_HERMES_WORKER_PYTHON;
-const UPSTREAM = process.env.MAIA_HERMES_UPSTREAM;
+/**
+ * Checkout pinado do Hermes. O CI desta lane provisiona `HERMES_PIN_*` no passo
+ * `Provision the real Hermes pin`; o dev local usa `MAIA_HERMES_*`. Nenhum dos
+ * dois vira `describe.skip` — ver o `beforeAll` do bloco pinado.
+ */
+const PYTHON = process.env.HERMES_PIN_PYTHON ?? process.env.MAIA_HERMES_WORKER_PYTHON;
+const UPSTREAM = process.env.HERMES_PIN_UPSTREAM ?? process.env.MAIA_HERMES_UPSTREAM;
 const PINS = !!(PYTHON && UPSTREAM);
 
 const HERMES_SHA = '5d59366010640c1d6b8f170d8a4ee109db2bbdef';
@@ -679,7 +687,20 @@ d('SC25-A — grant relay restrito e captura SDK pinado (DB real)', () => {
 
   // ═══ AC06/AC02/D09 — o cliente PINADO contra relay+stub com ledger real ══
 
-  (PINS ? describe : describe.skip)('cliente Hermes pinado (AIAgent real do SHA 5d59366)', () => {
+  describe('cliente Hermes pinado (AIAgent real do SHA 5d59366)', () => {
+    // Ausência do pin aqui é FALHA declarada, não `skip`: esta lane roda com
+    // `--max-pulados 0`, e um skip condicionado a ambiente que o job não define
+    // seria verde vazio permanente (PR #766 — mesmo defeito da lane de fault
+    // injection). O pin vem do CI (`HERMES_PIN_*`) ou do dev local
+    // (`MAIA_HERMES_*`).
+    beforeAll(() => {
+      if (!PINS) {
+        throw new Error(
+          'checkout pinado do Hermes ausente: defina HERMES_PIN_PYTHON/HERMES_PIN_UPSTREAM (CI) ou MAIA_HERMES_WORKER_PYTHON/MAIA_HERMES_UPSTREAM (dev local)',
+        );
+      }
+    });
+
     const HOME_ROOT = mkdtempSync(join(tmpdir(), 'maia-hermes-sc25a-'));
     afterAll(() => rmSync(HOME_ROOT, { recursive: true, force: true }));
 
