@@ -159,7 +159,11 @@ vi.mock('../../src/db/client.js', () => {
     limit: () => Promise.resolve(dbState.conversaResult),
   };
   return {
-    db: { select: () => fakeQuery },
+    // `execute` devolve zero linhas: é assim que estes casos declaram que o
+    // turno NÃO tem motor fixado nem run em voo, que é o estado real de todos
+    // eles. Sem isso, a consulta de rota (spec §5.2) morre antes da falha de
+    // transporte que cada caso quer observar.
+    db: { select: () => fakeQuery, execute: () => Promise.resolve({ rows: [] }) },
     withTx: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn({})),
   };
 });
@@ -167,8 +171,25 @@ vi.mock('../../src/db/schema.js', () => ({
   conversas: {},
   pessoas: {},
   mensagens: { metadata: {}, id: {} },
+  // Tabelas que `engine-repos.ts` referencia. Entram como stubs porque o
+  // `core.ts` passou a consultar o estado de motor do turno depois do claim.
+  agent_turns: {},
+  conversation_controls: {},
+  engine_run_events: {},
+  engine_runs: {},
+  engine_tool_calls: {},
+  engine_turn_bindings: {},
+  outbound_messages: {},
 }));
-vi.mock('drizzle-orm', () => ({ eq: () => ({}) }));
+// `sql` entra aqui porque o `core.ts` passou a consultar o estado de motor do
+// turno logo depois do claim (`routeExistingEngineRun`, spec §5.2), e
+// `engine-repos.ts` monta as consultas dele com o template tag do drizzle.
+// Sem o stub, o mock parcial derruba o turno com "No 'sql' export is defined"
+// ANTES da falha de transporte que cada caso abaixo quer observar.
+vi.mock('drizzle-orm', () => ({
+  eq: () => ({}),
+  sql: Object.assign(() => ({}), { raw: () => ({}), join: () => ({}) }),
+}));
 vi.mock('../../src/governance/audit.js', () => ({ audit }));
 vi.mock('../../src/lib/logger.js', () => ({
   logger: { info: vi.fn(), warn: vi.fn(), debug: vi.fn(), error: vi.fn() },

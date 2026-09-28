@@ -50,6 +50,10 @@ import { runSkill } from '@/skills/index.js';
 import { skillsRepo, outboundMessagesRepo } from '@/db/repositories.js';
 import { runReActLoop, type ReActDelivery } from './react-loop.js';
 import { decideTurnAction } from './turn-outcome.js';
+import {
+  routeExistingEngineRun,
+  decideRouteTurnAction,
+} from '@/runtime/engines/route-existing-run.js';
 // Issue #503 — máquina de estados durável do turno inbound. `core.ts` declara o
 // OUTCOME de negócio; a fachada escolhe o estado terminal e faz o CAS.
 import {
@@ -712,15 +716,83 @@ async function runAgentForMensagemInner(
   const comEscopoDeSaida = <T>(fn: () => Promise<T>): Promise<T> =>
     turn ? runWithOutboundTurnScope(turn, fn) : fn();
 
+  /**
+   * SEGUNDO SEAM do §5.2 — a rota antes do pipeline.
+   *
+   * A pergunta "este turno já tem run em voo?" é feita AQUI, e não lá embaixo
+   * na altura do reasoner, por uma razão só: um recovery que descobre o ledger
+   * na linha do motor já reexecutou pendências, procedures e skills — e parte
+   * disso commita efeito. Depois não adianta saber.
+   *
+   * Hoje isto é um no-op observável: nada chama `pinEngineAndPrepareRun` ainda,
+   * então todo turno responde `no_binding` e segue o caminho de sempre. O seam
+   * existe para que, quando o pin passar a ser escrito, o recovery não precise
+   * ser reescrito junto — que é o que torna a mudança seguinte pequena em vez
+   * de arriscada.
+   */
+  const comRotaDeMotor = async (): Promise<void> => {
+    if (turn === null) {
+      return runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
+    }
+    // Import TARDIO do repositório, e de propósito. `engine-repos.ts` arrasta
+    // `drizzle-orm` para o grafo de quem o importa; estaticamente aqui, ele
+    // entraria no grafo de TODO caller do `core.ts`. O módulo de rota
+    // (`routeExistingEngineRun`) é puro e continua no import de cima — o que
+    // chega tarde é só o acesso ao banco, que só o turno com handle usa.
+    const { engineRunsRepo } = await import('@/db/repositories/engine-repos.js');
+    const rota = routeExistingEngineRun(
+      await engineRunsRepo.findTurnEngineState({ turn_id: turn.turn_id }),
+    );
+    if (rota.kind === 'run_pipeline') {
+      return runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn });
+    }
+    // Não reexecuta. O run está no journal e quem o retoma é o caminho de
+    // manutenção (`engineRunsRepo.listDueRuns`), que sabe tomar o fence dele —
+    // coisa que este call site, com uma leitura otimista na mão, não sabe.
+    logger.warn(
+      {
+        mensagem_id,
+        turn_id: turn.turn_id,
+        run_id: rota.run.id,
+        run_phase: rota.run.phase,
+        route: rota.kind,
+        reason: rota.reason,
+        ops_alert: rota.kind === 'await_operator',
+      },
+      'agent.turn_pipeline_skipped_existing_engine_run',
+    );
+    /**
+     * E o turno RECEBE desfecho. Sair daqui sem tocar no estado deixaria o
+     * turno em `claimed`/`running` — ambos recuperáveis —, e o recovery o
+     * rearmaria para cair nesta mesma recusa, sem contar tentativa e sem
+     * nunca terminar. A regra de para onde ele vai é pura e mora junto da
+     * rota (`decideRouteTurnAction`); aqui só se aplica, com o fence na mão.
+     */
+    const desfecho = decideRouteTurnAction(rota);
+    if (desfecho.kind === 'retry') {
+      await failTurnRetryable(turn, { code: desfecho.code, mensagem_id });
+      return;
+    }
+    if (desfecho.kind === 'dead_letter') {
+      logger.error(
+        {
+          mensagem_id,
+          turn_id: turn.turn_id,
+          run_id: rota.run.id,
+          error_code: desfecho.code,
+          ops_alert: true,
+        },
+        'agent.turn_unsafe_to_retry',
+      );
+      await deadLetterTurn(turn, { code: desfecho.code, outcome: desfecho.outcome });
+    }
+  };
+
   try {
     if (!execCtx) {
-      return await comEscopoDeSaida(() =>
-        runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn }),
-      );
+      return await comEscopoDeSaida(() => comRotaDeMotor());
     }
-    return await runWithTurnExecution(execCtx, () =>
-      comEscopoDeSaida(() => runAgentTurnPipeline({ mensagem_id, channel_id, inbound, turn })),
-    );
+    return await runWithTurnExecution(execCtx, () => comEscopoDeSaida(() => comRotaDeMotor()));
   } catch (err) {
     if (err instanceof TurnOwnershipLostError) {
       logger.warn(

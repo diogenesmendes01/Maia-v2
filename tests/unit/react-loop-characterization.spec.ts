@@ -57,10 +57,7 @@ import type { Pessoa, Conversa, Mensagem } from '@/db/schema.js';
 import type { LLMMessage, LLMResponse } from '@/lib/llm/types.js';
 import type { RunReActLoopParams, ReActLoopResult } from '@/agent/react-loop.js';
 import type { TurnExecutionContext } from '@/runtime/turns/claim.js';
-import {
-  runWithTurnExecution,
-  TurnOwnershipLostError,
-} from '@/runtime/turns/execution-context.js';
+import { runWithTurnExecution, TurnOwnershipLostError } from '@/runtime/turns/execution-context.js';
 import { currentEgressAuthorization } from '@/runtime/outbound/egress-guard.js';
 
 // ─── Dublês ──────────────────────────────────────────────────────────────────
@@ -127,7 +124,7 @@ vi.mock('@/cognition/persister.js', () => ({ persistCandidate: h.persistCandidat
  * `react-loop.ts:672`.
  */
 vi.mock('@/observability/instrumentation.js', () => ({
-  instrumentReactIteration: <T,>(iteration: number, fn: () => Promise<T>): Promise<T> => {
+  instrumentReactIteration: <T>(iteration: number, fn: () => Promise<T>): Promise<T> => {
     h.spansDeIteracao.push(iteration);
     return fn();
   },
@@ -1180,31 +1177,27 @@ describe('§5.1.1 — sumários de tool, auditoria e flush sem outbound', () => 
 // explicitamente"
 // ─────────────────────────────────────────────────────────────────────────────
 
-describe('§5.1.1 — DISCREPÂNCIA: toolSummaries não chega a safeDispatchOutput', () => {
-  it('o objeto de dispatch NÃO carrega toolSummaries (comportamento ATUAL, defeituoso)', async () => {
+describe('§5.1.1 — CORRIGIDO: toolSummaries chega a safeDispatchOutput', () => {
+  it('o objeto de dispatch carrega toolSummaries (correção deliberada da extração)', async () => {
     /**
-     * ⚠️ ESTE CASO PINA UM DEFEITO, DE PROPÓSITO.
+     * ESTE CASO ERA O INVERSO E PINAVA UM DEFEITO, DE PROPÓSITO.
      *
-     * `react-loop.ts:380-390` monta o ctx com exatamente nove campos —
-     * `pessoa, conversa, inbound, jid, text, latestPending, latestReportPdf,
-     * turnHasSensitive, sensitiveTools` — e NÃO inclui `toolSummaries`, embora
-     * o acumulador exista desde `:243` e `DispatchOutputCtx.toolSummaries` seja
-     * opcional (`output-dispatch.ts:116`) e lido em `dispatchOutput` por
-     * `ctx.toolSummaries ?? []` (`output-dispatch.ts:628`), indo para
-     * `ferramentas_chamadas` em TODOS os ramos.
+     * A versão anterior afirmava que `toolSummaries` NÃO chegava a
+     * `safeDispatchOutput`, e o comentário dela dizia o que fazer quando a
+     * extração chegasse: "a correção é INTENCIONAL na extração, e quando ela
+     * vier este caso fica vermelho e vira um diff deliberado de uma linha —
+     * que é exatamente o sinal que §5.10.3 pede".
      *
-     * Consequência: no caminho normal do ReAct (rodou tools E respondeu), a row
-     * de saída persiste `ferramentas_chamadas: []`, e o bloco "## Eventos
-     * confirmados pelo backend" do turno seguinte fica hidratado só pela row do
-     * flush — que, por definição, só existe quando NÃO houve resposta. Um turno
-     * que roda tools e responde perde o anchor anti-anchoring.
+     * A extração chegou. O laço não monta mais o ctx de saída: quem monta é o
+     * `MaiaOutputCoordinator` (`@/runtime/engines/coordinator.js`), e ele passa
+     * `toolSummaries` sempre.
      *
-     * §5.1.1 é explícita: "Transmiti-lo na extração é uma correção observável,
-     * a isolar em teste/nota de compatibilidade; não afirmar que já funciona."
-     * Então a correção é INTENCIONAL na extração, e quando ela vier este caso
-     * fica vermelho e vira um diff deliberado de uma linha — que é exatamente o
-     * sinal que §5.10.3 pede ("Marcar correção de sumários como mudança
-     * intencional").
+     * O defeito que isto fecha: no caminho normal do ReAct — rodou tools E
+     * respondeu — a row de saída persistia `ferramentas_chamadas: []`, e o
+     * bloco "## Eventos confirmados pelo backend" do turno SEGUINTE ficava
+     * hidratado só pela row do flush, que por definição só existe quando NÃO
+     * houve resposta. Um turno que rodava tools e respondia perdia o anchor
+     * anti-anchoring.
      */
     h.registry.minha_tool = { side_effect: 'write' };
     h.dispatchTool.mockResolvedValue({ ok: true });
@@ -1222,12 +1215,14 @@ describe('§5.1.1 — DISCREPÂNCIA: toolSummaries não chega a safeDispatchOutp
       'pessoa',
       'sensitiveTools',
       'text',
+      'toolSummaries',
       'turnHasSensitive',
     ]);
-    expect(Object.keys(ctx)).not.toContain('toolSummaries');
-    expect(ctx.toolSummaries).toBeUndefined();
-    // E o outro sumidouro fica travado junto: como houve outbound, o flush não
-    // roda, então NENHUM dos dois destinos recebeu os sumários deste turno.
+    // O sumário da tool que rodou neste turno vai junto, com o id da chamada.
+    expect(ctx.toolSummaries).toHaveLength(1);
+    expect((ctx.toolSummaries as Array<{ tool_name: string }>)[0]?.tool_name).toBe('minha_tool');
+    // O outro destino continua travado: como houve outbound, o flush não roda.
+    // A diferença é que agora os sumários chegaram pelo PRIMEIRO destino.
     expect(r.delivery.dispatched).toBe(true);
     expect(h.mensagensCreate).not.toHaveBeenCalled();
   });
