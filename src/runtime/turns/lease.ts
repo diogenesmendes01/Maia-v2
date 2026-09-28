@@ -19,7 +19,9 @@ import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import {
   assertLeaseTiming,
   turnWorkerId,
+  leaseQueryTimeoutMs,
   MAX_HEARTBEAT_FAILURES,
+  UnsafeLeaseTimingError,
   type ClaimResult,
   type LeaseLossReason,
   type StreamBlockedReason,
@@ -44,32 +46,105 @@ export function turnClaimEnabled(): boolean {
  * POSSE VIVA de um turno. Enquanto este objeto está `alive`, o processo é o
  * dono da tentativa e pode gravar com o `claim_token`.
  *
- * O ciclo de vida é explícito de propósito — `stop()` em todo caminho de saída.
- * Ainda assim o timer é AUTO-LIMITADO: a renovação exige status gravável e
- * lease viva, então um `stop()` esquecido morre sozinho na primeira batida
- * depois de o turno virar terminal. Um vazamento vira, no pior caso, uma
- * consulta a cada `TURN_LEASE_HEARTBEAT_MS` até o turno acabar — nunca um timer
- * imortal.
+ * O ciclo de vida é explícito de propósito — `stop()`/`settle()`/`release()` em
+ * todo caminho de saída. Ainda assim o loop é AUTO-LIMITADO: a renovação exige
+ * status gravável e lease viva, então um `stop()` esquecido morre sozinho na
+ * primeira batida depois de o turno virar terminal. Um vazamento vira, no pior
+ * caso, uma consulta a cada `TURN_LEASE_HEARTBEAT_MS` até o turno acabar —
+ * nunca um timer imortal.
+ *
+ * ─── SC07 (§5.8.1): o loop é SERIAL, não um `setInterval` ────────────────────
+ *
+ * `setInterval` + `void this.#beat()` agenda a batida seguinte pelo RELÓGIO, não
+ * pela conclusão da anterior: com uma renovação mais lenta que o intervalo, duas
+ * (ou N) consultas convivem na mesma connection pool e chegam ao banco fora de
+ * ordem — a resposta atrasada de uma reescreve `#leaseExpiresAt` com um
+ * vencimento mais VELHO que o da batida mais recente, e o horizonte anda para
+ * trás. Aqui cada batida é agendada no `finally` da anterior (`#armar`), o que
+ * torna a sobreposição impossível por construção (uma única em voo, sempre).
+ *
+ * O tempo da consulta é limitado no SERVIDOR (`statement_timeout` via
+ * `renewTurnLease`), nunca por `Promise.race`: abandonar a promessa deixaria a
+ * consulta rodando e o timer agendaria a próxima por cima dela — precisamente a
+ * sobreposição que se quer impedir.
  */
 export class TurnLease {
   readonly claim: TurnClaim;
   readonly #abort = new AbortController();
+  /** Timer da PRÓXIMA batida. Só é armado depois de a anterior terminar. */
   #timer: NodeJS.Timeout | null = null;
+  /** A batida em voo, para o encerramento poder AGUARDÁ-LA (`#drenar`). */
+  #inFlight: Promise<void> | null = null;
   #failures = 0;
   #lost: LeaseLossReason | null = null;
   #leaseExpiresAt: Date;
+  /**
+   * O instante (relógio MONOTÔNICO) em que o horizonte da lease vence.
+   *
+   * Ancorado na resposta do BANCO e não no relógio de parede: a margem vem de
+   * `lease_expires_at - heartbeat_at`/`claimed_at`, dois instantes do MESMO
+   * relógio (o do PostgreSQL), e o decorrido é medido por um relógio que não
+   * anda para trás. Um salto de NTP no meio do turno não pode fazer uma lease
+   * saudável parecer vencida — nem uma vencida parecer saudável.
+   */
+  #leaseHorizonMono: number;
+  /** Orçamento ABSOLUTO do run (`agent_turns.deadline_at`), imune à renovação. */
+  readonly #runDeadlineAt: Date | null;
+  readonly #ttl_ms: number;
+  readonly #heartbeat_ms: number;
+  readonly #query_timeout_ms: number;
+  #stopped = false;
+  #onAbort: (() => void) | null = null;
+  readonly #mono: () => number;
 
-  constructor(claim: TurnClaim, opts: { ttl_ms: number; heartbeat_ms: number }) {
+  constructor(
+    claim: TurnClaim,
+    opts: {
+      ttl_ms: number;
+      heartbeat_ms: number;
+      /** Teto da consulta de renovação; default = metade do heartbeat. */
+      query_timeout_ms?: number;
+      /** Relógio monotônico injetável (teste). Default: `performance.now()`. */
+      mono_ms?: () => number;
+    },
+  ) {
     // Defesa em profundidade: a regra cross-field já barra isto no boot, mas um
     // caller programático (teste, script) pode montar valores próprios. Uma
     // lease mal dimensionada não é um bug local — é execução dupla.
     assertLeaseTiming(opts.ttl_ms, opts.heartbeat_ms);
     this.claim = claim;
+    this.#ttl_ms = opts.ttl_ms;
+    this.#heartbeat_ms = opts.heartbeat_ms;
+    this.#mono = opts.mono_ms ?? (() => performance.now());
     this.#leaseExpiresAt = claim.lease_expires_at;
-    this.#timer = setInterval(() => void this.#beat(opts.ttl_ms), opts.heartbeat_ms);
-    // Um heartbeat NUNCA deve segurar o event loop aberto: se o processo não
-    // tem mais nada a fazer, ele deve poder terminar, e a lease vence sozinha.
-    this.#timer.unref?.();
+    this.#runDeadlineAt = claim.deadline_at ?? null;
+    this.#query_timeout_ms = opts.query_timeout_ms ?? leaseQueryTimeoutMs(opts.heartbeat_ms);
+    // FAIL-CLOSED (§5.8.1 AC02): o teto da consulta precisa ser FINITO e MENOR
+    // que o intervalo de batida. `0`/`Infinity`/`>= heartbeat` são o mesmo
+    // defeito em roupas diferentes — nenhum deles limita a renovação a caber
+    // antes da próxima batida, e o "limite" viraria decoração.
+    if (
+      !Number.isFinite(this.#query_timeout_ms) ||
+      this.#query_timeout_ms <= 0 ||
+      this.#query_timeout_ms >= opts.heartbeat_ms
+    ) {
+      throw new UnsafeLeaseTimingError(
+        opts.ttl_ms,
+        opts.heartbeat_ms,
+        `query_timeout_ms=${this.#query_timeout_ms} não é finito e menor que o heartbeat`,
+      );
+    }
+    this.#leaseHorizonMono =
+      this.#mono() + Math.max(0, claim.lease_expires_at.getTime() - claim.claimed_at.getTime());
+    // Parar o loop quando a posse acaba (perda, `stop`, `release`): o listener é
+    // REMOVIDO no encerramento (`#finalizar`) — um `AbortSignal` que vive no ALS
+    // pelo turno inteiro não pode acumular ouvintes por tentativa.
+    this.#onAbort = () => {
+      this.#stopped = true;
+      this.#clearTimer();
+    };
+    this.#abort.signal.addEventListener('abort', this.#onAbort);
+    this.#armar();
   }
 
   /** Sinal de cancelamento da tentativa. Abortado quando a posse é perdida. */
@@ -105,7 +180,30 @@ export class TurnLease {
     // Arrow (e não `const self = this`): ela captura o `this` da lease
     // lexicamente, e o getter do objeto literal — que tem `this` próprio — só
     // precisa chamá-la.
-    const horizonte = (): Date => deadline ?? this.#leaseExpiresAt;
+    //
+    // SC07 (§5.8.1, AC03) — O MENOR DOS TRÊS PRAZOS, não um deles:
+    //
+    //   1. `deadline` do caller, quando existe (o orçamento global do turno,
+    //      #507, entra por aqui);
+    //   2. `deadline_at` do run — ABSOLUTO, vindo do PostgreSQL no claim
+    //      (`TurnClaim.deadline_at`) e IMUNE à renovação. Sem ele, um heartbeat
+    //      saudável empurraria `lease_expires_at` para sempre e o horizonte
+    //      móvel abaixo nunca venceria: o turno não teria fim;
+    //   3. o horizonte VIGENTE da lease, empurrado a cada renovação bem-sucedida.
+    //
+    // `min` e não uma escolha: prometer trabalho para além de QUALQUER um dos
+    // três é mentira — sem lease não há autoridade para escrever, e sem
+    // orçamento o run acabou. A lease pode encolher o prazo do caller (nunca
+    // esticá-lo) e o teto absoluto não se move com renovação nenhuma.
+    const prazoDoCaller = deadline ?? null;
+    const tetoAbsoluto = this.#runDeadlineAt;
+    const horizonteDaLease = (): Date => this.#leaseExpiresAt;
+    const menorPrazo = (): Date => {
+      const candidatos: Date[] = [horizonteDaLease()];
+      if (prazoDoCaller) candidatos.push(prazoDoCaller);
+      if (tetoAbsoluto) candidatos.push(tetoAbsoluto);
+      return candidatos.reduce((a, b) => (a.getTime() <= b.getTime() ? a : b));
+    };
     return {
       tenant_id: this.claim.tenant_id,
       agent_id: this.claim.agent_id,
@@ -126,21 +224,84 @@ export class TurnLease {
       // ferramentas por um prazo que não venceu. Falso `turn_deadline_exceeded`
       // é o mesmo tipo de mentira que a issue fecha, só que na outra direção.
       get deadline(): Date {
-        return horizonte();
+        return menorPrazo();
       },
       signal: this.signal,
     };
   }
 
-  /** Uma batida do heartbeat. Nunca lança — o timer não tem quem o pegue. */
-  async #beat(ttl_ms: number): Promise<void> {
-    if (!this.alive) return;
+  /**
+   * SC07 (§5.8.1) — A BATIDA, agendada no `finally` da anterior.
+   *
+   * `setTimeout` e não `setInterval`: o intervalo do `setInterval` é do relógio,
+   * não da conclusão. Serializar aqui é o que faz "no máximo uma renovação em
+   * voo" ser verdade por construção, e não por sorte de latência.
+   */
+  #armar(): void {
+    if (this.#stopped || !this.alive) return;
+    this.#timer = setTimeout(() => {
+      this.#timer = null;
+      this.#bater();
+    }, this.#heartbeat_ms);
+    // Um heartbeat NUNCA deve segurar o event loop aberto: se o processo não
+    // tem mais nada a fazer, ele deve poder terminar, e a lease vence sozinha.
+    this.#timer.unref?.();
+  }
+
+  /** Dispara UMA batida serializada e rearma o timer só quando ela termina. */
+  #bater(): void {
+    if (this.#stopped || !this.alive) return;
+    const emVoo = this.#batida();
+    this.#inFlight = emVoo;
+    void emVoo.finally(() => {
+      if (this.#inFlight === emVoo) this.#inFlight = null;
+      this.#armar();
+    });
+  }
+
+  /** Milissegundos (monotônicos) até o horizonte da lease vencer. */
+  #margemMono(): number {
+    return this.#leaseHorizonMono - this.#mono();
+  }
+
+  /**
+   * O corpo de uma batida. Nunca lança — o timer não tem quem o pegue.
+   *
+   * A ORDEM das verificações é o contrato:
+   *   1. posse/parada: quem já perdeu ou já parou não renova;
+   *   2. margem esgotada ANTES de tentar: não há renovação possível (§5.8.1,
+   *      "se margem da lease acabou antes de resposta: markLost('expired')");
+   *   3. resposta: margem esgotada DURANTE a espera também é `expired` — e o
+   *      `!renewed.ok` do banco não distingue "tomado" de "vencido", então quem
+   *      tem o relógio da lease na mão decide primeiro;
+   *   4. recusa com lease viva: `token_mismatch` (fomos tomados);
+   *   5. sucesso: zera falhas e empurra o horizonte (móvel E monotônico);
+   *   6. erro/timeout: conta falha, e na SEGUNDA aborta a tentativa — antes do
+   *      vencimento, porque `MAX_HEARTBEAT_FAILURES` é derivado da razão TTL/3.
+   */
+  async #batida(): Promise<void> {
+    if (!this.alive || this.#stopped) return;
+    if (this.#margemMono() <= 0) {
+      this.#lose('expired');
+      return;
+    }
     try {
       const renewed = await agentTurnsRepo.renewTurnLease({
         turn_id: this.claim.turn_id,
         claim_token: this.claim.claim_token,
-        lease_ms: ttl_ms,
+        lease_ms: this.#ttl_ms,
+        statement_timeout_ms: this.#query_timeout_ms,
       });
+      // Encerramento INTENCIONAL durante a consulta (stop/release/CAS terminal,
+      // ou perda detectada por outro caminho): a resposta que chega depois não é
+      // anomalia. Marcá-la aqui produziria `token_mismatch` falso em todo turno
+      // concluído com uma batida em voo — um alarme que só aparece sob sorte de
+      // agendamento é pior que nenhum.
+      if (!this.alive || this.#stopped) return;
+      if (this.#margemMono() <= 0) {
+        this.#lose('expired');
+        return;
+      }
       if (!renewed.ok) {
         // Perdemos a posse. Ou outro worker assumiu depois de a lease vencer,
         // ou o turno já é terminal. Nos dois casos parar é a única reação
@@ -150,10 +311,19 @@ export class TurnLease {
       }
       this.#failures = 0;
       this.#leaseExpiresAt = renewed.lease_expires_at;
+      // Ancoragem (relógio do BANCO → relógio monotônico do processo): a margem
+      // é a diferença entre dois instantes do PostgreSQL, e o decorrido passa a
+      // ser medido por um relógio que não anda para trás. É o que impede um
+      // salto de NTP de esticar — ou encurtar — a posse.
+      this.#leaseHorizonMono =
+        this.#mono() +
+        Math.max(0, renewed.lease_expires_at.getTime() - renewed.heartbeat_at.getTime());
       return;
     } catch (err) {
-      // O banco não respondeu. Isto NÃO é perda de posse ainda — pode ser um
-      // blip — mas o relógio da lease continua correndo do outro lado.
+      // O banco não respondeu (ou o statement foi CANCELADO no teto). Isto NÃO é
+      // perda de posse ainda — pode ser um blip — mas o relógio da lease
+      // continua correndo do outro lado.
+      if (!this.alive || this.#stopped) return;
       this.#failures += 1;
       logger.warn(
         {
@@ -161,11 +331,19 @@ export class TurnLease {
           attempt: this.claim.attempt,
           worker_id: this.claim.worker_id,
           failures: this.#failures,
+          statement_timeout_ms: this.#query_timeout_ms,
           err: (err as Error).message,
         },
         'turn.lease_heartbeat_failed',
       );
       incCounter('maia_turn_lease_heartbeat_total', { result: 'error' });
+      // A consulta travada pode ter consumido a margem inteira: aí a posse
+      // acabou por VENCIMENTO, e dizer `heartbeat_failed` esconderia que a lease
+      // já venceu do outro lado.
+      if (this.#margemMono() <= 0) {
+        this.#lose('expired');
+        return;
+      }
       if (this.#failures >= MAX_HEARTBEAT_FAILURES) {
         // Desistimos ANTES do vencimento (a aritmética de `MAX_HEARTBEAT_FAILURES`
         // garante a folga). Abortar cedo é o que impede a pior sequência da
@@ -180,7 +358,9 @@ export class TurnLease {
   #lose(reason: LeaseLossReason): void {
     if (this.#lost !== null) return;
     this.#lost = reason;
-    this.#clearTimer();
+    // O encerramento acontece ANTES do `abort`: ele tira o ouvinte do sinal e
+    // desarma o timer, então a sequência é uma só e idempotente.
+    this.#finalizar();
     this.#abort.abort(new Error(`turn.lease_lost:${reason}`));
     if (reason === 'released') return; // liberação intencional não é anomalia
     incCounter('maia_turn_lease_lost_total', { reason });
@@ -206,8 +386,46 @@ export class TurnLease {
   }
 
   #clearTimer(): void {
-    if (this.#timer) clearInterval(this.#timer);
+    if (this.#timer) clearTimeout(this.#timer);
     this.#timer = null;
+  }
+
+  /**
+   * Encerramento comum a perda, `stop()` e `release()`: desarma o timer e
+   * REMOVE o ouvinte do `AbortSignal`.
+   *
+   * Remover o ouvinte não é higiene: o `AbortSignal` da lease é copiado para o
+   * `TurnExecutionContext` e vive no `AsyncLocalStorage` pelo turno inteiro (e o
+   * ALS sobrevive ao `TurnLease`), então um ouvinte que ficasse preso manteria
+   * vivo o objeto da lease e a closure de cada tentativa. Idempotente.
+   */
+  #finalizar(): void {
+    this.#clearTimer();
+    if (this.#onAbort) {
+      this.#abort.signal.removeEventListener('abort', this.#onAbort);
+      this.#onAbort = null;
+    }
+  }
+
+  /**
+   * Aguarda a batida EM VOO terminar (ou ser CANCELADA no teto do statement).
+   *
+   * É o que o encerramento precisa antes de declarar o turno acabado: parar o
+   * timer não interrompe uma renovação que já saiu — sem esta espera, o turno
+   * concluiria e a consulta atrasada ainda poderia renovar a lease de um turno
+   * terminal (o CAS a recusa, mas a recusa viraria um `token_mismatch` falso, e
+   * a conexão ficaria presa até o teto). O tempo de espera é LIMITADO por
+   * construção: cada consulta tem `statement_timeout_ms < heartbeat_ms`.
+   */
+  async #drenar(): Promise<void> {
+    const emVoo = this.#inFlight;
+    if (!emVoo) return;
+    try {
+      await emVoo;
+    } catch {
+      // `#batida` não lança; o catch existe para que "aguardar" nunca seja o
+      // motivo de o encerramento falhar.
+    }
   }
 
   /**
@@ -227,14 +445,32 @@ export class TurnLease {
   }
 
   /**
-   * Para o heartbeat SEM devolver a posse.
+   * Para o heartbeat SEM devolver a posse e SEM esperar a batida em voo.
    *
    * É o caminho de conclusão normal: a transição terminal já limpou
    * `claim_token`/`lease_expires_at` na mesma transação do CAS, então não há
-   * nada a liberar — só um timer a desligar.
+   * nada a liberar. Síncrono de propósito — os call sites de lifecycle o usam
+   * depois de um CAS já comitado, onde não há o que aguardar.
+   *
+   * Quem precisa GARANTIR que nenhuma renovação continua em voo (o `finally` do
+   * core) usa `settle()`: parar o timer não interrompe uma consulta que já saiu.
    */
   stop(): void {
-    this.#clearTimer();
+    this.#stopped = true;
+    this.#finalizar();
+  }
+
+  /**
+   * SC07 (§5.8.1, AC04) — para o heartbeat E AGUARDA a batida em voo.
+   *
+   * É a forma que o encerramento de uma tentativa deve usar: `stop()` desarma o
+   * timer, mas a renovação que já saiu continua viva e pode tocar o banco depois
+   * de o turno ter sido declarado acabado. Aqui o encerramento só termina quando
+   * não há mais nada em voo — sem devolver a posse (quem faz isso é `release`).
+   */
+  async settle(): Promise<void> {
+    this.stop();
+    await this.#drenar();
   }
 
   /**
@@ -244,11 +480,21 @@ export class TurnLease {
    * vez de esperar o TTL inteiro. Depois disto este processo perde o direito de
    * escrever — inclusive porque `token` passa a devolver `null`.
    *
+   * SÓ A POSSE, e nada além dela (AC05): `releaseTurnClaim` vence
+   * `lease_expires_at = now()` e MANTÉM `claimed_by`/`claim_token` como forense;
+   * nenhum estado de run/request/efeito desconhecido é tocado, e nenhuma
+   * transição para `retryable`/`queued` é gravada. Soltar a posse não é declarar
+   * que a tentativa pode ser refeita — quem decide isso é o estado durável
+   * (outbox/run journal), via recovery.
+   *
    * Nunca lança: é chamado de caminhos de encerramento, onde uma exceção
    * mascararia a causa real do encerramento.
    */
   async release(): Promise<void> {
-    this.#clearTimer();
+    // Parar ANTES de drenar: a batida em voo não deve renovar uma lease que
+    // estamos devolvendo, e o `#stopped` faz a resposta dela ser ignorada.
+    this.stop();
+    await this.#drenar();
     if (!this.alive) return;
     try {
       await agentTurnsRepo.releaseTurnClaim({

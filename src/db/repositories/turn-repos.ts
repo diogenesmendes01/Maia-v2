@@ -123,6 +123,8 @@ type ClaimRow = {
   state_version: number | string;
   /** #629 — a espera, medida pelo relógio do BANCO no mesmo `RETURNING`. */
   wait_seconds: number | string;
+  /** SC07 — o orçamento absoluto do run (`agent_turns.deadline_at`), nullable. */
+  deadline_at: string | null;
 };
 
 /**
@@ -1032,17 +1034,48 @@ export const agentTurnsRepo = {
     );
   },
 
+  /**
+   * SC07 (§5.8.1, AC02/AC06) — a renovação agora tem um TETO de tempo real.
+   *
+   * `statement_timeout_ms` é aplicado no SERVIDOR (`SET LOCAL`, dentro de uma
+   * transação curta) e não como um `Promise.race` no cliente. A diferença não é
+   * estilística: um race abandonado deixa a consulta rodando, segurando a
+   * conexão e o lock da linha — o worker acharia que a batida terminou e
+   * agendaria a próxima enquanto a anterior ainda está em voo, que é
+   * exatamente a sobreposição que a AC01/AC02 proíbem. Com `SET LOCAL`, quem
+   * cancela é o PostgreSQL: a consulta morre, o erro volta como `57014` e a
+   * conexão é devolvida ao pool pelo `withTx` (ROLLBACK + release), sem
+   * transação aberta e sem statement pendurado.
+   *
+   * `SET LOCAL` e não `SET`: o escopo de sessão vazaria para a conexão do
+   * pool, e um teto de milissegundos herdado por outra consulta qualquer
+   * mataria trabalho alheio (o precedente do repositório é o do doctor, que
+   * usa `BEGIN READ ONLY` + `SET LOCAL` pelo mesmo motivo).
+   *
+   * Opcional de propósito: sem o parâmetro, o caminho segue sendo o statement
+   * único de sempre — quem escolhe o teto é o dono da lease, que conhece o
+   * intervalo de heartbeat (`leaseQueryTimeoutMs`). `0` (ou negativo) é
+   * elevado a `1`: em PostgreSQL, `statement_timeout = 0` significa SEM teto.
+   */
   async renewTurnLease(input: {
     turn_id: string;
     claim_token: string;
     lease_ms: number;
+    /** Teto do STATEMENT em ms, aplicado no servidor. Ausente = sem teto. */
+    statement_timeout_ms?: number;
   }): Promise<LeaseRenewalResult> {
     const { tenant_id, agent_id } = scope();
     const leaseSeconds = input.lease_ms / 1000;
-    const result = await db.execute<{
-      lease_expires_at: string;
-      heartbeat_at: string;
-    }>(sql`
+    const statementTimeout =
+      input.statement_timeout_ms === undefined
+        ? null
+        : Math.max(1, Math.trunc(input.statement_timeout_ms));
+
+    const renovar = async (executor: Executor): Promise<LeaseRenewalResult> => {
+      const result = await executor.execute<{
+        lease_expires_at: string;
+        heartbeat_at: string;
+      }>(sql`
       UPDATE ${agent_turns}
          SET lease_expires_at = now() + make_interval(secs => ${leaseSeconds}),
              heartbeat_at     = now(),
@@ -1055,24 +1088,39 @@ export const agentTurnsRepo = {
          AND lease_expires_at > now()
       RETURNING lease_expires_at, heartbeat_at
     `);
-    const row = (
-      result.rows as unknown as Array<{
-        lease_expires_at: string;
-        heartbeat_at: string;
-      }>
-    )[0];
-    if (!row) {
-      incCounter('maia_turn_lease_heartbeat_total', {
-        result: 'token_mismatch',
-      });
-      return { ok: false, reason: 'token_mismatch' };
-    }
-    incCounter('maia_turn_lease_heartbeat_total', { result: 'renewed' });
-    return {
-      ok: true,
-      lease_expires_at: new Date(row.lease_expires_at),
-      heartbeat_at: new Date(row.heartbeat_at),
+      const row = (
+        result.rows as unknown as Array<{
+          lease_expires_at: string;
+          heartbeat_at: string;
+        }>
+      )[0];
+      if (!row) {
+        // ZERO rows tem DUAS causas, e o nome do resultado cobre as duas sem
+        // mentir: `claim_token` diferente (fomos tomados) e `lease_expires_at
+        // <= now()` (a lease venceu — um CAS recusado, não uma falha de
+        // heartbeat). Quem traduz para `expired` é quem tem o relógio da lease
+        // na mão (`TurnLease`), não este WHERE, que não consegue distinguir as
+        // duas a partir daqui.
+        incCounter('maia_turn_lease_heartbeat_total', {
+          result: 'token_mismatch',
+        });
+        return { ok: false, reason: 'token_mismatch' };
+      }
+      incCounter('maia_turn_lease_heartbeat_total', { result: 'renewed' });
+      return {
+        ok: true,
+        lease_expires_at: new Date(row.lease_expires_at),
+        heartbeat_at: new Date(row.heartbeat_at),
+      };
     };
+
+    if (statementTimeout === null) return renovar(db);
+    return withTx(async (tx) => {
+      // `sql.raw` porque `SET` não aceita parâmetro vinculado (`$1` é erro de
+      // sintaxe) — e o valor já está truncado para inteiro positivo acima.
+      await tx.execute(sql`SET LOCAL statement_timeout = ${sql.raw(String(statementTimeout))}`);
+      return renovar(tx);
+    });
   },
 
   /**
@@ -3067,6 +3115,12 @@ async function claimWithinStreamExclusion(
        AND ${streamNotHumanControlled(escopo)}
     RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
               claimed_by, claimed_at, lease_expires_at, state_version,
+              -- SC07 -- o ORCAMENTO ABSOLUTO do run, no MESMO RETURNING do claim.
+              -- Vem daqui, e nao de uma segunda leitura, pela mesma razao de
+              -- wait_seconds logo abaixo: entre as duas leituras a linha pode
+              -- mudar, e o teto que o worker carregaria seria o de um estado que
+              -- ja nao existe. NULL = sem orcamento declarado (o caso de hoje).
+              deadline_at,
               -- #629 -- a ESPERA deste turno, do relogio do BANCO. E o que
               -- alimenta maia_stream_turn_wait_seconds, a serie de fairness que
               -- a issue-mae pede. GREATEST(...,0) porque um relogio que ande
@@ -3111,6 +3165,7 @@ async function claimWithinStreamExclusion(
       status: row.status as TurnStatus,
       state_version: Number(row.state_version),
       wait_seconds: Number(row.wait_seconds),
+      deadline_at: row.deadline_at ? new Date(row.deadline_at) : null,
     },
     ...trail,
   };
