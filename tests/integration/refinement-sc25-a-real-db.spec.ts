@@ -58,7 +58,7 @@ import {
 import { registerHermesInferenceRoute } from '@/integrations/hermes/inference-route.js';
 import type { StartFrame } from '@/integrations/hermes/protocol.js';
 import { createChatCompletionsRelay } from '@/lib/llm/providers/chat-completions-relay.js';
-import { startStubProvider, type StubProvider } from '../helpers/hermes-stub-provider.js';
+import { startStubProvider } from '../helpers/hermes-stub-provider.js';
 
 const SHOULD_RUN =
   !!process.env.TEST_DB_URL && process.env.DATABASE_URL === process.env.TEST_DB_URL;
@@ -274,7 +274,7 @@ async function postar(
   if (token !== null) headers.authorization = `Bearer ${token}`;
   const res = await fetch(`${base}${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
   const text = await res.text();
-  let parsed: Record<string, unknown> = {};
+  let parsed: Record<string, unknown>;
   try {
     parsed = text ? (JSON.parse(text) as Record<string, unknown>) : {};
   } catch {
@@ -848,7 +848,7 @@ d('SC25-A — grant relay restrito e captura SDK pinado (DB real)', () => {
         expect(result.stop).toEqual({ kind: 'reply', raw_text: 'eco respondido' });
       } catch (erro) {
         // Diagnóstico obrigatório: um timeout sem estado é meia informação.
-        throw new Error(`${String(erro)} | ${await diag('fluxo_do_worker')}`);
+        throw new Error(`${String(erro)} | ${await diag('fluxo_do_worker')}`, { cause: erro });
       }
 
       // TRÊS requests efetivos do SDK, e TRÊS tentativas admitidas — a repetição
