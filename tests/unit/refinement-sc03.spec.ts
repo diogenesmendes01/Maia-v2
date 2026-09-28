@@ -567,6 +567,17 @@ describe('SC03-AC02 — disabled não consulta; enabled incompleto rejeita com r
     expect(r.engine.unavailable_reason).toBe('kill_switch');
     expect(blockingFailures(r).length).toBeGreaterThanOrEqual(3);
   });
+
+  it('sem kill switch, o binding ausente vence a evidência ausente na razão reportada', () => {
+    const r = evaluateReadinessFacts(factsWithEngine({ policies: [], evidence: null }), FIXED_NOW);
+    // Duas portas fechadas ao mesmo tempo; a razão é a do fato mais a montante
+    // (não existe linha de política ⇒ não há nem o que aprovar), e os DOIS
+    // checks ficam vermelhos — a razão explica, não esconde.
+    expect(r.engine.unavailable_reason).toBe('binding_missing');
+    const failed = blockingFailures(r).map((c) => c.code);
+    expect(failed).toContain('engine_binding_valid');
+    expect(failed).toContain('engine_bundle_approved');
+  });
 });
 
 describe('SC03-AC03 — fixture sintética ready sem produção; defaults fechados', () => {
