@@ -1762,6 +1762,142 @@ d('SC02 rodada 2 — matriz de constraints, ledger e CAS do start (Postgres real
       'nenhuma inferência foi disparada por nenhuma destas escritas',
     ).toBe(0);
   }, 120_000);
+
+  /**
+   * SPEC-L1401 — o defeito que a revisão QA reproduziu: o terminal aceito era
+   * imutável só pelo `terminal_hash`. Reescrever `terminal_json` mantendo o
+   * hash antigo passava (`UPDATE 1`), e o journal passava a guardar um terminal
+   * que ninguém aceitou — invisível para qualquer leitor que compare hash, que
+   * é justamente o que o hash deveria estar guardando.
+   *
+   * Prova-se aqui que o CONTEÚDO é o imutável e o hash é a prova de qual
+   * conteúdo foi aceito, não uma licença para trocar o conteúdo:
+   *
+   *  (a) trocar o conteúdo com o hash intacto é conflito — cláusula que este
+   *      caso dirige (falha antes da migration, passa depois);
+   *  (b) repetir o terminal IDÊNTICO continua no-op, porque a recusa é do
+   *      CONFLITO e não "UPDATE proibido";
+   *  (c) aceito não volta a NULL;
+   *  (d) a linha segue byte a byte com o terminal original e nada de
+   *      inferência foi disparado por nenhuma destas escritas.
+   */
+  it('SPEC-L1401 — terminal aceito é imutável no CONTEÚDO, não só no hash', async () => {
+    const f = await criarTurno({ atual: 'l1401-conteudo' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+
+    const terminal = { resultado: 'sintetico' };
+    const terminalJson = JSON.stringify(terminal);
+    const terminalHash = canonicalDigest(terminal);
+    await pool.query(
+      `UPDATE engine_runs SET terminal_json=$2::jsonb, terminal_hash=$3 WHERE id=$1`,
+      [run_id, terminalJson, terminalHash],
+    );
+
+    // (a) O conteúdo MUDA e o hash NÃO: ainda assim é conflito.
+    await expect(
+      pool.query(`UPDATE engine_runs SET terminal_json=$2::jsonb WHERE id=$1`, [
+        run_id,
+        JSON.stringify({ resultado: 'ADULTERADO' }),
+      ]),
+      'terminal já aceito não pode ser reescrito nem mantendo o hash',
+    ).rejects.toMatchObject({ code: '23001' });
+
+    // (b) Repetir o IDÊNTICO é no-op — a recusa acima não é "UPDATE proibido".
+    const repetido = await pool.query(
+      `UPDATE engine_runs SET terminal_json=$2::jsonb, terminal_hash=$3 WHERE id=$1`,
+      [run_id, terminalJson, terminalHash],
+    );
+    expect(repetido.rowCount, 'repetir o terminal idêntico continua no-op').toBe(1);
+
+    // (c) Aceito não volta a NULL.
+    await expect(
+      pool.query(`UPDATE engine_runs SET terminal_json=NULL, terminal_hash=NULL WHERE id=$1`, [
+        run_id,
+      ]),
+      'terminal aceito não pode ser apagado',
+    ).rejects.toMatchObject({ code: '23001' });
+
+    // (d) A linha continua com o terminal ORIGINAL: nenhuma recusa escreveu.
+    const { rows } = await pool.query(
+      `SELECT terminal_json, terminal_hash FROM engine_runs WHERE id=$1`,
+      [run_id],
+    );
+    expect(rows[0].terminal_json).toEqual(terminal);
+    expect(rows[0].terminal_hash).toBe(terminalHash);
+    expect(
+      await contar(`SELECT count(*)::text AS n FROM engine_inference_attempts WHERE run_id=$1`, [
+        run_id,
+      ]),
+      'nenhuma inferência foi disparada por nenhuma destas escritas',
+    ).toBe(0);
+  }, 120_000);
+
+  /**
+   * AC07/SPEC-L1401 — a guarda é do BANCO, e o `_down` é um rollback REAL.
+   *
+   * Roda num SCHEMA DESCARTÁVEL do banco do card (não toca o journal real):
+   * aplica a 151 do ARQUIVO, prova a recusa, aplica o `_down`, prova que a
+   * MESMA escrita passa a ser aceita — isto é, quem recusava era o objeto que
+   * a 151 cria — e reaplica o `up` para provar que a recusa volta.
+   *
+   * Sem o passo do `_down` a prova seria ambígua: a recusa poderia vir de
+   * qualquer trigger preexistente do banco, e não do que esta migration
+   * acrescenta.
+   */
+  it('AC07/SPEC-L1401 — a guarda do terminal vive no banco e o down a remove de verdade', async () => {
+    const client = new pg.Client({ connectionString: process.env.TEST_DB_URL });
+    const schema = `sc02_terminal_${randomUUID().replaceAll('-', '')}`;
+    const up = readFileSync('migrations/151_engine_runs_terminal_immutable.sql', 'utf8');
+    const down = readFileSync('migrations/151_engine_runs_terminal_immutable_down.sql', 'utf8');
+    await client.connect();
+    try {
+      await client.query(`CREATE SCHEMA ${schema}`);
+      await client.query(`SET search_path TO ${schema},public`);
+      // Tabela mínima: a 151 só lê o par do terminal (não é fixture de runtime).
+      await client.query(
+        'CREATE TABLE engine_runs(id uuid PRIMARY KEY, terminal_json jsonb, terminal_hash text)',
+      );
+      await client.query(up);
+
+      const run = randomUUID();
+      await client.query(
+        `INSERT INTO engine_runs(id, terminal_json, terminal_hash) VALUES($1, $2::jsonb, $3)`,
+        [run, JSON.stringify({ resultado: 'sintetico' }), 'b'.repeat(64)],
+      );
+
+      const adulterar = (valor: string) =>
+        client.query(`UPDATE engine_runs SET terminal_json=$2::jsonb WHERE id=$1`, [
+          run,
+          JSON.stringify({ resultado: valor }),
+        ]);
+
+      // Com a 151: conflito, mesmo com o hash intacto.
+      await expect(
+        adulterar('ADULTERADO'),
+        'com a 151 aplicada, o conteúdo do terminal aceito não muda',
+      ).rejects.toMatchObject({ code: '23001' });
+
+      // Sem a 151 (o `down` real): a MESMA escrita passa — a recusa anterior era do objeto criado aqui.
+      await client.query(down);
+      expect(
+        (await adulterar('ADULTERADO')).rowCount,
+        'o down remove mesmo a guarda',
+      ).toBe(1);
+
+      // E o `up` de volta recusa de novo: a migration é reaplicável.
+      await client.query(up);
+      await expect(
+        adulterar('ADULTERADO-2'),
+        'reaplicar o up reinstala a recusa',
+      ).rejects.toMatchObject({ code: '23001' });
+    } finally {
+      await client.query('ROLLBACK');
+      await client.query('SET search_path TO public');
+      await client.query(`DROP SCHEMA ${schema} CASCADE`);
+      await client.end();
+    }
+  }, 120_000);
 });
 
 describe('SC02 — contratos estritos do wire (§5.3.1/§4.1) e canonicidade (T05/T07/T08)', () => {
