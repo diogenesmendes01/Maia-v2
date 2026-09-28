@@ -385,6 +385,22 @@ describe('SC03-AC02 — disabled não consulta; enabled incompleto rejeita com r
     expect(bombKillSwitch).not.toHaveBeenCalled();
   });
 
+  it('falha de leitura das linhas de política SOBE — nunca vira "sem pedido"', async () => {
+    // O modo de falha que o portão existe para impedir: um banco fora no ar
+    // fazendo um agente que PEDE o motor remoto parecer um agente sem pedido
+    // (e portanto "pronto"). A porta devolve erro; o avaliador propaga.
+    await expect(
+      evaluateAgentReadiness(SCOPE, {
+        loadFacts: async () => readyFacts(),
+        loadEnginePolicies: async () => {
+          throw new Error('banco fora');
+        },
+        loadEngineEvidence: forbidden('evidence') as never,
+        now: FIXED_NOW,
+      }),
+    ).rejects.toThrow('banco fora');
+  });
+
   it('uma linha do escopo que NÃO pede Hermes também não consulta as portas', async () => {
     const row: EnginePolicyBindingFactV1 = { ...HERMES_ROW, engine: 'maia_react' };
     expect(engineRequestedBy([row], SCOPE)).toBe(false);
