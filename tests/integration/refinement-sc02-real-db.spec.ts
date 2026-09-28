@@ -1178,7 +1178,8 @@ d('SC02 rodada 2 — matriz de constraints, ledger e CAS do start (Postgres real
     expect(sql150).toMatch(/CREATE OR REPLACE FUNCTION engine_turn_bindings_immutable_columns/);
     expect(sql150).toMatch(/BEFORE UPDATE ON engine_turn_bindings/);
 
-    // O fluxo provado não escreve em NENHUMA das duas outboxes nem em tentativa.
+    // O fluxo provado não escreve em NENHUMA outbox nem cria sessão de engine.
+    const sessoesAntes = await contar(`SELECT count(*)::text AS n FROM app_sessions`, []);
     const f = await criarTurno({ atual: 'ledger' });
     await reivindicar(f);
     const run_id = (await admitir(f))!;
@@ -1196,6 +1197,38 @@ d('SC02 rodada 2 — matriz de constraints, ledger e CAS do start (Postgres real
         run_id,
       ]),
     ).toBe(0);
+
+    // As OUTRAS outboxes/ledgers do repo seguem intocadas neste escopo — nenhuma
+    // "segunda outbox de envio" nasce do fluxo do engine.
+    const outrasOutboxes: Array<[string, string]> = [
+      [
+        'idempotency_effect_outbox',
+        `SELECT count(*)::text AS n FROM idempotency_effect_outbox WHERE tenant_id=$1 AND agent_id=$2`,
+      ],
+      [
+        'runtime_trace_body_outbox',
+        `SELECT count(*)::text AS n FROM runtime_trace_body_outbox WHERE tenant_id=$1 AND agent_id=$2`,
+      ],
+      [
+        'approval_requests',
+        `SELECT count(*)::text AS n FROM approval_requests WHERE tenant_id=$1 AND agent_id=$2`,
+      ],
+      [
+        'pending_questions',
+        `SELECT count(*)::text AS n FROM pending_questions WHERE tenant_id=$1 AND agent_id=$2`,
+      ],
+      [
+        'playground_sessions',
+        `SELECT count(*)::text AS n FROM playground_sessions WHERE tenant_id=$1 AND agent_id=$2`,
+      ],
+    ];
+    for (const [nome, sql] of outrasOutboxes) {
+      expect(await contar(sql, [T, A]), `${nome} não pode receber linha deste fluxo`).toBe(0);
+    }
+    expect(
+      await contar(`SELECT count(*)::text AS n FROM app_sessions`, []),
+      'sessão global de engine não é criada',
+    ).toBe(sessoesAntes);
   }, 120_000);
 
   /**
