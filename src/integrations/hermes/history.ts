@@ -52,6 +52,29 @@ export type EngineContextV1 = {
   history: EngineHistoryItemV1[];
 };
 
+/**
+ * Uma linha PERSISTIDA de `mensagens` — a projeção mínima que a fronteira do
+ * motor precisa. Não é o tipo da tabela de propósito: o produtor durável lê
+ * quatro colunas e nada mais, e o que não é lido não pode virar contexto.
+ */
+export type PersistedContextRow = {
+  id: string;
+  direcao: 'in' | 'out';
+  tipo: string;
+  conteudo: string | null;
+};
+
+/**
+ * Teto de linhas LIDAS do banco antes de normalizar.
+ *
+ * `max_history_messages + 1` — e o `+1` é o que transforma "não coube" numa
+ * RECUSA em vez de num truncamento silencioso: se a leitura bate no teto, não
+ * há como provar que a conversa inteira coube, e a admissão recusa. Ler
+ * `max_history_messages` e seguir em frente devolveria ao motor um histórico
+ * cortado em silêncio — exatamente o que a regra 3 proíbe.
+ */
+export const PERSISTED_HISTORY_FETCH_LIMIT = HISTORY_LIMITS.max_history_messages + 1;
+
 export type NormalizeRejectionCode =
   | 'empty_messages'
   | 'last_not_user'
@@ -179,4 +202,65 @@ export function normalizeEngineContext(input: {
     kind: 'ok',
     context: { system, user_message: inbound.text, history },
   };
+}
+
+/**
+ * SC02 (§4.1, "Compatibilidade de contexto") — o PRODUTOR DURÁVEL do contexto:
+ * linhas PERSISTIDAS de `mensagens` → contexto do `start`.
+ *
+ * ─── Por que esta função existe, separada de `normalizeEngineContext` ───────
+ *
+ * `normalizeEngineContext` recebe o array do `prompt-builder` — a forma do
+ * caminho local. O produtor durável do run remoto não tem esse array: ele lê o
+ * HISTÓRICO PERSISTIDO, e é a leitura que precisa das duas regras do §4.1:
+ *
+ *  1. **A mensagem atual sai do histórico por ID, nunca por texto.** Aqui a
+ *     exclusão é um dado do SQL (`m.id <> <representativa>`, em
+ *     `hermes-admission-repo.ts`) e a mensagem atual entra UMA única vez, no
+ *     fim. Duas mensagens de cliente com o MESMO texto e IDs diferentes são
+ *     duas mensagens — deduplicar por conteúdo apagaria uma delas, que é o erro
+ *     que a spec nomeia.
+ *  2. **Multimodal RECUSA.** Áudio/imagem/documento no histórico não viram
+ *     "texto ausente": o piloto recebe histórico textual canônico, e a mídia
+ *     continua no pipeline de ingestão da Maia. Recusar é o comportamento
+ *     fechado; ignorar a linha devolveria ao modelo uma conversa com um buraco
+ *     que ninguém decidiu.
+ *
+ * Linhas de EVENTO (`tipo='evento'`, gravadas pelo flush de sumários de
+ * ferramentas quando o turno não produziu outbound) são puladas por não
+ * carregarem texto algum — a MESMA regra do `prompt-builder:1172-1174`. Isso
+ * não é truncamento: é a projeção de uma linha que já não tinha conteúdo.
+ *
+ * A ordem é a ordem recebida; quem ordena é a consulta. Depois disto, TODAS as
+ * regras de `normalizeEngineContext` valem (último é o inbound, limites, vazio)
+ * — não há segundo conjunto de regras para o caminho durável.
+ */
+export function normalizePersistedEngineContext(input: {
+  system: string;
+  /** Linhas ANTERIORES à atual, em ordem cronológica, JÁ sem a atual. */
+  history: PersistedContextRow[];
+  /** A mensagem atual (a representativa do turno), que entra UMA vez. */
+  inbound: PersistedContextRow;
+}): NormalizeResult {
+  const messages: LLMMessage[] = [];
+  for (const [i, row] of input.history.entries()) {
+    if (row.tipo === 'evento' && row.direcao === 'out') continue;
+    if (row.tipo !== 'texto') {
+      return reject(
+        'unsupported_block',
+        `mensagem de histórico ${i} é "${row.tipo}": multimodal não é suportado nesta V1`,
+      );
+    }
+    const text = row.conteudo ?? '';
+    if (text.trim().length === 0) continue;
+    messages.push({ role: row.direcao === 'in' ? 'user' : 'assistant', content: text });
+  }
+  if (input.inbound.tipo !== 'texto') {
+    return reject(
+      'unsupported_block',
+      `mensagem atual é "${input.inbound.tipo}": multimodal não é suportado nesta V1`,
+    );
+  }
+  messages.push({ role: 'user', content: input.inbound.conteudo ?? '' });
+  return normalizeEngineContext({ system: input.system, messages });
 }
