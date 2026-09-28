@@ -28,14 +28,35 @@
  * Skipped sem `TEST_DB_URL` (não reporte "0 falhas" de uma rodada sem banco:
  * aqui as specs vão para `skipped`).
  */
+import { readFileSync } from 'node:fs';
 import { randomUUID } from 'node:crypto';
 import pg from 'pg';
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { runWithTenantContext } from '@/db/tenant-context.js';
-import { canonicalDigest } from '@/integrations/hermes/canonical-json.js';
+import {
+  CanonicalJsonError,
+  canonicalDigest,
+  canonicalJsonStringify,
+} from '@/integrations/hermes/canonical-json.js';
+import { engineRunsRepo } from '@/db/repositories/engine-repos.js';
+import { ensureHermesConversationControl } from '@/db/repositories/hermes-control-producer.js';
+import { loadHermesLaunchContext } from '@/db/repositories/hermes-launch-repo.js';
+import { parseRuntimeManifest } from '@/integrations/hermes/manifest.js';
+import { createJournaledHermesRuntime } from '@/runtime/engines/hermes-runtime.js';
+import { HERMES_ENGINE_ADAPTER_REVISION } from '@/runtime/engines/hermes-engine.js';
+import {
+  enginePinV1Schema,
+  engineRequestV1Schema,
+  hostContextSnapshotV1Schema,
+} from '@/runtime/engines/schemas.js';
+import { runWithTurnExecution } from '@/runtime/turns/execution-context.js';
+import type {
+  HermesSupervisorConfigV1,
+  HermesSupervisorV1,
+  WorkerLaunchSpecV1,
+} from '@/integrations/hermes/supervisor.js';
 import type { TurnExecutionContext } from '@/runtime/turns/claim.js';
 import type { SyntheticCoreRuntime } from '@/runtime/engines/synthetic-core-context.js';
-import type { HermesLaunchContext } from '@/db/repositories/hermes-launch-repo.js';
 import type { RuntimeManifestV1 } from '@/integrations/hermes/manifest.js';
 
 vi.hoisted(() => {
@@ -585,4 +606,1169 @@ d('SC02 — loader durável de request/context/manifest no fluxo real', () => {
       ),
     ).toBe(0);
   }, 60_000);
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// Rodada 2 — o que a rodada 1 deixou SEM prova: AC05, AC09, AC10, AC11 e a
+// matriz de constraints de AC07/AC08. O tier de dublê continua o MESMO: só o
+// MOTOR remoto é fronteira de transporte (`launch`), nunca reimplementado.
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Config do supervisor como DADO: nenhum processo é criado por este lane. */
+const SUPERVISOR_CONFIG: HermesSupervisorConfigV1 = {
+  python_executable: process.env.HERMES_PIN_PYTHON ?? '/bin/false',
+  worker_args: ['-m', 'services.hermes_worker.main'],
+  worker_cwd: process.cwd(),
+  python_path: [],
+  hermes_sha: HERMES_SHA,
+  expected_bridge_revision: null,
+  platform_env: {},
+  home_root: '/tmp',
+  ready_timeout_ms: 5_000,
+  cancel_grace_ms: 0,
+  exit_wait_ms: 1_000,
+  post_result_exit_ms: 1_000,
+  hook_timeout_ms: 5_000,
+  watchdog_interval_ms: 60_000,
+  session_retention_ms: 0,
+};
+
+type EngineDouble = {
+  /** `startPrepared` REAL: o que é dublado é o transporte, não a decisão. */
+  runtime: ReturnType<typeof createJournaledHermesRuntime>;
+  launches: WorkerLaunchSpecV1[];
+  admirable: SyntheticCoreRuntime;
+};
+
+/**
+ * `createJournaledHermesRuntime` (REAL) com um supervisor que NÃO cria processo.
+ *
+ * `resolveRunContext`, o loader, o manifest RELIDO do PostgreSQL, o grant de
+ * inferência e o CAS do journal continuam os reais — é justamente o caminho
+ * que o AC10 nomeia. O que o dublê substitui é a fronteira de transporte: o
+ * `launch` que, em produção, faria o `spawn` do worker.
+ */
+function engineDouble(
+  over: {
+    outcome?: 'accepted' | 'spawn_failed';
+    onLaunch?: (spec: WorkerLaunchSpecV1) => Promise<void>;
+  } = {},
+): EngineDouble {
+  const launches: WorkerLaunchSpecV1[] = [];
+  const incarnation = randomUUID();
+  const supervisor = {
+    incarnation,
+    config: SUPERVISOR_CONFIG,
+    async launch(spec: WorkerLaunchSpecV1) {
+      launches.push(spec);
+      if (over.onLaunch) await over.onLaunch(spec);
+      if (over.outcome === 'spawn_failed') {
+        return { kind: 'refused' as const, reason: 'spawn_failed' as const };
+      }
+      const worker_instance_id = randomUUID();
+      return {
+        kind: 'launched' as const,
+        session: {
+          run_id: spec.start.run_id,
+          worker_instance_id,
+          ready: Promise.resolve({ kind: 'accepted' as const }),
+          exited: new Promise<never>(() => {}),
+          released: new Promise<void>(() => {}),
+          cancellation: null,
+          snapshot: () => ({}) as never,
+          requestCancel: async () => 'already_exited' as const,
+        },
+      };
+    },
+    get: () => undefined,
+    shutdown: async () => {},
+    activeCount: () => 0,
+  } as unknown as HermesSupervisorV1;
+  const runtime = createJournaledHermesRuntime({
+    supervisor,
+    inference: {
+      base_url: 'http://127.0.0.1:9/internal/hermes-inference/v1',
+      model: 'sc02-stub-model',
+      provider: 'openai',
+    },
+  });
+  const admirable = {
+    pin: runtime.pin,
+    hermesSha: HERMES_SHA,
+    remoteInstanceId: runtime.remoteInstanceId,
+    shutdown: runtime.shutdown,
+    engine: runtime.engine,
+  } as unknown as SyntheticCoreRuntime;
+  return { runtime, launches, admirable };
+}
+
+type ManualRun = {
+  run_id: string;
+  request_key: string;
+  control_id: string;
+  execution: TurnExecutionContext;
+};
+
+/**
+ * Run escrito DIRETO no banco, sem passar pelo repositório.
+ *
+ * É o caminho do incidente no `psql` — aquele em que ninguém lê o código — e o
+ * que o loader tem de recusar quando o conteúdo não fecha consigo mesmo.
+ */
+type ControlResult =
+  | { kind: 'ok'; control_id: string; control_epoch: string }
+  | { kind: 'refused' };
+
+async function persistirRunManual(
+  over: {
+    request_json?: Record<string, unknown>;
+    request_json_text?: string;
+    request_hash?: string;
+    host_context_json?: Record<string, unknown>;
+    host_context_hash?: string;
+    request_key?: string;
+  } = {},
+): Promise<ManualRun> {
+  const f = await criarTurno({ atual: 'manual' });
+  const execution = await reivindicar(f);
+  const control: ControlResult = await scoped(() =>
+    ensureHermesConversationControl({ turn_id: f.turn_id, claim_token: f.claim_token }),
+  );
+  if (control.kind !== 'ok') throw new Error('controle manual não criado');
+  const ident = (
+    await pool.query<{
+      channel_id: string;
+      stream_key: string;
+      pessoa_id: string;
+      conversa_id: string;
+      control_epoch: string;
+    }>(
+      `SELECT channel_id, stream_key, pessoa_id, conversa_id, control_epoch::text
+         FROM conversation_controls WHERE id=$1`,
+      [control.control_id],
+    )
+  ).rows[0]!;
+
+  const run_id = randomUUID();
+  const request_key = over.request_key ?? randomUUID();
+  const request_json = over.request_json ?? {
+    version: 1,
+    run_id,
+    request_key,
+    task: 'reasoner',
+    isolation: 'one_run_no_shared_memory',
+    context: { system: 'SC02 manual', messages: [{ role: 'user', content: 'manual' }], tools: [] },
+    limits: {
+      max_iterations: 5,
+      max_output_tokens_per_call: 1024,
+      max_tool_calls: 1,
+      deadline_at: new Date(Date.now() + 60_000).toISOString(),
+      max_cost_microusd: '1000',
+    },
+  };
+  const host_context_json = over.host_context_json ?? {
+    version: 1,
+    tenant_id: T,
+    agent_id: A,
+    turn_id: f.turn_id,
+    pessoa_id: ident.pessoa_id,
+    conversa_id: ident.conversa_id,
+    channel_id: ident.channel_id,
+    representative_message_id: f.message_id,
+    input_message_ids: [f.message_id],
+    stream_key: ident.stream_key,
+    control_id: control.control_id,
+    control_epoch: ident.control_epoch,
+    remote_jid: 'sc02@invalid',
+    trace_id: randomUUID(),
+    active_role_id: null,
+    active_execution_id: null,
+    outbound_prefix: null,
+    allowed_entity_ids: [],
+    allowed_tool_names: [],
+    policy_digest: canonicalDigest({ evidence_class: 'synthetic' }),
+    source_versions: [],
+  };
+  await pool.query(
+    `INSERT INTO engine_turn_bindings(tenant_id,agent_id,turn_id,engine,adapter_revision,configuration_digest,protocol_version,max_generations)
+     VALUES($1,$2,$3,'hermes','manual-1',$4,1,1)`,
+    [T, A, f.turn_id, ADAPTER_DIGEST],
+  );
+  await pool.query(
+    `INSERT INTO engine_runs(id,tenant_id,agent_id,turn_id,generation_no,origin_turn_attempt,origin_claim_token,
+       origin_worker_id,control_id,control_epoch,mode,manifest_digest,phase,row_version,request_key,remote_instance_id,
+       request_json,request_hash,host_context_json,host_context_hash,deadline_at,reconcile_deadline_at,last_event_sequence)
+     VALUES($1,$2,$3,$4,1,1,$5,$6,$7,$8::bigint,'live',$9,'prepared',0,$10,'manual-instance',
+       $11::jsonb,$12,$13::jsonb,$14, now() + interval '5 minutes', now() + interval '6 minutes', 0)`,
+    [
+      run_id,
+      T,
+      A,
+      f.turn_id,
+      f.claim_token,
+      execution.worker_id,
+      control.control_id,
+      ident.control_epoch,
+      canonicalDigest({ manual: true }),
+      request_key,
+      over.request_json_text ?? JSON.stringify(request_json),
+      over.request_hash ??
+        (over.request_json_text ? 'a'.repeat(64) : canonicalDigest(request_json)),
+      JSON.stringify(host_context_json),
+      over.host_context_hash ?? canonicalDigest(host_context_json),
+    ],
+  );
+  return { run_id, request_key, control_id: control.control_id, execution };
+}
+
+/** O `request` canônico do contrato, para os testes de schema. */
+function requestV1(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    run_id: randomUUID(),
+    request_key: randomUUID(),
+    task: 'reasoner',
+    isolation: 'one_run_no_shared_memory',
+    context: { system: 'SC02', messages: [{ role: 'user', content: 'oi' }], tools: [] },
+    limits: {
+      max_iterations: 5,
+      max_output_tokens_per_call: 1024,
+      max_tool_calls: 1,
+      deadline_at: new Date(Date.now() + 60_000).toISOString(),
+      max_cost_microusd: '1000',
+    },
+    ...over,
+  };
+}
+
+/** O `host` canônico do contrato, para os testes de schema. */
+function hostV1(over: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    version: 1,
+    tenant_id: 't',
+    agent_id: 'a',
+    turn_id: randomUUID(),
+    pessoa_id: randomUUID(),
+    conversa_id: randomUUID(),
+    channel_id: randomUUID(),
+    representative_message_id: randomUUID(),
+    input_message_ids: [randomUUID()],
+    stream_key: 'v1:abc',
+    control_id: randomUUID(),
+    control_epoch: '0',
+    remote_jid: 'sc02@invalid',
+    trace_id: 'trace',
+    active_role_id: null,
+    active_execution_id: null,
+    outbound_prefix: null,
+    allowed_entity_ids: [],
+    allowed_tool_names: [],
+    policy_digest: 'a'.repeat(64),
+    source_versions: [],
+    ...over,
+  };
+}
+
+d('SC02 rodada 2 — loader fail-closed, ledger e start com CAS (Postgres real)', () => {
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 4 });
+    await criarIdentidades();
+  }, 60_000);
+
+  afterAll(async () => {
+    await pool?.end().catch(() => {});
+  });
+
+  /**
+   * AC05 — o loader FALHA FECHADO.
+   *
+   * A pergunta não é "o caminho feliz carrega": é "o que o loader devolve
+   * quando UMA das identidades do vínculo não é a do chamador". Cada caso
+   * abaixo muda exatamente uma dimensão do vínculo e exige `null` — nunca o
+   * contexto da linha, nunca um sujeito `owner`, nunca um escopo `default`.
+   */
+  it('AC05 — loader recusa outro claim, outro sujeito, outro canal, outro escopo e lookup ausente', async () => {
+    const f = await criarTurno({ atual: 'oi' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+    expect(run_id).not.toBeNull();
+    const run = await lerRun(run_id);
+    const controleId = (
+      await pool.query<{ id: string }>(
+        `SELECT id FROM conversation_controls WHERE tenant_id=$1 AND agent_id=$2 AND stream_key=$3`,
+        [T, A, f.control_stream_key],
+      )
+    ).rows[0]!.id;
+
+    // PREMISSA: o vínculo REAL carrega para o dono de origem.
+    expect(await scoped(() => loadHermesLaunchContext(run.id, f.execution))).not.toBeNull();
+
+    const outro = await criarTurno({ atual: 'outro' });
+    await reivindicar(outro);
+
+    // (1) claim de OUTRO turno contra este run.
+    expect(
+      await scoped(() =>
+        loadHermesLaunchContext(run.id, {
+          ...f.execution,
+          claim_token: outro.execution.claim_token,
+        }),
+      ),
+    ).toBeNull();
+    // (2) turno de OUTRO sujeito.
+    expect(await scoped(() => loadHermesLaunchContext(run.id, outro.execution))).toBeNull();
+    // (3) worker e (4) tentativa divergentes.
+    expect(
+      await scoped(() =>
+        loadHermesLaunchContext(run.id, { ...f.execution, worker_id: 'worker-de-outro' }),
+      ),
+    ).toBeNull();
+    expect(
+      await scoped(() =>
+        loadHermesLaunchContext(run.id, { ...f.execution, attempt: f.execution.attempt + 1 }),
+      ),
+    ).toBeNull();
+    // (5) ALS de outro tenant e (6) de outro agente.
+    expect(
+      await runWithTenantContext({ tenant_id: `${T}-outro`, agent_id: A }, () =>
+        loadHermesLaunchContext(run.id, f.execution),
+      ),
+    ).toBeNull();
+    expect(
+      await runWithTenantContext({ tenant_id: T, agent_id: `${A}-outro` }, () =>
+        loadHermesLaunchContext(run.id, f.execution),
+      ),
+    ).toBeNull();
+    // (7) posse abortada.
+    const abort = new AbortController();
+    abort.abort();
+    expect(
+      await scoped(() =>
+        loadHermesLaunchContext(run.id, { ...f.execution, signal: abort.signal }),
+      ),
+    ).toBeNull();
+    // (8) LOOKUP AUSENTE: não cai para owner nem para default.
+    expect(await scoped(() => loadHermesLaunchContext(randomUUID(), f.execution))).toBeNull();
+    // (9) controle tomado (modo humano, com dono nomeado — owner_chk da 140).
+    await pool.query(
+      `UPDATE conversation_controls SET mode='human', owner_app_user_id='sc02-operador', paused_at=now() WHERE id=$1`,
+      [controleId],
+    );
+    expect(await scoped(() => loadHermesLaunchContext(run.id, f.execution))).toBeNull();
+    await pool.query(`UPDATE conversation_controls SET mode='bot' WHERE id=$1`, [controleId]);
+    expect(await scoped(() => loadHermesLaunchContext(run.id, f.execution))).not.toBeNull();
+
+    // (10) outro CANAL: o vínculo do controle deixa de casar com a conversa.
+    const fCanal = await criarTurno({ atual: 'canal' });
+    await reivindicar(fCanal);
+    const runCanal = (await admitir(fCanal))!;
+    const outroCanal = await criarTurno({ atual: 'outro canal' });
+    await pool.query(`UPDATE conversas SET channel_id=$2 WHERE id=$1`, [
+      fCanal.conversa_id,
+      outroCanal.channel_id,
+    ]);
+    expect(await scoped(() => loadHermesLaunchContext(runCanal, fCanal.execution))).toBeNull();
+
+    // (11) outro SUJEITO na conversa do vínculo.
+    const fPessoa = await criarTurno({ atual: 'sujeito' });
+    await reivindicar(fPessoa);
+    const runPessoa = (await admitir(fPessoa))!;
+    await pool.query(`UPDATE conversas SET pessoa_id=$2 WHERE id=$1`, [
+      fPessoa.conversa_id,
+      outro.pessoa_id,
+    ]);
+    expect(await scoped(() => loadHermesLaunchContext(runPessoa, fPessoa.execution))).toBeNull();
+  }, 120_000);
+
+  /**
+   * AC05/T09 — o loader RECOMPUTA o digest; não confia na linha.
+   *
+   * Uma linha cujo `request_hash`/`host_context_hash` não corresponde ao JSON
+   * persistido é uma linha que mente sobre a própria identidade. Aceitá-la por
+   * "o hash está no formato certo" transformaria o digest em enfeite.
+   */
+  it('AC05/T09 — o loader recusa a linha cujo hash não corresponde ao JSON persistido', async () => {
+    const ok = await persistirRunManual();
+    expect(await scoped(() => loadHermesLaunchContext(ok.run_id, ok.execution))).not.toBeNull();
+
+    const requestAdulterado = await persistirRunManual({
+      request_hash: canonicalDigest({ nao: 'e o request' }),
+    });
+    expect(
+      await scoped(() => loadHermesLaunchContext(requestAdulterado.run_id, requestAdulterado.execution)),
+    ).toBeNull();
+
+    const hostAdulterado = await persistirRunManual({
+      host_context_hash: canonicalDigest({ nao: 'e o host' }),
+    });
+    expect(
+      await scoped(() => loadHermesLaunchContext(hostAdulterado.run_id, hostAdulterado.execution)),
+    ).toBeNull();
+  }, 120_000);
+});
+
+d('SC02 rodada 2 — matriz de constraints, ledger e CAS do start (Postgres real)', () => {
+  beforeAll(async () => {
+    pool = new pg.Pool({ connectionString: process.env.TEST_DB_URL, max: 4 });
+    await criarIdentidades();
+  }, 60_000);
+
+  afterAll(async () => {
+    await pool?.end().catch(() => {});
+  });
+
+  /**
+   * AC07/AC08 — a matriz de constraints do §5.6.1/§5.6.2, medida contra o
+   * BANCO (não contra o repositório): é o `psql` do incidente que estas
+   * constraints existem para parar.
+   *
+   * `23001` = `restrict_violation` (trigger de imutabilidade/append-only).
+   * `23514` = `check_violation`. `23503` = `foreign_key_violation`.
+   * `23505` = `unique_violation`.
+   */
+  it('AC08 — identidades distintas e imutáveis, fase/terminal/tamanho e FK de escopo', async () => {
+    const f = await criarTurno({ atual: 'constraints' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+    const antes = await lerRun(run_id);
+
+    // (1) IDENTIDADES: turn/attempt/token/worker/generation/request/pin.
+    const imutaveis: Array<[string, string]> = [
+      ['generation_no', '2'],
+      ['origin_turn_attempt', '9'],
+      ['origin_claim_token', `'${randomUUID()}'`],
+      ['remote_instance_id', "'outra-instancia'"],
+      ['manifest_digest', `'${'b'.repeat(64)}'`],
+      ['mode', "'shadow'"],
+      ['control_id', `'${randomUUID()}'`],
+      ['request_json', `'{"x":1}'::jsonb`],
+      ['request_key', `'${randomUUID()}'`],
+      ['host_context_json', `'{"x":1}'::jsonb`],
+    ];
+    for (const [coluna, valor] of imutaveis) {
+      await expect(
+        pool.query(`UPDATE engine_runs SET ${coluna}=${valor} WHERE id=$1`, [antes.id]),
+        `${coluna} tem de ser imutável no banco`,
+      ).rejects.toMatchObject({ code: '23001' });
+    }
+
+    /**
+     * `origin_worker_id` NÃO está na lista de colunas imutáveis do trigger da
+     * 140 — e não precisa estar: ele não carrega autoridade. Quem autoriza é
+     * `origin_claim_token` (imutável), e o LOADER exige a coincidência dos três
+     * (token, tentativa, worker). Reescrever o worker no `psql` só faz o run
+     * deixar de carregar para quem escreveu.
+     */
+    await pool.query(`UPDATE engine_runs SET origin_worker_id='outro-dono' WHERE id=$1`, [
+      antes.id,
+    ]);
+    expect(
+      await scoped(() => loadHermesLaunchContext(antes.id, f.execution)),
+      'worker divergente não carrega o run — não há herança de posse',
+    ).toBeNull();
+    await pool.query(`UPDATE engine_runs SET origin_worker_id=$2 WHERE id=$1`, [
+      antes.id,
+      f.execution.worker_id,
+    ]);
+    expect(await scoped(() => loadHermesLaunchContext(antes.id, f.execution))).not.toBeNull();
+
+    // (2) VOCABULÁRIO de fase.
+    await expect(
+      pool.query(`UPDATE engine_runs SET phase='nope' WHERE id=$1`, [antes.id]),
+    ).rejects.toMatchObject({ code: '23514' });
+
+    // (3) TERMINAL incompleto não é aceito como `result_ready`.
+    await expect(
+      pool.query(`UPDATE engine_runs SET phase='result_ready' WHERE id=$1`, [antes.id]),
+    ).rejects.toMatchObject({ code: '23514' });
+
+    // (4) `remote_run_id`: NULL → valor UMA vez; a segunda troca é recusada.
+    await pool.query(`UPDATE engine_runs SET remote_run_id='remote-once' WHERE id=$1`, [antes.id]);
+    await expect(
+      pool.query(`UPDATE engine_runs SET remote_run_id='remote-twice' WHERE id=$1`, [antes.id]),
+    ).rejects.toMatchObject({ code: '23001' });
+
+    // (5) O ledger é APPEND-ONLY.
+    await expect(
+      pool.query(`UPDATE engine_run_events SET metadata_json='{}'::jsonb WHERE run_id=$1`, [antes.id]),
+    ).rejects.toMatchObject({ code: '23001' });
+    await expect(
+      pool.query(`DELETE FROM engine_run_events WHERE run_id=$1`, [antes.id]),
+    ).rejects.toMatchObject({ code: '23001' });
+    const eventos = await pool.query<{ n: string; min_seq: string; max_seq: string }>(
+      `SELECT count(*)::text AS n, min(sequence_no)::text AS min_seq, max(sequence_no)::text AS max_seq
+         FROM engine_run_events WHERE run_id=$1`,
+      [antes.id],
+    );
+    expect(eventos.rows[0]).toEqual({ n: '1', min_seq: '1', max_seq: '1' });
+
+    // (6) ESCPO CRUZADO: a FK COMPOSTA recusa um run para um escopo que não existe.
+    await expect(
+      pool.query(
+        `INSERT INTO engine_runs(id,tenant_id,agent_id,turn_id,generation_no,origin_turn_attempt,
+           origin_claim_token,origin_worker_id,control_id,control_epoch,mode,manifest_digest,phase,row_version,
+           request_key,remote_instance_id,request_json,request_hash,host_context_json,host_context_hash,
+           deadline_at,reconcile_deadline_at,last_event_sequence)
+         SELECT gen_random_uuid(), $1, 'outro-agente-sc02', turn_id, 1, origin_turn_attempt,
+           origin_claim_token, origin_worker_id, control_id, control_epoch, mode, manifest_digest, 'prepared', 0,
+           gen_random_uuid(), remote_instance_id, request_json, request_hash, host_context_json, host_context_hash,
+           deadline_at, reconcile_deadline_at, 0
+           FROM engine_runs WHERE id=$2`,
+        [T, antes.id],
+      ),
+    ).rejects.toMatchObject({ code: '23503' });
+
+    // (7) ÚNICO parcial de run ABERTO por turno.
+    const idx = await pool.query<{ indexdef: string }>(
+      `SELECT indexdef FROM pg_indexes WHERE schemaname='public' AND indexname='engine_runs_one_open_turn_uq'`,
+    );
+    expect(idx.rowCount).toBe(1);
+    expect(idx.rows[0]!.indexdef).toContain('UNIQUE');
+    expect(idx.rows[0]!.indexdef).toContain('phase');
+
+    // (8) TAMANHO: um request acima do teto da coluna é recusado pelo CHECK.
+    const enorme = JSON.stringify({
+      ...requestV1(),
+      context: { system: 'SC02', messages: [{ role: 'user', content: 'x'.repeat(1_200_000) }], tools: [] },
+    });
+    await expect(persistirRunManual({ request_json_text: enorme })).rejects.toMatchObject({
+      code: '23514',
+    });
+
+    // (9) MESMA execução (`request_key`) não abre um segundo run.
+    const manual = await persistirRunManual();
+    await expect(persistirRunManual({ request_key: manual.request_key })).rejects.toMatchObject({
+      code: '23505',
+    });
+
+    // (10) Nenhuma recusa acima escreveu nada.
+    const depois = await lerRun(antes.id);
+    expect(depois.row_version).toBe(antes.row_version);
+    expect(depois.submit_count).toBe(0);
+    expect(depois.request_hash).toBe(antes.request_hash);
+    expect(depois.request_json).toEqual(antes.request_json);
+  }, 180_000);
+
+  /**
+   * AC07 — os LEDGERS são os que já existem; nenhuma segunda outbox de envio é
+   * criada, e a migration do card é APPEND-ONLY (função + trigger, sem tabela).
+   */
+  it('AC07 — ledgers existentes, sem segunda outbox e migration append-only', async () => {
+    const tabelas = await pool.query<{ tablename: string }>(
+      `SELECT tablename FROM pg_tables WHERE schemaname='public'
+        AND tablename IN ('outbound_messages','outbox_messages','engine_runs','engine_run_events',
+                          'engine_inference_attempts','engine_turn_bindings','hermes_runtime_manifests',
+                          'conversation_controls')
+        ORDER BY tablename`,
+    );
+    expect(tabelas.rows.map((r) => r.tablename)).toEqual([
+      'conversation_controls',
+      'engine_inference_attempts',
+      'engine_run_events',
+      'engine_runs',
+      'engine_turn_bindings',
+      'hermes_runtime_manifests',
+      'outbound_messages',
+      'outbox_messages',
+    ]);
+
+    const sql150 = readFileSync('migrations/150_engine_turn_bindings_immutable.sql', 'utf8');
+    expect(sql150).not.toMatch(/CREATE\s+TABLE/i);
+    expect(sql150).toMatch(/CREATE OR REPLACE FUNCTION engine_turn_bindings_immutable_columns/);
+    expect(sql150).toMatch(/BEFORE UPDATE ON engine_turn_bindings/);
+
+    // O fluxo provado não escreve em NENHUMA das duas outboxes nem em tentativa.
+    const f = await criarTurno({ atual: 'ledger' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+    expect(
+      await contar(`SELECT count(*)::text AS n FROM outbound_messages WHERE turn_id=$1`, [f.turn_id]),
+    ).toBe(0);
+    expect(
+      await contar(
+        `SELECT count(*)::text AS n FROM outbox_messages WHERE tenant_id=$1 AND agent_id=$2`,
+        [T, A],
+      ),
+    ).toBe(0);
+    expect(
+      await contar(`SELECT count(*)::text AS n FROM engine_inference_attempts WHERE run_id=$1`, [
+        run_id,
+      ]),
+    ).toBe(0);
+  }, 120_000);
+
+  /**
+   * AC10/T09 — `startPrepared` com o runtime REAL e o transporte dublado.
+   *
+   * Prova: o CAS de submissão vem antes do I/O, o aceite é gravado UMA vez
+   * (`submit_count=1`, `remote_run_id` uma vez), a cadeia de eventos é
+   * `prepared → submit_started → submit_observed` e um SEGUNDO start não abre
+   * segundo processo: ele é mandado para reconciliação.
+   */
+  it('AC10/T09 — startPrepared: CAS antes do I/O, aceite uma vez e segundo start sem segundo processo', async () => {
+    const dbl = engineDouble();
+    expect(dbl.runtime.pin.adapter_revision).toBe(HERMES_ENGINE_ADAPTER_REVISION);
+
+    const f = await criarTurno({ atual: 'start' });
+    await reivindicar(f);
+    const run_id = (await admitir(f, dbl.admirable))!;
+    expect(run_id).not.toBeNull();
+
+    const started = await scoped(() =>
+      runWithTurnExecution(f.execution, () => dbl.runtime.startPrepared(run_id)),
+    );
+    expect(started).toMatchObject({ kind: 'accepted' });
+    expect(dbl.launches).toHaveLength(1);
+
+    const run = await lerRun(run_id);
+    expect(run.phase).toBe('running');
+    expect(run.submit_count).toBe(1);
+    expect(run.remote_instance_id).toBe(dbl.runtime.remoteInstanceId);
+    expect(run.remote_run_id).not.toBeNull();
+    expect(run.capabilities_revoked_at).toBeNull();
+
+    const eventos = await pool.query<{ event_type: string; dedupe_key: string }>(
+      `SELECT event_type, dedupe_key FROM engine_run_events WHERE run_id=$1 ORDER BY sequence_no`,
+      [run_id],
+    );
+    expect(eventos.rows.map((r) => r.event_type)).toEqual([
+      'prepared',
+      'submit_started',
+      'submit_observed',
+    ]);
+    expect(eventos.rows.map((r) => r.dedupe_key)).toEqual([
+      'prepared',
+      'submit_started:1',
+      'submit_observed:1:accepted',
+    ]);
+
+    // O que o transporte recebeu é o REQUEST e o MANIFEST persistidos.
+    const enviado = dbl.launches[0]!.start;
+    expect(enviado.run_id).toBe(run_id);
+    expect(enviado.request_key).toBe(run.request_key);
+    expect(enviado.context).toEqual({
+      system: (run.request_json.context as { system: string }).system,
+      user_message: 'start',
+      history: [],
+    });
+    expect(enviado.manifest.tools).toEqual([]);
+
+    // SEGUNDO start: o journal manda reconciliar — nunca um segundo processo.
+    const segundo = await scoped(() =>
+      runWithTurnExecution(f.execution, () => dbl.runtime.startPrepared(run_id)),
+    );
+    expect(segundo).toEqual({ kind: 'unknown', code: 'run_requires_reconciliation' });
+    expect(dbl.launches).toHaveLength(1);
+    const depois = await lerRun(run_id);
+    expect(depois.submit_count).toBe(1);
+    expect(depois.remote_run_id).toBe(run.remote_run_id);
+  }, 120_000);
+
+  /**
+   * AC10 — a INTENÇÃO de submit é durável ANTES do I/O, e nenhuma TX nossa
+   * atravessa a chamada externa.
+   *
+   * O motor recusa (o `launch` falha). O que se mede depois: o run continua em
+   * `submitting` com `submit_count=1` (a intenção ficou gravada), as capacidades
+   * foram revogadas, e o processo NÃO é reutilizado — um novo `startPrepared`
+   * manda reconciliar. Durante o `launch`, um `FOR UPDATE NOWAIT` de OUTRA
+   * conexão na linha do run tem de funcionar: se um TX nosso estivesse aberto,
+   * a linha estaria travada e a prova falharia.
+   */
+  it('AC10 — recusa do motor deixa a intenção durável e revoga, sem TX aberta no I/O', async () => {
+    const probe = new pg.Client({ connectionString: process.env.TEST_DB_URL });
+    await probe.connect();
+    let lockFreeDuringIo: boolean | null = null;
+    try {
+      const dbl = engineDouble({
+        outcome: 'spawn_failed',
+        onLaunch: async (spec) => {
+          try {
+            const r = await probe.query(
+              `SELECT id FROM engine_runs WHERE tenant_id=$1 AND agent_id=$2 AND id=$3 FOR UPDATE NOWAIT`,
+              [T, A, spec.start.run_id],
+            );
+            lockFreeDuringIo = r.rowCount === 1;
+          } catch {
+            lockFreeDuringIo = false;
+          }
+        },
+      });
+
+      const f = await criarTurno({ atual: 'recusa' });
+      await reivindicar(f);
+      const run_id = (await admitir(f, dbl.admirable))!;
+
+      // SENSIBILIDADE DO MEDIDOR: com a linha realmente TRAVADA, o `NOWAIT`
+      // do probe falha. Sem esta prova, `lockFreeDuringIo === true` não
+      // distinguiria "sem TX" de "a query nunca checou nada".
+      const travas = new pg.Client({ connectionString: process.env.TEST_DB_URL });
+      await travas.connect();
+      try {
+        await travas.query('BEGIN');
+        await travas.query(
+          `SELECT id FROM engine_runs WHERE tenant_id=$1 AND agent_id=$2 AND id=$3 FOR UPDATE`,
+          [T, A, run_id],
+        );
+        let medidorAcusa = false;
+        try {
+          await probe.query(
+            `SELECT id FROM engine_runs WHERE tenant_id=$1 AND agent_id=$2 AND id=$3 FOR UPDATE NOWAIT`,
+            [T, A, run_id],
+          );
+        } catch {
+          medidorAcusa = true;
+        }
+        expect(
+          medidorAcusa,
+          'o medidor precisa acusar linha travada — senão lockFreeDuringIo não prova ausência de TX',
+        ).toBe(true);
+      } finally {
+        await travas.query('ROLLBACK').catch(() => {});
+        await travas.end().catch(() => {});
+      }
+
+      const res = await scoped(() =>
+        runWithTurnExecution(f.execution, () => dbl.runtime.startPrepared(run_id)),
+      );
+      expect(res).toEqual({
+        kind: 'rejected',
+        definitely_not_accepted: true,
+        code: 'launch_spawn_failed',
+      });
+      expect(
+        lockFreeDuringIo,
+        'o I/O do motor não pode acontecer dentro de uma TX do journal',
+      ).toBe(true);
+      expect(dbl.launches).toHaveLength(1);
+
+      const run = await lerRun(run_id);
+      expect(run.phase).toBe('submitting');
+      expect(run.submit_count).toBe(1);
+      expect(run.remote_run_id).toBeNull();
+      expect(run.capabilities_revoked_at).not.toBeNull();
+
+      // Sem retry inventado: um novo start é recusado por reconciliação.
+      const segundo = await scoped(() =>
+        runWithTurnExecution(f.execution, () => dbl.runtime.startPrepared(run_id)),
+      );
+      expect(segundo).toEqual({ kind: 'unknown', code: 'run_requires_reconciliation' });
+      expect(dbl.launches).toHaveLength(1);
+    } finally {
+      await probe.end().catch(() => {});
+    }
+  }, 120_000);
+
+  /**
+   * AC09 — `remote_run_id` só NULL→valor UMA vez, dedupe sob lock incrementa a
+   * sequência UMA vez, metadata minimizada (ids e códigos, nunca conteúdo).
+   */
+  it('AC09 — aceite uma vez, conflito de id bloqueia o run e metadata é só id/código', async () => {
+    const dbl = engineDouble();
+    const f = await criarTurno({ atual: 'ack' });
+    await reivindicar(f);
+    const run_id = (await admitir(f, dbl.admirable))!;
+    await scoped(() => runWithTurnExecution(f.execution, () => dbl.runtime.startPrepared(run_id)));
+    const aceito = await lerRun(run_id);
+    expect(aceito.remote_run_id).not.toBeNull();
+    const sequencia = aceito.last_event_sequence;
+
+    // (1) redelivery do MESMO aceite: idempotente, sem nova sequência.
+    const mesmo = await scoped(() =>
+      engineRunsRepo.recordStartObservation({
+        run_id,
+        turn_id: f.turn_id,
+        origin_claim_token: f.claim_token,
+        observation: { kind: 'accepted', remote_run_id: aceito.remote_run_id! },
+      }),
+    );
+    expect(mesmo).toMatchObject({ ok: true });
+    expect((await lerRun(run_id)).last_event_sequence).toBe(sequencia);
+
+    // (2) OUTRO id para a MESMA execução: bloqueia, nunca sobrescreve.
+    const outro = await scoped(() =>
+      engineRunsRepo.recordStartObservation({
+        run_id,
+        turn_id: f.turn_id,
+        origin_claim_token: f.claim_token,
+        observation: { kind: 'accepted', remote_run_id: 'outro-processo' },
+      }),
+    );
+    expect(outro).toMatchObject({ ok: false, reason: 'remote_id_conflict' });
+    const bloqueado = await lerRun(run_id);
+    expect(bloqueado.phase).toBe('blocked');
+    expect(bloqueado.remote_run_id).toBe(aceito.remote_run_id);
+
+    // (3) UMA linha por desfecho, e a metadata só carrega ids/códigos.
+    const observados = await pool.query<{ dedupe_key: string; metadata_json: unknown }>(
+      `SELECT dedupe_key, metadata_json FROM engine_run_events
+        WHERE run_id=$1 AND event_type='submit_observed' ORDER BY sequence_no`,
+      [run_id],
+    );
+    expect(observados.rows.map((r) => r.dedupe_key)).toEqual([
+      'submit_observed:1:accepted',
+      expect.stringMatching(/^submit_observed:conflict:[0-9a-f]{32}$/) as unknown as string,
+    ]);
+    expect(Object.keys(observados.rows[0]!.metadata_json as object).sort()).toEqual([
+      'kind',
+      'remote_run_id',
+    ]);
+    expect(Object.keys(observados.rows[1]!.metadata_json as object).sort()).toEqual([
+      'current_remote_run_id',
+      'kind',
+      'observed_remote_run_id',
+    ]);
+    const texto = JSON.stringify(observados.rows.map((r) => r.metadata_json));
+    expect(texto).not.toContain('SC02 manual');
+
+    // (4) O ancor da mensagem é validado no MESMO escopo: representativa de
+    // OUTRA conversa recusa a admissão inteira, sem persistir nada.
+    const outroTurno = await criarTurno({ atual: 'ancora' });
+    await reivindicar(outroTurno);
+    const mensagemDeOutraConversa = randomUUID();
+    await pool.query(
+      `INSERT INTO mensagens(id,tenant_id,agent_id,conversa_id,channel_id,direcao,tipo,conteudo,metadata,created_at,stream_key,stream_key_version,ingress_seq)
+       VALUES($1,$2,$3,$4,$5,'in','texto','ancora','{}'::jsonb, now(), $6, 1, 900001)`,
+      [mensagemDeOutraConversa, T, A, f.conversa_id, f.channel_id, f.control_stream_key],
+    );
+    await pool.query(`UPDATE agent_turns SET representative_message_id=$2 WHERE id=$1`, [
+      outroTurno.turn_id,
+      mensagemDeOutraConversa,
+    ]);
+    const recusado = await admitir(outroTurno);
+    expect(recusado).toBeNull();
+    expect(
+      await contar(`SELECT count(*)::text AS n FROM engine_runs WHERE turn_id=$1`, [
+        outroTurno.turn_id,
+      ]),
+    ).toBe(0);
+  }, 120_000);
+
+  /**
+   * AC11 — o fence avalia o TEMPO depois da espera pelo lock, e toda recusa é
+   * TIPADA e sem escrita.
+   *
+   * `now()` é o instante do INÍCIO da TX, congelado ANTES da espera; a lease é
+   * lida com `clock_timestamp()`. Este teste constrói exatamente essa janela:
+   * um dono externo trava a linha do turno, o repositório passa a ESPERAR pelo
+   * lock, e — enquanto ele espera — a lease vence.
+   */
+  it('AC11 — lease avaliada DEPOIS da espera de lock recusa como stale_claim, sem escrita', async () => {
+    const f = await criarTurno({ atual: 'lock' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+    const antes = await lerRun(run_id);
+
+    const holder = new pg.Client({ connectionString: process.env.TEST_DB_URL });
+    await holder.connect();
+    try {
+      await holder.query('BEGIN');
+      await holder.query(
+        `SELECT id FROM agent_turns WHERE tenant_id=$1 AND agent_id=$2 AND id=$3 FOR UPDATE`,
+        [T, A, f.turn_id],
+      );
+
+      const pendente = scoped(() =>
+        engineRunsRepo.markSubmitting({
+          run_id,
+          turn_id: f.turn_id,
+          origin_claim_token: f.claim_token,
+          expected_row_version: antes.row_version,
+        }),
+      );
+
+      // (a) o chamador está REALMENTE esperando o lock do turno.
+      let esperando = false;
+      for (let i = 0; i < 100 && !esperando; i++) {
+        const w = await pool.query<{ n: string }>(
+          `SELECT count(*)::text AS n FROM pg_stat_activity
+            WHERE datname = current_database() AND wait_event_type = 'Lock'`,
+        );
+        esperando = w.rows[0]!.n !== '0';
+        if (!esperando) await new Promise((r) => setTimeout(r, 50));
+      }
+      expect(esperando, 'markSubmitting tem de esperar o lock do turno').toBe(true);
+
+      // (b) enquanto espera, o dono da linha faz a lease VENCER.
+      await holder.query(
+        `UPDATE agent_turns SET lease_expires_at = now() - interval '1 second' WHERE id=$1`,
+        [f.turn_id],
+      );
+      await holder.query('COMMIT');
+
+      const res = await pendente;
+      expect(res).toMatchObject({ ok: false, reason: 'stale_claim' });
+
+      const depois = await lerRun(run_id);
+      expect(depois.phase).toBe('prepared');
+      expect(depois.row_version).toBe(antes.row_version);
+      expect(depois.submit_count).toBe(0);
+      expect(
+        await contar(`SELECT count(*)::text AS n FROM engine_run_events WHERE run_id=$1`, [run_id]),
+      ).toBe(1);
+    } finally {
+      await holder.end().catch(() => {});
+    }
+
+    // (c) SEM RETRY COM TOKEN NOVO: outro dono vivo do turno também não pode
+    // submeter o run de origem ANTIGA (o token do run é imutável).
+    const tokenNovo = randomUUID();
+    await pool.query(
+      `UPDATE agent_turns SET claim_token=$2, lease_expires_at=now() + interval '5 minutes'
+        WHERE id=$1`,
+      [f.turn_id, tokenNovo],
+    );
+    const comNovoToken = await scoped(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: f.turn_id,
+        origin_claim_token: tokenNovo,
+        expected_row_version: antes.row_version,
+      }),
+    );
+    expect(comNovoToken).toMatchObject({ ok: false, reason: 'stale_claim' });
+    const ainda = await lerRun(run_id);
+    expect(ainda.phase).toBe('prepared');
+    expect(ainda.submit_count).toBe(0);
+  }, 120_000);
+
+  /**
+   * AC11 — posse VIVA mas turno fora de `running` é `state_mismatch` tipado,
+   * não `stale_claim`: a distinção diz ao chamador "o turno andou", não "você
+   * não é mais o dono".
+   */
+  it('AC11 — turno fora de running com posse viva é state_mismatch tipado, sem escrita', async () => {
+    const f = await criarTurno({ atual: 'state' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+    const antes = await lerRun(run_id);
+
+    await pool.query(`UPDATE agent_turns SET status='retryable' WHERE id=$1`, [f.turn_id]);
+    const res = await scoped(() =>
+      engineRunsRepo.markSubmitting({
+        run_id,
+        turn_id: f.turn_id,
+        origin_claim_token: f.claim_token,
+        expected_row_version: antes.row_version,
+      }),
+    );
+    expect(res).toMatchObject({ ok: false, reason: 'state_mismatch' });
+
+    const depois = await lerRun(run_id);
+    expect(depois.phase).toBe('prepared');
+    expect(depois.row_version).toBe(antes.row_version);
+    expect(depois.submit_count).toBe(0);
+    expect(
+      await contar(`SELECT count(*)::text AS n FROM engine_run_events WHERE run_id=$1`, [run_id]),
+    ).toBe(1);
+  }, 120_000);
+
+  /**
+   * AC11 — os orçamentos de QUERY/LOCK do exemplo do §5.6.4 são fixtures do
+   * exemplo, não defaults operacionais: o banco do card não impõe
+   * `lock_timeout`/`statement_timeout`.
+   */
+  it('AC11 — o banco do card não impõe orçamento de lock/query (sem default operacional)', async () => {
+    const lt = await pool.query<{ lock_timeout: string }>('SHOW lock_timeout');
+    const st = await pool.query<{ statement_timeout: string }>('SHOW statement_timeout');
+    expect(lt.rows[0]!.lock_timeout).toBe('0');
+    expect(st.rows[0]!.statement_timeout).toBe('0');
+  }, 60_000);
+
+  /**
+   * SPEC-L2842 — os contratos do card NÃO são só interfaces TypeScript: os
+   * schemas executáveis e as recusas NEGATIVAS existem no mesmo SHA.
+   */
+  it('SPEC-L2842/AC04 — manifesto persistido: refs não autorizadas, tools vazias e digest sintético explícito', async () => {
+    const f = await criarTurno({ atual: 'manifest' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+    const run = await lerRun(run_id);
+    const linha = await pool.query<{ manifest_json: Record<string, unknown> }>(
+      `SELECT manifest_json FROM hermes_runtime_manifests WHERE tenant_id=$1 AND agent_id=$2 AND run_id=$3`,
+      [T, A, run_id],
+    );
+    const parsed = parseRuntimeManifest(linha.rows[0]!.manifest_json);
+    expect(parsed.kind).toBe('ok');
+    if (parsed.kind !== 'ok') throw new Error('manifest persistido inválido');
+    const manifest = parsed.manifest;
+
+    // Nenhuma publicação/bundle foi consumido: a lista é VAZIA, não "o que der".
+    expect(manifest.publication_refs).toEqual([]);
+    expect(manifest.tools).toEqual([]);
+    expect((run.request_json.context as unknown as { tools: unknown[] }).tools).toEqual([]);
+
+    // O digest de imagem é um RÓTULO SINTÉTICO explícito — não um digest real
+    // inventado a partir de colunas.
+    expect(manifest.runtime_pin.image_digest).toBe(
+      canonicalDigest({ evidence_class: 'synthetic', source_checkout: HERMES_SHA }),
+    );
+    expect(manifest.runtime_pin.dependency_lock_digest).toBe(
+      canonicalDigest({ evidence_class: 'synthetic', unattested: true }),
+    );
+    expect(manifest.runtime_pin.image_digest).not.toBe(
+      manifest.runtime_pin.dependency_lock_digest,
+    );
+
+    // O pin do engine é o vocabulário fechado e os epochs são decimais.
+    expect(enginePinV1Schema.safeParse(manifest.runtime_pin.hermes_sha).success).toBe(false);
+    expect(manifest.control_epoch).toBe('0');
+    expect(manifest.exposure_epoch).toBe('0');
+  }, 120_000);
+
+  /**
+   * SPEC-L1401 — as cláusulas de imutabilidade que a rodada 1 não provou:
+   * terminal conflituoso (`engine_runs`) rejeitado, repetir o IDÊNTICO é no-op
+   * e os args da tool call (`engine_tool_calls`) também são imutáveis, com
+   * `effect_evidence` monotônico.
+   */
+  it('SPEC-L1401 — terminal e args de tool são imutáveis; repetir o idêntico é no-op', async () => {
+    const f = await criarTurno({ atual: 'l1401' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+
+    const terminal = JSON.stringify({ resultado: 'sintetico' });
+    const terminalHash = canonicalDigest({ resultado: 'sintetico' });
+    const aceitarTerminal = () =>
+      pool.query(`UPDATE engine_runs SET terminal_json=$2::jsonb, terminal_hash=$3 WHERE id=$1`, [
+        run_id,
+        terminal,
+        terminalHash,
+      ]);
+
+    // NULL -> valor (uma vez) e, repetido BYTE A BYTE, é no-op.
+    await aceitarTerminal();
+    await aceitarTerminal();
+
+    // Terminal DIFERENTE para a mesma execução é conflito, não sobrescrita.
+    await expect(
+      pool.query(`UPDATE engine_runs SET terminal_hash=$2 WHERE id=$1`, [
+        run_id,
+        canonicalDigest({ outro: 'terminal' }),
+      ]),
+      'terminal já aceito não pode ser substituído',
+    ).rejects.toMatchObject({ code: '23001' });
+
+    // `call args` (SPEC-L1401) vivem em `engine_tool_calls`.
+    await pool.query(
+      `INSERT INTO engine_tool_calls(id,tenant_id,agent_id,run_id,turn_id,call_id,ordinal,tool_name,args_json,args_hash,request_id,state,effect_evidence)
+       VALUES(gen_random_uuid(),$1,$2,$3,$4,'run:1',0,'ler_memoria','{"x":1}'::jsonb,$5,gen_random_uuid(),'received','possible')`,
+      [T, A, run_id, f.turn_id, 'a'.repeat(64)],
+    );
+    await expect(
+      pool.query(`UPDATE engine_tool_calls SET args_json='{"x":2}'::jsonb WHERE run_id=$1`, [
+        run_id,
+      ]),
+      'args_json é imutável',
+    ).rejects.toMatchObject({ code: '23001' });
+    await expect(
+      pool.query(`UPDATE engine_tool_calls SET effect_evidence='none' WHERE run_id=$1`, [run_id]),
+      'effect_evidence não regride para none',
+    ).rejects.toMatchObject({ code: '23001' });
+
+    // Repetir os MESMOS args é no-op — a recusa acima não é "UPDATE proibido".
+    await pool.query(`UPDATE engine_tool_calls SET args_json='{"x":1}'::jsonb WHERE run_id=$1`, [
+      run_id,
+    ]);
+    expect(
+      await contar(`SELECT count(*)::text AS n FROM engine_inference_attempts WHERE run_id=$1`, [
+        run_id,
+      ]),
+      'nenhuma inferência foi disparada por nenhuma destas escritas',
+    ).toBe(0);
+  }, 120_000);
+});
+
+describe('SC02 — contratos estritos do wire (§5.3.1/§4.1) e canonicidade (T05/T07/T08)', () => {
+  it('T05/AC06 — omissão, campo EXTRA e UUID inválido são recusados pelo schema estrito', () => {
+    expect(engineRequestV1Schema.safeParse(requestV1()).success).toBe(true);
+
+    // (1) CAMPO EXTRA no topo e dentro do contexto: autoridade acidental barrada.
+    expect(engineRequestV1Schema.safeParse(requestV1({ extra: 1 })).success).toBe(false);
+    const comExtraNoContexto = requestV1();
+    (comExtraNoContexto.context as Record<string, unknown>).approved = true;
+    expect(engineRequestV1Schema.safeParse(comExtraNoContexto).success).toBe(false);
+
+    // (2) OMISSÃO de campo obrigatório.
+    const semLimites = requestV1();
+    delete semLimites.limits;
+    expect(engineRequestV1Schema.safeParse(semLimites).success).toBe(false);
+
+    // (3) UUID inválido e vocabulário fechado.
+    expect(engineRequestV1Schema.safeParse(requestV1({ run_id: 'nao-e-uuid' })).success).toBe(false);
+    expect(engineRequestV1Schema.safeParse(requestV1({ task: 'chat' })).success).toBe(false);
+    expect(engineRequestV1Schema.safeParse(requestV1({ isolation: 'shared' })).success).toBe(false);
+
+    // (4) O snapshot de host: extra, epoch decimal e ids não vazios.
+    expect(hostContextSnapshotV1Schema.safeParse(hostV1()).success).toBe(true);
+    expect(hostContextSnapshotV1Schema.safeParse(hostV1({ extra: true })).success).toBe(false);
+    expect(
+      hostContextSnapshotV1Schema.safeParse(hostV1({ control_epoch: '007' })).success,
+    ).toBe(false);
+    expect(hostContextSnapshotV1Schema.safeParse(hostV1({ control_epoch: '1' })).success).toBe(true);
+    expect(hostContextSnapshotV1Schema.safeParse(hostV1({ input_message_ids: [] })).success).toBe(
+      false,
+    );
+    expect(hostContextSnapshotV1Schema.safeParse(hostV1({ channel_id: 'x' })).success).toBe(false);
+
+    // (5) O pin: só `maia_react`/`hermes`, protocolo 1, digest sha256.
+    expect(
+      enginePinV1Schema.safeParse({
+        engine: 'outro',
+        adapter_revision: 'r',
+        configuration_digest: 'a'.repeat(64),
+        protocol_version: 1,
+      }).success,
+    ).toBe(false);
+    expect(
+      enginePinV1Schema.safeParse({
+        engine: 'maia_react',
+        adapter_revision: 'r',
+        configuration_digest: 'a'.repeat(64),
+        protocol_version: 1,
+      }).success,
+    ).toBe(true);
+    expect(
+      enginePinV1Schema.safeParse({
+        engine: 'hermes',
+        adapter_revision: 'r',
+        configuration_digest: 'A'.repeat(64),
+        protocol_version: 1,
+      }).success,
+    ).toBe(false);
+  });
+
+  it('T08 — reordenar o payload mantém o fingerprint; mutá-lo troca o fingerprint', () => {
+    const a = { b: { d: 3, c: [1, 2] }, a: 1 };
+    const reordenado = { a: 1, b: { c: [1, 2], d: 3 } };
+    expect(canonicalDigest(a)).toBe(canonicalDigest(reordenado));
+
+    const mutado = { a: 1, b: { c: [1, 2], d: 4 } };
+    expect(canonicalDigest(a)).not.toBe(canonicalDigest(mutado));
+    expect(canonicalDigest({ a: 1 })).not.toBe(canonicalDigest({ a: 2 }));
+  });
+
+  it('T07/§5.3.4 — JSON não serializável é erro TIPADO, não conversão silenciosa', () => {
+    const casos: Array<[unknown, string]> = [
+      [{ x: undefined }, 'unsupported_type'],
+      [{ x: () => 1 }, 'unsupported_type'],
+      [{ x: new Map() }, 'unsupported_type'],
+      [{ x: new Date() }, 'unsupported_type'],
+      [{ x: Number.NaN }, 'non_finite'],
+      [{ x: Number.POSITIVE_INFINITY }, 'non_finite'],
+    ];
+    for (const [valor, codigo] of casos) {
+      let capturado: unknown = null;
+      try {
+        canonicalJsonStringify(valor);
+      } catch (error) {
+        capturado = error;
+      }
+      expect(capturado, `${codigo}: tem de lançar`).toBeInstanceOf(CanonicalJsonError);
+      expect((capturado as CanonicalJsonError).code).toBe(codigo);
+    }
+    const ciclo: Record<string, unknown> = {};
+    ciclo.self = ciclo;
+    expect(() => canonicalJsonStringify(ciclo)).toThrow(CanonicalJsonError);
+  });
 });
