@@ -55,7 +55,6 @@ const T = 'sc07hb-tenant';
 const A = 'sc07hb-agent';
 
 let pool: pg.Pool;
-const createdMensagens: string[] = [];
 
 const inT = <R>(fn: () => Promise<R>): Promise<R> =>
   runWithTenantContext({ tenant_id: T, agent_id: A }, fn);
@@ -103,7 +102,6 @@ async function mkTurn(): Promise<{ turn_id: string; mensagem_id: string }> {
      VALUES ($1, $2, $3, NULL, 'in', 'texto', 'x', '{}'::jsonb, NULL)`,
     [mensagem_id, T, A],
   );
-  createdMensagens.push(mensagem_id);
   const { agentTurnsRepo } = await import('@/db/repositories/turn-repos.js');
   const turn = await inT(() =>
     agentTurnsRepo.ensureTurnForMessage({
@@ -201,27 +199,27 @@ d('SC07 — heartbeat limitado e serializado (Postgres real)', () => {
   }, 30_000);
 
   afterAll(async () => {
-    for (const id of createdMensagens) {
-      const turns = await pool.query<{ id: string }>(
-        `SELECT id FROM agent_turns WHERE tenant_id = $1 AND agent_id = $2 AND representative_message_id = $3`,
-        [T, A, id],
-      );
-      for (const t of turns.rows) {
-        await pool.query(
-          `DELETE FROM engine_runs WHERE tenant_id = $1 AND agent_id = $2 AND turn_id = $3`,
-          [T, A, t.id],
-        );
-        await pool.query(
-          `DELETE FROM engine_turn_bindings WHERE tenant_id = $1 AND agent_id = $2 AND turn_id = $3`,
-          [T, A, t.id],
-        );
-        await pool.query(
-          `DELETE FROM agent_turns WHERE tenant_id = $1 AND agent_id = $2 AND id = $3`,
-          [T, A, t.id],
-        );
-      }
-      await pool.query(`DELETE FROM mensagens WHERE id = $1`, [id]);
-    }
+    // Teardown em ORDEM de FK e por TENANT/AGENT — não pela lista de ids criados.
+    //
+    // O tenant deste spec é exclusivo, então o filtro por (tenant, agent) é
+    // isolado por construção; e limpar por escopo, em vez de por id, faz a
+    // rodada seguinte apagar qualquer sobra de uma rodada ANTERIOR que tenha
+    // morrido no meio (um caso que falha não pode deixar o banco sujo para o
+    // próximo — foi exatamente o que aconteceu aqui: uma sobra de `engine_runs`
+    // de uma rodada anterior quebrou o DELETE de `conversation_controls` por FK,
+    // e o erro no teardown contamina a rodada seguinte).
+    //
+    // Ordem: `engine_runs` (referenciado por engine_tool_calls/events/projections)
+    // → `engine_turn_bindings` → `agent_turns` (leva `agent_turn_inputs` por
+    // ON DELETE CASCADE, que é quem segura `mensagens`) → `mensagens` →
+    // `conversation_controls` (referenciado por `engine_runs.control_id`).
+    await pool.query(`DELETE FROM engine_runs WHERE tenant_id = $1 AND agent_id = $2`, [T, A]);
+    await pool.query(`DELETE FROM engine_turn_bindings WHERE tenant_id = $1 AND agent_id = $2`, [
+      T,
+      A,
+    ]);
+    await pool.query(`DELETE FROM agent_turns WHERE tenant_id = $1 AND agent_id = $2`, [T, A]);
+    await pool.query(`DELETE FROM mensagens WHERE tenant_id = $1 AND agent_id = $2`, [T, A]);
     await pool.query(`DELETE FROM conversation_controls WHERE tenant_id = $1 AND agent_id = $2`, [
       T,
       A,
