@@ -72,10 +72,16 @@ import {
 import {
   blockingFailures,
   evaluateAgentReadiness,
+  revalidateEngineReadiness,
+  NO_ENGINE_DEPLOYMENT_EVIDENCE,
+  ENGINE_DEPLOYMENT_EVIDENCE_CLASSES,
+  ENGINE_UNAVAILABLE_REASONS,
   READINESS_CHECK_CODES,
   type AgentReadiness,
+  type EngineEvidenceLoader,
 } from './readiness.js';
 import { loadReadinessFactsWith, lockReadinessSnapshot } from './readiness-facts.js';
+import { loadEnginePolicyBindingsWith } from '@/db/repositories/engine-policy-repos.js';
 import {
   parseCancelReason,
   projectRunMetadata,
@@ -446,6 +452,16 @@ export type WizardDeps = {
   requestPairing?: PairingPort;
   evaluateReadiness?: ReadinessEvaluator;
   startLineSessions?: LineSessionStarter;
+  /**
+   * SC03 — a porta da EVIDÊNCIA de implantação do motor remoto.
+   *
+   * Injetável porque ela é o único fato do readiness que NÃO mora no banco: o
+   * atestador do §9.4. Não injetada, vale o portão FECHADO
+   * (`NO_ENGINE_DEPLOYMENT_EVIDENCE`): nenhuma atestação ⇒ nenhum agente que
+   * peça o motor remoto fica pronto. O que os testes injetam é a evidência
+   * SINTÉTICA completa.
+   */
+  loadEngineEvidence?: EngineEvidenceLoader;
   now?: () => Date;
 };
 
@@ -971,13 +987,28 @@ export async function executeOnboardingStep(input: {
    * escritas: só a row de `onboarding_runs` estava travada, e profile, grant,
    * papel, política ou canal podiam mudar entre o retrato e o `applyActivate`.
    */
+  /**
+   * SC03 — a evidência de implantação do motor remoto. Não injetada vale o
+   * portão fechado; ver `WizardDeps.loadEngineEvidence`.
+   */
+  const engineEvidence: EngineEvidenceLoader =
+    input.deps?.loadEngineEvidence ?? NO_ENGINE_DEPLOYMENT_EVIDENCE;
+
   const evaluate: ReadinessEvaluator =
     input.deps?.evaluateReadiness ??
     ((scope, ctx) =>
-      evaluateAgentReadiness(
-        scope,
-        ctx ? { loadFacts: (s) => loadReadinessFactsWith(ctx.tx, s) } : {},
-      ));
+      evaluateAgentReadiness(scope, {
+        ...(ctx
+          ? {
+              loadFacts: (s) => loadReadinessFactsWith(ctx.tx, s),
+              // SC03: as linhas de `agent_engine_policies` são lidas pelo
+              // MESMO executor dos fatos. Ler pelo handle global tiraria a
+              // decisão de dentro da transação que faz as escritas.
+              loadEnginePolicies: (s) => loadEnginePolicyBindingsWith(ctx.tx, s),
+            }
+          : {}),
+        loadEngineEvidence: engineEvidence,
+      }));
 
   let outcome: CommitStepOutcome;
   try {
@@ -1134,6 +1165,38 @@ export async function executeOnboardingStep(input: {
             // auditoria da desativação precisa dos `failed_checks` de cada um
             // (re-review do PR #541, achado 3). O ator vai junto porque tirar
             // um canal do roteamento é decisão de governança — tem dono.
+            // SC03 — CAS do MOTOR REMOTO, imediatamente antes da escrita.
+            //
+            // A reavaliação acima é do banco e das portas; ela diz "pronto
+            // AGORA". O que esta etapa acrescenta é a pergunta que um retrato
+            // sozinho não responde: "o retrato que autorizou a ativação ainda é
+            // o do backend no instante da escrita?". As linhas de política são
+            // relidas PELO MESMO `tx` e a evidência de implantação pela porta
+            // (que é externa por natureza), e as duas revisões são comparadas
+            // com as do relatório. Divergência ⇒ recusa tipada ANTES de
+            // qualquer escrita: nenhuma admissão nova nasce de um retrato
+            // velho, e nada é criado no caminho de recusa.
+            //
+            // Um agente que NÃO pede o motor remoto não consulta nada aqui
+            // (SC03-AC02): não há política nem evidência para um motor local.
+            const engineCheck = await revalidateEngineReadiness({
+              expected: readiness.engine,
+              scope,
+              loadEnginePolicies: (s) => loadEnginePolicyBindingsWith(tx, s),
+              loadEngineEvidence: engineEvidence,
+            });
+            if (!engineCheck.ok) {
+              return {
+                result: readinessResult(readiness),
+                summary: readinessSummary(readiness),
+                deny: { code: engineCheck.code, message: engineCheck.message },
+                audit: {
+                  action: 'onboarding_agent_activated',
+                  resource_type: 'agent',
+                  resource_id: run.agent_id,
+                },
+              };
+            }
             return applyActivate(tx, run, {
               configuration_fingerprint: readiness.configuration_fingerprint,
               schema_fingerprint: readiness.schema_fingerprint,
@@ -1341,6 +1404,9 @@ function readinessSummary(readiness: AgentReadiness): Record<string, unknown> {
     failed_checks: blockingFailures(readiness).map((c) => c.code),
     configuration_fingerprint: readiness.configuration_fingerprint,
     schema_fingerprint: readiness.schema_fingerprint,
+    // SC03 — o veredito do motor remoto na trilha. São códigos e revisões
+    // (digests), nunca conteúdo de bundle nem credencial.
+    engine: readiness.engine ?? null,
   };
 }
 
@@ -1372,6 +1438,10 @@ function readinessResult(readiness: AgentReadiness): Record<string, unknown> {
     evaluated_at: readiness.evaluated_at,
     configuration_fingerprint: readiness.configuration_fingerprint,
     schema_fingerprint: readiness.schema_fingerprint,
+    // SC03 — o readback do motor remoto. É o que permite comparar o estado
+    // projetado no console com o que o backend decidiu, e o que a revalidação
+    // CAS compara numa ativação seguinte.
+    engine: readiness.engine ?? null,
     checks: readiness.checks.map((c) => ({
       code: c.code,
       status: c.status,
@@ -1406,6 +1476,26 @@ const replayedReadinessSchema = z.object({
   evaluated_at: z.string(),
   configuration_fingerprint: z.string(),
   schema_fingerprint: z.string(),
+  /**
+   * SC03 — o readback do motor remoto. É OBRIGATÓRIO no schema, e isto é
+   * deliberado: um `result` gravado ANTES desta spec não tem a projeção, e o
+   * replay dele passa a devolver code/message sem relatório — exatamente o
+   * comportamento que este módulo já documenta para payload antigo/truncado.
+   * A alternativa (opcional aqui) devolveria um `AgentReadiness` SEM `engine`,
+   * isto é, um relatório que contradiz o próprio tipo e faria o próximo
+   * consumidor estourar longe da causa.
+   */
+  engine: z
+    .object({
+      requested: z.boolean(),
+      kill_switch: z.boolean(),
+      evidence_class: z.enum(ENGINE_DEPLOYMENT_EVIDENCE_CLASSES).nullable(),
+      binding_revision: z.string().nullable(),
+      evidence_revision: z.string().nullable(),
+      available: z.boolean(),
+      unavailable_reason: z.enum(ENGINE_UNAVAILABLE_REASONS).nullable(),
+    })
+    .nullable(),
   checks: z.array(
     z.object({
       code: z.enum(READINESS_CHECK_CODES),
@@ -1431,7 +1521,14 @@ const replayedReadinessSchema = z.object({
 
 function reconstituteReadiness(result: unknown): AgentReadiness | undefined {
   const parsed = replayedReadinessSchema.safeParse(result);
-  return parsed.success ? parsed.data : undefined;
+  if (!parsed.success) return undefined;
+  // SC03: `engine: null` no ledger significa que o relatório gravado não tinha
+  // a projeção do motor (relatório injetado, ou linha anterior a esta spec).
+  // Reconstituir assim devolveria um `AgentReadiness` que contradiz o próprio
+  // tipo — então vale a regra do módulo: sem relatório, nunca com relatório
+  // inventado.
+  if (parsed.data.engine === null) return undefined;
+  return { ...parsed.data, engine: parsed.data.engine };
 }
 
 /**

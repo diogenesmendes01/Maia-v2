@@ -20,6 +20,7 @@
 import { and, eq, sql } from 'drizzle-orm';
 import type { EngineKind } from '@/runtime/engines/contracts.js';
 import { ENGINE_KINDS } from '@/runtime/engines/schemas.js';
+import type { EnginePolicyBindingFactV1 } from '@/onboarding/readiness.js';
 import { db } from '../client.js';
 import { agent_engine_policies } from '../schema.js';
 import { getCurrentAgent, getCurrentTenant } from '../tenant-context.js';
@@ -151,4 +152,69 @@ export async function readEnginePolicyForScope(s: EnginePolicyScope): Promise<En
     throw new EnginePolicyLookupError('scope_mismatch');
   }
   return enginePoliciesRepo.find(s.channel_id);
+}
+
+// ─── SC03: leitura por ESCOPO EXPLÍCITO (readiness e sua revalidação) ─────────
+
+/**
+ * Executor de leitura: o handle global `db` OU o `tx` do passo de ativação.
+ *
+ * A ativação precisa reler as linhas de política DENTRO da transação que faz as
+ * escritas; caso contrário a revalidação de CAS compararia o retrato com um
+ * banco que não é o do commit, que é a forma mais fácil de um check verde
+ * autorizar uma escrita que a configuração já não sustenta.
+ */
+export type EnginePolicyReadExecutor = Pick<typeof db, 'select'>;
+
+/**
+ * As linhas de `agent_engine_policies` do escopo pedido — TODAS elas, incluindo
+ * as de outros canais do mesmo agente, porque é a POLÍTICA do agente que decide
+ * se o motor remoto é pedido.
+ *
+ * Escopo EXPLÍCITO (`tenant_id AND agent_id` no `WHERE`), e não o par do ALS:
+ * diferente de `readEnginePolicyForScope`, aqui o alvo é arbitrário (a run de
+ * ativação, o doctor, o console), e exigir ALS obrigaria o chamador a mentir
+ * sobre quem está rodando. A checagem de escopo do avaliador puro continua
+ * existindo por cima (`owns`), porque um `WHERE` esquecido é o modo de falha
+ * que o readiness existe para pegar.
+ *
+ * Falha de consulta SOBE como `EnginePolicyLookupError`: nunca devolve `[]`,
+ * que significaria "este agente não pede o motor remoto".
+ */
+export async function loadEnginePolicyBindingsWith(
+  executor: EnginePolicyReadExecutor,
+  s: { tenant_id: string; agent_id: string },
+): Promise<readonly EnginePolicyBindingFactV1[]> {
+  let rows: Array<{ tenant_id: string; agent_id: string; channel_id: string; engine: string; row_version: number }>;
+  try {
+    rows = await executor
+      .select({
+        tenant_id: t.tenant_id,
+        agent_id: t.agent_id,
+        channel_id: t.channel_id,
+        engine: t.engine,
+        row_version: t.row_version,
+      })
+      .from(t)
+      .where(and(eq(t.tenant_id, s.tenant_id), eq(t.agent_id, s.agent_id)));
+  } catch (err) {
+    throw new EnginePolicyLookupError('query_failed', { cause: err });
+  }
+  return rows.map((r) => ({
+    tenant_id: r.tenant_id,
+    agent_id: r.agent_id,
+    channel_id: r.channel_id,
+    // O valor é validado pelo avaliador puro contra o vocabulário fechado; o
+    // CHECK da 145 é a segunda barreira.
+    engine: r.engine,
+    row_version: Number(r.row_version),
+  }));
+}
+
+/** O caminho default do readiness: leitura pelo handle global. */
+export async function loadEnginePolicyBindingsFromDb(s: {
+  tenant_id: string;
+  agent_id: string;
+}): Promise<readonly EnginePolicyBindingFactV1[]> {
+  return loadEnginePolicyBindingsWith(db, s);
 }

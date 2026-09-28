@@ -14,6 +14,27 @@ import { Button } from '../../../../components/ui/button.js';
  * Antes deste card as duas últimas etapas não eram sequer mencionadas na UI:
  * o wizard terminava em "aprove o perfil" e o elo canal/papel/política ficava
  * invisível (canais e papéis eram seed/SQL-only).
+ *
+ * ─── SC03: indisponível ≠ pronto ────────────────────────────────────────────
+ *
+ * O componente antes fazia `if (isLoading || error) return null`, e o efeito era
+ * o pior possível para um checklist: quando o backend NÃO respondia, o card
+ * simplesmente desaparecia — e ausência de card lê como "nada pendente". Era o
+ * mesmo falso positivo que o readiness canônico existe para matar, só que
+ * pintado de vazio em vez de verde (§8.3: "Status desconhecido precisa
+ * permanecer visível, em vez de o card sumir em erro").
+ *
+ * Agora o estado DESCONHECIDO é explícito: o card continua na tela dizendo que
+ * não foi possível verificar, com o motivo e um "Tentar de novo". Nada é
+ * inferido de estado local para preencher a lacuna.
+ *
+ * O que este componente continua NÃO sendo: a autoridade do readiness. Ele lê
+ * uma projeção do backend (perfil/canais/papéis) e nunca declara "pronto" a
+ * partir de booleanos locais. A disponibilidade do MOTOR REMOTO
+ * (`AgentReadiness.engine` — pedido, kill switch, bundle, limites, pin) vem do
+ * mesmo avaliador de backend e é apresentada aqui quando a superfície do
+ * console que a expõe estiver ligada; enquanto ela não existir, esta tela não
+ * inventa um "pronto" para o motor: ela não o declara.
  */
 export default function GoLiveChecklist({
   tenantId,
@@ -31,7 +52,44 @@ export default function GoLiveChecklist({
     { enabled: tenantId !== '' },
   );
 
-  if (overviewQuery.isLoading || overviewQuery.error) return null;
+  // O veredito do backend não chegou: nem verde, nem oculto. `data` ausente sem
+  // erro é o mesmo estado — "não sei", nunca "nada pendente".
+  if (overviewQuery.error || (overviewQuery.data === undefined && !overviewQuery.isLoading)) {
+    return (
+      <Card>
+        <CardHeader title="Colocar no ar" description="Pré-condições para este agente atender." />
+        <CardBody>
+          <ul className="space-y-3">
+            <li className="flex items-start gap-3">
+              <span
+                aria-hidden
+                className="mt-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-zinc-200 text-xs font-semibold text-zinc-700"
+              >
+                ?
+              </span>
+              <span className="min-w-0 flex-1">
+                <span className="block text-sm font-medium text-zinc-900">
+                  Status indisponível
+                </span>
+                <span className="mt-0.5 block text-xs text-zinc-500">
+                  O backend não respondeu sobre canais e papéis deste agente. Sem
+                  essa resposta não é possível afirmar que ele está pronto — nem
+                  que não está.
+                </span>
+              </span>
+              <Button size="sm" variant="secondary" onClick={() => void overviewQuery.refetch()}>
+                Tentar de novo
+              </Button>
+            </li>
+          </ul>
+        </CardBody>
+      </Card>
+    );
+  }
+
+  // Carregando é estado transitório e conhecido: o card aparece assim que o
+  // veredito chega (o que não pode acontecer é o erro cair no mesmo silêncio).
+  if (overviewQuery.isLoading) return null;
 
   const overview = overviewQuery.data;
   const channels = overview?.channels ?? [];
