@@ -43,6 +43,14 @@
  *  6. Pergunta REAL é provada (mesma conversa, aberta, no prazo) e só então
  *     sobe; expirada ou de OUTRA conversa é suprimida do output, sem ressuscitar
  *     poll nem tocar a máquina de pendências (AC01/AC05/AC06).
+ *  7. Crash REAL entre o marcador e o `consume` (pedido preso em `claimed`, call
+ *     órfã em `handler_started`): o turno NOVO reconcilia pelo JOURNAL — a
+ *     evidência vira `execution_failed`, ZERO handler, e um pedido NOVO nasce
+ *     com o MESMO fingerprint, destravando a intenção (AC04/AC06). Antes desta
+ *     correção o pedido ficava `claimed` para sempre e a operação ficava presa.
+ *  8. Crash REAL entre o claim e o marcador (claim sem carimbo): o journal prova
+ *     NÃO INÍCIO, a evidência VOLTA a `approved` e a MESMA evidência executa UMA
+ *     vez no turno novo, sendo consumida por ele (AC04).
  *
  * Skipped sem `TEST_DB_URL`.
  */
@@ -533,6 +541,76 @@ async function vencePorSql(id: string): Promise<void> {
     [id],
   );
   if (r.rowCount !== 1) throw new Error(`vencimento por SQL não aplicou: ${id}`);
+}
+
+/**
+ * §5.5.1 (SC05) — O ESTADO QUE UM SIGKILL DEIXA, montado a partir de uma
+ * execução REAL.
+ *
+ * O crash que o AC04 descreve não é reproduzível dentro do processo: o
+ * dispatcher sempre passa por `consume`, `failClaimedApproval` ou
+ * `releaseClaimedApproval` antes de morrer, porque esses caminhos são código
+ * dele. O que um `kill -9` deixa é outra coisa — o pedido `claimed` (com o
+ * token que a call carrega) e a call no journal exatamente como estava no
+ * instante da morte. É esse estado que se recria aqui, a partir das rows que
+ * uma execução REAL produziu, sem inventar transição nenhuma:
+ *
+ *   * a evidência volta a `claimed` com o token da call — o CHECK da migration
+ *     095 exige token justamente nesse estado, e é ele que o CAS de recovery
+ *     vai exigir de volta;
+ *   * `aposMarcador: false` limpa o carimbo de início e o desfecho da call: é o
+ *     processo que morreu ENTRE o claim e o marcador. Nada rodou, e o journal
+ *     diz isso;
+ *   * `aposMarcador: true` deixa a call intacta (carimbo de início presente):
+ *     o processo morreu ENTRE o marcador e o `consume`;
+ *   * a reserva de idempotência é REMOVIDA para representar um cache podado ou
+ *     vencido — sem isso a repetição nem chegaria à máquina de aprovação, e o
+ *     que se mediria seria o ledger de idempotência, não o AC04.
+ *
+ * Nada aqui decide o desfecho: quem decide é o turno NOVO, pelo caminho real.
+ */
+async function simularCrashDoClaim(input: {
+  run_id: string;
+  call_id: string;
+  pedido_id: string;
+  aposMarcador: boolean;
+}): Promise<string> {
+  const call = await lerCall(input.run_id, input.call_id);
+  const token = call.approval_claim_token;
+  if (token === null) throw new Error('call sem approval_claim_token para simular o crash');
+  const r = await pool.query(
+    `UPDATE approval_requests SET status = 'claimed', claim_token = $2, updated_at = now()
+      WHERE id = $1 AND status = 'consumed'`,
+    [input.pedido_id, token],
+  );
+  if (r.rowCount !== 1) throw new Error(`crash simulado não aplicou no pedido: ${input.pedido_id}`);
+  if (!input.aposMarcador) {
+    await pool.query(
+      `UPDATE engine_tool_calls
+          SET state = 'dispatching', handler_started_at = NULL,
+              finished_at = NULL, result_json = NULL,
+              receipt_json = NULL, receipt_hash = NULL
+        WHERE run_id = $1 AND call_id = $2`,
+      [input.run_id, input.call_id],
+    );
+  } else {
+    // Morreu depois do marcador, antes do `consume`: a call fica `handler_started`
+    // (o carimbo existe, e com ele os dois tokens que o CHECK exige) e SEM
+    // desfecho gravado.
+    await pool.query(
+      `UPDATE engine_tool_calls
+          SET state = 'handler_started', finished_at = NULL,
+              result_json = NULL, receipt_json = NULL, receipt_hash = NULL
+        WHERE run_id = $1 AND call_id = $2`,
+      [input.run_id, input.call_id],
+    );
+  }
+  await pool.query(
+    `DELETE FROM idempotency_keys
+      WHERE tenant_id = $1 AND agent_id = $2 AND tool_name = 'create_contraparte' AND pessoa_id = $3`,
+    [TENANT, AGENT, PESSOA_ID],
+  );
+  return token;
 }
 
 /**
@@ -1050,8 +1128,17 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
       }),
     ).toBe('release_claim');
 
-    // ── TTL NÃO libera efeito: o claim vencido continua segurando a vaga e o
-    // token continua sendo a única chave para consumir ─────────────────────
+    // ── TTL NÃO libera efeito — e não é ele que decide ────────────────────
+    //
+    // O pedido volta a 'claimed' e VENCIDO, com o journal ainda provando NÃO
+    // INÍCIO (o carimbo foi removido no bloco acima). A idade não é critério:
+    // quem decide é o journal. O claim é DEVOLVIDO (a evidência volta a
+    // 'approved') — e, por estar vencida, é ENCERRADA em seguida pela regra de
+    // vencimento, porque `claim` exige `expires_at > now()`. O desfecho é
+    // 'none': nenhum efeito, nenhuma execução, e um pedido NOVO é o único
+    // caminho — o fingerprint não fica preso atrás de uma evidência que já não
+    // pode executar. É esta a diferença entre "TTL libera efeito" (proibido) e
+    // "TTL fecha a janela de uma evidência cujo efeito não começou" (exigido).
     await pool.query(
       `UPDATE approval_requests SET status = 'claimed', claim_token = $2, expires_at = now() - interval '1 hour'
         WHERE id = $1`,
@@ -1060,13 +1147,36 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
     const comClaimVencido = await noEscopo(() =>
       claimExecutableApproval({ intent_hash: pedido.intent_hash, requester: pessoaBase }),
     );
-    // Outro executante NÃO rouba o claim por relógio: a resposta é 'pending'.
-    expect(comClaimVencido.outcome).toBe('pending');
+    expect(comClaimVencido.outcome).toBe('none');
     const aposTtl = await lerAprovacao(pedido.id);
-    expect(aposTtl.status).toBe('claimed');
-    expect(aposTtl.claim_token).toBe(rowExec.approval_claim_token);
+    expect(aposTtl.status).toBe('expired');
+    expect(aposTtl.claim_token).toBeNull();
     // Devolver com o token ERRADO nunca passa.
     expect(await lerAprovacaoDevolvida(pedido.id, randomUUID())).toBe(false);
+
+    // ── o MESMO cenário, com o journal provando INÍCIO: terminal ───────────
+    // O vencimento não muda a resposta do CAS nem da política: com o carimbo
+    // de início, o claim continua RECUSADO — TTL não transforma "pode ter
+    // acontecido" em "não aconteceu".
+    await pool.query(
+      `UPDATE approval_requests SET status = 'claimed', claim_token = $2, expires_at = now() - interval '1 hour'
+        WHERE id = $1`,
+      [pedido.id, rowExec.approval_claim_token],
+    );
+    await pool.query(
+      `UPDATE engine_tool_calls SET effect_class = 'non_interruptible', handler_started_at = now() - interval '1 minute'
+        WHERE run_id = $1 AND call_id = $2`,
+      [run2, call2],
+    );
+    expect(
+      await lerAprovacaoDevolvida(pedido.id, rowExec.approval_claim_token!),
+    ).toBe(false);
+    const reivindicadoVencido = await noEscopo(() =>
+      claimExecutableApproval({ intent_hash: pedido.intent_hash, requester: pessoaBase }),
+    );
+    expect(reivindicadoVencido.outcome).toBe('none');
+    expect((await lerAprovacao(pedido.id)).status).toBe('execution_failed');
+
     // A incerteza do próprio journal é tratada como início comprovado.
     expect(
       classifyApprovalClaimRecovery({
@@ -1076,6 +1186,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         start_uncertain: true,
       }),
     ).toBe('execution_failed');
+    expect(fixture.contraparte).toBe(1);
   });
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -1307,5 +1418,158 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
     // A pergunta vencida continua `aberta` e sem resposta: o gateway suprime, não
     // cancela nem ressuscita.
     expect((await lerPendencia(idF)).status).toBe('aberta');
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 7. crash REAL pós-marcador: o claim órfão é reconciliado pelo caminho real
+  // ══════════════════════════════════════════════════════════════════════════
+  it('7. AC04/AC06 — crash entre o marcador e o consume: novo turno reconcilia pelo JOURNAL e a evidência vira execution_failed (nova aprovação, zero handler)', async () => {
+    const nonce = randomUUID();
+    const args = { texto: 'orfao-pos-marcador', nonce };
+
+    // ── o pedido nasce e é aprovado por humanos ────────────────────────────
+    const turno1 = await mkTurnoVivo();
+    const run1 = await runRodando(turno1, await mkControle());
+    const call1 = `sc05:orf1:${randomUUID().slice(0, 8)}`;
+    await gatewayReal(turno1, run1).invoke(chamadaGw(run1, call1, args));
+    const pedido = (await pedidosDoNonce(nonce))[0]!;
+    await aprovarPorSql(pedido.id);
+
+    // ── uma execução REAL reivindica a evidência e roda o handler ──────────
+    const turno2 = await mkTurnoVivo();
+    const run2 = await runRodando(turno2, await mkControle());
+    const call2 = `sc05:orf2:${randomUUID().slice(0, 8)}`;
+    const r2 = await gatewayReal(turno2, run2).invoke(chamadaGw(run2, call2, args));
+    expect(r2).toMatchObject({ kind: 'result', is_error: false });
+    expect(fixture.contraparte).toBe(1);
+    expect((await lerCall(run2, call2)).approval_request_id).toBe(pedido.id);
+
+    // ── o processo MORRE antes do consume e o pedido fica preso em 'claimed' ─
+    const tokenDoCrash = await simularCrashDoClaim({
+      run_id: run2,
+      call_id: call2,
+      pedido_id: pedido.id,
+      aposMarcador: true,
+    });
+    const orfa = await lerCall(run2, call2);
+    expect(orfa.state).toBe('handler_started');
+    expect(orfa.handler_started_at).not.toBeNull();
+    const presa = await lerAprovacao(pedido.id);
+    expect(presa.status).toBe('claimed');
+    expect(presa.claim_token).toBe(tokenDoCrash);
+    // O estado ANTES da correção: `claimed` está em OPEN_STATUSES, então este
+    // pedido — que ninguém consegue decidir — bloqueia a partial unique do
+    // fingerprint e a operação fica presa para sempre.
+    expect(await pedidosAbertosDoFingerprint(pedido.fingerprint)).toHaveLength(1);
+
+    // ── turno NOVO (mensagem nova, mesmo intent): quem reconcilia é o caminho
+    // real — gateway → dispatcher → claimExecutableApproval ────────────────
+    const turno3 = await mkTurnoVivo();
+    const run3 = await runRodando(turno3, await mkControle());
+    const call3 = `sc05:orf3:${randomUUID().slice(0, 8)}`;
+    const r3 = await gatewayReal(turno3, run3).invoke(chamadaGw(run3, call3, args));
+
+    // ZERO handler: a reconciliação não executa nada, nem "retoma" o run antigo.
+    expect(fixture.contraparte).toBe(1);
+    expect(r3).toMatchObject({ kind: 'result', is_error: true });
+
+    // O pedido órfão vira TERMINAL — o journal provou o início, e uma execução
+    // que pode ter acontecido exige aprovação NOVA (§5.5.1, INV-09).
+    const posRecuperacao = await lerAprovacao(pedido.id);
+    expect(posRecuperacao.status).toBe('execution_failed');
+    expect(await pedidosAbertosDoFingerprint(pedido.fingerprint)).toHaveLength(1);
+
+    // O pedido NOVO tem o MESMO fingerprint/hash — a intenção é a mesma, a
+    // EVIDÊNCIA é que não se transfere.
+    const novos = await pedidosDoNonce(nonce);
+    expect(novos).toHaveLength(2);
+    const novo = novos[1]!;
+    expect(novo.id).not.toBe(pedido.id);
+    expect(novo.status).toBe('pending');
+    expect(novo.fingerprint).toBe(pedido.fingerprint);
+    expect(novo.intent_hash).toBe(pedido.intent_hash);
+
+    const row3 = await lerCall(run3, call3);
+    expect(row3.state).toBe('approval_required');
+    expect(row3.approval_request_id).toBe(novo.id);
+    expect(row3.handler_started_at).toBeNull();
+
+    // A call órfã NÃO é ressuscitada nem reescrita: o journal guarda o que
+    // aconteceu, e quem reconcilia o RUN (não a aprovação) é o motor de recovery.
+    const orfaDepois = await lerCall(run2, call2);
+    expect(orfaDepois.state).toBe('handler_started');
+    expect(orfaDepois.handler_started_at).toEqual(orfa.handler_started_at);
+    expect(orfaDepois.receipt_json).toBeNull();
+
+    // ── e o fingerprint DESTRAVOU: aprovado o pedido novo, a operação executa
+    // UMA vez (o efeito antigo não foi reemitido por causa disso) ───────────
+    await aprovarPorSql(novo.id);
+    const turno4 = await mkTurnoVivo();
+    const run4 = await runRodando(turno4, await mkControle());
+    const call4 = `sc05:orf4:${randomUUID().slice(0, 8)}`;
+    const r4 = await gatewayReal(turno4, run4).invoke(chamadaGw(run4, call4, args));
+    expect(r4).toMatchObject({ kind: 'result', is_error: false });
+    expect(fixture.contraparte).toBe(2);
+    expect((await lerAprovacao(novo.id)).status).toBe('consumed');
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 8. crash REAL antes do marcador: a evidência VOLTA (prova de não início)
+  // ══════════════════════════════════════════════════════════════════════════
+  it('8. AC04 — crash entre o claim e o marcador: o journal prova não início e a MESMA evidência volta a executar UMA vez', async () => {
+    const nonce = randomUUID();
+    const args = { texto: 'orfao-antes-do-marcador', nonce };
+
+    const turno1 = await mkTurnoVivo();
+    const run1 = await runRodando(turno1, await mkControle());
+    const call1 = `sc05:pre1:${randomUUID().slice(0, 8)}`;
+    await gatewayReal(turno1, run1).invoke(chamadaGw(run1, call1, args));
+    const pedido = (await pedidosDoNonce(nonce))[0]!;
+    await aprovarPorSql(pedido.id);
+
+    const turno2 = await mkTurnoVivo();
+    const run2 = await runRodando(turno2, await mkControle());
+    const call2 = `sc05:pre2:${randomUUID().slice(0, 8)}`;
+    await gatewayReal(turno2, run2).invoke(chamadaGw(run2, call2, args));
+    expect(fixture.contraparte).toBe(1);
+
+    // ── o processo morre ANTES do marcador: o claim existe, o carimbo não ──
+    const tokenDoCrash = await simularCrashDoClaim({
+      run_id: run2,
+      call_id: call2,
+      pedido_id: pedido.id,
+      aposMarcador: false,
+    });
+    const orfa = await lerCall(run2, call2);
+    expect(orfa.state).toBe('dispatching');
+    expect(orfa.handler_started_at).toBeNull();
+    expect((await lerAprovacao(pedido.id)).status).toBe('claimed');
+
+    // ── turno NOVO: a prova de NÃO INÍCIO devolve a evidência e ela executa ─
+    const turno3 = await mkTurnoVivo();
+    const run3 = await runRodando(turno3, await mkControle());
+    const call3 = `sc05:pre3:${randomUUID().slice(0, 8)}`;
+    const r3 = await gatewayReal(turno3, run3).invoke(chamadaGw(run3, call3, args));
+
+    // UM handler — o do turno novo —, sob o MESMO pedido de aprovação: a
+    // evidência humana voltou a valer porque o efeito comprovadamente não
+    // começou, e o consume é dela.
+    expect(fixture.contraparte).toBe(2);
+    expect(r3).toMatchObject({ kind: 'result', is_error: false });
+    const row3 = await lerCall(run3, call3);
+    expect(row3.state).toBe('completed');
+    expect(row3.approval_request_id).toBe(pedido.id);
+    expect(row3.approval_claim_token).not.toBeNull();
+    expect(row3.approval_claim_token).not.toBe(tokenDoCrash);
+
+    const depois = await lerAprovacao(pedido.id);
+    expect(depois.status).toBe('consumed');
+    expect(depois.claim_token).toBe(row3.approval_claim_token);
+
+    // Nenhum pedido NOVO foi criado: a evidência devolvida é a MESMA, porque o
+    // journal provou que o handler não chegou a rodar. Devolver aqui não é
+    // reutilizar evidência gasta — é não gastar uma evidência que não executou.
+    expect(await pedidosDoNonce(nonce)).toHaveLength(1);
+    expect((await lerCall(run2, call2)).handler_started_at).toBeNull();
   });
 });

@@ -28,6 +28,17 @@ export type ApprovalStatus =
 
 const OPEN_STATUSES: ApprovalStatus[] = ['pending', 'approved', 'claimed'];
 
+/**
+ * §5.5.1 / SPEC-L1406 (SC05) — o instantâneo do journal que a política de
+ * recovery do claim consome. Contagens e uma classe, não conteúdo de chamada: a
+ * decisão não precisa saber QUAL operação foi tentada, só se algo pode ter
+ * começado no mundo.
+ */
+export interface ApprovalClaimJournal {
+  handler_started: boolean;
+  effect_class: string | null;
+}
+
 function scope() {
   return { tenant_id: getCurrentTenant(), agent_id: getCurrentAgent() };
 }
@@ -212,6 +223,62 @@ export const approvalRequestsRepo = {
       )
       .returning();
     return rows[0] ?? null;
+  },
+
+  /**
+   * §5.5.1 / SPEC-L1406 (SC05) — O JOURNAL do pedido, na forma EXATA que a
+   * política de recovery do claim consome (`classifyApprovalClaimRecovery`).
+   *
+   * ─── Por que a leitura é um AGREGADO e não "a call" ─────────────────────────
+   *
+   * Um pedido pode ser carregado por MAIS de uma call: a que reivindicou e caiu
+   * (a que interessa aqui) e as que voltaram `approval_required` apontando para
+   * o mesmo pedido. Responder por "uma call qualquer" escolheria a resposta pelo
+   * acaso da ordenação. As duas perguntas que a política faz são EXISTENCIAIS e
+   * é assim que elas são respondidas aqui:
+   *
+   *   * `handler_started` — existe alguma call deste pedido com carimbo de
+   *     início? O carimbo é gravado ANTES da chamada física (§5.6.4), então ele
+   *     é a única prova de que algo pode ter acontecido no mundo;
+   *   * `effect_class` — `'abort_safe'` SOMENTE quando TODA call iniciada
+   *     declara ausência de efeito (é a declaração que libera o carimbo de
+   *     provar coisa alguma, a mesma régua de `classifyToolCancellation`).
+   *     Qualquer outra coisa — inclusive classe nula, que é "não sei" — sai
+   *     como a classe observada, e a política trata o resto como terminal.
+   *
+   * ─── O que esta leitura NÃO é ───────────────────────────────────────────────
+   *
+   * Não é reconciliação e não decide nada: devolve contagens, sem o conteúdo de
+   * nenhuma chamada, e não olha relógio. Idade não é prova de não início — a
+   * ausência do carimbo é.
+   */
+  async claimJournal(input: { approval_request_id: string }): Promise<ApprovalClaimJournal> {
+    const { tenant_id, agent_id } = scope();
+    const rows = await db
+      .select({
+        iniciadas: sql<string>`count(*) FILTER (WHERE ${engine_tool_calls.handler_started_at} IS NOT NULL)`,
+        com_efeito: sql<string>`count(*) FILTER (WHERE ${engine_tool_calls.handler_started_at} IS NOT NULL
+          AND ${engine_tool_calls.effect_class} IS DISTINCT FROM 'abort_safe')`,
+        classe: sql<string | null>`min(${engine_tool_calls.effect_class})
+          FILTER (WHERE ${engine_tool_calls.handler_started_at} IS NOT NULL
+            AND ${engine_tool_calls.effect_class} IS DISTINCT FROM 'abort_safe')`,
+      })
+      .from(engine_tool_calls)
+      .where(
+        and(
+          eq(engine_tool_calls.tenant_id, tenant_id),
+          eq(engine_tool_calls.agent_id, agent_id),
+          eq(engine_tool_calls.approval_request_id, input.approval_request_id),
+        ),
+      );
+    const linha = rows[0];
+    if (Number(linha?.iniciadas ?? 0) === 0) {
+      return { handler_started: false, effect_class: null };
+    }
+    if (Number(linha?.com_efeito ?? 0) === 0) {
+      return { handler_started: true, effect_class: 'abort_safe' };
+    }
+    return { handler_started: true, effect_class: linha?.classe ?? null };
   },
 
   /**

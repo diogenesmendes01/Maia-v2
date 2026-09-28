@@ -27,10 +27,12 @@ import {
   approvalDecisionsRepo,
   pessoasRepo,
   type ApprovalClass,
+  type ApprovalClaimJournal,
 } from '@/db/repositories.js';
 import type { ApprovalRequest, Pessoa } from '@/db/schema.js';
 import { audit } from './audit.js';
 import { isOwnerType, listOwners } from './permissions.js';
+import { classifyApprovalClaimRecovery } from '@/runtime/engines/recovery.js';
 import { logger } from '@/lib/logger.js';
 
 export const INTENT_HASH_VERSION = 1;
@@ -478,7 +480,12 @@ export async function claimExecutableApproval(input: {
   intent_hash: string;
   requester: Pessoa;
 }): Promise<ClaimOutcome> {
-  const open = await approvalRequestsRepo.findOpenByFingerprint(input.intent_hash);
+  /**
+   * `let` porque a RECUPERAÇÃO pode devolver a evidência ao estado executável
+   * durante esta mesma chamada (§5.5.1): o que era um claim órfão volta a ser
+   * 'approved' e o fluxo continua daqui — sem segundo claim de fora do caminho.
+   */
+  let open = await approvalRequestsRepo.findOpenByFingerprint(input.intent_hash);
   if (!open) return { outcome: 'none' };
 
   // A evidência pertence ao requester do intent — outra pessoa repetindo o
@@ -494,24 +501,65 @@ export async function claimExecutableApproval(input: {
   }
 
   if (open.status === 'pending') {
+    /**
+     * §5.5.1 / SPEC-L1406 (SC05) — 'pending' por status não quer dizer VÁLIDO.
+     * Um pedido pendente que já passou do prazo não é autorização em falta que
+     * valha esperar: ele é terminal (`expired`) e o caminho honesto é um pedido
+     * NOVO — é isso que impede a operação de ficar presa atrás de um pedido que
+     * ninguém pode mais aprovar (`markApproved` exige `expires_at > now()`).
+     */
+    if ((await descartarEvidenciaVencida(open)) === 'recreate') return { outcome: 'none' };
     return { outcome: 'pending', request: open, ref: approvalRef(open) };
   }
-  if (open.status !== 'approved') {
+
+  if (open.status === 'claimed') {
     /**
-     * §5.5.1 / SPEC-L1406 (SC05) — 'pending' OU 'claimed', e os dois precisam
-     * ser distinguidos de "vencido". Um pedido pendente que já passou do prazo
-     * não é autorização em falta que valha esperar: ele é terminal (`expired`) e
-     * o caminho honesto é um pedido NOVO — é isso que impede a operação de ficar
-     * presa para sempre atrás de um pedido que ninguém pode mais aprovar
-     * (`markApproved` exige `expires_at > now()`).
+     * §5.5.1 / SPEC-L1406 (SC05) — O CLAIM ÓRFÃO NÃO PRENDE A INTENÇÃO.
      *
-     * `claimed` NÃO entra: claim vivo é um executor em andamento, e encerrá-lo
-     * por relógio liberaria uma execução que pode estar acontecendo (§5.5.1).
+     * Um processo morto entre o claim e o `consume` deixa o pedido `claimed`
+     * para sempre, e `claimed` está em `OPEN_STATUSES`: todo turno novo com a
+     * mesma intenção cairia no `return 'pending'` abaixo, apontando para um
+     * pedido que nenhum humano consegue decidir — a operação travada por um
+     * efeito que NUNCA começou, ou por um que ninguém reconciliou.
+     *
+     * A recuperação pergunta ao JOURNAL (nunca ao relógio) se o handler chegou
+     * a começar:
+     *
+     *  * `release_claim` — prova de não início: a evidência volta a `approved`,
+     *    é relida AQUI e o fluxo continua para o claim normal. Quem executa
+     *    depois passa pelo mesmo CAS e pelo mesmo `consume`: devolver não é
+     *    executar;
+     *  * `execution_failed` — início, incerteza ou classe com efeito: a
+     *    evidência fica TERMINAL e a resposta é 'none', para que um pedido NOVO
+     *    nasça com o mesmo fingerprint (o antigo sai da partial unique);
+     *  * `held` — o CAS de recovery não passou (o pedido mudou de estado, ou já
+     *    não é daquele claim): não inventa desfecho e a resposta é 'pending'.
+     *
+     * ─── O que a devolução NÃO consegue distinguir, e por quê ────────────────
+     *
+     * Um claim SEM carimbo pode ser um processo morto ou um executor VIVO entre
+     * o claim e o marcador. A plataforma não tem sinal de vida para o claim
+     * (§5.5.1: «o claim de approval atual não é `TurnLease` e não herda
+     * heartbeat»), então o journal é a ÚNICA prova disponível — e é ela que a
+     * spec manda usar. Na corrida, quem garante UM efeito não é esta máquina: é
+     * a reserva de idempotência (§5.5.1/SC04), que devolve o resultado já
+     * comprometido ao perdedor sem rodar handler. Devolver a evidência aqui não
+     * cria segundo efeito; o que ela não pode fazer é escolher "pending" por
+     * relógio, que é exatamente o defeito que o AC04 proíbe.
      */
-    if (open.status === 'pending' && (await descartarEvidenciaVencida(open)) === 'recreate') {
-      return { outcome: 'none' };
+    const recuperacao = await recoverClaimedApproval({ request: open });
+    if (recuperacao === 'execution_failed') return { outcome: 'none' };
+    if (recuperacao === 'held') {
+      return { outcome: 'pending', request: open, ref: approvalRef(open) };
     }
-    // 'claimed' — outro executor está com o claim; não execute em paralelo.
+    const devolvida = await approvalRequestsRepo.byId(open.id);
+    if (!devolvida) return { outcome: 'none' };
+    open = devolvida;
+  }
+
+  if (open.status !== 'approved') {
+    // A devolução pode ter perdido para uma decisão humana em corrida (negada,
+    // ou já consumida por outro turno): não há evidência executável aqui.
     return { outcome: 'pending', request: open, ref: approvalRef(open) };
   }
 
@@ -617,22 +665,137 @@ export async function releaseClaimedApproval(input: {
   return true;
 }
 
-/** Execução falhou após o claim: terminal, exige NOVA aprovação (fail-closed). */
+/**
+ * Execução falhou após o claim: terminal, exige NOVA aprovação (fail-closed).
+ *
+ * §5.5.1 (SC05) — devolve `true` SÓ quando o banco aceitou a transição. Quem
+ * reconcilia precisa dessa resposta: um `false` significa que o pedido já não
+ * era daquele claim (outro executor, outra decisão humana, TTL já aplicado) e
+ * concluir "terminal" a partir daí seria afirmar um efeito de journal que o
+ * banco não confirmou.
+ */
 export async function failClaimedApproval(input: {
   request: ApprovalRequest;
   claim_token: string;
   cause: string;
-}): Promise<void> {
-  await approvalRequestsRepo.markExecutionFailed({
+}): Promise<boolean> {
+  const falhou = await approvalRequestsRepo.markExecutionFailed({
     id: input.request.id,
     claim_token: input.claim_token,
   });
+  if (!falhou) {
+    logger.warn(
+      { request_id: input.request.id, tool: input.request.tool },
+      'approval.mark_execution_failed_refused',
+    );
+    return false;
+  }
   await audit({
     acao: 'approval_execution_failed',
     pessoa_id: input.request.requester_pessoa_id,
     alvo_id: input.request.id,
     metadata: { tool: input.request.tool, cause: input.cause.slice(0, 200) },
   });
+  return true;
+}
+
+/**
+ * §5.5.1 / SPEC-L1406 (SC05) — RECONCILIA um claim de aprovação que chegou
+ * ÓRFÃO ao caminho de execução, e é o único consumidor de produção de
+ * `classifyApprovalClaimRecovery`.
+ *
+ * ─── O estado que esta função existe para desfazer ──────────────────────────
+ *
+ * Um processo que morre entre o claim e o `consume` (SIGKILL, OOM, deploy)
+ * deixa o banco assim: `approval_requests.status = 'claimed'` para sempre e a
+ * call do pedido com o carimbo de início. O pedido está em `OPEN_STATUSES`,
+ * então ele segue bloqueando a partial unique do fingerprint: TODO novo turno
+ * com a mesma intenção recebe `approval_required` apontando para um pedido que
+ * nenhum humano consegue decidir (`markApproved` exige `pending` e
+ * `expires_at > now()`). A operação fica presa — e não existe relógio que a
+ * solte, porque TTL não libera efeito (§5.5.1).
+ *
+ * ─── A decisão vem do JOURNAL, nunca do relógio ─────────────────────────────
+ *
+ * `classifyApprovalClaimRecovery` recebe o instantâneo lido de
+ * `approvalRequestsRepo.claimJournal` (carimbo de início + classe declarada) e
+ * responde uma de três coisas:
+ *
+ *   * `release_claim` — PROVA de não início: a evidência volta a `approved` e o
+ *     dono legítimo pode executá-la. Devolver aqui não "libera efeito": libera
+ *     uma evidência cujo efeito comprovadamente não começou, e quem executa
+ *     depois passa pelo MESMO claim e pelo mesmo `consume`;
+ *   * `execution_failed` — início comprovado, classe com efeito, ou journal
+ *     ILEGÍVEL (`start_uncertain`: "não consegui ler" não é prova de não
+ *     início). Terminal: exige aprovação NOVA, como manda o INV-09;
+ *   * `hold` — não há claim vivo a resolver, ou o CAS perdeu. Não inventa
+ *     desfecho.
+ *
+ * ─── Por que não é auto-resume ──────────────────────────────────────────────
+ *
+ * A função não executa nada, não cria run nem turno, e não "continua" execução
+ * interrompida: ela só fecha (ou devolve) a evidência humana. Quem executa é o
+ * turno que veio depois e passou de novo por claim e por journal.
+ */
+export type ClaimRecoveryOutcome = 'released' | 'execution_failed' | 'held';
+
+export async function recoverClaimedApproval(input: {
+  request: ApprovalRequest;
+}): Promise<ClaimRecoveryOutcome> {
+  const request = input.request;
+  // Só um claim VIVO tem o que resolver. A row de `claimed` carrega sempre o
+  // token (CHECK da migration 095), e é ele que o CAS exige.
+  if (request.status !== 'claimed' || request.claim_token === null) return 'held';
+
+  let journal: ApprovalClaimJournal = { handler_started: false, effect_class: null };
+  let start_uncertain = false;
+  try {
+    journal = await approvalRequestsRepo.claimJournal({ approval_request_id: request.id });
+  } catch (err) {
+    /**
+     * Journal ilegível é INCERTEZA, e incerteza não devolve evidência: a
+     * política a trata como início comprovado. Se o banco está fora, o CAS
+     * abaixo também não passa — a transição só acontece quando o mesmo banco
+     * que não pôde ser lido aceita a escrita.
+     */
+    start_uncertain = true;
+    logger.error(
+      { err: (err as Error).message, request_id: request.id, ops_alert: true },
+      'approval.claim_recovery_journal_unreadable',
+    );
+  }
+
+  const disposicao = classifyApprovalClaimRecovery({
+    approval_status: request.status,
+    handler_started: journal.handler_started,
+    effect_class: journal.effect_class,
+    start_uncertain,
+  });
+
+  if (disposicao === 'release_claim') {
+    const devolvida = await releaseClaimedApproval({
+      request,
+      claim_token: request.claim_token,
+    });
+    if (!devolvida) return 'held';
+    logger.info(
+      { request_id: request.id, tool: request.tool },
+      'approval.claim_released_by_recovery',
+    );
+    return 'released';
+  }
+
+  if (disposicao === 'execution_failed') {
+    const falhou = await failClaimedApproval({
+      request,
+      claim_token: request.claim_token,
+      cause: start_uncertain ? 'claim_recovery_journal_unreadable' : 'claim_recovery_handler_started',
+    });
+    if (!falhou) return 'held';
+    return 'execution_failed';
+  }
+
+  return 'held';
 }
 
 /**
