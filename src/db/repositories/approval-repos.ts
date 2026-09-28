@@ -34,19 +34,33 @@ const OPEN_STATUSES: ApprovalStatus[] = ['pending', 'approved', 'claimed'];
  * decisão não precisa saber QUAL operação foi tentada, só se algo pode ter
  * começado no mundo.
  *
- * `journal_call_linked` não é uma contagem a mais, é a diferença entre LER e
- * NÃO TER ONDE LER. Todo o resto do instantâneo é respondido por linhas de
+ * `owner_call_linked` não é uma contagem a mais, é a diferença entre LER e NÃO
+ * TER ONDE LER — e, mais que isso, entre ler sobre ESTE dono e ler sobre um
+ * dono que já não existe. Todo o resto do instantâneo é respondido por linhas de
  * `engine_tool_calls` do pedido: sem nenhuma linha, `handler_started` e os dois
  * sinais de vitalidade são falsos por AUSÊNCIA DE FONTE, não por ausência de
  * início — e o caminho LEGADO (`dispatchTool`, `run === null`, o que roda em
- * produção) é exatamente esse caso. Quem decide precisa saber que o journal não
- * tem o que dizer.
+ * produção) é exatamente esse caso.
+ *
+ * E uma linha QUALQUER do pedido não basta para provar coisa alguma sobre o
+ * claim VIGENTE: o pedido pode ter sido aberto por um turno DURÁVEL (a call
+ * antiga fica `approval_required`, terminal, ligada ao pedido) e depois
+ * reivindicado/executado pelo caminho LEGADO, que não escreve call nenhuma. A
+ * call antiga não tem carimbo e não é do dono, e lida como «prova de não início»
+ * devolvia a autorização de um executor VIVO no handler (o QA-P8/F4). Por isso a
+ * pergunta é feita com o token do claim: existe ao menos uma call do pedido
+ * carregando o `approval_claim_token` do dono VIGENTE?
  */
 export interface ApprovalClaimJournal {
   handler_started: boolean;
   effect_class: string | null;
-  /** Existe ao menos UMA call do journal carregando este `approval_request_id`. */
-  journal_call_linked: boolean;
+  /**
+   * Existe ao menos UMA call do journal carregando este `approval_request_id`
+   * E o `approval_claim_token` do claim VIGENTE (o dono que se está tentando
+   * reconciliar). `false` ⇒ não há observação sobre ESTE dono ⇒ não há prova de
+   * não início ⇒ segurar.
+   */
+  owner_call_linked: boolean;
 }
 
 function scope() {
@@ -259,13 +273,23 @@ export const approvalRequestsRepo = {
    *     Qualquer outra coisa — inclusive classe nula, que é "não sei" — sai
    *     como a classe observada, e a política trata o resto como terminal.
    *
-   *   * `journal_call_linked` — existe ALGUMA call deste pedido? É a pergunta
-   *     anterior a todas as outras, e a única que a ausência total de linhas
-   *     responde. No caminho LEGADO (`dispatchTool`, `run === null`) o pedido
-   *     vive só no `approval_requests` e o journal não tem linha nenhuma para
-   *     ele; sem esta resposta, "não há call carimbada" seria lido como prova
-   *     de não início e a evidência de um executor VIVO voltaria a circular
-   *     (o QA-P6/F3).
+   *   * `owner_call_linked` — existe ALGUMA call deste pedido carregando o
+   *     `approval_claim_token` do dono VIGENTE? É a pergunta anterior a todas as
+   *     outras, e a única que a ausência total de linhas responde — mas ela não
+   *     pergunta só «o journal tem o que dizer sobre este pedido?», e sim «o
+   *     journal tem o que dizer sobre ESTE dono?». As duas perguntas coincidem no
+   *     caminho LEGADO (`dispatchTool`, `run === null`), onde o pedido vive só no
+   *     `approval_requests` e o journal não tem linha nenhuma para ele: sem esta
+   *     resposta, «não há call carimbada» seria lido como prova de não início e a
+   *     evidência de um executor VIVO voltaria a circular (o QA-P6/F3).
+   *
+   *     E divergem no cenário MISTO (o QA-P8/F4): pedido aberto pelo gateway
+   *     DURÁVEL — deixando uma call antiga, já TERMINAL, ligada ao pedido — e
+   *     execução pelo caminho LEGADO, que não escreve call. A call antiga não tem
+   *     carimbo e não carrega o token do dono, então o escopo por token é o que
+   *     separa «nada começou» de «não sei nada sobre quem está executando agora».
+   *     Sem ele, a regra do release devolvia o claim de um handler em curso e a
+   *     MESMA aprovação autorizava dois efeitos.
    *
    * ─── O que esta leitura NÃO é ───────────────────────────────────────────────
    *
@@ -273,17 +297,35 @@ export const approvalRequestsRepo = {
    * nenhuma chamada, e não olha relógio. Idade não é prova de não início — a
    * ausência do carimbo é.
    */
-  async claimJournal(input: { approval_request_id: string }): Promise<ApprovalClaimJournal> {
+  async claimJournal(input: {
+    approval_request_id: string;
+    /**
+     * O token do claim VIGENTE — o dono que se está tentando reconciliar. É ele
+     * que dá ESCOPO à leitura: uma call do pedido que não carregue este token
+     * não é observação sobre este dono (nem sobre nenhum dono vivo). `null` cai
+     * no mesmo lugar que «sem call»: nenhum token casa, `owner_call_linked` é
+     * falso e a evidência é segurada — o lado seguro.
+     */
+    approval_claim_token: string | null;
+  }): Promise<ApprovalClaimJournal> {
     const { tenant_id, agent_id } = scope();
     const rows = await db
       .select({
-        chamadas: sql<string>`count(*)`,
         iniciadas: sql<string>`count(*) FILTER (WHERE ${engine_tool_calls.handler_started_at} IS NOT NULL)`,
         com_efeito: sql<string>`count(*) FILTER (WHERE ${engine_tool_calls.handler_started_at} IS NOT NULL
           AND ${engine_tool_calls.effect_class} IS DISTINCT FROM 'abort_safe')`,
         classe: sql<string | null>`min(${engine_tool_calls.effect_class})
           FILTER (WHERE ${engine_tool_calls.handler_started_at} IS NOT NULL
             AND ${engine_tool_calls.effect_class} IS DISTINCT FROM 'abort_safe')`,
+        /**
+         * A pergunta do ESCOPO: alguma call deste pedido carrega o claim do dono
+         * VIGENTE? `NULL` no lado do token não casa com nada (`= NULL` é NULL, e
+         * `FILTER` não conta) — que é exatamente o comportamento fail-closed
+         * querido: sem token não há dono a provar.
+         */
+        do_dono: sql<string>`count(*) FILTER (
+          WHERE ${engine_tool_calls.approval_claim_token} IS NOT NULL
+            AND ${engine_tool_calls.approval_claim_token} = ${input.approval_claim_token}::text)`,
       })
       .from(engine_tool_calls)
       .where(
@@ -294,17 +336,17 @@ export const approvalRequestsRepo = {
         ),
       );
     const linha = rows[0];
-    // A PRIMEIRA resposta é se o journal tem o que dizer sobre este pedido. Ela
-    // entra em TODOS os ramos: sem call ligada, "não começou" não é um fato
-    // observado, é um vazio — e a política não troca um vazio por prova.
-    const journal_call_linked = Number(linha?.chamadas ?? 0) > 0;
+    // A PRIMEIRA resposta é se o journal observou ESTE dono. Ela entra em TODOS
+    // os ramos: sem call do dono, "não começou" não é um fato observado, é um
+    // vazio — e a política não troca um vazio por prova.
+    const owner_call_linked = Number(linha?.do_dono ?? 0) > 0;
     if (Number(linha?.iniciadas ?? 0) === 0) {
-      return { journal_call_linked, handler_started: false, effect_class: null };
+      return { owner_call_linked, handler_started: false, effect_class: null };
     }
     if (Number(linha?.com_efeito ?? 0) === 0) {
-      return { journal_call_linked, handler_started: true, effect_class: 'abort_safe' };
+      return { owner_call_linked, handler_started: true, effect_class: 'abort_safe' };
     }
-    return { journal_call_linked, handler_started: true, effect_class: linha?.classe ?? null };
+    return { owner_call_linked, handler_started: true, effect_class: linha?.classe ?? null };
   },
 
   /**

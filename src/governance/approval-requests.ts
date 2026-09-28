@@ -548,7 +548,7 @@ export async function claimExecutableApproval(input: {
      * relógio, que é exatamente o defeito que o AC04 proíbe.
      *
      * E existe um caso em que a devolução é simplesmente ERRADA, porque não há
-     * journal nenhum a consultar: o caminho LEGADO (`dispatchTool`,
+     * journal nenhum a consultar sobre o dono: o caminho LEGADO (`dispatchTool`,
      * `run === null`), que é o que roda em produção neste SHA e não abre call em
      * `engine_tool_calls`. Ali `handler_started` e os dois sinais de vitalidade
      * são falsos por ausência de FONTE, enquanto o dono do claim pode estar vivo
@@ -557,6 +557,14 @@ export async function claimExecutableApproval(input: {
      * positiva, a evidência não circula. É a resposta que a base já dava, por
      * outro motivo (lá `claimed` nunca devolvia), e a única segura aqui — um
      * claim preso se resolve com decisão humana; um efeito duplicado, não.
+     *
+     * O QA-P8/F4 mostrou que "sem call no journal" não basta como critério: um
+     * pedido aberto pelo gateway DURÁVEL deixa uma call TERMINAL ligada a ele, e
+     * a execução seguinte pode vir pelo LEGADO. Aquela call antiga não é do dono
+     * — não carrega o `claim_token` vigente —, então "o pedido tem call" não é
+     * prova de nada sobre quem executa agora. A leitura do journal é escopada
+     * pelo token do claim (`claimJournal({ approval_claim_token })`): sem uma
+     * call DO DONO, a resposta é a mesma do caminho legado, `hold`.
      */
     const recuperacao = await recoverClaimedApproval({ request: open });
     if (recuperacao === 'execution_failed') return { outcome: 'none' };
@@ -732,10 +740,12 @@ export async function failClaimedApproval(input: {
  * `approvalRequestsRepo.claimJournal` (carimbo de início + classe declarada) e
  * responde uma de três coisas:
  *
- *   * `release_claim` — PROVA de não início: a evidência volta a `approved` e o
- *     dono legítimo pode executá-la. Devolver aqui não "libera efeito": libera
- *     uma evidência cujo efeito comprovadamente não começou, e quem executa
- *     depois passa pelo MESMO claim e pelo mesmo `consume`;
+ *   * `release_claim` — PROVA de não início: existe call DO DONO no journal (a
+ *     que carrega o `claim_token` vigente), sem carimbo, e o fence dela já não
+ *     pode cruzar o marcador. A evidência volta a `approved` e o dono legítimo
+ *     pode executá-la. Devolver aqui não "libera efeito": libera uma evidência
+ *     cujo efeito comprovadamente não começou, e quem executa depois passa pelo
+ *     MESMO claim e pelo mesmo `consume`;
  *   * `execution_failed` — início comprovado, classe com efeito, ou journal
  *     ILEGÍVEL (`start_uncertain`: "não consegui ler" não é prova de não
  *     início). Terminal: exige aprovação NOVA, como manda o INV-09;
@@ -765,7 +775,7 @@ export async function recoverClaimedApproval(input: {
     effect_class: null,
     // Sem leitura NÃO existe journal: o default é o vazio explícito, e a
     // política o trata como "não há prova de não início" (segura o claim).
-    journal_call_linked: false,
+    owner_call_linked: false,
   };
   /**
    * A VITALIDADE do executor (§5.5.1): os dois sinais que o status do pedido não
@@ -780,7 +790,15 @@ export async function recoverClaimedApproval(input: {
   };
   let start_uncertain = false;
   try {
-    journal = await approvalRequestsRepo.claimJournal({ approval_request_id: request.id });
+    journal = await approvalRequestsRepo.claimJournal({
+      approval_request_id: request.id,
+      // O ESCOPO da leitura é o claim VIGENTE: prova sobre um dono só vale se
+      // observada no journal DESSE dono. Uma call antiga do mesmo pedido (por
+      // exemplo a que abriu o pedido pelo gateway durável, já terminal) não é
+      // observação sobre quem está executando agora — e era ela que fazia a
+      // regra do release devolver a autorização de um handler em curso (QA-P8).
+      approval_claim_token: request.claim_token,
+    });
     liveness = await approvalRequestsRepo.claimExecutorLiveness({
       approval_request_id: request.id,
     });
@@ -802,7 +820,7 @@ export async function recoverClaimedApproval(input: {
     approval_status: request.status,
     handler_started: journal.handler_started,
     effect_class: journal.effect_class,
-    journal_call_linked: journal.journal_call_linked,
+    owner_call_linked: journal.owner_call_linked,
     start_uncertain,
     can_still_start: liveness.can_still_start,
     execution_in_flight: liveness.execution_in_flight,

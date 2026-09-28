@@ -280,18 +280,33 @@ export function classifyRecovery(s: RecoverySnapshotV1): RecoveryDisposition {
  *
  * ─── E há um SEXTO campo: o journal pode NÃO TER O QUE DIZER ────────────────
  *
- * Os cinco campos acima pressupõem que existe journal para o pedido. O caminho
- * LEGADO (`dispatchTool`, `run === null`, o que roda em produção neste SHA) não
- * abre call nenhuma: o pedido vive só no `approval_requests`. Ali
- * `handler_started` e os dois sinais de vitalidade são falsos por AUSÊNCIA DE
- * FONTE, não por observação — e ler esse vazio como "ninguém começou" devolvia a
- * autorização de um executor VIVO no handler (o QA-P6/F3, que terminava com a
- * MESMA aprovação autorizando dois efeitos).
+ * Os cinco campos acima pressupõem que existe journal para o pedido — e que ele
+ * fala do dono VIGENTE. O caminho LEGADO (`dispatchTool`, `run === null`, o que
+ * roda em produção neste SHA) não abre call nenhuma: o pedido vive só no
+ * `approval_requests`. Ali `handler_started` e os dois sinais de vitalidade são
+ * falsos por AUSÊNCIA DE FONTE, não por observação — e ler esse vazio como
+ * "ninguém começou" devolvia a autorização de um executor VIVO no handler (o
+ * QA-P6/F3, que terminava com a MESMA aprovação autorizando dois efeitos).
  *
- * Por isso `journal_call_linked` é o campo que a política consulta ANTES de
- * aceitar qualquer resposta negativa: sem call ligada ao pedido, "não há prova"
- * — e sem prova a evidência é SEGURADA (regra 5), nunca devolvida. Devolver uma
- * evidência que pode ter dono vivo é o único erro irreversível aqui.
+ * Por isso `owner_call_linked` é o campo que a política consulta ANTES de
+ * aceitar qualquer resposta negativa: sem call DO DONO, "não há prova" — e sem
+ * prova a evidência é SEGURADA (regra 5), nunca devolvida. Devolver uma evidência
+ * que pode ter dono vivo é o único erro irreversível aqui.
+ *
+ * ─── E o escopo é o TOKEN do claim, não o pedido ────────────────────────────
+ *
+ * Perguntar "existe ALGUMA call deste pedido?" era ainda cedo demais, e o QA o
+ * reproduziu (QA-P8/F4): quando o pedido é aberto pelo gateway DURÁVEL, a call
+ * que o abriu fica ligada a ele — `approval_required`, TERMINAL — e a execução
+ * seguinte pode vir pelo caminho LEGADO, que não escreve call. Aquela call
+ * antiga, sem carimbo e sem token, satisfazia "existe call do pedido",
+ * `can_still_start=false` e `handler_started=false`, e a regra 6 devolvia o
+ * claim de um executor VIVO dentro do handler: dois efeitos com a MESMA
+ * aprovação.
+ *
+ * Prova sobre um dono só vale se observada NO dono. A pergunta é, portanto:
+ * existe call deste pedido carregando `approval_claim_token = <claim vigente>`?
+ * Sem call do dono, a resposta é a mesma do caminho legado — `hold`.
  *
  * ─── A mesma regra vive no banco ────────────────────────────────────────────
  *
@@ -314,16 +329,19 @@ export interface ApprovalClaimSnapshotV1 {
   /** `engine_tool_calls.effect_class` da call que carrega o pedido. */
   effect_class: string | null;
   /**
-   * O journal TEM ao menos uma call carregando este pedido.
+   * O journal TEM ao menos uma call DESTE pedido carregando o claim VIGENTE
+   * (`approval_claim_token = <o token do dono>`).
    *
    * Sem esta resposta, todo o resto do instantâneo é ambíguo: `handler_started`
-   * falso e os dois sinais de vitalidade falsos podem significar "ninguém
-   * começou e ninguém pode começar" OU "não há journal para este pedido" — e o
-   * caminho LEGADO (`dispatchTool`, `run === null`, o que roda em produção
-   * neste SHA) é o segundo caso, com um executor VIVO no handler. `false` ⇒
-   * não há prova de não início ⇒ segurar.
+   * falso e os dois sinais de vitalidade falsos podem significar "ninguém começou
+   * e ninguém pode começar" OU "não há journal sobre ESTE dono" — e os dois
+   * caminhos sem call são o LEGADO (`dispatchTool`, `run === null`, o que roda em
+   * produção neste SHA), com um executor VIVO no handler, e o MISTO (pedido
+   * aberto pelo gateway durável e executado pelo legado — o QA-P8/F4), onde a
+   * call antiga do pedido existe mas não é do dono. `false` ⇒ não há prova de não
+   * início ⇒ segurar.
    */
-  journal_call_linked: boolean;
+  owner_call_linked: boolean;
   /** O instantâneo do journal NÃO pôde ser lido — "não começou" não é prova. */
   start_uncertain: boolean;
   /**
@@ -361,7 +379,7 @@ export function classifyApprovalClaimRecovery(
   //    `execution_failed` sobre um efeito que está acontecendo — o P5 do QA.
   if (s.handler_started && s.execution_in_flight) return "hold";
 
-  // 5. SEM carimbo e SEM journal: não há fonte, não há prova.
+  // 5. SEM carimbo e SEM call DO DONO no journal: não há fonte, não há prova.
   //
   //    Esta é a regra que o F3 da rodada 3 do QA obrigou a existir. Quando o
   //    pedido não tem NENHUMA call que o carregue, `handler_started` e os dois
@@ -372,15 +390,24 @@ export function classifyApprovalClaimRecovery(
   //    a autorização de um efeito em curso ao turno concorrente, e a MESMA
   //    aprovação acabava autorizando dois efeitos (o QA-P6).
   //
+  //    E o F4 da rodada 4 mostrou que "o pedido" não é o escopo certo: pedido
+  //    aberto pelo gateway DURÁVEL deixa uma call TERMINAL ligada a ele, e a
+  //    execução seguinte pode vir pelo LEGADO, que não escreve call. Aquela call
+  //    antiga, sem carimbo e sem o token do dono, satisfazia "existe call" e
+  //    devolvia o claim de um handler VIVO (o QA-P8). Fonte é o journal do DONO:
+  //    `owner_call_linked` pergunta pelo `approval_claim_token` vigente, e o
+  //    vazio de um dono futuro é o mesmo vazio do caminho que não journala.
+  //
   //    `hold` é a resposta que a base já dava por outro motivo (lá `claimed`
   //    nunca devolvia): sem prova positiva, a evidência não circula. Ela também
   //    é a resposta SEGURA em toda a família: um claim preso é recuperável por
   //    decisão humana; um efeito duplicado não é.
-  if (!s.handler_started && !s.journal_call_linked) return "hold";
+  if (!s.handler_started && !s.owner_call_linked) return "hold";
 
-  // 6. PROVA de não início: existe call do pedido no journal, nenhuma delas tem
-  //    carimbo de início, e o fence que autorizaria uma a cruzar o marcador já
-  //    não vale. Aqui a ausência do carimbo é um FATO LIDO, não um vazio.
+  // 6. PROVA de não início: existe call DO DONO no journal, nenhuma call do
+  //    pedido tem carimbo de início, e o fence que autorizaria uma a cruzar o
+  //    marcador já não vale. Aqui a ausência do carimbo é um FATO LIDO sobre um
+  //    executor identificado, não um vazio.
   if (!s.handler_started) return "release_claim";
 
   // 7. Carimbo existe, mas a classe declara AUSÊNCIA de efeito

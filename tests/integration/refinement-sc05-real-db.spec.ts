@@ -61,6 +61,13 @@
  *     com o efeito real, sem pedido novo (AC04/AC06).
  * 11. Fence do banco: evidência devolvida (`claimed → approved`) não deixa o
  *     dono antigo iniciar — o marcador exige o claim VIGENTE (AC04).
+ * 12. Caminho LEGADO (`run === null`) — o que roda em produção: SEM call no
+ *     journal, "não começou" não é prova, e o dono VIVO no handler não é
+ *     destituído por um turno concorrente (AC03/AC04/AC06).
+ * 13. Cenário MISTO (F4/QA-P8): pedido aberto pelo gateway DURÁVEL (deixando uma
+ *     call TERMINAL ligada a ele) e execução pelo LEGADO. A prova de não início
+ *     é escopada ao claim VIGENTE: call antiga do pedido não é observação sobre
+ *     o dono, e sem call do dono a evidência é SEGURADA (AC03/AC04/AC06).
  *
  * Skipped sem `TEST_DB_URL`.
  */
@@ -682,6 +689,25 @@ async function contarCallsDoPedido(approval_request_id: string): Promise<number>
 }
 
 /**
+ * §5.5.1 / AC04 (SC05) — quantas calls do pedido carregam ESTE claim (o token do
+ * dono vigente). É a pergunta do ESCOPO da prova de não início: a call que
+ * ABRIU o pedido pelo gateway durável fica ligada a ele e é TERMINAL, e sem o
+ * token ela não é observação sobre quem está executando agora (QA-P8/F4).
+ */
+async function contarCallsDoPedidoComClaim(
+  approval_request_id: string,
+  claim_token: string,
+): Promise<number> {
+  const r = await pool.query<{ c: string }>(
+    `SELECT count(*) AS c FROM engine_tool_calls
+      WHERE tenant_id = $1 AND agent_id = $2 AND approval_request_id = $3
+        AND approval_claim_token = $4`,
+    [TENANT, AGENT, approval_request_id, claim_token],
+  );
+  return Number(r.rows[0]?.c ?? 0);
+}
+
+/**
  * O caminho LEGADO (`dispatchTool`, `run === null`) — em produção neste SHA é
  * ELE que roda: `runtime/engines/reasoner-stage.ts`, `scheduling/engine.ts` e
  * `agent/pending-resolver.ts` chamam `dispatchTool`, e nenhum chamador de `src`
@@ -1149,7 +1175,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         approval_status: 'claimed',
         handler_started: true,
         effect_class: 'non_interruptible',
-        journal_call_linked: true,
+        owner_call_linked: true,
         start_uncertain: false,
         can_still_start: false,
         execution_in_flight: false,
@@ -1196,7 +1222,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         approval_status: 'claimed',
         handler_started: false,
         effect_class: null,
-        journal_call_linked: true,
+        owner_call_linked: true,
         start_uncertain: false,
         can_still_start: false,
         execution_in_flight: false,
@@ -1258,7 +1284,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         approval_status: 'claimed',
         handler_started: false,
         effect_class: null,
-        journal_call_linked: true,
+        owner_call_linked: true,
         start_uncertain: true,
         can_still_start: false,
         execution_in_flight: false,
@@ -1306,7 +1332,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         approval_status: 'claimed',
         handler_started: true,
         effect_class: 'non_interruptible',
-        journal_call_linked: true,
+        owner_call_linked: true,
         start_uncertain: false,
         can_still_start: false,
         execution_in_flight: false,
@@ -1324,7 +1350,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         approval_status: 'claimed',
         handler_started: false,
         effect_class: null,
-        journal_call_linked: true,
+        owner_call_linked: true,
         start_uncertain: false,
         can_still_start: true,
         execution_in_flight: false,
@@ -1335,7 +1361,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         approval_status: 'claimed',
         handler_started: false,
         effect_class: null,
-        journal_call_linked: true,
+        owner_call_linked: true,
         start_uncertain: false,
         can_still_start: false,
         execution_in_flight: false,
@@ -1349,7 +1375,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         approval_status: 'claimed',
         handler_started: true,
         effect_class: 'nil',
-        journal_call_linked: true,
+        owner_call_linked: true,
         start_uncertain: false,
         can_still_start: false,
         execution_in_flight: true,
@@ -1360,7 +1386,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         approval_status: 'claimed',
         handler_started: true,
         effect_class: 'nil',
-        journal_call_linked: true,
+        owner_call_linked: true,
         start_uncertain: false,
         can_still_start: false,
         execution_in_flight: false,
@@ -2028,11 +2054,11 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
 
     // ── a POLÍTICA PURA, no instantâneo exato do caminho legado ───────────
     //
-    // Sem call ligada ao pedido, `handler_started` e os dois sinais de
+    // Sem call DO DONO no journal, `handler_started` e os dois sinais de
     // vitalidade são estruturalmente falsos — eles olham o journal que não
-    // existe. "Não começou" deixa de ser fato PROVADO e a evidência é
-    // SEGURADA; devolver aqui é que autorizaria dois efeitos com a MESMA
-    // aprovação (o QA-P6).
+    // existe para este pedido. "Não começou" deixa de ser fato PROVADO e a
+    // evidência é SEGURADA; devolver aqui é que autorizaria dois efeitos com a
+    // MESMA aprovação (o QA-P6).
     expect(
       classifyApprovalClaimRecovery({
         approval_status: 'claimed',
@@ -2041,12 +2067,12 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         start_uncertain: false,
         can_still_start: false,
         execution_in_flight: false,
-        journal_call_linked: false,
+        owner_call_linked: false,
       }),
     ).toBe('hold');
-    // Controle diferencial: o MESMO instantâneo com a call ligada ao pedido (o
-    // caminho durável, onde os dois sinais têm significado) é prova de não
-    // início e devolve a evidência.
+    // Controle diferencial: o MESMO instantâneo com a call DO DONO (o caminho
+    // durável, onde os dois sinais têm significado) é prova de não início e
+    // devolve a evidência.
     expect(
       classifyApprovalClaimRecovery({
         approval_status: 'claimed',
@@ -2055,8 +2081,110 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         start_uncertain: false,
         can_still_start: false,
         execution_in_flight: false,
-        journal_call_linked: true,
+        owner_call_linked: true,
       }),
     ).toBe('release_claim');
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 13. cenário MISTO (F4/QA-P8): pedido aberto no DURÁVEL, execução no LEGADO
+  // ══════════════════════════════════════════════════════════════════════════
+  it('13. AC03/AC04/AC06/SPEC-L1406 — call antiga do pedido NÃO é prova de não início do dono: MISTO durável+legado mantém UM efeito', async () => {
+    const nonce = randomUUID();
+    const args = { texto: 'sc05-misto', nonce };
+
+    // ── 1º: o pedido nasce pelo gateway DURÁVEL e fica ligado a uma call ────
+    //
+    // É ESTE o traço que o F4 explorou: o pedido tem call no journal, mas a call
+    // é a do turno que ABRIU o pedido — terminal, sem carimbo e sem claim. Ela
+    // responde "o journal tem o que dizer sobre o pedido?", e a pergunta certa é
+    // "sobre o DONO do claim vigente?".
+    const turno1 = await mkTurnoVivo();
+    const run1 = await runRodando(turno1, await mkControle());
+    const call1 = `sc05:mis1:${randomUUID().slice(0, 8)}`;
+    await gatewayReal(turno1, run1).invoke(chamadaGw(run1, call1, args));
+    const pedido = (await pedidosDoNonce(nonce))[0]!;
+    const row1 = await lerCall(run1, call1);
+    expect(row1.state).toBe('approval_required');
+    expect(row1.approval_request_id).toBe(pedido.id);
+    expect(row1.finished_at).not.toBeNull();
+    expect(row1.handler_started_at).toBeNull();
+    expect(row1.approval_claim_token).toBeNull();
+    expect(await contarCallsDoPedido(pedido.id)).toBe(1);
+
+    await aprovarPorSql(pedido.id);
+
+    // ── A: executa pelo caminho LEGADO e PARA dentro do handler ─────────────
+    let soltarA!: () => void;
+    fixture.gate = new Promise<void>((r) => (soltarA = r));
+    const pA = legado(args);
+    for (let i = 0; i < 100 && fixture.contraparte === 0; i += 1) await espera(50);
+    expect(fixture.contraparte).toBe(1);
+    const durante = await lerAprovacao(pedido.id);
+    expect(durante.status).toBe('claimed');
+    const tokenA = durante.claim_token!;
+    // O dono VIVO não tem call nenhuma com o SEU token: o caminho legado não
+    // journala. A call que existe é a antiga, do turno que abriu o pedido.
+    expect(await contarCallsDoPedido(pedido.id)).toBe(1);
+    expect(await contarCallsDoPedidoComClaim(pedido.id, tokenA)).toBe(0);
+
+    // ── B: MESMA intenção, concorrente, com A vivo no handler ──────────────
+    //
+    // Sem o escopo por token, a call antiga (terminal, sem carimbo) era lida
+    // como prova de não início: B devolvia o claim de A, reivindicava com o
+    // próprio token, executava — dois efeitos sob a MESMA aprovação (o F4).
+    const pB = legado(args);
+    await espera(1500);
+    const aposB = await lerAprovacao(pedido.id);
+    expect(aposB.status).toBe('claimed');
+    expect(aposB.claim_token).toBe(tokenA);
+    expect(fixture.contraparte).toBe(1);
+
+    // ── A conclui: UM efeito, evidência CONSUMIDA, nenhum pedido novo ──────
+    soltarA();
+    fixture.gate = null;
+    const [resA, resB] = await Promise.all([pA, pB]);
+    expect((resA as { error?: string }).error).toBeUndefined();
+    expect((resB as { error?: string }).error).toBe('approval_pending');
+    expect(fixture.contraparte).toBe(1);
+    expect((await lerAprovacao(pedido.id)).status).toBe('consumed');
+    expect(await pedidosDoNonce(nonce)).toHaveLength(1);
+
+    // ── repetição DEPOIS da janela de idempotência: pedido NOVO, zero efeito ─
+    await pool.query(
+      `DELETE FROM idempotency_keys
+        WHERE tenant_id = $1 AND agent_id = $2 AND tool_name = 'create_contraparte' AND pessoa_id = $3`,
+      [TENANT, AGENT, PESSOA_ID],
+    );
+    const resC = (await legado(args)) as { error?: string };
+    expect(fixture.contraparte).toBe(1);
+    expect(resC.error).toBe('requires_dual_approval');
+    const pedidos = await pedidosDoNonce(nonce);
+    expect(pedidos).toHaveLength(2);
+    expect(pedidos[0]!.status).toBe('consumed');
+    expect(pedidos[1]!.status).toBe('pending');
+    expect(pedidos[1]!.fingerprint).toBe(pedido.fingerprint);
+    // A call ANTIGA continua sendo a única ligada ao pedido consumido — e segue
+    // sem carregar token nenhum: nenhuma observação sobre o dono foi produzida.
+    expect(await contarCallsDoPedido(pedido.id)).toBe(1);
+    expect(await contarCallsDoPedidoComClaim(pedido.id, tokenA)).toBe(0);
+
+    // ── a POLÍTICA PURA, no instantâneo EXATO deste cenário ────────────────
+    //
+    // A call antiga existe e o pedido tem journal; ainda assim não há carimbo
+    // nem dono identificado. "Não começou" não é fato LIDO sobre quem executa:
+    // é vazio sobre o dono, e a evidência é SEGURADA (a mesma resposta do
+    // caminho legado, sem call alguma).
+    expect(
+      classifyApprovalClaimRecovery({
+        approval_status: 'claimed',
+        handler_started: false,
+        effect_class: null,
+        start_uncertain: false,
+        can_still_start: false,
+        execution_in_flight: false,
+        owner_call_linked: false,
+      }),
+    ).toBe('hold');
   });
 });
