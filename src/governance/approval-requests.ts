@@ -29,7 +29,6 @@ import {
   type ApprovalClass,
   type ApprovalClaimJournal,
 } from '@/db/repositories.js';
-import { engineRunsRepo } from '@/db/repositories/engine-repos.js';
 import type { ApprovalRequest, Pessoa } from '@/db/schema.js';
 import { audit } from './audit.js';
 import { isOwnerType, listOwners } from './permissions.js';
@@ -765,7 +764,9 @@ export async function recoverClaimedApproval(input: {
   let start_uncertain = false;
   try {
     journal = await approvalRequestsRepo.claimJournal({ approval_request_id: request.id });
-    liveness = await engineRunsRepo.claimExecutorLiveness({ approval_request_id: request.id });
+    liveness = await approvalRequestsRepo.claimExecutorLiveness({
+      approval_request_id: request.id,
+    });
   } catch (err) {
     /**
      * Journal ilegível é INCERTEZA, e incerteza não devolve evidência: a

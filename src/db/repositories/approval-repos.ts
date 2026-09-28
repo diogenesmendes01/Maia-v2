@@ -43,6 +43,9 @@ function scope() {
   return { tenant_id: getCurrentTenant(), agent_id: getCurrentAgent() };
 }
 
+/** Linha da leitura de vitalidade do executor (§5.5.1/SC05). */
+type LivenessRow = { can_still_start: boolean; execution_in_flight: boolean };
+
 export const approvalRequestsRepo = {
   /**
    * Cria um request. A partial unique (tenant, agent, fingerprint | status
@@ -279,6 +282,92 @@ export const approvalRequestsRepo = {
       return { handler_started: true, effect_class: 'abort_safe' };
     }
     return { handler_started: true, effect_class: linha?.classe ?? null };
+  },
+
+  /**
+   * §5.5.1 / AC04 (SC05) — A VITALIDADE DO EXECUTOR DE UM CLAIM.
+   *
+   * A reconciliação de uma evidência presa em `claimed` precisa distinguir duas
+   * situações que o status do pedido NÃO distingue: um dono que ainda pode agir
+   * (e vai consumir/executar) de um dono que morreu no meio (e cuja autorização
+   * tem de voltar a circular). Quem responde é o JOURNAL, e a resposta depende de
+   * ONDE o dono parou:
+   *
+   *  - **Antes do marcador** (`can_still_start`): o que autoriza o dono a cruzar
+   *    o limite do efeito é o FENCE do turno. A condição é LITERALMENTE a mesma
+   *    que o marcador vai exigir (`engineRunsRepo.checarFenceDoRun`): turno
+   *    `running`, com lease VIVA e com o claim que originou o run, run `running`,
+   *    capacidades não revogadas e prazo válido. É o que o marcador responderia
+   *    se fosse chamado neste instante.
+   *
+   *  - **Depois do marcador** (`execution_in_flight`): o handler pode estar
+   *    rodando AGORA. O sinal de "em voo" é a RESERVA de idempotência do próprio
+   *    efeito, que nasce antes do handler e é liquidada por quem executa: uma
+   *    reserva `in_progress` ainda dentro do TTL significa dono vivo dentro do
+   *    handler. A lease do turno NÃO serve aqui — quando o processo morre depois
+   *    do marcador, o que ele deixa é justamente a reserva órfã.
+   *
+   * Os dois sinais existem porque os dois lados do marcador são perguntas
+   * diferentes: antes, "ele ainda pode entrar?"; depois, "ele ainda está lá?".
+   * Nenhum dos dois LIBERA efeito — ambos SEGURAM a evidência, que é a resposta
+   * segura quando não se pode provar não início.
+   *
+   * Mora AQUI, ao lado de `claimJournal`, e não no repositório do engine: quem
+   * consome é a política do claim, e o repositório de approvals é o que os
+   * caminhos de aprovação já carregam — importar o repositório inteiro do engine
+   * só para estas duas contagens ligaria a máquina de aprovação ao journal de
+   * execução inteiro (e às suas dependências de módulo) sem necessidade.
+   *
+   * LIMITE declarado: um processo morto ANTES do marcador só é reconhecido
+   * quando a lease vence. É o desenho do §5.5.1 — a lease é o que o crash deixa —
+   * e não uma detecção de crash por si só.
+   */
+  async claimExecutorLiveness(input: {
+    approval_request_id: string;
+  }): Promise<{ can_still_start: boolean; execution_in_flight: boolean }> {
+    const { tenant_id, agent_id } = scope();
+    const res = await db.execute(sql`
+      SELECT
+        EXISTS (
+          SELECT 1
+            FROM engine_tool_calls c
+            JOIN engine_runs r
+              ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id
+             AND r.id = c.run_id
+            JOIN agent_turns t
+              ON t.tenant_id = r.tenant_id AND t.agent_id = r.agent_id
+             AND t.id = r.turn_id
+           WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+             AND c.approval_request_id = ${input.approval_request_id}::uuid
+             AND c.state IN ('received', 'dispatching', 'handler_started')
+             AND c.finished_at IS NULL
+             AND r.phase = 'running'
+             AND r.capabilities_revoked_at IS NULL
+             AND r.deadline_at > clock_timestamp()
+             AND r.origin_claim_token = t.claim_token
+             AND r.origin_turn_attempt = t.attempt_count
+             AND t.status = 'running'
+             AND t.lease_expires_at IS NOT NULL
+             AND t.lease_expires_at > clock_timestamp()
+        ) AS can_still_start,
+        EXISTS (
+          SELECT 1
+            FROM engine_tool_calls c
+            JOIN idempotency_keys k
+              ON k.tenant_id = c.tenant_id AND k.agent_id = c.agent_id
+             AND k.tool_name = c.tool_name
+             AND k.key = c.idempotency_key
+           WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+             AND c.approval_request_id = ${input.approval_request_id}::uuid
+             AND c.handler_started_at IS NOT NULL
+             AND k.state = 'in_progress'
+             AND k.expires_at > clock_timestamp()
+        ) AS execution_in_flight`);
+    const linhas = (res as unknown as { rows: LivenessRow[] }).rows ?? [];
+    return {
+      can_still_start: linhas[0]?.can_still_start === true,
+      execution_in_flight: linhas[0]?.execution_in_flight === true,
+    };
   },
 
   /**

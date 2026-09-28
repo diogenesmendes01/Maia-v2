@@ -88,7 +88,6 @@ import {
   engine_runs,
   engine_tool_calls,
   engine_turn_bindings,
-  idempotency_keys,
   outbound_messages,
 } from "../schema.js";
 import { getCurrentAgent, getCurrentTenant } from "../tenant-context.js";
@@ -2873,87 +2872,6 @@ export const engineRunsRepo = {
         row_version: Number(marcado.row_version),
       };
     });
-  },
-
-  /**
-   * §5.5.1 / AC04 (SC05) — A VITALIDADE DO EXECUTOR DE UM CLAIM.
-   *
-   * A reconciliação de uma evidência presa em `claimed` precisa distinguir duas
-   * situações que o estado da aprovação NÃO distingue: um dono que ainda pode
-   * agir (e vai consumir/executar) de um dono que morreu no meio (e cuja
-   * autorização tem de voltar a circular). O pedido sozinho não basta — quem
-   * responde é o journal, e a resposta depende de ONDE o dono parou:
-   *
-   *  - **Antes do marcador** (`can_still_start`): o que autoriza o dono a cruzar
-   *    o limite do efeito é o FENCE do turno. Reusamos aqui, exatamente, o que
-   *    `checarFenceDoRun` exige — turno `running` com lease VIVA e com o claim
-   *    que originou o run, run `running`, capacidades não revogadas e prazo
-   *    válido. É a mesma condição que o marcador vai checar, então a resposta
-   *    aqui é o que ele diria se fosse chamado neste instante.
-   *
-   *  - **Depois do marcador** (`execution_in_flight`): o handler pode estar
-   *    rodando AGORA. O sinal de "em voo" é a RESERVA de idempotência do próprio
-   *    efeito, que nasce antes do handler e é liquidada por quem executa: uma
-   *    reserva `in_progress` ainda dentro do TTL significa que o dono está vivo
-   *    dentro do handler. A lease do turno NÃO serve aqui: quando o processo
-   *    morre depois do marcador, o que ele deixa é justamente a reserva órfã.
-   *
-   * Os dois sinais existem porque os dois lados do marcador são perguntas
-   * diferentes: antes, "ele ainda pode entrar?"; depois, "ele ainda está lá?".
-   * Nenhum dos dois LIBERA efeito — ambos SEGURAM a evidência, que é a resposta
-   * segura quando não se pode provar não início.
-   *
-   * LIMITE (documentado no parecer): um processo morto ANTES do marcador só é
-   * reconhecido quando a lease vence. Isto é o desenho do §5.5.1 — a lease é o
-   * que o crash deixa —, não uma detecção de crash por si só.
-   */
-  async claimExecutorLiveness(input: {
-    approval_request_id: string;
-  }): Promise<{ can_still_start: boolean; execution_in_flight: boolean }> {
-    const { tenant_id, agent_id } = scope();
-    const res = await withTx(async (tx) => {
-      const rows = linhas<{ can_still_start: boolean; execution_in_flight: boolean }>(
-        await tx.execute(sql`
-          SELECT
-            EXISTS (
-              SELECT 1
-                FROM ${engine_tool_calls} c
-                JOIN ${engine_runs} r
-                  ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id
-                 AND r.id = c.run_id
-                JOIN ${agent_turns} t
-                  ON t.tenant_id = r.tenant_id AND t.agent_id = r.agent_id
-                 AND t.id = r.turn_id
-               WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
-                 AND c.approval_request_id = ${input.approval_request_id}::uuid
-                 AND c.state IN ('received', 'dispatching', 'handler_started')
-                 AND c.finished_at IS NULL
-                 AND r.phase = 'running'
-                 AND r.capabilities_revoked_at IS NULL
-                 AND r.deadline_at > clock_timestamp()
-                 AND r.origin_claim_token = t.claim_token
-                 AND r.origin_turn_attempt = t.attempt_count
-                 AND t.status = 'running'
-                 AND t.lease_expires_at IS NOT NULL
-                 AND t.lease_expires_at > clock_timestamp()
-            ) AS can_still_start,
-            EXISTS (
-              SELECT 1
-                FROM ${engine_tool_calls} c
-                JOIN ${idempotency_keys} k
-                  ON k.tenant_id = c.tenant_id AND k.agent_id = c.agent_id
-                 AND k.tool_name = c.tool_name
-                 AND k.key = c.idempotency_key
-               WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
-                 AND c.approval_request_id = ${input.approval_request_id}::uuid
-                 AND c.handler_started_at IS NOT NULL
-                 AND k.state = 'in_progress'
-                 AND k.expires_at > clock_timestamp()
-            ) AS execution_in_flight`),
-      );
-      return rows[0] ?? { can_still_start: false, execution_in_flight: false };
-    });
-    return res;
   },
 
   /**
