@@ -7,7 +7,7 @@
  */
 import { and, eq, inArray, lt, sql } from 'drizzle-orm';
 import { db } from '../client.js';
-import { approval_requests, approval_decisions } from '../schema.js';
+import { approval_requests, approval_decisions, engine_tool_calls } from '../schema.js';
 import type { ApprovalRequest, ApprovalDecision } from '../schema.js';
 import { applyTenantGuard } from '../tenant-guard.js';
 import { getCurrentTenant, getCurrentAgent } from '../tenant-context.js';
@@ -218,6 +218,20 @@ export const approvalRequestsRepo = {
    * CAS claimed → approved (devolve a evidência). SOMENTE para caminhos em
    * que o handler NÃO chegou a rodar (ex.: corrida de idempotência) — nunca
    * após execução iniciada.
+   *
+   * §5.5.1 / SPEC-L1406 (SC05) — a segunda condição do `WHERE` é a PROVA de
+   * não início, e ela vive AQUI, no mesmo CAS, e não só na política: o handler
+   * marcou `engine_tool_calls.handler_started_at` antes de tocar o mundo, e uma
+   * vez marcado o journal afirma que o efeito pode ter acontecido. Devolver a
+   * evidência nesse estado apagaria a única prova de que a operação aconteceu e
+   * convidaria o dono a executá-la duas vezes. Sem journal (caminho legado, sem
+   * call no `engine_tool_calls`) o `NOT EXISTS` é verdadeiro e o comportamento
+   * não muda.
+   *
+   * Classe ABORT_SAFE é a exceção declarada: ela mesma afirma ausência de efeito
+   * (`classifyToolCancellation`), então o carimbo não prova nada que obrigue a
+   * segurar a evidência. Negar a devolução nesse caso deixaria um claim preso
+   * para sempre por uma execução que não produziu efeito.
    */
   async releaseClaim(input: { id: string; claim_token: string }): Promise<ApprovalRequest | null> {
     const { tenant_id, agent_id } = scope();
@@ -231,6 +245,51 @@ export const approvalRequestsRepo = {
           eq(approval_requests.id, input.id),
           eq(approval_requests.status, 'claimed'),
           eq(approval_requests.claim_token, input.claim_token),
+          sql`NOT EXISTS (
+            SELECT 1 FROM ${engine_tool_calls} c
+             WHERE c.tenant_id = ${approval_requests.tenant_id}
+               AND c.agent_id = ${approval_requests.agent_id}
+               AND c.approval_request_id = ${approval_requests.id}
+               AND c.handler_started_at IS NOT NULL
+               AND c.effect_class IS DISTINCT FROM 'abort_safe'
+          )`,
+        ),
+      )
+      .returning();
+    return rows[0] ?? null;
+  },
+
+  /**
+   * §5.5.1 (SC05) — expiração LAZY de um pedido VENCIDO, por RELÓGIO DO BANCO.
+   *
+   * O sweeper (`expireDue`) cobre `pending` no tick do engine, mas não é
+   * suficiente para o caminho de execução: entre o instante em que o TTL venceu
+   * e o próximo tick, o pedido continua `open` — e `findOpenByFingerprint` o
+   * devolveria como se valesse. Pior, um pedido que chegou a `approved` e venceu
+   * sem ser executado não era coberto por ninguém: ficava preso na partial unique
+   * do fingerprint, bloqueando um pedido novo da MESMA intenção.
+   *
+   * `approved` é incluído de propósito: vencimento é vencimento. A janela em que
+   * a evidência podia ser consumida fechou, e `claim` já exige
+   * `expires_at > now()`, então este CAS apenas dá ao pedido o estado terminal
+   * que a regra do claim já implicava.
+   *
+   * Devolve a row quando ESTE chamador venceu o CAS; `null` quando o pedido não
+   * estava vencido (ou mudou de estado no meio). Quem chama não pode concluir
+   * nada de não ter vencido — pode ter perdido para uma decisão humana.
+   */
+  async expireIfDue(input: { id: string }): Promise<ApprovalRequest | null> {
+    const { tenant_id, agent_id } = scope();
+    const rows = await db
+      .update(approval_requests)
+      .set({ status: 'expired', updated_at: sql`now()` })
+      .where(
+        and(
+          eq(approval_requests.tenant_id, tenant_id),
+          eq(approval_requests.agent_id, agent_id),
+          eq(approval_requests.id, input.id),
+          inArray(approval_requests.status, ['pending', 'approved']),
+          sql`${approval_requests.expires_at} <= now()`,
         ),
       )
       .returning();

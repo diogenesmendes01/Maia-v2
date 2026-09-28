@@ -721,7 +721,20 @@ export type FreezeIdentityResult =
     };
 
 export type RecordToolApprovalResult =
-  | { ok: true; state: EngineToolCallStateV1; row_version: number }
+  | {
+      ok: true;
+      state: EngineToolCallStateV1;
+      row_version: number;
+      /**
+       * §5.5.1 (SC05) — o `result_json` PERSISTIDO, devolvido para quem acabou de
+       * gravar. Em `approval_required` ele é a recusa do ledger (com o UUID e o
+       * `intent_hash` do pedido); em `claimed` é `null` (a call continua viva e
+       * não tem desfecho). Devolvê-lo aqui evita a segunda síntese em memória da
+       * mesma recusa — que é exatamente o que fazia a resposta ao motor divergir
+       * entre a primeira entrega e o replay.
+       */
+      result_json: Json | null;
+    }
   | TurnFenceConflict
   | ControlConflict
   | NotFound
@@ -2390,6 +2403,17 @@ export const engineRunsRepo = {
     approval_request_id: string;
     approval_claim_token: string | null;
     state: "pending" | "claimed";
+    /**
+     * §5.3.2 / §5.5.1 (SC05) — o `intent_hash` e a CLASSE do pedido.
+     *
+     * O `ref` (`AP-xxxxxxxx`) é identificador de UX e não prova nada: o hash do
+     * intent é o que amarra a recusa ao payload EXATO que foi aprovado, e a
+     * classe é o que diz quantas assinaturas ele exige. Opcionais para não
+     * quebrar chamadas antigas — quando ausentes, o `result_json` da recusa sai
+     * só com `error`/`ref`, como antes.
+     */
+    approval_intent_hash?: string | null;
+    approval_class?: string | null;
   }): Promise<RecordToolApprovalResult> {
     const { tenant_id, agent_id } = scope();
     return withTx(async (tx): Promise<RecordToolApprovalResult> => {
@@ -2434,7 +2458,7 @@ export const engineRunsRepo = {
       // terminal.
       const atualizado =
         input.state === "claimed"
-          ? linhas<{ state: string; row_version: string | number }>(
+          ? linhas<{ state: string; row_version: string | number; result_json: Json | null }>(
               await tx.execute(sql`
                 UPDATE ${engine_tool_calls}
                    SET approval_request_id = ${input.approval_request_id}::uuid,
@@ -2446,9 +2470,9 @@ export const engineRunsRepo = {
                    AND state = 'dispatching'
                    AND dispatch_token = ${input.dispatch_token}::uuid
                    AND row_version = ${input.expected_row_version}
-                 RETURNING state, row_version`),
+                 RETURNING state, row_version, result_json`),
             )
-          : linhas<{ state: string; row_version: string | number }>(
+          : linhas<{ state: string; row_version: string | number; result_json: Json | null }>(
               await tx.execute(sql`
                 UPDATE ${engine_tool_calls}
                    SET state = 'approval_required',
@@ -2456,7 +2480,12 @@ export const engineRunsRepo = {
                        approval_claim_token = ${input.approval_claim_token},
                        result_json = jsonb_build_object(
                          'error', 'approval_required',
-                         'ref', 'AP-' || substr(${input.approval_request_id}::text, 1, 8)),
+                         'ref', 'AP-' || substr(${input.approval_request_id}::text, 1, 8),
+                         'approval', jsonb_strip_nulls(jsonb_build_object(
+                           'request_id', ${input.approval_request_id}::text,
+                           'ref', 'AP-' || substr(${input.approval_request_id}::text, 1, 8),
+                           'intent_hash', ${input.approval_intent_hash ?? null}::text,
+                           'approval_class', ${input.approval_class ?? null}::text))),
                        finished_at = clock_timestamp(),
                        row_version = row_version + 1,
                        updated_at = clock_timestamp()
@@ -2465,7 +2494,7 @@ export const engineRunsRepo = {
                    AND state = 'dispatching'
                    AND dispatch_token = ${input.dispatch_token}::uuid
                    AND row_version = ${input.expected_row_version}
-                 RETURNING state, row_version`),
+                 RETURNING state, row_version, result_json`),
             );
 
       const linha = atualizado[0];
@@ -2537,6 +2566,7 @@ export const engineRunsRepo = {
         ok: true,
         state: linha.state as EngineToolCallStateV1,
         row_version: Number(linha.row_version),
+        result_json: (linha.result_json ?? null) as Json | null,
       };
     });
   },

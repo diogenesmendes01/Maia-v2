@@ -208,7 +208,32 @@ export type ToolGatewayDepsV1 = {
     approval_request_id: string;
     approval_claim_token: string | null;
     state: 'pending' | 'claimed';
-  }) => Promise<{ ok: true; row_version: number } | { ok: false; reason: string }>;
+    /**
+     * §5.3.2 / §5.5.1 (SC05) — a PROVA que acompanha o pedido: o hash do intent
+     * aprovado e a classe (quantas assinaturas ele exige). Sem eles, o
+     * `result_json` da recusa sai com um `AP-xxxxxxxx` truncado que não amarra
+     * nada ao payload aprovado.
+     */
+    approval_intent_hash: string;
+    approval_class: string;
+  }) => Promise<
+    { ok: true; row_version: number; result_json?: Json | null } | { ok: false; reason: string }
+  >;
+  /**
+   * §5.5.2 / SPEC-L1406 (SC05) — a PROVA de que a pendência devolvida pelo
+   * handler é a pergunta ABERTA e no prazo **desta** conversa.
+   *
+   * `'open'` autoriza a pendência a subir; `'stale'` e `'unknown'` a suprimem.
+   * AUSENTE também suprime: sem prova, a pendência não sobe. Não há default
+   * permissivo aqui de propósito — quem liga o gateway num caminho em que a
+   * pergunta não pode ser verificada não ganha, por omissão, o direito de
+   * oferecer uma pergunta possivelmente morta ao usuário.
+   */
+  pendingQuestionProof?: (input: {
+    call: EngineToolCallV1;
+    pending_question_id: string;
+    run_id: string;
+  }) => Promise<'open' | 'stale' | 'unknown'>;
 };
 
 const RETRY_PADRAO_MS = 30_000;
@@ -243,6 +268,112 @@ function recusaDoWire(
  * um objeto.
  */
 const ROW_VERSION_DA_ADMISSAO = 0;
+
+/**
+ * §5.5.1 / SPEC-L1406 (SC05) — a recusa de aprovação que vai AO MOTOR.
+ *
+ * O `result_json` de uma call em `approval_required` é a prova do ledger: traz o
+ * UUID COMPLETO do pedido, o `intent_hash` do intent aprovado e a classe. Isso é
+ * o que a plataforma guarda, e não é — necessariamente — o que o motor precisa
+ * receber. Ele recebe a PROJEÇÃO: o erro, a referência curta de UX e a classe,
+ * que é o mesmo vocabulário que o dispatcher já devolvia a ele antes desta
+ * mudança. O UUID e o hash ficam do lado de cá, no journal.
+ *
+ * A função é PURA e é usada nas DUAS entregas — a primeira, logo depois de
+ * gravar, e o replay pelo `admissao.result` —, e é isso que garante que a
+ * recusa repetida seja a MESMA recusa. Antes, cada entrega montava o próprio
+ * JSON a partir de fontes diferentes (o `details` do dispatcher numa, o
+ * `result_json` na outra) e o motor via duas respostas distintas para o mesmo
+ * callback.
+ */
+function recusaDeAprovacaoParaOMotor(ledger: Json | null): Json {
+  const registro =
+    typeof ledger === 'object' && ledger !== null && !Array.isArray(ledger)
+      ? (ledger as Record<string, Json>)
+      : {};
+  const approval =
+    typeof registro['approval'] === 'object' &&
+    registro['approval'] !== null &&
+    !Array.isArray(registro['approval'])
+      ? (registro['approval'] as Record<string, Json>)
+      : {};
+  const projecao: Record<string, Json> = {
+    error: typeof registro['error'] === 'string' ? registro['error'] : 'approval_required',
+  };
+  if (typeof registro['ref'] === 'string') projecao['ref'] = registro['ref'];
+  if (typeof approval['approval_class'] === 'string') {
+    projecao['approval_class'] = approval['approval_class'];
+  }
+  return projecao as Json;
+}
+
+/**
+ * §5.5.2 / SPEC-L1406 (SC05) — a pendência só sobe com PROVA.
+ *
+ * `ask_pending_question` devolve um `pending_question_id` no resultado do
+ * handler. Entregá-lo ao motor sem verificar nada é oferecer ao usuário uma
+ * pergunta que pode estar vencida, cancelada, já respondida — ou pertencer a
+ * OUTRA conversa. O §5.5.2 exige a pergunta ABERTA **desta** conversa, e quem
+ * sabe responder isso é a máquina de pendências do caminho legado
+ * (`pendingQuestionsRepo.findActiveSnapshot`), por isso a prova é INJETADA: o
+ * gateway não tem cliente de banco e não deve passar a ter.
+ *
+ * Fail-closed, e a supressão é CIRÚRGICA: some o `pending_question_id` e as
+ * `opcoes_validas` (opções sem pergunta seriam uma oferta sem sujeito) da
+ * projeção, e o `receipt.pending_question_id` fica `null`. O resto do resultado
+ * permanece, porque o handler de fato rodou. Nada aqui ressuscita a pergunta,
+ * cria poll novo ou toca a máquina de pendências: o gateway SUPRIME, não
+ * conserta — inventar uma pergunta seria pior que não mostrar nenhuma.
+ */
+async function reconciliarPendencia(
+  receipt: ToolReceiptV1,
+  deps: ToolGatewayDepsV1,
+  identity: GatewayRunIdentityV1,
+  call: EngineToolCallV1,
+): Promise<ToolReceiptV1> {
+  const projecao = receipt.result_for_engine;
+  const sacola =
+    typeof projecao === 'object' && projecao !== null && !Array.isArray(projecao)
+      ? (projecao as Record<string, Json>)
+      : null;
+  const candidato = sacola?.['pending_question_id'];
+  if (typeof candidato !== 'string' || candidato.length === 0) return receipt;
+
+  let veredito: 'open' | 'stale' | 'unknown' = 'unknown';
+  if (deps.pendingQuestionProof !== undefined) {
+    try {
+      veredito = await deps.pendingQuestionProof({
+        call,
+        pending_question_id: candidato,
+        run_id: identity.run_id,
+      });
+    } catch (err) {
+      // A prova existe e FALHOU (banco indisponível, por exemplo): não é "não
+      // aberta", é "não sei" — e "não sei" não sobe.
+      veredito = 'unknown';
+      logger.error(
+        {
+          run_id: identity.run_id,
+          call_id: call.call_id,
+          err: (err as Error).message,
+          ops_alert: true,
+        },
+        'engine.tool_gateway.pending_question_proof_failed',
+      );
+    }
+  }
+
+  if (veredito === 'open') return { ...receipt, pending_question_id: candidato };
+
+  const limpa: Record<string, Json> = { ...sacola };
+  delete limpa['pending_question_id'];
+  delete limpa['opcoes_validas'];
+  logger.warn(
+    { run_id: identity.run_id, call_id: call.call_id, tool: call.name, veredito },
+    'engine.tool_gateway.pending_question_suppressed',
+  );
+  return { ...receipt, result_for_engine: limpa as Json, pending_question_id: null };
+}
 
 export function createEngineToolGateway(
   identity: GatewayRunIdentityV1,
@@ -452,17 +583,37 @@ export function createEngineToolGateway(
        */
       const projecao = admissao.result_for_engine;
       const statusPersistido = admissao.receipt_status;
+      /**
+       * §5.5.1 (SC05) — a recusa de aprovação é TERMINAL e não tem receipt
+       * persistido (`receipt_json` é `NULL` nesse estado), então é o
+       * `result_json` do ledger que volta — o mesmo objeto cuja projeção a
+       * primeira entrega devolveu. `is_error` é `true`: a recusa continua sendo
+       * recusa no callback repetido.
+       */
+      if (statusPersistido === undefined && admissao.state === 'approval_required') {
+        return {
+          kind: 'result',
+          call_id: call.call_id,
+          result: recusaDeAprovacaoParaOMotor(admissao.result),
+          is_error: true,
+        };
+      }
       return {
         kind: 'result',
         call_id: call.call_id,
         result: projecao === undefined ? admissao.result : projecao,
-        // O `is_error` vem do MESMO receipt que decidiu o `is_error` da
-        // primeira entrega. Sem receipt (legado), ele sai do estado da linha —
-        // que é como o legado sempre respondeu.
+        /**
+         * O `is_error` vem do MESMO receipt que decidiu o `is_error` da
+         * primeira entrega. Sem receipt, ele sai do estado da linha — que é como
+         * o legado sempre respondeu — mais `approval_required`, que é recusa
+         * terminal e nunca foi um desfecho "de sucesso" (§5.5.1).
+         */
         is_error:
           statusPersistido !== undefined
             ? statusPersistido === 'error'
-            : admissao.state === 'denied' || admissao.state === 'effect_unknown',
+            : admissao.state === 'denied' ||
+              admissao.state === 'effect_unknown' ||
+              admissao.state === 'approval_required',
       };
     }
 
@@ -568,6 +719,12 @@ export function createEngineToolGateway(
       let rowVersion = congelou.row_version;
       let handlerComecou = false;
       let aprovacaoJaJournalada = false;
+      /**
+       * §5.5.1 (SC05) — a recusa PERSISTIDA em `approval_required`, lida da row
+       * que o próprio `recordToolApproval` acabou de gravar. `null` quando o
+       * canal não devolveu o `result_json` (dep que só reporta `ok`).
+       */
+      let recusaDoLedger: Json | null = null;
 
       const control: DurableDispatchControlV1 = {
         call_id: admissao.call_id,
@@ -661,16 +818,27 @@ export function createEngineToolGateway(
             approval_request_id: input.approval.request_id,
             approval_claim_token: input.claim_token,
             state: input.state,
+            approval_intent_hash: input.approval.intent_hash,
+            approval_class: input.approval.approval_class,
           });
           if (!gravou.ok) {
             throw new Error(`record_approval:${gravou.reason}`);
           }
           rowVersion = gravou.row_version;
-          // A chamada já está TERMINAL no journal (`approval_required`): quem
-          // liquidar por cima disso recebe `state_conflict`, e o run ficaria
-          // com um erro de CAS no lugar do fato. Registrar que ela já foi
-          // journalada evita o settle redundante.
-          if (input.state === 'pending') aprovacaoJaJournalada = true;
+          /**
+           * §5.3.2 / §5.5.1 (SC05) — a chamada já está TERMINAL no journal
+           * (`approval_required`): quem liquidar por cima disso recebe
+           * `state_conflict`, e o run ficaria com um erro de CAS no lugar do
+           * fato. Registrar que ela já foi journalada evita o settle redundante —
+           * e a row que acabou de ser gravada é GUARDADA aqui, porque é ela que
+           * será devolvida ao motor. Sintetizar a recusa de novo em memória foi
+           * o defeito de origem: a primeira entrega e o replay saíam com JSONs
+           * diferentes para a MESMA recusa.
+           */
+          if (input.state === 'pending') {
+            aprovacaoJaJournalada = true;
+            recusaDoLedger = gravou.result_json ?? null;
+          }
         },
 
         beforeHandler: async (input) => {
@@ -787,7 +955,12 @@ export function createEngineToolGateway(
         };
       }
 
-      const receipt: ToolReceiptV1 = desfecho.receipt;
+      const receipt: ToolReceiptV1 = await reconciliarPendencia(
+        desfecho.receipt,
+        deps,
+        identity,
+        call,
+      );
       const erroDoReceipt = receipt.status === 'error';
 
       /**
@@ -894,7 +1067,25 @@ export function createEngineToolGateway(
        * (`result_for_engine`): caminhos de arquivo, nome de arquivo interno e
        * resumo de relatório são material do backend. O protegido
        * (`receipt.result`) fica no receipt/jornal, para o step-evaluator.
+       *
+       * §5.5.1 (SC05) — `approval_required` sai daqui como TERMINAL, e a resposta
+       * é a PROJEÇÃO da recusa que acabou de ser gravada no ledger (não o
+       * `details` do dispatcher, e não um JSON montado de novo): assim a primeira
+       * entrega e o replay do mesmo callback devolvem exatamente a mesma recusa.
+       * `is_error` é `true` porque recusa é erro para quem chamou — a aprovação
+       * humana ainda não existe.
        */
+      if (aprovacaoJaJournalada) {
+        return {
+          kind: 'result',
+          call_id: call.call_id,
+          result: recusaDeAprovacaoParaOMotor(
+            recusaDoLedger ?? (receipt.result_for_engine as Json),
+          ),
+          is_error: true,
+        };
+      }
+
       return {
         kind: 'result',
         call_id: call.call_id,

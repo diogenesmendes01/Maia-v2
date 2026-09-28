@@ -222,3 +222,72 @@ export function classifyRecovery(s: RecoverySnapshotV1): RecoveryDisposition {
     `recovery: fase sem regra declarada (${String(s.phase)}) — ver §5.8.2`,
   );
 }
+
+/**
+ * SC05 (§5.5.1, SPEC-L1406) — POLÍTICA de recovery do CLAIM de aprovação.
+ *
+ * ─── A frase que esta função torna executável ───────────────────────────────
+ *
+ * «O claim de aprovação só volta se o journal provar que o handler não começou;
+ * TTL nunca libera efeito; execução incerta é terminal e exige nova aprovação.»
+ *
+ * ─── Por que este instantâneo tem TRÊS campos e não um ──────────────────────
+ *
+ * `approval_status === 'claimed'` diz que ALGUÉM está com a evidência — não diz
+ * se chegou a acontecer alguma coisa no mundo. Quem diz isso é o JOURNAL:
+ * `handler_started_at` é gravado pelo marcador ANTES da chamada física (§5.6.4),
+ * e `effect_class` diz se aquela classe carrega efeito. Julgar pelo status do
+ * pedido sozinho seria devolver a autorização de uma operação que pode ter sido
+ * executada — o defeito que esta política existe para impedir.
+ *
+ * ─── `start_uncertain` é "não consegui ler", não "acho que começou" ─────────
+ *
+ * Quando o próprio journal não pôde ser lido, "não começou" deixa de ser um fato
+ * PROVADO e passa a ser uma suposição — e a única resposta honesta é a mesma de
+ * um início comprovado: tratar como terminal. Negar isso transformaria uma falha
+ * de leitura em autorização para repetir o efeito.
+ *
+ * ─── A mesma regra vive no banco ────────────────────────────────────────────
+ *
+ * Este módulo é PURO e por isso é a POLÍTICA; o `WHERE` de
+ * `approvalRequestsRepo.releaseClaim` é a MESMA regra como CAS, no banco, para
+ * que nenhum call site que ignore a política consiga afrouxar um claim gasto.
+ * Duas expressões da mesma regra: a daqui é testável sem Postgres, a de lá é a
+ * que o banco impõe sob concorrência.
+ */
+export type ApprovalClaimRecoveryV1 = "hold" | "release_claim" | "execution_failed";
+
+export interface ApprovalClaimSnapshotV1 {
+  /** `approval_requests.status`. Só `claimed` carrega um claim a resolver. */
+  approval_status: string;
+  /** `engine_tool_calls.handler_started_at IS NOT NULL` para o MESMO pedido. */
+  handler_started: boolean;
+  /** `engine_tool_calls.effect_class` da call que carrega o pedido. */
+  effect_class: string | null;
+  /** O instantâneo do journal NÃO pôde ser lido — "não começou" não é prova. */
+  start_uncertain: boolean;
+}
+
+export function classifyApprovalClaimRecovery(
+  s: ApprovalClaimSnapshotV1,
+): ApprovalClaimRecoveryV1 {
+  // 1. Sem claim vivo não há o que devolver: o pedido já é terminal ou pertence
+  //    a outro momento (`approved`/`consumed`/`expired`).
+  if (s.approval_status !== "claimed") return "hold";
+
+  // 2. "Não começou" precisa ser PROVA. Sem o journal não há prova — e sem prova
+  //    a evidência não volta.
+  if (s.start_uncertain) return "execution_failed";
+
+  // 3. PROVA de não início: nenhuma call deste pedido tem carimbo de início.
+  if (!s.handler_started) return "release_claim";
+
+  // 4. Carimbo existe, mas a classe declara AUSÊNCIA de efeito
+  //    (`abort_safe` em `classifyToolCancellation`): não há efeito a reconciliar,
+  //    e segurar a evidência aqui prenderia o claim para sempre.
+  if (s.effect_class === "abort_safe") return "release_claim";
+
+  // 5. Início (ou carimbo de classe com efeito): TERMINAL. Nova execução exige
+  //    NOVA aprovação humana — o INV-09 não admite retomada automática.
+  return "execution_failed";
+}

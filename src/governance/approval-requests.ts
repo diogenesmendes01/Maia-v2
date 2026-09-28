@@ -100,6 +100,36 @@ export type EnsureApprovalResult = {
 };
 
 /**
+ * §5.5.1 / SPEC-L1406 (SC05) — `'reuse'` quando a evidência pode ser servida,
+ * `'recreate'` quando ela foi ENCERRADA como vencida por este chamador.
+ *
+ * A regra é: nenhuma evidência VENCIDA pode ser oferecida como se valesse, e
+ * isso precisa acontecer ANTES da decisão de reutilizar — não no próximo tick do
+ * sweeper. `claimed` nunca é tocado: um claim vivo pertence a um executor, e
+ * encerrá-lo por relógio liberaria uma execução em andamento (o §5.5.1 diz
+ * exatamente que TTL não libera efeito).
+ *
+ * A comparação de relógio aqui é só um FILTRO BARATO para não ir ao banco em
+ * toda chamada: quem decide é o CAS (`expireIfDue`), pelo relógio do banco, e
+ * o resultado dele é que conta.
+ */
+async function descartarEvidenciaVencida(
+  request: ApprovalRequest,
+): Promise<'reuse' | 'recreate'> {
+  if (request.status === 'claimed') return 'reuse';
+  if (new Date(request.expires_at).getTime() > Date.now()) return 'reuse';
+  const vencida = await approvalRequestsRepo.expireIfDue({ id: request.id });
+  if (!vencida) return 'reuse';
+  await audit({
+    acao: 'approval_expired',
+    pessoa_id: request.requester_pessoa_id,
+    alvo_id: request.id,
+    metadata: { tool: request.tool, approval_class: request.approval_class, via: 'lazy' },
+  });
+  return 'recreate';
+}
+
+/**
  * Como este módulo pede que um aviso de aprovação seja emitido.
  *
  * Issue #506 — a assinatura era `(jid, text) => Promise<unknown>` e passou a
@@ -155,7 +185,16 @@ export async function ensureApprovalRequest(input: {
 
   const existing = await approvalRequestsRepo.findOpenByFingerprint(intent_hash);
   if (existing) {
-    return { request: existing, created: false, ref: approvalRef(existing) };
+    /**
+     * §5.5.1 (SC05) — `open` por status não quer dizer VÁLIDO. Uma evidência
+     * vencida que o sweeper ainda não alcançou seria devolvida como se valesse,
+     * e a operação ficaria presa atrás de uma aprovação que já não pode ser
+     * executada (`claim` exige `expires_at > now()`). Aqui ela é encerrada e o
+     * caminho segue para criar um pedido NOVO com o mesmo fingerprint.
+     */
+    if ((await descartarEvidenciaVencida(existing)) === 'reuse') {
+      return { request: existing, created: false, ref: approvalRef(existing) };
+    }
   }
 
   const expires_at = new Date(Date.now() + config.DUAL_APPROVAL_TIMEOUT_HOURS * 3600 * 1000);
@@ -458,8 +497,29 @@ export async function claimExecutableApproval(input: {
     return { outcome: 'pending', request: open, ref: approvalRef(open) };
   }
   if (open.status !== 'approved') {
+    /**
+     * §5.5.1 / SPEC-L1406 (SC05) — 'pending' OU 'claimed', e os dois precisam
+     * ser distinguidos de "vencido". Um pedido pendente que já passou do prazo
+     * não é autorização em falta que valha esperar: ele é terminal (`expired`) e
+     * o caminho honesto é um pedido NOVO — é isso que impede a operação de ficar
+     * presa para sempre atrás de um pedido que ninguém pode mais aprovar
+     * (`markApproved` exige `expires_at > now()`).
+     *
+     * `claimed` NÃO entra: claim vivo é um executor em andamento, e encerrá-lo
+     * por relógio liberaria uma execução que pode estar acontecendo (§5.5.1).
+     */
+    if (open.status === 'pending' && (await descartarEvidenciaVencida(open)) === 'recreate') {
+      return { outcome: 'none' };
+    }
     // 'claimed' — outro executor está com o claim; não execute em paralelo.
     return { outcome: 'pending', request: open, ref: approvalRef(open) };
+  }
+
+  // Uma evidência 'approved' mas VENCIDA não é executável: `claim` exige
+  // `expires_at > now()`. Encerrar aqui evita gastar o CAS para descobrir isso e
+  // evita que a operação fique presa na partial unique do fingerprint.
+  if ((await descartarEvidenciaVencida(open)) === 'recreate') {
+    return { outcome: 'none' };
   }
 
   // Revalida que o payload aprovado continua idêntico (imutabilidade).
@@ -479,7 +539,25 @@ export async function claimExecutableApproval(input: {
     claim_token,
     intent_hash: input.intent_hash,
   });
-  if (!claimed) return { outcome: 'pending', request: open, ref: approvalRef(open) };
+  if (!claimed) {
+    /**
+     * §5.5.1 (SC05) — o CAS pode ter perdido por dois motivos MUITO diferentes,
+     * e tratá-los como um só era o defeito: (a) outro executor levou o claim —
+     * aí 'pending' é a resposta honesta; (b) a evidência VENCEU entre a leitura e
+     * o CAS — aí não há execução em paralelo nenhuma e 'pending' manda o chamador
+     * esperar por uma aprovação que nunca vai vir. Reler distingue os dois.
+     */
+    const atual = await approvalRequestsRepo.byId(open.id);
+    if (!atual) return { outcome: 'none' };
+    if (atual.status === 'claimed') {
+      return { outcome: 'pending', request: atual, ref: approvalRef(atual) };
+    }
+    if (atual.status !== 'approved') {
+      await descartarEvidenciaVencida(atual);
+      return { outcome: 'none' };
+    }
+    return { outcome: 'pending', request: atual, ref: approvalRef(atual) };
+  }
   await audit({
     acao: 'approval_claimed',
     pessoa_id: input.requester.id,
@@ -513,15 +591,30 @@ export async function consumeApproval(input: {
 /**
  * Devolve um claim quando o handler NÃO chegou a rodar (ex.: perdeu a corrida
  * de idempotência). A evidência volta a 'approved' e continua utilizável.
+ *
+ * §5.5.1 (SC05) — devolve `true` SÓ quando a evidência voltou de fato. `false`
+ * significa que o banco RECUSOU a devolução: ou o claim já não era deste
+ * executor, ou o journal prova que o handler começou (e aí devolver apagaria a
+ * prova de que o efeito pode ter acontecido). Não é erro do chamador, e por isso
+ * não lança — mas é silêncio que não pode ser confundido com sucesso, então
+ * fica registrado.
  */
 export async function releaseClaimedApproval(input: {
   request: ApprovalRequest;
   claim_token: string;
-}): Promise<void> {
-  await approvalRequestsRepo.releaseClaim({
+}): Promise<boolean> {
+  const devolvida = await approvalRequestsRepo.releaseClaim({
     id: input.request.id,
     claim_token: input.claim_token,
   });
+  if (!devolvida) {
+    logger.warn(
+      { request_id: input.request.id, tool: input.request.tool },
+      'approval.release_claim_refused',
+    );
+    return false;
+  }
+  return true;
 }
 
 /** Execução falhou após o claim: terminal, exige NOVA aprovação (fail-closed). */
