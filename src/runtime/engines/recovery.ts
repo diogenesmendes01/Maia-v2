@@ -247,13 +247,47 @@ export function classifyRecovery(s: RecoverySnapshotV1): RecoveryDisposition {
  * um início comprovado: tratar como terminal. Negar isso transformaria uma falha
  * de leitura em autorização para repetir o efeito.
  *
+ * ─── E o instantâneo tem CINCO campos porque "sem carimbo" ≠ "dono morto" ───
+ *
+ * A regra 3 (o carimbo prova o início) estava incompleta do outro lado: "não há
+ * carimbo" prova que nada começou, mas NÃO prova que ninguém vai começar. O dono
+ * do claim pode estar vivo entre o claim e o marcador — e devolver a evidência
+ * nesse intervalo é o defeito que o QA reproduziu (QA-P4/P5): a autorização era
+ * entregue a um turno novo ENQUANTO o dono antigo executava, o dono antigo
+ * entrava no handler, e a MESMA aprovação acabava autorizando dois efeitos.
+ *
+ * Por isso os dois lados do marcador trazem o próprio sinal de vida, e nenhum
+ * deles é o status do pedido:
+ *
+ *  - `can_still_start` (antes do marcador): o FENCE do turno ainda autoriza
+ *    esta tentativa — turno `running` com lease viva e com o claim que originou
+ *    o run, run `running`, capacidades e prazo válidos. É a MESMA condição que o
+ *    marcador exige para deixar o dono entrar; enquanto ela valer, a evidência
+ *    não circula. Ela NÃO libera efeito nenhum: apenas adia a reconciliação para
+ *    o único instante em que ela é decidível.
+ *
+ *  - `execution_in_flight` (depois do marcador): a reserva de idempotência do
+ *    efeito continua `in_progress` dentro do TTL, isto é, quem marcou ainda está
+ *    DENTRO do handler. Aqui a lease do turno seria o sinal errado: o processo
+ *    que morre depois do marcador deixa justamente a reserva órfã, e é por isso
+ *    que "carimbo sem reserva viva" é o que caracteriza o crash pós-marcador
+ *    (caso 7) — e leva a `execution_failed`.
+ *
+ * Quando a lease vence e a reserva cai, a evidência volta a circular pela regra
+ * 5 (prova de não início) ou é fechada pela 7 (início sem prova de não efeito).
+ * A idade do pedido continua não decidindo nada: quem decide é o fence do turno
+ * ou a reserva do efeito — nunca o relógio do pedido.
+ *
  * ─── A mesma regra vive no banco ────────────────────────────────────────────
  *
  * Este módulo é PURO e por isso é a POLÍTICA; o `WHERE` de
  * `approvalRequestsRepo.releaseClaim` é a MESMA regra como CAS, no banco, para
  * que nenhum call site que ignore a política consiga afrouxar um claim gasto.
- * Duas expressões da mesma regra: a daqui é testável sem Postgres, a de lá é a
- * que o banco impõe sob concorrência.
+ * E o `WHERE` do marcador (`engineRunsRepo.markToolHandlerStarted`) é a mesma
+ * ideia no limite do efeito: lá, o claim VIGENTE é condição para entrar no
+ * handler, de modo que uma evidência devolvida deixa de autorizar quem a tinha.
+ * Três expressões da mesma regra: a daqui é testável sem Postgres, as de lá são
+ * as que o banco impõe sob concorrência.
  */
 export type ApprovalClaimRecoveryV1 = "hold" | "release_claim" | "execution_failed";
 
@@ -266,6 +300,17 @@ export interface ApprovalClaimSnapshotV1 {
   effect_class: string | null;
   /** O instantâneo do journal NÃO pôde ser lido — "não começou" não é prova. */
   start_uncertain: boolean;
+  /**
+   * O FENCE do turno AINDA autoriza a tentativa que carrega este pedido a
+   * cruzar o marcador (turno/run vivos, lease viva, capacidades e prazo ok).
+   * `true` ⇒ o dono pode entrar a qualquer instante ⇒ segurar.
+   */
+  can_still_start: boolean;
+  /**
+   * A reserva de idempotência do efeito segue `in_progress` dentro do TTL para
+   * uma call deste pedido JÁ carimbada ⇒ o handler está rodando agora ⇒ segurar.
+   */
+  execution_in_flight: boolean;
 }
 
 export function classifyApprovalClaimRecovery(
@@ -279,15 +324,27 @@ export function classifyApprovalClaimRecovery(
   //    a evidência não volta.
   if (s.start_uncertain) return "execution_failed";
 
-  // 3. PROVA de não início: nenhuma call deste pedido tem carimbo de início.
+  // 3. SEM carimbo, mas com o dono ainda autorizado a começar: não é prova de
+  //    não início — é a corrida do QA-P4. A evidência é SEGURADA até que o dono
+  //    cruze o marcador (aí a regra 4 assume) ou perca o fence (aí a regra 5
+  //    prova o não início de verdade).
+  if (!s.handler_started && s.can_still_start) return "hold";
+
+  // 4. Carimbo E execução em voo (reserva `in_progress` viva): o dono está dentro
+  //    do handler neste instante. Fechar a evidência agora faria o ledger dizer
+  //    `execution_failed` sobre um efeito que está acontecendo — o P5 do QA.
+  if (s.handler_started && s.execution_in_flight) return "hold";
+
+  // 5. PROVA de não início: nenhuma call deste pedido tem carimbo de início, e o
+  //    fence que autorizaria uma a cruzar o marcador já não vale.
   if (!s.handler_started) return "release_claim";
 
-  // 4. Carimbo existe, mas a classe declara AUSÊNCIA de efeito
+  // 6. Carimbo existe, mas a classe declara AUSÊNCIA de efeito
   //    (`abort_safe` em `classifyToolCancellation`): não há efeito a reconciliar,
   //    e segurar a evidência aqui prenderia o claim para sempre.
   if (s.effect_class === "abort_safe") return "release_claim";
 
-  // 5. Início (ou carimbo de classe com efeito): TERMINAL. Nova execução exige
+  // 7. Início (ou carimbo de classe com efeito): TERMINAL. Nova execução exige
   //    NOVA aprovação humana — o INV-09 não admite retomada automática.
   return "execution_failed";
 }

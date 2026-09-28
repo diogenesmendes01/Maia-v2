@@ -29,6 +29,7 @@ import {
   type ApprovalClass,
   type ApprovalClaimJournal,
 } from '@/db/repositories.js';
+import { engineRunsRepo } from '@/db/repositories/engine-repos.js';
 import type { ApprovalRequest, Pessoa } from '@/db/schema.js';
 import { audit } from './audit.js';
 import { isOwnerType, listOwners } from './permissions.js';
@@ -728,8 +729,10 @@ export async function failClaimedApproval(input: {
  *   * `execution_failed` — início comprovado, classe com efeito, ou journal
  *     ILEGÍVEL (`start_uncertain`: "não consegui ler" não é prova de não
  *     início). Terminal: exige aprovação NOVA, como manda o INV-09;
- *   * `hold` — não há claim vivo a resolver, ou o CAS perdeu. Não inventa
- *     desfecho.
+ *   * `hold` — não há claim vivo a resolver, o dono do claim AINDA pode agir
+ *     (o fence do turno vale, ou o handler dele está em voo), ou o CAS perdeu.
+ *     Não inventa desfecho: adiar não custa efeito, e é o único estado em que a
+ *     reconciliação ainda pode ser decidida com prova.
  *
  * ─── Por que não é auto-resume ──────────────────────────────────────────────
  *
@@ -748,9 +751,21 @@ export async function recoverClaimedApproval(input: {
   if (request.status !== 'claimed' || request.claim_token === null) return 'held';
 
   let journal: ApprovalClaimJournal = { handler_started: false, effect_class: null };
+  /**
+   * A VITALIDADE do executor (§5.5.1): os dois sinais que o status do pedido não
+   * carrega — o fence do turno ainda autoriza esta tentativa a cruzar o marcador
+   * (`can_still_start`) e/ou o handler dela está rodando agora (`execution_in_flight`).
+   * Ambos SEGURAM a evidência; nenhum libera efeito. É o que separa "ninguém
+   * começou" (devolve) de "alguém pode começar ou está começando agora" (espera).
+   */
+  let liveness: { can_still_start: boolean; execution_in_flight: boolean } = {
+    can_still_start: false,
+    execution_in_flight: false,
+  };
   let start_uncertain = false;
   try {
     journal = await approvalRequestsRepo.claimJournal({ approval_request_id: request.id });
+    liveness = await engineRunsRepo.claimExecutorLiveness({ approval_request_id: request.id });
   } catch (err) {
     /**
      * Journal ilegível é INCERTEZA, e incerteza não devolve evidência: a
@@ -770,6 +785,8 @@ export async function recoverClaimedApproval(input: {
     handler_started: journal.handler_started,
     effect_class: journal.effect_class,
     start_uncertain,
+    can_still_start: liveness.can_still_start,
+    execution_in_flight: liveness.execution_in_flight,
   });
 
   if (disposicao === 'release_claim') {

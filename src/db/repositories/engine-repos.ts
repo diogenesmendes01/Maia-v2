@@ -55,7 +55,7 @@
  *     declarada.
  *  3. `discarded` não é fechável por esta porta: ver `CloseDecisionV1`.
  */
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import { canonicalDigest } from "@/integrations/hermes/canonical-json.js";
 import { incCounter } from "@/lib/metrics.js";
 import type {
@@ -82,11 +82,13 @@ import {
 } from "./conversation-control-sql.js";
 import {
   agent_turns,
+  approval_requests,
   conversation_controls,
   engine_run_events,
   engine_runs,
   engine_tool_calls,
   engine_turn_bindings,
+  idempotency_keys,
   outbound_messages,
 } from "../schema.js";
 import { getCurrentAgent, getCurrentTenant } from "../tenant-context.js";
@@ -410,6 +412,46 @@ async function appendEvent(
 
 function conta(op: string, result: string): void {
   incCounter("maia_engine_run_ops_total", { op, result });
+}
+
+/**
+ * §5.5.1 / SPEC-L1406 (SC05) — O FENCE DA APROVAÇÃO no MARCADOR.
+ *
+ * O `claim_token` de uma aprovação é uma AUTORIZAÇÃO de uso único, e o marcador
+ * é o limite do efeito: é aqui que "pode executar" vira "está executando". Sem
+ * este `AND`, a autorização podia ser REVOGADA depois do marcador e o dono
+ * antigo executava assim mesmo — foi o que o QA reproduziu (QA-P4): a evidência
+ * voltava a `approved`, o dono antigo entrava no handler e a MESMA aprovação
+ * autorizava um segundo efeito no turno seguinte.
+ *
+ * A condição é uma só, e é a mesma que os CAS de consumo e de devolução usam:
+ * `status = 'claimed' AND claim_token = <o meu>`. Ela vive no `WHERE` do
+ * marcador — e não numa checagem anterior, em memória — porque precisa valer
+ * contra o estado do banco NO INSTANTE do UPDATE, sob `FOR UPDATE`.
+ *
+ * Quando o chamador não carrega token algum (caminho legado, sem aprovação
+ * humana, §5.6.4), não há autorização a cercar e o fragmento é vazio: o
+ * comportamento desses caminhos não muda.
+ *
+ * O `COALESCE` espelha o do `SET`: o pedido que vale é o que a linha JÁ tem,
+ * ou o que este UPDATE está gravando.
+ */
+function fenceDaAprovacaoDoMarcador(input: {
+  approval_claim_token: string | null | undefined;
+  approval_request_id: string | null | undefined;
+}): SQL {
+  const token = input.approval_claim_token ?? null;
+  if (token === null) return sql``;
+  const { tenant_id, agent_id } = scope();
+  return sql`AND EXISTS (
+    SELECT 1 FROM ${approval_requests} a
+     WHERE a.tenant_id = ${tenant_id}
+       AND a.agent_id = ${agent_id}
+       AND a.id = COALESCE(${input.approval_request_id ?? null}::uuid,
+                            ${engine_tool_calls}.approval_request_id)
+       AND a.status = 'claimed'
+       AND a.claim_token = ${token}
+  )`;
 }
 
 // ---------------------------------------------------------------------------
@@ -755,6 +797,16 @@ export type HandlerStartedResult =
   | { ok: false; reason: "dispatch_token_mismatch" }
   /** §5.6.4 exige `idempotency_key`/`payload_hash` presentes ANTES do marcador. */
   | { ok: false; reason: "identity_not_frozen" }
+  /**
+   * §5.5.1 (SC05) — O FENCE DA APROVAÇÃO. O marcador carrega o `claim_token` da
+   * evidência humana que autoriza esta execução, e o UPDATE exige que ESSE token
+   * seja o VIGENTE no pedido (`status='claimed' AND claim_token=<o meu>`). Uma
+   * evidência que voltou a `approved` — numa corrida, ou por uma reconciliação
+   * de claim que provou não início — deixa de autorizar quem a tinha: sem este
+   * fence, o dono antigo executaria DEPOIS da devolução e a MESMA aprovação
+   * autorizaria dois efeitos.
+   */
+  | { ok: false; reason: "approval_claim_lost" }
   /**
    * A call JÁ tem carimbo de início. Distinto de `version_conflict`: ali o
    * chamador está com snapshot velho e reler resolve; aqui o handler pode já ter
@@ -2704,6 +2756,10 @@ export const engineRunsRepo = {
              AND idempotency_key IS NOT NULL
              AND idempotency_payload_hash IS NOT NULL
              AND row_version = ${input.expected_row_version}
+             ${fenceDaAprovacaoDoMarcador({
+               approval_claim_token: input.approval_claim_token,
+               approval_request_id: input.approval_request_id,
+             })}
            RETURNING row_version`),
       );
       const marcado = atualizado[0];
@@ -2714,10 +2770,12 @@ export const engineRunsRepo = {
           dispatch_token: string | null;
           idempotency_key: string | null;
           handler_started_at: string | null;
+          approval_request_id: string | null;
         }>(
           await tx.execute(sql`
             SELECT state, row_version, dispatch_token::text AS dispatch_token,
-                   idempotency_key, handler_started_at
+                   idempotency_key, handler_started_at,
+                   approval_request_id::text AS approval_request_id
               FROM ${engine_tool_calls}
              WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
                AND run_id = ${input.run_id} AND call_id = ${input.call_id}`),
@@ -2742,6 +2800,31 @@ export const engineRunsRepo = {
         if (linha.idempotency_key === null) {
           conta("handler_started", "identity_not_frozen");
           return { ok: false, reason: "identity_not_frozen" };
+        }
+        /**
+         * §5.5.1 (SC05) — o motivo do fence da APROVAÇÃO é lido e devolvido
+         * separado dos demais: ele diz a quem chamou que a autorização humana
+         * deixou de ser dele (e não que o journal está fora de forma), então a
+         * reação certa é NÃO iniciar — sem reler e sem tentar de novo.
+         */
+        if (input.approval_claim_token != null) {
+          const aprov = linhas<{ status: string; claim_token: string | null }>(
+            await tx.execute(sql`
+              SELECT status, claim_token
+                FROM ${approval_requests}
+               WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+                 AND id = COALESCE(${input.approval_request_id ?? null}::uuid,
+                                   ${linha.approval_request_id}::uuid)`),
+          );
+          const vigente = aprov[0];
+          if (
+            !vigente ||
+            vigente.status !== "claimed" ||
+            vigente.claim_token !== input.approval_claim_token
+          ) {
+            conta("handler_started", "approval_claim_lost");
+            return { ok: false, reason: "approval_claim_lost" };
+          }
         }
         if (linha.handler_started_at !== null) {
           // Estado, token e identidade batem: o que sobra é que o marcador JÁ
@@ -2790,6 +2873,87 @@ export const engineRunsRepo = {
         row_version: Number(marcado.row_version),
       };
     });
+  },
+
+  /**
+   * §5.5.1 / AC04 (SC05) — A VITALIDADE DO EXECUTOR DE UM CLAIM.
+   *
+   * A reconciliação de uma evidência presa em `claimed` precisa distinguir duas
+   * situações que o estado da aprovação NÃO distingue: um dono que ainda pode
+   * agir (e vai consumir/executar) de um dono que morreu no meio (e cuja
+   * autorização tem de voltar a circular). O pedido sozinho não basta — quem
+   * responde é o journal, e a resposta depende de ONDE o dono parou:
+   *
+   *  - **Antes do marcador** (`can_still_start`): o que autoriza o dono a cruzar
+   *    o limite do efeito é o FENCE do turno. Reusamos aqui, exatamente, o que
+   *    `checarFenceDoRun` exige — turno `running` com lease VIVA e com o claim
+   *    que originou o run, run `running`, capacidades não revogadas e prazo
+   *    válido. É a mesma condição que o marcador vai checar, então a resposta
+   *    aqui é o que ele diria se fosse chamado neste instante.
+   *
+   *  - **Depois do marcador** (`execution_in_flight`): o handler pode estar
+   *    rodando AGORA. O sinal de "em voo" é a RESERVA de idempotência do próprio
+   *    efeito, que nasce antes do handler e é liquidada por quem executa: uma
+   *    reserva `in_progress` ainda dentro do TTL significa que o dono está vivo
+   *    dentro do handler. A lease do turno NÃO serve aqui: quando o processo
+   *    morre depois do marcador, o que ele deixa é justamente a reserva órfã.
+   *
+   * Os dois sinais existem porque os dois lados do marcador são perguntas
+   * diferentes: antes, "ele ainda pode entrar?"; depois, "ele ainda está lá?".
+   * Nenhum dos dois LIBERA efeito — ambos SEGURAM a evidência, que é a resposta
+   * segura quando não se pode provar não início.
+   *
+   * LIMITE (documentado no parecer): um processo morto ANTES do marcador só é
+   * reconhecido quando a lease vence. Isto é o desenho do §5.5.1 — a lease é o
+   * que o crash deixa —, não uma detecção de crash por si só.
+   */
+  async claimExecutorLiveness(input: {
+    approval_request_id: string;
+  }): Promise<{ can_still_start: boolean; execution_in_flight: boolean }> {
+    const { tenant_id, agent_id } = scope();
+    const res = await withTx(async (tx) => {
+      const rows = linhas<{ can_still_start: boolean; execution_in_flight: boolean }>(
+        await tx.execute(sql`
+          SELECT
+            EXISTS (
+              SELECT 1
+                FROM ${engine_tool_calls} c
+                JOIN ${engine_runs} r
+                  ON r.tenant_id = c.tenant_id AND r.agent_id = c.agent_id
+                 AND r.id = c.run_id
+                JOIN ${agent_turns} t
+                  ON t.tenant_id = r.tenant_id AND t.agent_id = r.agent_id
+                 AND t.id = r.turn_id
+               WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+                 AND c.approval_request_id = ${input.approval_request_id}::uuid
+                 AND c.state IN ('received', 'dispatching', 'handler_started')
+                 AND c.finished_at IS NULL
+                 AND r.phase = 'running'
+                 AND r.capabilities_revoked_at IS NULL
+                 AND r.deadline_at > clock_timestamp()
+                 AND r.origin_claim_token = t.claim_token
+                 AND r.origin_turn_attempt = t.attempt_count
+                 AND t.status = 'running'
+                 AND t.lease_expires_at IS NOT NULL
+                 AND t.lease_expires_at > clock_timestamp()
+            ) AS can_still_start,
+            EXISTS (
+              SELECT 1
+                FROM ${engine_tool_calls} c
+                JOIN ${idempotency_keys} k
+                  ON k.tenant_id = c.tenant_id AND k.agent_id = c.agent_id
+                 AND k.tool_name = c.tool_name
+                 AND k.key = c.idempotency_key
+               WHERE c.tenant_id = ${tenant_id} AND c.agent_id = ${agent_id}
+                 AND c.approval_request_id = ${input.approval_request_id}::uuid
+                 AND c.handler_started_at IS NOT NULL
+                 AND k.state = 'in_progress'
+                 AND k.expires_at > clock_timestamp()
+            ) AS execution_in_flight`),
+      );
+      return rows[0] ?? { can_still_start: false, execution_in_flight: false };
+    });
+    return res;
   },
 
   /**

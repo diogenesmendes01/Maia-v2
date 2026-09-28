@@ -46,11 +46,21 @@
  *  7. Crash REAL entre o marcador e o `consume` (pedido preso em `claimed`, call
  *     órfã em `handler_started`): o turno NOVO reconcilia pelo JOURNAL — a
  *     evidência vira `execution_failed`, ZERO handler, e um pedido NOVO nasce
- *     com o MESMO fingerprint, destravando a intenção (AC04/AC06). Antes desta
- *     correção o pedido ficava `claimed` para sempre e a operação ficava presa.
- *  8. Crash REAL entre o claim e o marcador (claim sem carimbo): o journal prova
- *     NÃO INÍCIO, a evidência VOLTA a `approved` e a MESMA evidência executa UMA
- *     vez no turno novo, sendo consumida por ele (AC04).
+ *     com o MESMO fingerprint, destravando a intenção (AC04/AC06).
+ *  8. Claim SEM carimbo: o estado do banco é o MESMO para um dono vivo e para um
+ *     processo morto — e é o fence do marcador que os separa. Dono VIVO ⇒ a
+ *     evidência é SEGURADA (`pending`, zero handler, nenhum pedido novo); fence
+ *     morto (a lease do turno parou de ser renovada: o que um crash deixa) ⇒ a
+ *     MESMA evidência volta a `approved` e executa UMA vez (AC04).
+ *  9. Executor VIVO entre o claim e o marcador (QA-P4): o turno concorrente NÃO
+ *     herda o claim, a evidência nunca volta a `approved` depois do efeito, UM
+ *     handler, e a repetição depois da janela de idempotência exige aprovação
+ *     NOVA (AC03/AC04/AC06/SPEC-L1406).
+ * 10. Executor VIVO DENTRO do handler (P5): o turno concorrente não fecha a
+ *     evidência de quem está executando; o ledger termina `consumed`, coerente
+ *     com o efeito real, sem pedido novo (AC04/AC06).
+ * 11. Fence do banco: evidência devolvida (`claimed → approved`) não deixa o
+ *     dono antigo iniciar — o marcador exige o claim VIGENTE (AC04).
  *
  * Skipped sem `TEST_DB_URL`.
  */
@@ -95,6 +105,13 @@ const { fixture } = vi.hoisted(() => ({
     contraparte: 0,
     pendencia: 0,
     lancar: false,
+    /**
+     * Casos 9/10 (F2/QA-P5) — o portão que PAUSA um executor DENTRO do handler.
+     * Sem ele não existe o estado "executor VIVO entre o claim e o consume": os
+     * dois cenários de corrida precisam de um dono que já entrou no handler e
+     * ainda não saiu.
+     */
+    gate: null as Promise<void> | null,
     resultadoContraparte: { ok: true, contraparte_id: 'c-1' } as unknown,
   },
 }));
@@ -141,6 +158,10 @@ vi.mock('@/tools/_registry.js', () => {
         feature_flag: undefined,
         handler: async () => {
           fixture.contraparte += 1;
+          // O contador sobe ANTES do portão: o caso 10 mede "o handler começou
+          // e AINDA não terminou" — a janela em que a evidência dele não pode
+          // ser fechada por um turno concorrente.
+          if (fixture.gate) await fixture.gate;
           if (fixture.lancar) throw new Error('handler fixture explodiu pós-marcador');
           return fixture.resultadoContraparte;
         },
@@ -467,6 +488,23 @@ async function lerCall(run_id: string, call_id: string): Promise<CallRow> {
   return r.rows[0];
 }
 
+/**
+ * §5.5.1 (SC05) — O CRASH DE VERDADE, para o turno: o processo para de renovar
+ * a lease e o fence do marcador morre. É a ÚNICA diferença observável entre um
+ * dono vivo (que pode iniciar a qualquer instante) e um processo morto — a fase
+ * do run e o estado da call são idênticos nos dois.
+ */
+async function expirarLeaseDoTurno(turn_id: string): Promise<void> {
+  const r = await pool.query(
+    `UPDATE agent_turns SET lease_expires_at = now() - interval '1 minute'
+      WHERE tenant_id = $1 AND agent_id = $2 AND id = $3`,
+    [TENANT, AGENT, turn_id],
+  );
+  if (r.rowCount !== 1) throw new Error(`lease do turno não expirou: ${turn_id}`);
+}
+
+const espera = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
 type ApprovalRow = {
   id: string;
   status: string;
@@ -714,6 +752,7 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
     fixture.contraparte = 0;
     fixture.pendencia = 0;
     fixture.lancar = false;
+    fixture.gate = null;
     fixture.resultadoContraparte = { ok: true, contraparte_id: 'c-1' };
     pendenciaCtl.devolverId = null;
     pendenciaCtl.conversaDaCriacao = null;
@@ -1081,6 +1120,8 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         handler_started: true,
         effect_class: 'non_interruptible',
         start_uncertain: false,
+        can_still_start: false,
+        execution_in_flight: false,
       }),
     ).toBe('execution_failed');
 
@@ -1125,6 +1166,8 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         handler_started: false,
         effect_class: null,
         start_uncertain: false,
+        can_still_start: false,
+        execution_in_flight: false,
       }),
     ).toBe('release_claim');
 
@@ -1184,6 +1227,8 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         handler_started: false,
         effect_class: null,
         start_uncertain: true,
+        can_still_start: false,
+        execution_in_flight: false,
       }),
     ).toBe('execution_failed');
     expect(fixture.contraparte).toBe(1);
@@ -1229,9 +1274,60 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
         handler_started: true,
         effect_class: 'non_interruptible',
         start_uncertain: false,
+        can_still_start: false,
+        execution_in_flight: false,
       }),
     ).toBe('execution_failed');
 
+    // ── as DUAS regras de espera: o carimbo ausente não é prova de não início ─
+    //
+    // Sem carimbo, mas com o fence do turno ainda valendo, o dono do claim pode
+    // cruzar o marcador a qualquer instante: o instantâneo NÃO prova não início
+    // e a evidência é SEGURADA — é a corrida que o QA reproduziu (QA-P4). O MESMO
+    // instantâneo, com o fence morto (lease vencida), é prova de não início.
+    expect(
+      classifyApprovalClaimRecovery({
+        approval_status: 'claimed',
+        handler_started: false,
+        effect_class: null,
+        start_uncertain: false,
+        can_still_start: true,
+        execution_in_flight: false,
+      }),
+    ).toBe('hold');
+    expect(
+      classifyApprovalClaimRecovery({
+        approval_status: 'claimed',
+        handler_started: false,
+        effect_class: null,
+        start_uncertain: false,
+        can_still_start: false,
+        execution_in_flight: false,
+      }),
+    ).toBe('release_claim');
+
+    // E com o carimbo posto, quem segura é a EXECUÇÃO EM VOO (a reserva viva do
+    // efeito): fechar a evidência enquanto o handler roda é o P5 do QA.
+    expect(
+      classifyApprovalClaimRecovery({
+        approval_status: 'claimed',
+        handler_started: true,
+        effect_class: 'nil',
+        start_uncertain: false,
+        can_still_start: false,
+        execution_in_flight: true,
+      }),
+    ).toBe('hold');
+    expect(
+      classifyApprovalClaimRecovery({
+        approval_status: 'claimed',
+        handler_started: true,
+        effect_class: 'nil',
+        start_uncertain: false,
+        can_still_start: false,
+        execution_in_flight: false,
+      }),
+    ).toBe('execution_failed');
     // Repetir a operação NÃO herda a evidência gasta: exige aprovação NOVA e
     // não emite efeito nenhum antes disso.
     fixture.lancar = false;
@@ -1514,9 +1610,9 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
   });
 
   // ══════════════════════════════════════════════════════════════════════════
-  // 8. crash REAL antes do marcador: a evidência VOLTA (prova de não início)
+  // 8. claim SEM carimbo: dono VIVO segura a evidência; lease morta a devolve
   // ══════════════════════════════════════════════════════════════════════════
-  it('8. AC04 — crash entre o claim e o marcador: o journal prova não início e a MESMA evidência volta a executar UMA vez', async () => {
+  it('8. AC04 — claim sem carimbo: o dono VIVO não perde a evidência; com o fence morto (crash) ela volta e executa UMA vez', async () => {
     const nonce = randomUUID();
     const args = { texto: 'orfao-antes-do-marcador', nonce };
 
@@ -1545,6 +1641,37 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
     expect(orfa.handler_started_at).toBeNull();
     expect((await lerAprovacao(pedido.id)).status).toBe('claimed');
 
+    /**
+     * ── O MESMO estado do banco, mas o dono AINDA VIVO: a evidência é SEGURA ──
+     *
+     * «Sem carimbo» NÃO é prova de não início: `turno2` continua com a lease
+     * viva, então a tentativa que reivindicou a evidência ainda pode cruzar o
+     * marcador a qualquer instante. Era exatamente este o defeito que o QA
+     * reproduziu (QA-P4): a evidência era devolvida, o dono antigo executava
+     * depois e a MESMA aprovação autorizava um segundo efeito. Enquanto o fence
+     * do marcador autoriza AQUELA tentativa, a resposta é `pending`: um turno
+     * novo recebe `approval_required` apontando para o pedido `claimed`, sem
+     * handler e sem pedido novo.
+     */
+    const turnoVivo = await mkTurnoVivo();
+    const runVivo = await runRodando(turnoVivo, await mkControle());
+    const callVivo = `sc05:pre2v:${randomUUID().slice(0, 8)}`;
+    const rVivo = await gatewayReal(turnoVivo, runVivo).invoke(chamadaGw(runVivo, callVivo, args));
+    expect(rVivo).toMatchObject({ kind: 'result', is_error: true });
+    expect(fixture.contraparte).toBe(1);
+    const retida = await lerAprovacao(pedido.id);
+    expect(retida.status).toBe('claimed');
+    expect(retida.claim_token).toBe(tokenDoCrash);
+    expect(await pedidosDoNonce(nonce)).toHaveLength(1);
+
+    // ── agora sim o crash: o heartbeat para e a lease do turno morre ──────
+    //
+    // É ESTA a diferença entre um dono vivo e um processo morto — e é a única.
+    // Um crash real não muda a fase do run nem o estado da call: ele para de
+    // renovar `agent_turns.lease_expires_at`, e é o fence do marcador que passa
+    // a recusar a tentativa antiga.
+    await expirarLeaseDoTurno(turno2.turn_id);
+
     // ── turno NOVO: a prova de NÃO INÍCIO devolve a evidência e ela executa ─
     const turno3 = await mkTurnoVivo();
     const run3 = await runRodando(turno3, await mkControle());
@@ -1552,8 +1679,8 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
     const r3 = await gatewayReal(turno3, run3).invoke(chamadaGw(run3, call3, args));
 
     // UM handler — o do turno novo —, sob o MESMO pedido de aprovação: a
-    // evidência humana voltou a valer porque o efeito comprovadamente não
-    // começou, e o consume é dela.
+    // evidência humana voltou a valer porque a tentativa antiga comprovadamente
+    // já não pode iniciar (o fence dela está morto), e o consume é dela.
     expect(fixture.contraparte).toBe(2);
     expect(r3).toMatchObject({ kind: 'result', is_error: false });
     const row3 = await lerCall(run3, call3);
@@ -1571,5 +1698,216 @@ d('SC05 — approval terminal e pendência real (Postgres real)', () => {
     // reutilizar evidência gasta — é não gastar uma evidência que não executou.
     expect(await pedidosDoNonce(nonce)).toHaveLength(1);
     expect((await lerCall(run2, call2)).handler_started_at).toBeNull();
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 9. executor VIVO entre o claim e o marcador (F2 / QA-P4)
+  // ══════════════════════════════════════════════════════════════════════════
+  it('9. AC03/AC04/AC06/SPEC-L1406 — executor VIVO antes do marcador: o turno concorrente NÃO herda o claim, UM efeito, sem reexecução depois', async () => {
+    const nonce = randomUUID();
+    const args = { texto: 'sc05-vivo-antes-do-marcador', nonce };
+
+    const turno1 = await mkTurnoVivo();
+    const run1 = await runRodando(turno1, await mkControle());
+    await gatewayReal(turno1, run1).invoke(chamadaGw(run1, `sc05:v4p:${randomUUID().slice(0, 8)}`, args));
+    const pedido = (await pedidosDoNonce(nonce))[0]!;
+    await aprovarPorSql(pedido.id);
+
+    // ── A: reivindica a evidência e PAUSA antes do marcador ──────────────
+    let soltarA!: () => void;
+    const gateA = new Promise<void>((r) => (soltarA = r));
+    let chegouAoMarcador!: () => void;
+    const noMarcador = new Promise<void>((r) => (chegouAoMarcador = r));
+    const turnoA = await mkTurnoVivo();
+    const runA = await runRodando(turnoA, await mkControle());
+    const callA = `sc05:v4A:${randomUUID().slice(0, 8)}`;
+    const gwA = gatewayReal(turnoA, runA, {
+      over: {
+        markToolHandlerStarted: async (
+          i: Parameters<ToolGatewayDepsV1['markToolHandlerStarted']>[0],
+        ) => {
+          chegouAoMarcador();
+          await gateA;
+          return noEscopo(() => engineRunsRepo.markToolHandlerStarted(i)) as never;
+        },
+      },
+    });
+    const pA = gwA.invoke(chamadaGw(runA, callA, args));
+    await noMarcador;
+
+    const durante = await lerAprovacao(pedido.id);
+    expect(durante.status).toBe('claimed');
+    expect(fixture.contraparte).toBe(0);
+    const tokenA = durante.claim_token!;
+
+    // ── B: turno CONCORRENTE, mesma intenção, com A vivo ────────────────
+    const turnoB = await mkTurnoVivo();
+    const runB = await runRodando(turnoB, await mkControle());
+    const callB = `sc05:v4B:${randomUUID().slice(0, 8)}`;
+    const pB = gatewayReal(turnoB, runB).invoke(chamadaGw(runB, callB, args));
+
+    // Dá a B a chance de TENTAR tomar a evidência. O que ele NÃO pode fazer é
+    // mudar quem é o dono: o claim tem de continuar sendo o de A.
+    await espera(1500);
+    const aposB = await lerAprovacao(pedido.id);
+    const callBRow = await lerCall(runB, callB);
+    expect(fixture.contraparte).toBe(0);
+
+    soltarA();
+    const [resA, resB] = await Promise.all([pA, pB]);
+
+    // O claim de A não foi tomado, a evidência não voltou a `approved` e B não
+    // emitiu efeito nenhum: B é recusado com a aprovação do MESMO pedido.
+    expect(aposB.status).toBe('claimed');
+    expect(aposB.claim_token).toBe(tokenA);
+    expect(resB).toMatchObject({ kind: 'result', is_error: true });
+    expect(callBRow.state).toBe('approval_required');
+    expect(callBRow.approval_request_id).toBe(pedido.id);
+
+    // A conclui: UM efeito, e o efeito CONSOME a evidência (nunca volta a
+    // `approved` depois de um efeito — o defeito do QA-P4).
+    expect(resA).toMatchObject({ kind: 'result', is_error: false });
+    expect(fixture.contraparte).toBe(1);
+    const fim = await lerAprovacao(pedido.id);
+    expect(fim.status).toBe('consumed');
+
+    // ── repetição DEPOIS da janela de idempotência: NÃO executa de novo ──
+    await pool.query(
+      `DELETE FROM idempotency_keys
+        WHERE tenant_id = $1 AND agent_id = $2 AND tool_name = 'create_contraparte' AND pessoa_id = $3`,
+      [TENANT, AGENT, PESSOA_ID],
+    );
+    const turnoC = await mkTurnoVivo();
+    const runC = await runRodando(turnoC, await mkControle());
+    const callC = `sc05:v4C:${randomUUID().slice(0, 8)}`;
+    const resC = await gatewayReal(turnoC, runC).invoke(chamadaGw(runC, callC, args));
+
+    expect(fixture.contraparte).toBe(1);
+    expect(resC).toMatchObject({ kind: 'result', is_error: true });
+    const pedidos = await pedidosDoNonce(nonce);
+    expect(pedidos).toHaveLength(2);
+    expect(pedidos[0]!.status).toBe('consumed');
+    expect(pedidos[1]!.status).toBe('pending');
+    expect((await lerCall(runC, callC)).approval_request_id).toBe(pedidos[1]!.id);
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 10. executor VIVO DENTRO do handler (P5)
+  // ══════════════════════════════════════════════════════════════════════════
+  it('10. AC04/AC06 — executor VIVO dentro do handler: o turno concorrente não fecha a evidência dele', async () => {
+    const nonce = randomUUID();
+    const args = { texto: 'sc05-vivo-no-handler', nonce };
+
+    const turno1 = await mkTurnoVivo();
+    const run1 = await runRodando(turno1, await mkControle());
+    await gatewayReal(turno1, run1).invoke(chamadaGw(run1, `sc05:v5p:${randomUUID().slice(0, 8)}`, args));
+    const pedido = (await pedidosDoNonce(nonce))[0]!;
+    await aprovarPorSql(pedido.id);
+
+    // ── A: entra no handler e FICA lá ───────────────────────────────────
+    let soltar!: () => void;
+    fixture.gate = new Promise<void>((r) => (soltar = r));
+    const turnoA = await mkTurnoVivo();
+    const runA = await runRodando(turnoA, await mkControle());
+    const callA = `sc05:v5A:${randomUUID().slice(0, 8)}`;
+    const pA = gatewayReal(turnoA, runA).invoke(chamadaGw(runA, callA, args));
+    for (let i = 0; i < 100 && fixture.contraparte === 0; i++) await espera(50);
+    expect(fixture.contraparte).toBe(1);
+    const durante = await lerAprovacao(pedido.id);
+    expect(durante.status).toBe('claimed');
+
+    // ── B: turno concorrente enquanto A está DENTRO do handler ──────────
+    const turnoB = await mkTurnoVivo();
+    const runB = await runRodando(turnoB, await mkControle());
+    const callB = `sc05:v5B:${randomUUID().slice(0, 8)}`;
+    const resB = await gatewayReal(turnoB, runB).invoke(chamadaGw(runB, callB, args));
+    const aposB = await lerAprovacao(pedido.id);
+    const pedidosAposB = await pedidosDoNonce(nonce);
+
+    soltar();
+    fixture.gate = null;
+    const resA = await pA;
+
+    /**
+     * O LEDGER TEM DE CONCORDAR COM O EFEITO REAL.
+     *
+     * O dono está VIVO e dentro do handler: declarar `execution_failed` aqui
+     * afirmaria um desfecho terminal sobre uma execução em voo (e o efeito que
+     * ela produziria ficaria sem a evidência que o autoriza). B recebe a mesma
+     * recusa de aprovação de sempre — e quem fecha a evidência é A, consumindo.
+     */
+    expect(aposB.status).toBe('claimed');
+    expect(pedidosAposB).toHaveLength(1);
+    expect(fixture.contraparte).toBe(1);
+    expect(resA).toMatchObject({ kind: 'result', is_error: false });
+    expect(resB).toMatchObject({ kind: 'result', is_error: true });
+    const fim = await lerAprovacao(pedido.id);
+    expect(fim.status).toBe('consumed');
+    expect((await lerCall(runA, callA)).state).toBe('completed');
+    expect(await pedidosDoNonce(nonce)).toHaveLength(1);
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // 11. o marcador é CERCADO pelo claim (fence do banco)
+  // ══════════════════════════════════════════════════════════════════════════
+  it('11. AC04 — evidência devolvida não deixa o dono antigo iniciar: o marcador exige o claim VIGENTE', async () => {
+    const nonce = randomUUID();
+    const args = { texto: 'sc05-fence-do-marcador', nonce };
+
+    const turno1 = await mkTurnoVivo();
+    const run1 = await runRodando(turno1, await mkControle());
+    await gatewayReal(turno1, run1).invoke(chamadaGw(run1, `sc05:fc1:${randomUUID().slice(0, 8)}`, args));
+    const pedido = (await pedidosDoNonce(nonce))[0]!;
+    await aprovarPorSql(pedido.id);
+
+    // ── A: reivindica a evidência e PAUSA antes do marcador ──────────────
+    let soltarA!: () => void;
+    const gateA = new Promise<void>((r) => (soltarA = r));
+    let chegouAoMarcador!: () => void;
+    const noMarcador = new Promise<void>((r) => (chegouAoMarcador = r));
+    const turnoA = await mkTurnoVivo();
+    const runA = await runRodando(turnoA, await mkControle());
+    const callA = `sc05:fcA:${randomUUID().slice(0, 8)}`;
+    const gwA = gatewayReal(turnoA, runA, {
+      over: {
+        markToolHandlerStarted: async (
+          i: Parameters<ToolGatewayDepsV1['markToolHandlerStarted']>[0],
+        ) => {
+          chegouAoMarcador();
+          await gateA;
+          return noEscopo(() => engineRunsRepo.markToolHandlerStarted(i)) as never;
+        },
+      },
+    });
+    const pA = gwA.invoke(chamadaGw(runA, callA, args));
+    await noMarcador;
+
+    const durante = await lerAprovacao(pedido.id);
+    expect(durante.status).toBe('claimed');
+    const tokenA = durante.claim_token!;
+
+    // ── a evidência é DEVOLVIDA enquanto A está vivo (o defeito do QA-P4) ──
+    //
+    // É a devolução real do repositório — o CAS que exige a prova de não início
+    // no journal —, e ela é ACEITA (não há carimbo algum).
+    expect(await lerAprovacaoDevolvida(pedido.id, tokenA)).toBe(true);
+    expect((await lerAprovacao(pedido.id)).status).toBe('approved');
+
+    // ── o dono ANTIGO não inicia mesmo assim ──────────────────────────────
+    //
+    // O marcador é cercado pelo claim: `status = 'claimed' AND claim_token =
+    // <o meu>`. Uma evidência devolvida deixa de autorizar quem a tinha — é isso
+    // que torna a devolução segura, e é isso que impede a mesma aprovação de
+    // autorizar dois efeitos (§5.5.1).
+    soltarA();
+    const resA = await pA;
+    const rowA = await lerCall(runA, callA);
+    expect(rowA.handler_started_at).toBeNull();
+    expect(fixture.contraparte).toBe(0);
+    expect(resA).toMatchObject({ kind: 'refused', code: 'run_not_authorized' });
+    expect(rowA.state).toBe('denied');
+    // E a evidência continua intacta e executável para quem a reivindicar de
+    // novo (devolver não é gastar): o pedido segue `approved`.
+    expect((await lerAprovacao(pedido.id)).status).toBe('approved');
   });
 });
