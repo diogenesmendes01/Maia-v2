@@ -95,6 +95,110 @@ async function waitFor(
   }
 }
 
+/**
+ * CONEXÃO MEIO-ABERTA (SC07 §5.8.1, AC02/AC06 — F1).
+ *
+ * Envolve `appPool.connect` para que a conexão PARE DE LER o socket
+ * (`stream.pause()`) na primeira consulta que casar com o filtro. É o cenário
+ * que o `statement_timeout` do servidor não alcança: o PostgreSQL cancela o
+ * statement e envia o `57014`, mas a resposta viaja pela conexão que ninguém
+ * está lendo — sem destruir o socket, a promessa da renovação nunca liquida.
+ *
+ * DUAS armadilhas que este helper evita, e as duas já custaram uma rodada:
+ *
+ *  1. o filtro recebe o histórico da CONEXÃO (`{ tetoDeStatement }`), além do
+ *    texto. Não é enfeite: o `UPDATE` do CLAIM também escreve `heartbeat_at`,
+ *    então um filtro solto (`agent_turns` + `heartbeat_at`) pausa a conexão do
+ *    `claimNextEligibleTurn` — o claim seguinte fica pendurado num socket que
+ *    ninguém lê, e o sintoma aparece num teste que não tem relação alguma com
+ *    heartbeat. Quem identifica a conexão da renovação é o `SET LOCAL
+ *    statement_timeout` que só o caminho cancelável emite;
+ *  2. `desfazer()` DEVOLVE o `query` original de cada cliente envolvido. O
+ *    wrapper fica no OBJETO, não no pool: sem devolvê-lo, uma conexão que volta
+ *    ao pool continua com o filtro do teste anterior e o efeito reaparece
+ *    depois, longe da causa.
+ *
+ * Devolve o contador de consultas travadas (a prova de que o cenário ACONTECEU)
+ * e o desfazer.
+ */
+function travarSocketEm(
+  casar: (texto: string, conexao: { tetoDeStatement: boolean }) => boolean,
+): {
+  travadas: () => number;
+  desfazer: () => void;
+} {
+  const original = appPool.connect.bind(appPool) as (
+    cb?: (err: unknown, client: pg.PoolClient, release: unknown) => void,
+  ) => Promise<pg.PoolClient> | void;
+  let travadas = 0;
+  type ClienteSonda = pg.PoolClient & { __sc07Teto?: boolean };
+  const envolvidos: Array<{ client: ClienteSonda; query: unknown }> = [];
+  const envolver = (client: pg.PoolClient): pg.PoolClient => {
+    const sonda = client as ClienteSonda;
+    if (envolvidos.some((e) => e.client === sonda)) return client;
+    const queryOriginal = client.query.bind(client) as (...a: unknown[]) => unknown;
+    envolvidos.push({ client: sonda, query: (sonda as unknown as { query: unknown }).query });
+    (sonda as unknown as { query: unknown }).query = (...a: unknown[]) => {
+      const texto = typeof a[0] === 'string' ? a[0] : ((a[0] as { text?: string })?.text ?? '');
+      // A marca vem do próprio caminho exercitado: é o repositório que aplica o
+      // teto do statement na conexão da renovação.
+      if (/SET\s+LOCAL\s+statement_timeout/i.test(texto)) sonda.__sc07Teto = true;
+      if (casar(texto, { tetoDeStatement: sonda.__sc07Teto === true })) {
+        travadas += 1;
+        (sonda as unknown as { connection: { stream: { pause(): void } } }).connection.stream.pause();
+      }
+      return queryOriginal(...a);
+    };
+    return client;
+  };
+  // `pool.query` chama `connect` na forma de CALLBACK: um patch que devolvesse
+  // só a Promise deixaria `pool.query` pendurado para sempre. As duas formas
+  // são atendidas, e é por isso que o wrapper é um `function` e não um `async`.
+  (appPool as unknown as { connect: unknown }).connect = (...args: unknown[]) => {
+    const cb = args.find((a) => typeof a === 'function') as
+      | ((err: unknown, client: pg.PoolClient, release: unknown) => void)
+      | undefined;
+    if (cb) {
+      original((err, client, release) => {
+        if (client) envolver(client);
+        cb(err, client, release);
+      });
+      return;
+    }
+    const semCallback = original as () => Promise<pg.PoolClient>;
+    return semCallback().then(envolver);
+  };
+  return {
+    travadas: () => travadas,
+    desfazer: () => {
+      (appPool as unknown as { connect: unknown }).connect = original;
+      for (const { client, query } of envolvidos) {
+        (client as unknown as { query: unknown }).query = query;
+        delete client.__sc07Teto;
+      }
+      envolvidos.length = 0;
+    },
+  };
+}
+
+/**
+ * Renovação de lease (`UPDATE agent_turns ... heartbeat_at`).
+ *
+ * O `!SET status` separa a renovação do CLAIM: os dois escrevem `heartbeat_at`
+ * e `lease_expires_at = now() + make_interval(...)`, então só o `status` os
+ * distingue. Quem confirma que a conexão é mesmo a da renovação é a marca
+ * `tetoDeStatement` do helper — esta função sozinha não bastaria.
+ */
+const ehRenovacao = (texto: string): boolean =>
+  /UPDATE\s+"?agent_turns"?/i.test(texto) &&
+  /heartbeat_at/i.test(texto) &&
+  !/SET\s+status\s*=\s*'claimed'/i.test(texto);
+
+/** Devolução da posse (`UPDATE agent_turns SET lease_expires_at = now()`, e só). */
+const ehDevolucao = (texto: string): boolean =>
+  /UPDATE\s+"?agent_turns"?/i.test(texto) &&
+  /SET\s+lease_expires_at\s*=\s*now\(\)\s*,/i.test(texto);
+
 async function mkTurn(): Promise<{ turn_id: string; mensagem_id: string }> {
   const mensagem_id = randomUUID();
   await pool.query(
@@ -145,6 +249,25 @@ async function counterTotal(name: string): Promise<number> {
   let total = 0;
   for (const line of text.split('\n')) {
     if (!line.startsWith(name)) continue;
+    const value = Number(line.slice(line.lastIndexOf(' ') + 1));
+    if (Number.isFinite(value)) total += value;
+  }
+  return total;
+}
+
+/**
+ * O valor de uma série com RÓTULO específico (não o `sum()` de `counterTotal`).
+ *
+ * A distinção importa aqui: `maia_turn_lease_heartbeat_total` tem `renewed`,
+ * `error` e `token_mismatch` sob o mesmo nome, e somar tudo deixaria a prova do
+ * teste passar por incremento de OUTRO desfecho — a batida presa tem de contar
+ * como `error`, não "sumir no agregado".
+ */
+async function contadorComRotulo(name: string, rotulo: string): Promise<number> {
+  const text = await renderPrometheus();
+  let total = 0;
+  for (const line of text.split('\n')) {
+    if (!line.startsWith(`${name}{`) || !line.includes(rotulo)) continue;
     const value = Number(line.slice(line.lastIndexOf(' ') + 1));
     if (Number.isFinite(value)) total += value;
   }
@@ -324,7 +447,7 @@ d('SC07 — heartbeat limitado e serializado (Postgres real)', () => {
     'AC02 — a aritmética é fail-closed: heartbeat ≤ TTL/3 e teto da consulta < heartbeat',
     async () => {
       const { TurnLease } = await import('@/runtime/turns/lease.js');
-      const { checkLeaseTiming, leaseQueryTimeoutMs, UnsafeLeaseTimingError } =
+      const { checkLeaseTiming, leaseQueryCancelMs, leaseQueryTimeoutMs, UnsafeLeaseTimingError } =
         await import('@/runtime/turns/claim.js');
       const { turn_id } = await mkTurn();
       const claim = await claimTurn(turn_id, 8_000);
@@ -337,6 +460,15 @@ d('SC07 — heartbeat limitado e serializado (Postgres real)', () => {
         expect(teto).toBeGreaterThan(0);
         expect(teto).toBeLessThan(hb);
         expect(teto).toBe(Math.floor(hb / 2));
+
+        // SC07 (F1) — e o teto do CLIENTE fica ENTRE os dois: depois do
+        // statement do servidor (para o `57014` normal continuar devolvendo a
+        // conexão ao pool) e antes do próximo heartbeat (para a cadência não
+        // nascer atrasada).
+        const cancel = leaseQueryCancelMs(hb);
+        expect(Number.isFinite(cancel), `cancel_timeout_ms finito em hb=${hb}`).toBe(true);
+        expect(cancel).toBeGreaterThan(teto);
+        expect(cancel).toBeLessThan(hb);
       }
       expect(checkLeaseTiming(60_000, 15_000).ok, 'default de produção continua válido').toBe(true);
       expect(
@@ -352,9 +484,30 @@ d('SC07 — heartbeat limitado e serializado (Postgres real)', () => {
             new TurnLease(base, { ttl_ms: 8_000, heartbeat_ms: 400, query_timeout_ms: inseguro }),
         ).toThrow(UnsafeLeaseTimingError);
       }
+      // O teto do CLIENTE é validado pela MESMA disciplina: maior que o do
+      // statement e menor que o heartbeat, ou o construtor recusa.
+      for (const inseguro of [0, -1, Number.POSITIVE_INFINITY, 200, 400, 401]) {
+        expect(
+          () =>
+            new TurnLease(base, {
+              ttl_ms: 8_000,
+              heartbeat_ms: 400,
+              query_timeout_ms: 200,
+              cancel_timeout_ms: inseguro,
+            }),
+          `cancel_timeout_ms=${inseguro} não limita nada e precisa ser recusado`,
+        ).toThrow(UnsafeLeaseTimingError);
+      }
       // E um teto explícito válido é aceito.
       const ok = new TurnLease(base, { ttl_ms: 8_000, heartbeat_ms: 400, query_timeout_ms: 150 });
       await ok.settle();
+      const okCancel = new TurnLease(base, {
+        ttl_ms: 8_000,
+        heartbeat_ms: 400,
+        query_timeout_ms: 150,
+        cancel_timeout_ms: 300,
+      });
+      await okCancel.settle();
     },
     30_000,
   );
@@ -432,6 +585,236 @@ d('SC07 — heartbeat limitado e serializado (Postgres real)', () => {
           /* já revertida */
         }
         locker.release();
+      }
+    },
+    30_000,
+  );
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // SC07-AC02/AC04/AC06 — F1: a conexão PAROU DE LER o socket. O teto do
+  //   servidor não alcança este caso; o do CLIENTE destrói a conexão.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  itT(
+    'AC02/AC04/AC06 — renovação PRESA no socket do CLIENTE: perde a posse, destrói a conexão e nenhum renew ressurge',
+    async () => {
+      const { TurnLease } = await import('@/runtime/turns/lease.js');
+
+      const TTL = 1_200;
+      const HB = 400;
+      const { turn_id } = await mkTurn();
+      const claim = await claimTurn(turn_id, TTL);
+      const antes = await turnRow(turn_id);
+
+      const sonda = travarSocketEm((texto, cx) => cx.tetoDeStatement && ehRenovacao(texto));
+      const removidas: unknown[] = [];
+      const aoRemover = (client: unknown): void => {
+        removidas.push(client);
+      };
+      appPool.on('remove', aoRemover);
+
+      const lease = new TurnLease(claim, { ttl_ms: TTL, heartbeat_ms: HB });
+      const t0 = Date.now();
+      try {
+        await waitFor(() => !lease.alive, 'a posse ser declarada perdida com a batida presa', 8_000);
+        const decorrido = Date.now() - t0;
+
+        expect(
+          sonda.travadas(),
+          'a renovação precisa ter ficado PRESA no socket de verdade',
+        ).toBeGreaterThanOrEqual(1);
+        expect(
+          decorrido,
+          'a perda NÃO pode depender de a batida responder: o vigia do cliente declara a posse perdida com a consulta ainda em voo',
+        ).toBeLessThan(TTL + 2 * HB);
+        expect(lease.lostReason, 'a margem da lease acabou com a batida presa').toBe('expired');
+        expect(lease.token, 'depois da perda o token não pode ser devolvido').toBeNull();
+        expect(lease.signal.aborted, 'a tentativa local precisa ser abortada').toBe(true);
+
+        // O BANCO confirma o que o processo declarou: nenhuma renovação passou.
+        const depois = await turnRow(turn_id);
+        expect(depois.heartbeat_at, 'nenhum heartbeat passou por este caminho').toEqual(
+          antes.heartbeat_at,
+        );
+        expect((depois.lease_expires_at as Date).getTime()).toBeLessThanOrEqual(Date.now());
+
+        // A conexão PRESA foi DESTRUÍDA (removida do pool), não devolvida a ele.
+        await waitFor(() => removidas.length >= 1, 'a conexão presa ser removida do pool');
+        expect(appPool.waitingCount).toBe(0);
+        await appPool.query('SELECT 1');
+
+        // Encerramento LIMITADO: `settle()` não espera um socket morto.
+        const s0 = Date.now();
+        await lease.settle();
+        expect(
+          Date.now() - s0,
+          'settle() com a conexão morta precisa terminar no teto, não pendurar',
+        ).toBeLessThan(2 * HB);
+
+        // "Nenhum renew ressurge": o loop parou de verdade.
+        const travadasNoFim = sonda.travadas();
+        await sleep(3 * HB);
+        expect(sonda.travadas(), 'um dono que perdeu a posse não pode continuar batendo').toBe(
+          travadasNoFim,
+        );
+      } finally {
+        appPool.off('remove', aoRemover);
+        sonda.desfazer();
+        await lease.settle();
+      }
+    },
+    30_000,
+  );
+
+  itT(
+    'AC02/AC04 — `settle()` com a batida PRESA termina em tempo LIMITADO',
+    async () => {
+      const { TurnLease } = await import('@/runtime/turns/lease.js');
+      const { leaseQueryCancelMs } = await import('@/runtime/turns/claim.js');
+
+      const TTL = 8_000;
+      const HB = 400;
+      const { turn_id } = await mkTurn();
+      const claim = await claimTurn(turn_id, TTL);
+
+      const sonda = travarSocketEm((texto, cx) => cx.tetoDeStatement && ehRenovacao(texto));
+      const lease = new TurnLease(claim, { ttl_ms: TTL, heartbeat_ms: HB });
+      try {
+        await waitFor(() => sonda.travadas() >= 1, 'a primeira renovação ficar presa');
+        const s0 = Date.now();
+        await lease.settle();
+        expect(
+          Date.now() - s0,
+          'o encerramento destrói a conexão presa em vez de esperar para sempre',
+        ).toBeLessThan(2 * HB + leaseQueryCancelMs(HB));
+        expect(lease.lostReason, 'encerrar não é perder a posse').toBeNull();
+
+        const travadasNoFim = sonda.travadas();
+        await sleep(3 * HB);
+        expect(sonda.travadas(), 'nenhuma renovação nova depois do encerramento').toBe(
+          travadasNoFim,
+        );
+      } finally {
+        sonda.desfazer();
+        await lease.settle();
+      }
+    },
+    30_000,
+  );
+
+  itT(
+    'AC02/AC04/AC06 — renovação PRESA num socket morto FALHA no teto do cliente e NÃO congela o loop',
+    async () => {
+      const { TurnLease } = await import('@/runtime/turns/lease.js');
+      const { leaseQueryCancelMs } = await import('@/runtime/turns/claim.js');
+
+      // Margem LARGA de propósito (TTL 8 s contra batidas de 400 ms): aqui não há
+      // vencimento para declarar a perda nem `settle()` para drenar. O que está
+      // em teste é a OUTRA metade do teto do cliente — a batida presa precisa
+      // LIQUIDAR como falha e o loop precisa VOLTAR a bater, sozinho. Sem ele, a
+      // renovação fica em voo para sempre, o loop morre com ela, e a lease
+      // expira por inanição mesmo com o processo vivo.
+      const TTL = 8_000;
+      const HB = 400;
+      const { turn_id } = await mkTurn();
+      const claim = await claimTurn(turn_id, TTL);
+      const antes = await turnRow(turn_id);
+
+      const sonda = travarSocketEm((texto, cx) => cx.tetoDeStatement && ehRenovacao(texto));
+      const removidas: unknown[] = [];
+      const aoRemover = (client: unknown): void => {
+        removidas.push(client);
+      };
+      appPool.on('remove', aoRemover);
+
+      const errosAntes = await contadorComRotulo('maia_turn_lease_heartbeat_total', 'result="error"');
+      const lease = new TurnLease(claim, { ttl_ms: TTL, heartbeat_ms: HB });
+      try {
+        await waitFor(() => sonda.travadas() >= 1, 'a primeira renovação ficar presa');
+
+        // A batida presa tem de LIQUIDAR (falha contada) dentro do teto do
+        // cliente: é isso que a impede de ficar em voo para sempre.
+        await waitFor(
+          async () =>
+            (await contadorComRotulo('maia_turn_lease_heartbeat_total', 'result="error"')) >
+            errosAntes,
+          'a renovação presa liquidar como falha no teto do cliente',
+          leaseQueryCancelMs(HB) + 8 * HB,
+        );
+
+        // E o loop VOLTA: a segunda batida parte (e trava de novo, porque a
+        // sonda segue ligada) — o socket morto não sequestra o heartbeat.
+        await waitFor(
+          () => sonda.travadas() >= 2,
+          'o loop de heartbeat voltar a bater depois da renovação presa',
+          leaseQueryCancelMs(HB) + 8 * HB,
+        );
+
+        // A posse continua NOSSA (a margem é larga) e o banco não recebeu
+        // renovação nenhuma: falhar não é perder.
+        expect(lease.alive, 'a lease não pode morrer por uma batida presa').toBe(true);
+        expect(lease.lostReason).toBeNull();
+        const depois = await turnRow(turn_id);
+        expect(depois.heartbeat_at, 'nenhuma renovação passou pelo socket morto').toEqual(
+          antes.heartbeat_at,
+        );
+
+        // Cada conexão presa morre: destruída, não devolvida ao pool.
+        await waitFor(() => removidas.length >= 1, 'a conexão presa ser destruída');
+        expect(appPool.waitingCount).toBe(0);
+        await appPool.query('SELECT 1');
+      } finally {
+        appPool.off('remove', aoRemover);
+        sonda.desfazer();
+        await lease.settle();
+      }
+    },
+    30_000,
+  );
+
+  itT(
+    'AC02/AC04/AC06 — `release()` com a DEVOLUÇÃO presa termina limitada e declara a posse devolvida',
+    async () => {
+      const { TurnLease } = await import('@/runtime/turns/lease.js');
+
+      const TTL = 8_000;
+      const HB = 400;
+      const { turn_id } = await mkTurn();
+      const claim = await claimTurn(turn_id, TTL);
+
+      // Renovação E devolução param de ser lidas: o encerramento do core não
+      // pode pendurar em NENHUMA das duas.
+      const sonda = travarSocketEm(
+        (texto, cx) => (cx.tetoDeStatement && ehRenovacao(texto)) || ehDevolucao(texto),
+      );
+      const removidas: unknown[] = [];
+      const aoRemover = (client: unknown): void => {
+        removidas.push(client);
+      };
+      appPool.on('remove', aoRemover);
+
+      const lease = new TurnLease(claim, { ttl_ms: TTL, heartbeat_ms: HB });
+      try {
+        await waitFor(() => sonda.travadas() >= 1, 'a renovação ficar presa');
+        const s0 = Date.now();
+        await lease.release();
+        const decorrido = Date.now() - s0;
+        expect(
+          decorrido,
+          'release() precisa terminar no teto do cliente: a lease vence sozinha em <= TTL',
+        ).toBeLessThan(4 * HB);
+        expect(
+          sonda.travadas(),
+          'a devolução também precisa ter travado — é ela que o teto do cliente encerra',
+        ).toBeGreaterThanOrEqual(2);
+        expect(lease.lostReason).toBe('released');
+        await waitFor(() => removidas.length >= 2, 'as duas conexões presas serem destruídas');
+        expect(appPool.waitingCount).toBe(0);
+        await appPool.query('SELECT 1');
+      } finally {
+        appPool.off('remove', aoRemover);
+        sonda.desfazer();
+        await lease.settle();
       }
     },
     30_000,

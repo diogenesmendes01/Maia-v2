@@ -624,9 +624,57 @@ export const MAX_HEARTBEAT_FAILURES = 2;
  * em `renewTurnLease`): um `Promise.race` no cliente abandonaria a promessa e
  * deixaria a consulta e a conexão rodando, que é exatamente o que a AC02
  * proíbe.
+ *
+ * Ele NÃO basta sozinho, e é por isso que existe `leaseQueryCancelMs` abaixo: o
+ * teto do servidor só chega ao processo se o processo estiver LENDO o socket.
  */
 export function leaseQueryTimeoutMs(heartbeat_ms: number): number {
   return Math.max(1, Math.floor(heartbeat_ms / 2));
+}
+
+/**
+ * SC07 (§5.8.1, AC02/AC06) — o teto do LADO DO CLIENTE: quanto a CONEXÃO da
+ * renovação pode ficar sem liquidar antes de ser destruída.
+ *
+ * Por que o teto do servidor não cobre isto: `statement_timeout` mata o
+ * STATEMENT no PostgreSQL e devolve `57014` — pela CONEXÃO. Numa conexão
+ * meio-aberta (o processo parou de ler o socket, uma partição de rede, um peer
+ * que congelou), a resposta do servidor nunca é processada e a promessa da
+ * renovação NUNCA liquida: a lease não percebe o próprio vencimento, o
+ * `finally` do core fica pendurado no `settle()`/`release()`, e o turno segue
+ * trabalhando depois de o banco já ter dado a posse a outro. Um teto do
+ * cliente é a única defesa contra isso, e ele precisa ser AÇÃO, não desistência:
+ * quem cancela destrói a conexão (`client.release(err)` ⇒ `stream.destroy()`),
+ * porque um `Promise.race` abandonado deixaria a consulta e o socket presos.
+ *
+ * O cronômetro é armado pelo REPOSITÓRIO, quando ele já tem a conexão na mão
+ * (`renewTurnLease`/`releaseTurnClaim`, parâmetro `client_timeout_ms`) — isto é,
+ * ele mede a fase em que a consulta pode ficar presa no socket, e não o
+ * trabalho que o caller faz ANTES de pedir a renovação. A distinção importa:
+ * uma batida lenta por outro motivo (fila do pool, trabalho no próprio
+ * heartbeat) não é um socket morto e não deve perder a conexão por isso.
+ *
+ * Ele é ESTRITAMENTE MAIOR que `leaseQueryTimeoutMs` e ESTRITAMENTE MENOR que o
+ * intervalo de heartbeat, e as duas desigualdades têm razão:
+ *
+ *  - maior que o do servidor: no caminho normal quem cancela é o PostgreSQL, e
+ *    o cliente lê o `57014` e devolve a conexão AO POOL. Se o teto do cliente
+ *    empatasse, todo statement cancelado no servidor viraria destruição de
+ *    conexão — trocar a limpeza normal por churn de socket;
+ *  - menor que o heartbeat: a batida seguinte só é agendada quando a anterior
+ *    termina; uma espera que ultrapassasse o intervalo transformaria
+ *    "no máximo uma renovação em voo" em "uma renovação em voo por vez, sempre
+ *    atrasada", e a cadência do heartbeat deixaria de ser a configurada.
+ *
+ * A folga é um oitavo do intervalo (piso de 1 ms), que é tempo de sobra para o
+ * `57014` chegar numa conexão saudável — localhost e rede local gastam
+ * microssegundos — e curto o bastante para a lease ser declarada perdida
+ * dentro do próprio TTL.
+ */
+export function leaseQueryCancelMs(heartbeat_ms: number): number {
+  const tetoDoServidor = leaseQueryTimeoutMs(heartbeat_ms);
+  const folga = Math.max(1, Math.floor(heartbeat_ms / 8));
+  return Math.min(Math.max(1, heartbeat_ms - 1), tetoDoServidor + folga);
 }
 
 export type LeaseTimingCheck =

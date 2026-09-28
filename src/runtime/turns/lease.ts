@@ -19,6 +19,7 @@ import { incCounter, observeHistogram } from '@/lib/metrics.js';
 import {
   assertLeaseTiming,
   turnWorkerId,
+  leaseQueryCancelMs,
   leaseQueryTimeoutMs,
   MAX_HEARTBEAT_FAILURES,
   UnsafeLeaseTimingError,
@@ -67,6 +68,30 @@ export function turnClaimEnabled(): boolean {
  * `renewTurnLease`), nunca por `Promise.race`: abandonar a promessa deixaria a
  * consulta rodando e o timer agendaria a próxima por cima dela — precisamente a
  * sobreposição que se quer impedir.
+ *
+ * ─── SC07 (§5.8.1, AC02/AC04/AC06) — e limitado também no CLIENTE ────────────
+ *
+ * O teto do servidor NÃO cobre a conexão meio-aberta: o `57014` do PostgreSQL
+ * viaja pela mesma conexão que parou de ser lida, então a promessa da renovação
+ * nunca liquida — a lease não vê o próprio vencimento, o turno continua
+ * trabalhando com a posse já dada a outro, e o `finally` do core pendura em
+ * `settle()`/`release()`. Duas defesas, com papéis separados:
+ *
+ *   1. o teto do CLIENTE (`#cancel_ms`, `leaseQueryCancelMs`) — vai para o
+ *      repositório como `client_timeout_ms` e é aplicado na PRÓPRIA conexão,
+ *      quando ela já está na mão. Vencido, a conexão é DESTRUÍDA, a batida
+ *      liquida e a falha é contada no `catch`: o loop volta a bater e uma
+ *      lease com margem larga NÃO expira por inanição;
+ *   2. o vigia do horizonte MONOTÔNICO da lease — se a margem acaba DURANTE a
+ *      batida, a posse já não é nossa e esperar a resposta não mudaria isso: a
+ *      perda é declarada na hora (`expired`) e a tentativa local é abortada.
+ *
+ * Os dois prazos são medidos de pontos diferentes de propósito: o teto do
+ * cliente conta a CONSULTA (socket preso), e o vigia conta a POSSE (horizonte
+ * vencido). Destruição e cancelamento juntos são o que faz `settle()`/`release()`
+ * serem de espera LIMITADA sem abandonar promessa nenhuma: quem encerra cancela
+ * a conexão e aguarda a liquidação, em vez de esperar para sempre por um socket
+ * morto.
  */
 export class TurnLease {
   readonly claim: TurnClaim;
@@ -75,6 +100,14 @@ export class TurnLease {
   #timer: NodeJS.Timeout | null = null;
   /** A batida em voo, para o encerramento poder AGUARDÁ-LA (`#drenar`). */
   #inFlight: Promise<void> | null = null;
+  /**
+   * O CANCELAMENTO da batida em voo (SC07 §5.8.1, AC02/AC06).
+   *
+   * Ele é a alça que o encerramento e o vigia usam para DESTRUIR a conexão
+   * presa: quem cancela destrói o socket, porque um `Promise.race` abandonado
+   * deixaria a consulta rodando e o timer agendaria a próxima por cima dela.
+   */
+  #beatCancel: AbortController | null = null;
   #failures = 0;
   #lost: LeaseLossReason | null = null;
   #leaseExpiresAt: Date;
@@ -93,6 +126,12 @@ export class TurnLease {
   readonly #ttl_ms: number;
   readonly #heartbeat_ms: number;
   readonly #query_timeout_ms: number;
+  /**
+   * Teto do LADO DO CLIENTE (`leaseQueryCancelMs`): vai ao repositório como
+   * `client_timeout_ms` — vencido, a conexão da batida é destruída — e delimita
+   * a espera de `#drenar` no encerramento.
+   */
+  readonly #cancel_ms: number;
   #stopped = false;
   #onAbort: (() => void) | null = null;
   readonly #mono: () => number;
@@ -104,6 +143,12 @@ export class TurnLease {
       heartbeat_ms: number;
       /** Teto da consulta de renovação; default = metade do heartbeat. */
       query_timeout_ms?: number;
+      /**
+       * Teto do CLIENTE (SC07 AC02/AC06); default = `leaseQueryCancelMs`.
+       * Vencido, a conexão da batida é DESTRUÍDA — é ele que limita a espera de
+       * `settle()`/`release()` numa conexão meio-aberta.
+       */
+      cancel_timeout_ms?: number;
       /** Relógio monotônico injetável (teste). Default: `performance.now()`. */
       mono_ms?: () => number;
     },
@@ -132,6 +177,29 @@ export class TurnLease {
         opts.ttl_ms,
         opts.heartbeat_ms,
         `query_timeout_ms=${this.#query_timeout_ms} não é finito e menor que o heartbeat`,
+      );
+    }
+    // O teto do CLIENTE (F1) obedece à MESMA disciplina: finito, MENOR que o
+    // heartbeat (senão a batida seguinte nasceria atrasada) e MAIOR que o do
+    // servidor (senão o `57014` normal seria trocado por destruição de conexão).
+    // O default se adapta a um `query_timeout_ms` explícito para que as duas
+    // desigualdades continuem valendo sem configuração extra.
+    this.#cancel_ms =
+      opts.cancel_timeout_ms ??
+      Math.min(
+        opts.heartbeat_ms - 1,
+        Math.max(leaseQueryCancelMs(opts.heartbeat_ms), this.#query_timeout_ms + 1),
+      );
+    if (
+      !Number.isFinite(this.#cancel_ms) ||
+      this.#cancel_ms <= this.#query_timeout_ms ||
+      this.#cancel_ms >= opts.heartbeat_ms
+    ) {
+      throw new UnsafeLeaseTimingError(
+        opts.ttl_ms,
+        opts.heartbeat_ms,
+        `cancel_timeout_ms=${this.#cancel_ms} precisa ser finito, maior que o teto do ` +
+          `statement (${this.#query_timeout_ms}) e menor que o heartbeat`,
       );
     }
     this.#leaseHorizonMono =
@@ -285,12 +353,22 @@ export class TurnLease {
       this.#lose('expired');
       return;
     }
+    // O cancelamento desta batida: é ele que o encerramento usa para DESTRUIR a
+    // conexão presa.
+    const cancel = new AbortController();
+    this.#beatCancel = cancel;
+    const vigia = this.#vigiarMargem();
     try {
       const renewed = await agentTurnsRepo.renewTurnLease({
         turn_id: this.claim.turn_id,
         claim_token: this.claim.claim_token,
         lease_ms: this.#ttl_ms,
         statement_timeout_ms: this.#query_timeout_ms,
+        cancel_signal: cancel.signal,
+        // O teto do cliente é aplicado pelo REPOSITÓRIO, quando a conexão já
+        // está na mão: ele mede a consulta presa no socket, não o trabalho que
+        // esta batida faz antes de pedir a renovação.
+        client_timeout_ms: this.#cancel_ms,
       });
       // Encerramento INTENCIONAL durante a consulta (stop/release/CAS terminal,
       // ou perda detectada por outro caminho): a resposta que chega depois não é
@@ -332,6 +410,7 @@ export class TurnLease {
           worker_id: this.claim.worker_id,
           failures: this.#failures,
           statement_timeout_ms: this.#query_timeout_ms,
+          cancel_timeout_ms: this.#cancel_ms,
           err: (err as Error).message,
         },
         'turn.lease_heartbeat_failed',
@@ -351,6 +430,60 @@ export class TurnLease {
         // dois escrevem. Perder a tentativa é barato; escrever sem posse não é.
         this.#lose('heartbeat_failed');
       }
+    } finally {
+      clearTimeout(vigia);
+      if (this.#beatCancel === cancel) this.#beatCancel = null;
+    }
+  }
+
+  /**
+   * O VIGIA da batida (SC07 §5.8.1, AC04) — o que faz o VENCIMENTO ser
+   * detectado com a batida AINDA em voo, e não só quando ela liquidar.
+   *
+   * Ele é armado no horizonte MONOTÔNICO da lease: se a margem acaba antes da
+   * resposta, a posse já não é nossa, e declarar `expired` aqui — em vez de
+   * esperar a batida terminar — é o que a §5.8.1 exige ("se a margem da lease
+   * acabou antes de resposta: `markLost('expired')`"). `#lose` cancela a
+   * tentativa local e destrói a conexão presa, sem depender da resposta.
+   *
+   * Quem limita a ESPERA no cliente é outra coisa: o teto `client_timeout_ms`
+   * que o repositório aplica na própria conexão (`leaseQueryCancelMs`). Os dois
+   * papéis são separados de propósito — o teto do cliente mede a fase da
+   * consulta (socket preso), e este vigia mede a posse (horizonte vencido).
+   *
+   * O timer é `unref`ado como o do heartbeat: um vigia não pode ser o motivo de
+   * o processo não terminar.
+   */
+  #vigiarMargem(): NodeJS.Timeout {
+    const vigia = setTimeout(() => {
+      if (!this.alive || this.#stopped) {
+        // Encerramento/perda já aconteceram por outro caminho (um `stop()`
+        // durante a espera, por exemplo): o que resta é a conexão presa, que
+        // precisa morrer para o `#drenar` de quem encerrou poder retornar.
+        this.#cancelarBatida();
+        return;
+      }
+      this.#lose('expired');
+    }, Math.max(0, this.#margemMono()));
+    vigia.unref?.();
+    return vigia;
+  }
+
+  /**
+   * DESTRÓI a conexão da batida em voo (se houver), via `cancel_signal`.
+   *
+   * Idempotente e nunca lança: é chamada de caminhos de encerramento, onde uma
+   * exceção mascararia a causa real. Sem batida em voo é no-op — e o
+   * cancelamento NÃO é uma desistência da promessa: a batida liquida (com o
+   * erro do driver) e o `finally` dela rearma o loop ou declara a perda.
+   */
+  #cancelarBatida(motivo = 'turn.lease_renew_cancelled'): void {
+    const cancel = this.#beatCancel;
+    if (!cancel) return;
+    try {
+      cancel.abort(new Error(motivo));
+    } catch {
+      /* `abort` é idempotente por contrato; aqui a falha não teria o que fazer */
     }
   }
 
@@ -361,6 +494,10 @@ export class TurnLease {
     // O encerramento acontece ANTES do `abort`: ele tira o ouvinte do sinal e
     // desarma o timer, então a sequência é uma só e idempotente.
     this.#finalizar();
+    // A batida em voo vai junto: a conexão dela é destruída em vez de ficar
+    // pendurada num socket que já não vale nada — quem perdeu a posse não tem
+    // resposta a esperar.
+    this.#cancelarBatida(`turn.lease_lost:${reason}`);
     this.#abort.abort(new Error(`turn.lease_lost:${reason}`));
     if (reason === 'released') return; // liberação intencional não é anomalia
     incCounter('maia_turn_lease_lost_total', { reason });
@@ -408,24 +545,49 @@ export class TurnLease {
   }
 
   /**
-   * Aguarda a batida EM VOO terminar (ou ser CANCELADA no teto do statement).
+   * Aguarda a batida EM VOO terminar, com TETO EXPLÍCITO (SC07 §5.8.1, F1).
    *
    * É o que o encerramento precisa antes de declarar o turno acabado: parar o
    * timer não interrompe uma renovação que já saiu — sem esta espera, o turno
    * concluiria e a consulta atrasada ainda poderia renovar a lease de um turno
-   * terminal (o CAS a recusa, mas a recusa viraria um `token_mismatch` falso, e
-   * a conexão ficaria presa até o teto). O tempo de espera é LIMITADO por
-   * construção: cada consulta tem `statement_timeout_ms < heartbeat_ms`.
+   * terminal (o CAS a recusa, mas a recusa viraria um `token_mismatch` falso).
+   *
+   * E ele é LIMITADO, que é o que faltava: `await this.#inFlight` sozinho é uma
+   * espera ILIMITADA numa conexão meio-aberta, porque o `statement_timeout` do
+   * servidor viaja pela mesma conexão que o processo parou de ler — o `finally`
+   * do core penduraria para sempre. O teto é o do cliente (`#cancel_ms`, o mesmo
+   * que o repositório aplica na conexão) com uma folga de um statement; se ele
+   * estourar, a conexão presa é DESTRUÍDA aqui mesmo e a espera termina logo
+   * depois (a liquidação pós-destruição é do driver, não da rede). NADA é
+   * abandonado: a promessa continua com handler e o loop só é rearmado no
+   * `finally` dela.
    */
   async #drenar(): Promise<void> {
     const emVoo = this.#inFlight;
     if (!emVoo) return;
-    try {
-      await emVoo;
-    } catch {
-      // `#batida` não lança; o catch existe para que "aguardar" nunca seja o
-      // motivo de o encerramento falhar.
+    const dentroDoTeto = await this.#liquidaEm(emVoo, this.#cancel_ms + this.#query_timeout_ms);
+    if (!dentroDoTeto) {
+      // Só se chega aqui com a batida presa além do próprio vigia (event loop
+      // travado, timer atrasado). Destruir a conexão é o que libera o
+      // encerramento; a liquidação seguinte é do driver.
+      this.#cancelarBatida('turn.lease_drain_deadline');
+      await this.#liquidaEm(emVoo, this.#query_timeout_ms);
     }
+  }
+
+  /** `true` se a promessa liquidou antes do prazo; `false` se o prazo venceu. */
+  async #liquidaEm(p: Promise<unknown>, ms: number): Promise<boolean> {
+    return new Promise<boolean>((resolve) => {
+      const t = setTimeout(() => resolve(false), ms);
+      t.unref?.();
+      const liquidou = (): void => {
+        clearTimeout(t);
+        resolve(true);
+      };
+      // Handler nos DOIS caminhos: uma batida que falha não pode virar
+      // rejeição não tratada só porque o encerramento estava esperando.
+      void p.then(liquidou, liquidou);
+    });
   }
 
   /**
@@ -467,6 +629,10 @@ export class TurnLease {
    * timer, mas a renovação que já saiu continua viva e pode tocar o banco depois
    * de o turno ter sido declarado acabado. Aqui o encerramento só termina quando
    * não há mais nada em voo — sem devolver a posse (quem faz isso é `release`).
+   *
+   * A espera é LIMITADA por `#drenar` (F1): numa conexão meio-aberta a batida
+   * não liquida sozinha, e o encerramento a DESTRÓI em vez de esperar para
+   * sempre.
    */
   async settle(): Promise<void> {
     this.stop();
@@ -496,10 +662,21 @@ export class TurnLease {
     this.stop();
     await this.#drenar();
     if (!this.alive) return;
+    // SC07 (§5.8.1, F1) — e a DEVOLUÇÃO também é limitada no CLIENTE.
+    //
+    // `releaseTurnClaim` é UM statement, mas um statement pendurado num socket
+    // que parou de ser lido penduraria o `finally` do core aqui — depois de o
+    // heartbeat já ter sido desligado. O teto do cliente (`client_timeout_ms`,
+    // aplicado pelo repositório com a conexão na mão) encerra a espera: a
+    // conexão presa é DESTRUÍDA e a lease vence sozinha em <= TTL. Perdemos
+    // velocidade de recuperação (um sucessor espera o TTL em vez do próximo
+    // tick), nunca correção — o fence continua recusando qualquer gravação de
+    // quem já não tem posse.
     try {
       await agentTurnsRepo.releaseTurnClaim({
         turn_id: this.claim.turn_id,
         claim_token: this.claim.claim_token,
+        client_timeout_ms: this.#cancel_ms,
       });
     } catch (err) {
       // Falhou em liberar: a lease vence sozinha em <= TTL. Perdemos velocidade
