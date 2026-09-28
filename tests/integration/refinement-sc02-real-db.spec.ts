@@ -41,6 +41,7 @@ import {
 import { engineRunsRepo } from '@/db/repositories/engine-repos.js';
 import { ensureHermesConversationControl } from '@/db/repositories/hermes-control-producer.js';
 import { loadHermesLaunchContext } from '@/db/repositories/hermes-launch-repo.js';
+import { persistSyntheticHermesManifest } from '@/db/repositories/hermes-manifest-repo.js';
 import { parseRuntimeManifest } from '@/integrations/hermes/manifest.js';
 import { createJournaledHermesRuntime } from '@/runtime/engines/hermes-runtime.js';
 import { HERMES_ENGINE_ADAPTER_REVISION } from '@/runtime/engines/hermes-engine.js';
@@ -1614,6 +1615,57 @@ d('SC02 rodada 2 — matriz de constraints, ledger e CAS do start (Postgres real
     expect(enginePinV1Schema.safeParse(manifest.runtime_pin.hermes_sha).success).toBe(false);
     expect(manifest.control_epoch).toBe('0');
     expect(manifest.exposure_epoch).toBe('0');
+  }, 120_000);
+
+  /**
+   * AC04/SPEC-L2842 — a cláusula de AUTORIZAÇÃO: o manifesto sintético não
+   * consome bundle que ninguém publicou e não carrega tool de negócio. O
+   * manifesto adulterado PARSEIA (senão a recusa seria do schema, não da
+   * autorização) e a recusa deixa a linha original intacta.
+   */
+  it('AC04/SPEC-L2842 — ref de publicação não autorizada é RECUSADA e nada é persistido', async () => {
+    const f = await criarTurno({ atual: 'ref-nao-autorizada' });
+    await reivindicar(f);
+    const run_id = (await admitir(f))!;
+
+    const lerManifesto = async () => {
+      const r = await pool.query<{ manifest_json: Record<string, unknown> }>(
+        `SELECT manifest_json FROM hermes_runtime_manifests WHERE tenant_id=$1 AND agent_id=$2 AND run_id=$3`,
+        [T, A, run_id],
+      );
+      return { linhas: r.rowCount, json: r.rows[0]!.manifest_json };
+    };
+    const original = await lerManifesto();
+    expect(original.linhas).toBe(1);
+    expect(original.json.publication_refs).toEqual([]);
+
+    // (1) Bundle que ninguém publicou: a interface RECUSA em vez de consumir.
+    const comRef = { ...original.json, publication_refs: ['bundle:nao-publicado'] };
+    expect(parseRuntimeManifest(comRef).kind, 'adulterar precisa PARSEAR').toBe('ok');
+    expect(await scoped(() => persistSyntheticHermesManifest(comRef, f.execution))).toEqual({
+      kind: 'refused',
+    });
+
+    // (2) Tool de negócio: recusada já no CONTRATO (allowlist do §7.10.3) e
+    // também pela cláusula de autorização do produtor.
+    const comTool = { ...original.json, tools: ['consultar_saldo'] };
+    expect(parseRuntimeManifest(comTool).kind, 'tool fora da allowlist é recusada no parse').toBe(
+      'rejected',
+    );
+    expect(await scoped(() => persistSyntheticHermesManifest(comTool, f.execution))).toEqual({
+      kind: 'refused',
+    });
+
+    // (3) Nada foi escrito: uma linha, e é a original, byte a byte.
+    const depois = await lerManifesto();
+    expect(depois.linhas).toBe(1);
+    expect(depois.json).toEqual(original.json);
+    expect(
+      await contar(`SELECT count(*)::text AS n FROM engine_inference_attempts WHERE run_id=$1`, [
+        run_id,
+      ]),
+      'nenhuma inferência foi disparada',
+    ).toBe(0);
   }, 120_000);
 
   /**
