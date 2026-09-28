@@ -10,11 +10,25 @@ import { ensureHermesConversationControl } from './hermes-control-producer.js';
 import { engineRunsRepo } from './engine-repos.js';
 import { persistSyntheticHermesManifest } from './hermes-manifest-repo.js';
 import { canonicalDigest } from '@/integrations/hermes/canonical-json.js';
+import {
+  PERSISTED_HISTORY_FETCH_LIMIT,
+  normalizePersistedEngineContext,
+} from '@/integrations/hermes/history.js';
 import { computeManifestDigest, parseRuntimeManifest } from '@/integrations/hermes/manifest.js';
 import { engineRequestV1Schema, hostContextSnapshotV1Schema } from '@/runtime/engines/schemas.js';
 import type { TurnExecutionContext } from '@/runtime/turns/claim.js';
 import type { SyntheticCoreRuntime } from '@/runtime/engines/synthetic-core-context.js';
 import { config } from '@/config/env.js';
+
+/**
+ * O `system` desta composição é um rótulo EXPLÍCITO de evidência sintética —
+ * nunca uma alegação de release. O prompt pós-gates do caminho local
+ * (`buildPrompt`) não é reconstruído aqui: este lane não executa o pipeline
+ * (nem pendência, nem preturn), e inventar um system "real" a partir de colunas
+ * seria afirmar uma autoridade que ninguém compôs.
+ */
+const SYNTHETIC_SYSTEM_PROMPT =
+  'Synthetic text-only evaluation. No tools, business actions or persistent memory.';
 class Refused extends Error {}
 
 export async function prepareSyntheticHermesAdmission(input: {
@@ -49,6 +63,7 @@ export async function prepareSyntheticHermesAdmission(input: {
       const row = (
         await tx.execute(sql`
         SELECT c.pessoa_id,c.conversa_id,c.channel_id,c.stream_key,c.control_epoch::text,
+          m.id AS representative_message_id,m.tipo AS representative_message_tipo,
           m.conteudo,m.metadata
         FROM agent_turns t
         JOIN mensagens m ON m.tenant_id=t.tenant_id AND m.agent_id=t.agent_id AND m.id=t.representative_message_id
@@ -74,6 +89,8 @@ export async function prepareSyntheticHermesAdmission(input: {
             channel_id: string;
             stream_key: string;
             control_epoch: string;
+            representative_message_id: string;
+            representative_message_tipo: string;
             conteudo: string;
             metadata: Record<string, unknown>;
           }
@@ -91,6 +108,52 @@ export async function prepareSyntheticHermesAdmission(input: {
         WHERE tenant_id=${tenant} AND agent_id=${agent} AND turn_id=${e.turn_id}`)
       ).rows;
       if (inputs.length !== 1 || inputs[0]?.mensagem_id !== input.message_id) throw new Refused();
+      /**
+       * SC02 — o HISTÓRICO durável (§4.1). As linhas são as PERSISTIDAS desta
+       * conversa/canal, em ordem cronológica, e a mensagem ATUAL fica de fora
+       * por ID (`m.id <> <representativa>`) — nunca por comparação de texto.
+       *
+       * A leitura é limitada a `PERSISTED_HISTORY_FETCH_LIMIT`; bater no teto
+       * RECUSA (não se pode provar que a conversa inteira coube), e o resto das
+       * regras — limites de bytes, último é o inbound, multimodal — fica no
+       * normalizador real, que é o MESMO do caminho local.
+       */
+      const historicoBruto = (
+        await tx.execute(sql`
+        SELECT m.id,m.direcao,m.tipo,m.conteudo
+        FROM mensagens m
+        WHERE m.tenant_id=${tenant} AND m.agent_id=${agent}
+          AND m.conversa_id=${row.conversa_id} AND m.channel_id=${row.channel_id}
+          AND m.id<>${input.message_id}
+          AND m.created_at <= (
+            SELECT r.created_at FROM mensagens r
+            WHERE r.tenant_id=${tenant} AND r.agent_id=${agent} AND r.id=${input.message_id}
+          )
+        ORDER BY m.created_at DESC, m.id DESC
+        LIMIT ${PERSISTED_HISTORY_FETCH_LIMIT}`)
+      ).rows as Array<{ id: string; direcao: 'in' | 'out'; tipo: string; conteudo: string | null }>;
+      if (historicoBruto.length >= PERSISTED_HISTORY_FETCH_LIMIT) throw new Refused();
+      const historico = [...historicoBruto].reverse();
+      const normalizado = normalizePersistedEngineContext({
+        system: SYNTHETIC_SYSTEM_PROMPT,
+        history: historico,
+        inbound: {
+          id: row.representative_message_id,
+          direcao: 'in',
+          tipo: row.representative_message_tipo,
+          conteudo: row.conteudo,
+        },
+      });
+      if (normalizado.kind !== 'ok') throw new Refused();
+      /**
+       * O contexto que vai ao request é o do NORMALIZADOR — a mesma projeção
+       * que o motor receberia: o histórico textual canônico e a mensagem atual
+       * UMA vez no fim. Nada é reescrito depois disto.
+       */
+      const contextoMensagens: Array<{ role: 'user' | 'assistant'; content: string }> = [
+        ...normalizado.context.history.map((h) => ({ role: h.role, content: h.text })),
+        { role: 'user' as const, content: normalizado.context.user_message },
+      ];
       const deadline_ms = Math.min(120000, e.deadline.getTime() - Date.now());
       if (deadline_ms <= 0 || e.signal.aborted) throw new Refused();
       const run_id = randomUUID();
@@ -101,9 +164,8 @@ export async function prepareSyntheticHermesAdmission(input: {
         task: 'reasoner',
         isolation: 'one_run_no_shared_memory',
         context: {
-          system:
-            'Synthetic text-only evaluation. No tools, business actions or persistent memory.',
-          messages: [{ role: 'user', content: row.conteudo }],
+          system: normalizado.context.system,
+          messages: contextoMensagens,
           tools: [],
         },
         limits: {
