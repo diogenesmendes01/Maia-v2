@@ -27,12 +27,13 @@ nenhuma.
 
 from __future__ import annotations
 
+import json
 import os
 import sys
 import threading
 import time
 from pathlib import Path
-from typing import Any, Final, Mapping, Sequence
+from typing import Any, Final, Mapping, NamedTuple, Sequence
 
 from .binding import WorkerBinding
 from .bridge_tools import (
@@ -50,9 +51,15 @@ from .protocol import (
 from .result_projection import project_observed, project_stop, project_usage
 
 __all__ = [
+    "AUX_ROUTE_POLICY",
+    "AUX_ROUTES_ALLOWED",
     "BootstrapError",
     "SurfaceMismatch",
+    "assert_aux_policy_consistent",
+    "assert_aux_routes_closed",
+    "aux_policy_document",
     "build_agent_kwargs",
+    "build_worker_config",
     "inventory_home",
     "render_worker_config",
     "require_ephemeral_home",
@@ -159,6 +166,208 @@ def require_ephemeral_home(
     return home
 
 
+# ─── 3b. política de rotas auxiliares (spec §9.1 "Cobertura de auxiliares") ──
+
+
+class AuxRoutePosture(NamedTuple):
+    """Postura DECLARADA de uma rota auxiliar/compressão do cliente pinado.
+
+    ``posture`` é vocabulário FECHADO:
+
+    * ``disabled`` — a rota está desligada na configuração do home efêmero e o
+      valor fechado é conferido antes de o worker emitir ``ready``;
+    * ``through_relay`` — a rota está habilitada E obrigada a passar pelo
+      gateway de inferência (o único caminho de egresso do filho).
+
+    Hoje NÃO existe nenhuma ``through_relay``, e isso é medido, não presumido:
+    as rotas auxiliares do Hermes constroem clientes próprios
+    (``agent/auxiliary_client.py:164-185``), com base URL/credencial de
+    provider, ou seja, sairiam do relay. A postura correta é desligar — e a
+    consequência está nomeada na spec: "ou estar desabilitadas e
+    demonstravelmente bloqueadas". A lista é o artefato que a AC04 pede
+    (permitida/negada) e o gate abaixo é o que a torna executável.
+    """
+
+    route: str
+    path: tuple[str, ...]
+    closed_value: Any
+    #: Valores que CONTAM como bloqueio para esta rota. `closed_value` tem de
+    #: estar aqui: sem esta âncora, editar o valor declarado (por acidente ou
+    #: por conveniência) reescreveria o gate e a rota abriria em silêncio — o
+    #: `posture` e o `why` continuariam dizendo "desligada".
+    off_literals: tuple[Any, ...]
+    posture: str
+    why: str
+
+
+#: Fatos medidos no SHA pinado `5d59366`, um por rota.
+AUX_ROUTE_POLICY: Final[tuple[AuxRoutePosture, ...]] = (
+    AuxRoutePosture(
+        route="compression",
+        path=("compression", "enabled"),
+        closed_value=False,
+        off_literals=(False,),
+        posture="disabled",
+        why=(
+            "o compressor pede o modelo AUXILIAR, que constrói cliente próprio"
+            " (agent/auxiliary_client.py:164-185) — fora do gateway"
+        ),
+    ),
+    AuxRoutePosture(
+        route="context.engine",
+        path=("context", "engine"),
+        closed_value="compressor",
+        off_literals=("compressor",),
+        posture="disabled",
+        why="o context engine (lcm_*) tem caminho de sumarização próprio, fora do relay",
+    ),
+    AuxRoutePosture(
+        route="tools.tool_search",
+        path=("tools", "tool_search", "enabled"),
+        closed_value="off",
+        off_literals=("off", "false", "disabled"),
+        posture="disabled",
+        why=(
+            "o bridge de Tool Search troca a superfície efetiva e pede inferência"
+            " própria (tools/tool_search.py:64,189-198)"
+        ),
+    ),
+    AuxRoutePosture(
+        route="memory.memory_enabled",
+        path=("memory", "memory_enabled"),
+        closed_value=False,
+        off_literals=(False,),
+        posture="disabled",
+        why="memória nativa agrega inferência por caminho próprio e não é a coorte",
+    ),
+    AuxRoutePosture(
+        route="memory.user_profile_enabled",
+        path=("memory", "user_profile_enabled"),
+        closed_value=False,
+        off_literals=(False,),
+        posture="disabled",
+        why="perfil de usuário é dado de outra pessoa e não entra no piloto",
+    ),
+    AuxRoutePosture(
+        route="mcp_servers",
+        path=("mcp_servers",),
+        closed_value={},
+        off_literals=({},),
+        posture="disabled",
+        why="nenhum servidor MCP é autorizado no piloto (§6.6)",
+    ),
+)
+
+#: Rotas auxiliares PERMITIDAS fora do relay. Vazia é o estado correto.
+AUX_ROUTES_ALLOWED: Final[tuple[AuxRoutePosture, ...]] = ()
+
+_POSTURES: Final[frozenset[str]] = frozenset({"disabled", "through_relay"})
+
+
+def _assign(config: dict[str, Any], path: tuple[str, ...], value: Any) -> None:
+    """Grava ``value`` no caminho de chaves de ``config``, criando os níveis."""
+    cursor = config
+    for key in path[:-1]:
+        nxt = cursor.get(key)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cursor[key] = nxt
+        cursor = nxt
+    cursor[path[-1]] = value
+
+
+def _dig(config: Mapping[str, Any], path: tuple[str, ...]) -> Any:
+    """Lê o caminho; ausência devolve :data:`_ABSENT` (diferente de qualquer valor)."""
+    cursor: Any = config
+    for key in path:
+        if not isinstance(cursor, Mapping) or key not in cursor:
+            return _ABSENT
+        cursor = cursor[key]
+    return cursor
+
+
+_ABSENT: Final[Any] = object()
+
+
+def aux_policy_document() -> dict[str, Any]:
+    """A lista permitida/negada em forma serializável (artefato D09, AC04).
+
+    É o que o dump ``--print-aux-policy`` publica e o que a fixture redigida
+    guarda: permitidas (vazia hoje) e negadas, com caminho e motivo, para que a
+    revisão de outrem possa conferir a lista sem ler Python.
+    """
+    return {
+        "version": 1,
+        "allowed": [
+            {"route": r.route, "path": list(r.path), "posture": r.posture}
+            for r in AUX_ROUTES_ALLOWED
+        ],
+        "denied": [
+            {
+                "route": r.route,
+                "path": list(r.path),
+                "closed_value": r.closed_value,
+                "off_literals": list(r.off_literals),
+                "posture": r.posture,
+                "why": r.why,
+            }
+            for r in AUX_ROUTE_POLICY
+        ],
+    }
+
+
+def assert_aux_policy_consistent() -> None:
+    """Consistência INTERNA da política declarada — sem olhar o config.
+
+    Fail-closed em duas conferências:
+
+    1. ``posture`` no vocabulário fechado, e nenhuma rota permitida sem estar
+       ``through_relay`` (lista de permitidas com postura ``disabled`` seria uma
+       contradição que passaria despercebida);
+    2. ``closed_value`` tem de pertencer à lista de valores de BLOQUEIO da
+       própria rota (``off_literals``). Sem esta âncora, editar o valor
+       declarado reescreveria o gate: a rota abriria no `config.yaml` e o
+       ``posture``/``why`` continuariam dizendo "desligada".
+    """
+    for route in AUX_ROUTE_POLICY:
+        if route.posture not in _POSTURES:
+            raise BootstrapError(f"postura desconhecida para a rota auxiliar '{route.route}'")
+        if route.closed_value not in route.off_literals:
+            raise BootstrapError(
+                f"rota auxiliar '{route.route}': valor declarado {route.closed_value!r} não é"
+                f" um valor de BLOQUEIO declarado {route.off_literals!r}"
+            )
+    for route in AUX_ROUTES_ALLOWED:
+        if route.posture != "through_relay":
+            raise BootstrapError(
+                f"rota auxiliar permitida '{route.route}' precisa ser through_relay"
+            )
+
+
+def assert_aux_routes_closed(config: Mapping[str, Any]) -> None:
+    """Readiness: recusa se QUALQUER rota auxiliar declarada não estiver fechada.
+
+    Duas conferências, ambas fail-closed:
+
+    1. a própria política — ver :func:`assert_aux_policy_consistent`;
+    2. o ``config`` EFETIVO que vai virar ``config.yaml`` — cada rota negada
+       tem de estar exatamente no valor fechado. Chave ausente também recusa:
+       ausência de configuração não é promessa de bloqueio.
+    """
+    assert_aux_policy_consistent()
+    for route in AUX_ROUTE_POLICY:
+        value = _dig(config, route.path)
+        if value is _ABSENT:
+            raise BootstrapError(
+                f"rota auxiliar '{route.route}' sem valor fechado em {'.'.join(route.path)}"
+            )
+        if value != route.closed_value:
+            raise BootstrapError(
+                f"rota auxiliar '{route.route}' fora do relay: "
+                f"{'.'.join(route.path)}={value!r} (esperado {route.closed_value!r})"
+            )
+
+
 # ─── 3. config.yaml do home efêmero ─────────────────────────────────────────
 
 
@@ -212,30 +421,46 @@ def render_worker_config(*, context_length: int) -> str:
     O resto desliga caminhos que ampliam superfície ou abrem rota de egress
     fora do gateway (§6.6).
     """
+    return _render_yaml(build_worker_config(context_length=context_length)) + "\n"
+
+
+def build_worker_config(*, context_length: int) -> dict[str, Any]:
+    """O dict que vira ``config.yaml`` — DERIVADO da política de auxiliares.
+
+    ─── Por que derivar em vez de escrever o literal ─────────────────────────
+
+    Cada chave de superfície auxiliar é escrita A PARTIR de
+    :data:`AUX_ROUTE_POLICY`, e não ao lado dela. Habilitar compressão passa a
+    exigir mudar a política (com ``why`` e postura à vista) e não apenas
+    acrescentar uma linha ao dict — que é exatamente como uma rota auxiliar
+    entraria em produção sem ninguém notar que o gateway deixou de ser o único
+    caminho de egresso. O gate correspondente roda em :func:`write_worker_config`,
+    ANTES de o arquivo existir.
+    """
     if not isinstance(context_length, int) or context_length < 64_000:
         raise BootstrapError(
             "model.context_length precisa ser inteiro >= 64000 (piso do Hermes)"
         )
     config: dict[str, Any] = {
-        "model": {"context_length": context_length},
-        # Superfície: sem o bridge de Tool Search.
-        "tools": {"tool_search": {"enabled": "off"}},
-        # Memória: nem store nativo, nem perfil de usuário.
-        "memory": {"memory_enabled": False, "user_profile_enabled": False},
-        # Contexto: compressor da build aprovada, nunca o context engine (lcm_*).
-        "context": {"engine": "compressor"},
-        # Compressão desligada: as rotas auxiliares constroem clientes próprios
-        # (agent/auxiliary_client.py:164-185) e sairiam fora do gateway.
-        "compression": {"enabled": False},
-        # Nenhum servidor MCP.
-        "mcp_servers": {},
+        # `model.context_length` — sem ele, construir o ``AIAgent`` faz I/O DE
+        # REDE (ver `render_worker_config`).
+        "model": {"context_length": context_length}
     }
-    return _render_yaml(config) + "\n"
+    for route in AUX_ROUTE_POLICY:
+        _assign(config, route.path, route.closed_value)
+    return config
 
 
 def write_worker_config(home: Path, *, context_length: int) -> Path:
+    """Escreve ``config.yaml`` — e o gate de auxiliares roda ANTES da escrita.
+
+    A ordem é o contrato: uma configuração com rota auxiliar fora do relay NÃO
+    vira arquivo e o worker não alcança ``ready`` (``BootstrapError`` ⇒ exit 2).
+    """
+    config = build_worker_config(context_length=context_length)
+    assert_aux_routes_closed(config)
     path = home / "config.yaml"
-    path.write_text(render_worker_config(context_length=context_length), encoding="utf-8")
+    path.write_text(_render_yaml(config) + "\n", encoding="utf-8")
     return path
 
 
@@ -637,8 +862,48 @@ def _hermes_sha() -> str:
     return (os.environ.get("MAIA_HERMES_SHA") or "0" * 40).strip().lower()
 
 
-def main() -> int:  # pragma: no cover - entrada de processo
-    return run_worker()
+def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover - entrada de processo
+    """Entrada do processo: o spawn NÃO passa argumento nenhum.
+
+    Dois modos de verificação são aceitos, e existem para que a política de
+    auxiliares seja AUDITÁVEL de fora do Python (a fixture D09 do spike TS e o
+    teste que a compara são o consumidor):
+
+    * ``--print-aux-policy`` publica a lista permitida/negada em JSON;
+    * ``--check-aux-config`` lê um ``config`` JSON do stdin e devolve o MESMO
+      veredito do gate de readiness (0 fechado, 2 aberto).
+
+    Qualquer outro argumento é recusado: um worker iniciado com flag inventada
+    não deve seguir como se não houvesse flag.
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        return run_worker()
+    if args == ["--print-aux-policy"]:
+        try:
+            assert_aux_policy_consistent()
+        except BootstrapError as exc:
+            print(f"[hermes-worker] política de auxiliares inconsistente: {exc}", file=sys.stderr)
+            return EXIT_BOOTSTRAP
+        sys.stdout.write(json.dumps(aux_policy_document(), sort_keys=True) + "\n")
+        return EXIT_OK
+    if args == ["--check-aux-config"]:
+        try:
+            bruto = json.loads(sys.stdin.read() or "null")
+        except json.JSONDecodeError:
+            print("[hermes-worker] --check-aux-config: stdin não é JSON", file=sys.stderr)
+            return EXIT_BOOTSTRAP
+        if not isinstance(bruto, dict):
+            print("[hermes-worker] --check-aux-config: config precisa ser objeto", file=sys.stderr)
+            return EXIT_BOOTSTRAP
+        try:
+            assert_aux_routes_closed(bruto)
+        except BootstrapError as exc:
+            print(f"[hermes-worker] config recusado: {exc}", file=sys.stderr)
+            return EXIT_BOOTSTRAP
+        return EXIT_OK
+    print(f"[hermes-worker] argumento não suportado: {args[0]}", file=sys.stderr)
+    return EXIT_PROTOCOL
 
 
 if __name__ == "__main__":  # pragma: no cover

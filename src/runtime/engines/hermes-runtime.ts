@@ -16,6 +16,7 @@ import {
   toolSurfaceOf,
 } from '@/integrations/hermes/inference-credential.js';
 import { computeManifestDigest, parseRuntimeManifest } from '@/integrations/hermes/manifest.js';
+import { assertPinnedSdkSurfaceReady } from '@/integrations/hermes/inference-sdk-surface.js';
 import type { HermesSupervisorV1 } from '@/integrations/hermes/supervisor.js';
 import { getTurnExecutionContext } from '@/runtime/turns/execution-context.js';
 import { createHermesEngine, type HermesRunContextV1 } from './hermes-engine.js';
@@ -71,6 +72,13 @@ export async function createConfiguredHermesRuntime(
   if (!input.deployment) throw new Error('deployment_required');
   const parsed = syntheticDeploymentSchema.safeParse(input.deployment);
   if (!parsed.success) throw new Error('synthetic_deployment_invalid');
+  // SC25-A/D09 — gate de READINESS do pin do SDK: o cliente Hermes fixado emite
+  // exatamente os campos que este gateway admite. Estreitar
+  // `INFERENCE_ADMITTED_FIELDS` abaixo do que o cliente JÁ envia, ou habilitar
+  // rota auxiliar fora do relay, REPROVA aqui — e não em produção, com um run
+  // recusando inferência. O erro é tipado e fechado: carrega tipos de achado e
+  // nomes de campo, nunca conteúdo de conversa.
+  assertPinnedSdkSurfaceReady();
   const supervisor = createHermesSupervisor(parsed.data.supervisor);
   const runtime = createJournaledHermesRuntime({ supervisor, inference: parsed.data.inference });
   return {
