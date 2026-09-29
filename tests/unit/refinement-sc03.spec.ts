@@ -52,6 +52,7 @@ import {
   type AgentReadiness,
   type EngineDeploymentEvidenceV1,
   type EnginePolicyBindingFactV1,
+  type EngineReadinessProjection,
   type EngineReadinessFactsV1,
   type ReadinessFacts,
   type ReadinessCheckCode,
@@ -60,6 +61,11 @@ import {
 import { READINESS_CHECK_CODE_VALUES } from '../../src/observability/taxonomy.js';
 import { resolveEngineForNewTurn, lookupEngineForNewTurn } from '../../src/runtime/engines/selector.js';
 import { ENGINE_KINDS } from '../../src/runtime/engines/schemas.js';
+import {
+  ENGINE_UNAVAILABLE_DETAIL,
+  GO_LIVE_ENGINE_LABEL,
+  goLiveEngineItem,
+} from '../../src/admin-ui/app/agents/[agentId]/_components/go-live-engine-status.js';
 
 const T = 'acme';
 const A = 'acme-bot';
@@ -733,6 +739,124 @@ describe('SC03-AC04 — kill switch barra só admissão nova; turno pinado não 
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
+// SC03-AC04 (correção pós-QA239/240) — o checklist consome a projeção do
+// MOTOR REMOTO do BACKEND (`AgentReadiness.engine`), e não declara pronto a
+// partir de booleanos locais.
+//
+// O achado do QA: o card continuava sumindo com base só em perfil/canal/
+// política, mesmo com o agente PEDINDO Hermes e o motor indisponível. A
+// decisão é pura (`go-live-engine-status.ts`) e é executada aqui; o RENDER é
+// provado no e2e do console (`tests/admin-ui/e2e/go-live-engine-readiness.spec.ts`),
+// porque o tier raiz não tem React nem jsdom.
+// ─────────────────────────────────────────────────────────────────────────────
+describe('SC03-AC04 — o item do motor remoto vem da projeção do backend', () => {
+  const projection = (
+    over: Partial<EngineReadinessProjection> = {},
+  ): EngineReadinessProjection => ({
+    requested: true,
+    kill_switch: false,
+    evidence_class: 'synthetic',
+    binding_revision: 'b-1',
+    evidence_revision: 'ev-1',
+    available: true,
+    unavailable_reason: null,
+    ...over,
+  });
+
+  it('sem pedido: item NÃO APLICÁVEL — nenhum "pronto" inventado e nada bloqueado', () => {
+    const item = goLiveEngineItem(
+      projection({ requested: false, available: true, unavailable_reason: null }),
+    );
+    expect(item.state).toBe('not_applicable');
+    expect(item.blocks_ready).toBe(false);
+    expect(item.label).toBe(GO_LIVE_ENGINE_LABEL);
+  });
+
+  it('pedido e conferido pelo backend: item satisfeito, sem bloquear o checklist', () => {
+    const item = goLiveEngineItem(projection());
+    expect(item.state).toBe('available');
+    expect(item.blocks_ready).toBe(false);
+  });
+
+  it.each([...ENGINE_UNAVAILABLE_REASONS])(
+    'pedido + indisponível (%s) ⇒ BLOQUEIA o "tudo pronto" com o motivo em português',
+    (reason) => {
+      const item = goLiveEngineItem(
+        projection({ available: false, unavailable_reason: reason }),
+      );
+      expect(item.state).toBe('unavailable');
+      expect(item.blocks_ready).toBe(true);
+      expect(item.detail).toBe(ENGINE_UNAVAILABLE_DETAIL[reason]);
+      expect(item.detail.length).toBeGreaterThan(20);
+    },
+  );
+
+  it('o vocabulário do console é EXATAMENTE o do readiness — sem lista paralela', () => {
+    expect(Object.keys(ENGINE_UNAVAILABLE_DETAIL).sort()).toEqual(
+      [...ENGINE_UNAVAILABLE_REASONS].sort(),
+    );
+  });
+
+  it('motivo ausente ou fora do vocabulário NÃO vira "sem problema": continua bloqueando', () => {
+    const semMotivo = goLiveEngineItem(projection({ available: false, unavailable_reason: null }));
+    expect(semMotivo.state).toBe('unavailable');
+    expect(semMotivo.blocks_ready).toBe(true);
+
+    const motivoDesconhecido = goLiveEngineItem(
+      projection({
+        available: false,
+        unavailable_reason: 'motivo_novo_do_backend' as never,
+      }),
+    );
+    expect(motivoDesconhecido.state).toBe('unavailable');
+    expect(motivoDesconhecido.blocks_ready).toBe(true);
+    expect(motivoDesconhecido.detail).toContain('motivo_novo_do_backend');
+  });
+
+  it('projeção ausente (backend antigo, ou avaliação que não respondeu) ⇒ desCONHECIDO bloqueante', () => {
+    for (const missing of [null, undefined]) {
+      const item = goLiveEngineItem(missing);
+      expect(item.state).toBe('unknown');
+      expect(item.blocks_ready).toBe(true);
+      expect(item.detail).toContain('possível verificar');
+    }
+  });
+
+  it('o checklist CONSUME a projeção e usa o veto do motor na regra de "tudo pronto"', () => {
+    // Asserção ESTRUTURAL (o render é o e2e): o que ela fixa é que a decisão
+    // deixou de ser "booleanos locais" e passou a depender do veredito do
+    // backend — inclusive na hora de o card sumir.
+    const src = readFileSync(
+      new URL(
+        '../../src/admin-ui/app/agents/[agentId]/_components/go-live-checklist.tsx',
+        import.meta.url,
+      ),
+      'utf8',
+    );
+    expect(src).toContain('includeEngine: true');
+    expect(src).toContain('goLiveEngineItem(overview?.engine)');
+    expect(src).toContain('hasActiveProfile && hasChannel && policyDone && !engineItem.blocks_ready');
+    expect(src).toContain("key: 'engine'");
+    // A projeção NÃO é reimplementada aqui: o componente não lê
+    // `unavailable_reason` nem conta checks por conta própria.
+    expect(src).not.toContain('unavailable_reason');
+    expect(src).not.toContain('engine_runtime_compatible');
+  });
+
+  it('o backend do console projeta o motor pelo avaliador canônico, atrás da flag', () => {
+    const src = readFileSync(
+      new URL('../../src/admin-ui/trpc/routers/channelPolicies.ts', import.meta.url),
+      'utf8',
+    );
+    expect(src).toContain('evaluateAgentReadiness');
+    expect(src).toContain('readiness.engine');
+    expect(src).toContain('includeEngine');
+    // Fail-closed: avaliação que não responde devolve `null`, nunca um prontuário.
+    expect(src).toContain('engineProjectionOrNull');
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Ativação sob CAS — o orquestrador REAL contra um store de saga em memória.
 //
 // O store falso existe só para a durabilidade (transação + FOR UPDATE), que é
@@ -755,12 +879,45 @@ const activateSpy = vi.fn(async () => ({
 /** As linhas de política que o `tx` da ativação enxerga AGORA. */
 let txPolicyRows: readonly EnginePolicyBindingFactV1[] = [];
 
+/**
+ * Rastro ORDENADO do que a transação do passo fez: cada `execute` (as travas)
+ * e a releitura das linhas de política. É com ele que o caso da correção
+ * pós-QA239/240 prova que a trava acontece ANTES da releitura do CAS — a
+ * asserção não é "existe um lock", é "a ordem é trav→reler→decidir".
+ */
+const txTrace: string[] = [];
+const POLICY_READ = 'read:agent_engine_policies';
+
+/** O texto de um `sql` do drizzle, sem depender de detalhe interno do driver. */
+function sqlTextOf(query: unknown): string {
+  const chunks = (query as { queryChunks?: unknown[] }).queryChunks ?? [];
+  return chunks
+    .map((chunk) => {
+      const value = (chunk as { value?: unknown }).value;
+      if (Array.isArray(value)) return value.join('');
+      if (typeof value === 'string') return value;
+      return '?';
+    })
+    .join(' ')
+    .replace(/\s+/g, ' ');
+}
+
 function fakeTx() {
   return {
-    execute: async () => ({ rows: [] }),
+    execute: async (query: unknown) => {
+      txTrace.push(sqlTextOf(query));
+      return { rows: [] };
+    },
     // O loader de política lê pelo MESMO tx da escrita: a cadeia drizzle é
     // reproduzida no mínimo necessário para que a leitura aconteça DE FATO.
-    select: () => ({ from: () => ({ where: async () => txPolicyRows }) }),
+    select: () => ({
+      from: () => ({
+        where: async () => {
+          txTrace.push(POLICY_READ);
+          return txPolicyRows;
+        },
+      }),
+    }),
   };
 }
 
@@ -889,6 +1046,7 @@ describe('SC03 — a ativação revalida o retrato do motor sob CAS', () => {
     activateSpy.mockClear();
     runs.set('run-sc03', makeRun());
     txPolicyRows = [HERMES_ROW];
+    txTrace.length = 0;
   });
 
   it('retrato igual ⇒ a ativação roda e o readback carrega o veredito do motor', async () => {
@@ -955,5 +1113,33 @@ describe('SC03 — a ativação revalida o retrato do motor sob CAS', () => {
     expect(activateSpy).toHaveBeenCalledTimes(1);
     expect(bombEvidence).not.toHaveBeenCalled();
     expect(runs.get('run-sc03')?.state).toBe('active');
+  });
+
+  it('correção pós-QA239/240 — a política é TRAVADA antes de ser relida para o CAS', async () => {
+    // O achado do QA: a releitura CAS acontecia sem lock nas linhas de
+    // `agent_engine_policies`, e um UPDATE concorrente entrava entre a
+    // releitura e o commit. A correção tem de estar na ORDEM da transação, não
+    // só na existência do lock — este caso mede a ordem.
+    const report = evaluateReadinessFacts(factsWithEngine(), FIXED_NOW);
+    const out = await runActivate({
+      evaluateReadiness: async () => report,
+      loadEngineEvidence: async () => approvedEvidence(),
+    });
+    expect(out.status).toBe('completed');
+
+    const lockIdx = txTrace.findIndex(
+      (e) => e.includes('agent_engine_policies') && e.includes('FOR SHARE'),
+    );
+    const readIdx = txTrace.indexOf(POLICY_READ);
+    const channelsIdx = txTrace.findIndex(
+      (e) => e.includes('FROM channels') && e.includes('FOR UPDATE'),
+    );
+
+    expect(lockIdx, `trava ausente no rastro: ${JSON.stringify(txTrace)}`).toBeGreaterThanOrEqual(0);
+    expect(readIdx).toBeGreaterThanOrEqual(0);
+    // A ordem FIXA: canal travado (retrato) → política travada → política relida.
+    expect(channelsIdx).toBeGreaterThanOrEqual(0);
+    expect(channelsIdx).toBeLessThan(lockIdx);
+    expect(lockIdx).toBeLessThan(readIdx);
   });
 });

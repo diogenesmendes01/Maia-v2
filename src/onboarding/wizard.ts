@@ -81,7 +81,7 @@ import {
   type EngineEvidenceLoader,
 } from './readiness.js';
 import { loadReadinessFactsWith, lockReadinessSnapshot } from './readiness-facts.js';
-import { loadEnginePolicyBindingsWith } from '@/db/repositories/engine-policy-repos.js';
+import { loadEnginePolicyBindingsWith, lockEnginePolicyBindings } from '@/db/repositories/engine-policy-repos.js';
 import {
   parseCancelReason,
   projectRunMetadata,
@@ -1139,6 +1139,20 @@ export async function executeOnboardingStep(input: {
             // escritas — lock não é predicate lock, e uma linha nova inserida
             // concorrentemente não seria travada por nada.
             await lockReadinessSnapshot(tx, scope);
+            // SC03-AC01 (correção pós-QA239/240) — as linhas de
+            // `agent_engine_policies` entram no MESMO retrato travado.
+            //
+            // `lockReadinessSnapshot` cobre profile/grant/papel/canal/política
+            // de canal, mas NÃO esta tabela: o QA reproduziu em Postgres real
+            // que um `UPDATE` concorrente de uma linha existente era aplicado
+            // depois da releitura do CAS e antes do commit, de modo que a
+            // ativação committava sobre um retrato que já não valia. A FK
+            // composta para `channels` só barra INSERT de linha NOVA.
+            //
+            // A trava vem ANTES da reavaliação e da releitura do CAS de
+            // propósito: assim a decisão, a revalidação e a escrita dependem do
+            // mesmo retrato, que ninguém muda até o commit.
+            await lockEnginePolicyBindings(tx, scope);
             readiness = await evaluate(scope, { tx });
             if (!readiness.ready) {
               return {

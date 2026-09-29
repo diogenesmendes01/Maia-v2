@@ -5,11 +5,12 @@ import Link from 'next/link';
 import { trpc } from '../../../../trpc/client.js';
 import { Card, CardHeader, CardBody } from '../../../../components/ui/card.js';
 import { Button } from '../../../../components/ui/button.js';
+import { goLiveEngineItem } from './go-live-engine-status.js';
 
 /**
- * Checklist "colocar no ar" — mostra em um só lugar as três pré-condições
- * reais para o agente operar (perfil ativo → canal → papel + política), cada
- * uma com link para a tela que resolve. Some quando tudo está completo.
+ * Checklist "colocar no ar" — mostra em um só lugar as pré-condições reais para
+ * o agente operar (perfil ativo → canal → papel + política → motor remoto),
+ * cada uma com link para a tela que resolve. Some quando tudo está completo.
  *
  * Antes deste card as duas últimas etapas não eram sequer mencionadas na UI:
  * o wizard terminava em "aprove o perfil" e o elo canal/papel/política ficava
@@ -17,24 +18,25 @@ import { Button } from '../../../../components/ui/button.js';
  *
  * ─── SC03: indisponível ≠ pronto ────────────────────────────────────────────
  *
- * O componente antes fazia `if (isLoading || error) return null`, e o efeito era
- * o pior possível para um checklist: quando o backend NÃO respondia, o card
- * simplesmente desaparecia — e ausência de card lê como "nada pendente". Era o
- * mesmo falso positivo que o readiness canônico existe para matar, só que
- * pintado de vazio em vez de verde (§8.3: "Status desconhecido precisa
- * permanecer visível, em vez de o card sumir em erro").
+ * 1. O componente antes fazia `if (isLoading || error) return null`, e o efeito
+ *    era o pior possível para um checklist: quando o backend NÃO respondia, o
+ *    card simplesmente desaparecia — e ausência de card lê como "nada
+ *    pendente". Era o mesmo falso positivo que o readiness canônico existe para
+ *    matar, só que pintado de vazio em vez de verde (§8.3: "Status desconhecido
+ *    precisa permanecer visível, em vez de o card sumir em erro"). Agora o
+ *    estado DESCONHECIDO é explícito: o card continua na tela dizendo que não
+ *    foi possível verificar, com o motivo e um "Tentar de novo".
  *
- * Agora o estado DESCONHECIDO é explícito: o card continua na tela dizendo que
- * não foi possível verificar, com o motivo e um "Tentar de novo". Nada é
- * inferido de estado local para preencher a lacuna.
- *
- * O que este componente continua NÃO sendo: a autoridade do readiness. Ele lê
- * uma projeção do backend (perfil/canais/papéis) e nunca declara "pronto" a
- * partir de booleanos locais. A disponibilidade do MOTOR REMOTO
- * (`AgentReadiness.engine` — pedido, kill switch, bundle, limites, pin) vem do
- * mesmo avaliador de backend e é apresentada aqui quando a superfície do
- * console que a expõe estiver ligada; enquanto ela não existir, esta tela não
- * inventa um "pronto" para o motor: ela não o declara.
+ * 2. (correção pós-QA239/240) O checklist passa a consumir a projeção
+ *    `AgentReadiness.engine` do BACKEND — a mesma que o avaliador canônico
+ *    produz —, e não declara "pronto" a partir de booleanos locais. A decisão
+ *    do que o veredito significa é pura e vive em `go-live-engine-status.ts`;
+ *    aqui só se RENDERIZA. Quando `engine.requested && !engine.available` (ou
+ *    quando a projeção não veio), o item do motor entra bloqueando e o card NÃO
+ *    some: o operador vê o motivo fechado — kill switch, evidência ausente,
+ *    bundle não aprovado, limites, pin — vindo do backend, em vez de um "tudo
+ *    pronto" inventado. Nenhum critério de readiness é replicado no React
+ *    (§8.3.3): o console consulta e apresenta.
  */
 export default function GoLiveChecklist({
   tenantId,
@@ -48,7 +50,10 @@ export default function GoLiveChecklist({
   onGoToVersions: () => void;
 }) {
   const overviewQuery = trpc.channelPolicies.channelsOverview.useQuery(
-    { tenantId, agentId },
+    // SC03-AC04 — `includeEngine` pede ao backend a projeção
+    // `AgentReadiness.engine` do avaliador canônico. Ela é a ÚNICA fonte da
+    // disponibilidade do motor remoto: o console não reavalia nada por conta.
+    { tenantId, agentId, includeEngine: true },
     { enabled: tenantId !== '' },
   );
 
@@ -95,6 +100,12 @@ export default function GoLiveChecklist({
   const channels = overview?.channels ?? [];
   const rolesCount = overview?.roles_count ?? 0;
 
+  // SC03-AC04 — o veredito do MOTOR REMOTO, direto da projeção do backend.
+  // `undefined` (backend antigo/sem a projeção) e `null` (avaliação que não
+  // respondeu) caem os dois em `unknown` BLOQUEANTE: o checklist não declara
+  // pronto o que não conseguiu verificar.
+  const engineItem = goLiveEngineItem(overview?.engine);
+
   const hasChannel = channels.length > 0;
   // policy_ready = política existe E o papel padrão está ativo — has_policy
   // sozinho deixaria o checklist sumir com um papel padrão desativado
@@ -104,7 +115,11 @@ export default function GoLiveChecklist({
   const hasStalePolicy = channels.some((c) => c.has_policy && !c.policy_ready);
 
   // Tudo pronto — o checklist já cumpriu o papel; não polui a visão geral.
-  if (hasActiveProfile && hasChannel && policyDone) return null;
+  // MAS o motor remoto tem veto: perfil + canal + política verdes NÃO bastam
+  // para o agente operar quando ele PEDE Hermes e o backend diz que o motor
+  // está indisponível (ou não diz nada). Nesse caso o card continua na tela
+  // (correção pós-QA239/240 do SC03-AC04).
+  if (hasActiveProfile && hasChannel && policyDone && !engineItem.blocks_ready) return null;
 
   const channelsHref = '/setup/channels';
 
@@ -164,11 +179,32 @@ export default function GoLiveChecklist({
     },
   ];
 
+  // SC03-AC04 — o item do MOTOR REMOTO. Entra quando o backend diz que o
+  // agente PEDE o motor remoto e ele não está disponível (motivo fechado), ou
+  // quando a projeção não veio (`unknown`). Nos dois casos ele BLOQUEIA o
+  // "tudo pronto" — é o veto que impede o card de sumir com o motor fora.
+  if (engineItem.blocks_ready) {
+    items.push({
+      key: 'engine',
+      done: false,
+      label: engineItem.label,
+      detail: engineItem.detail,
+      // Só o estado DESCONHECIDO ganha "tentar de novo": indisponibilidade com
+      // motivo é um fato do backend, e refazer a consulta não muda o motivo.
+      action:
+        engineItem.state === 'unknown' && (
+          <Button size="sm" variant="secondary" onClick={() => void overviewQuery.refetch()}>
+            Tentar de novo
+          </Button>
+        ),
+    });
+  }
+
   return (
     <Card>
       <CardHeader
         title="Colocar no ar"
-        description="As três pré-condições para este agente atender. O card some quando tudo estiver pronto."
+        description="As pré-condições para este agente atender. O card some quando tudo estiver pronto."
       />
       <CardBody>
         <ul className="space-y-3">
