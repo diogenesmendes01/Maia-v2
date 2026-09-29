@@ -16,8 +16,8 @@
  * ─── O que está pinado aqui, e onde ele foi MEDIDO ──────────────────────────
  *
  * Os fatos abaixo vêm da captura executável
- * `tests/hermes-spike/hermes-inference-d09-capture.spec.ts`, cujo artefato
- * redigido está em `tests/hermes-spike/fixtures/d09-sdk-requests.json`
+ * `tests/integration/hermes-inference-d09-capture.spec.ts`, cujo artefato
+ * redigido está em `tests/fixtures/d09-sdk-requests.json`
  * (principal, retry do SDK, follow-up e a lista auxiliar). Nada aqui foi
  * deduzido de leitura de SDK: cada campo foi observado chegando ao gateway.
  *
@@ -100,6 +100,131 @@ export const PINNED_SDK_FAMILIES: Record<string, { output_limit_field: string; s
  */
 export const PINNED_SDK_AUX_ROUTES_ALLOWED_OUTSIDE_RELAY: readonly string[] = [];
 
+/**
+ * Headers que a rota ADMITE num pedido de inferência. AC03: "Headers/body
+ * desconhecidos … recusados" — a lista é FECHADA, e o que não está nela (nem
+ * casa com um prefixo declarado) é recusado com `invalid_request` antes de o
+ * corpo ser lido.
+ *
+ * São DUAS origens, e por isso ficam separadas:
+ *
+ *  1. `INFERENCE_REQUEST_HEADERS_STANDARD` — o que um cliente HTTP/1.1 precisa
+ *     para falar com a rota (RFC 9110) mais o que Fastify/undici/httpx emitem.
+ *     Sem eles o transporte não funciona; e os headers de PROXY continuam
+ *     recusados antes (`isInternalRequest` → 404), inclusive `via`/`forwarded`.
+ *  2. `INFERENCE_REQUEST_HEADER_PREFIXES` — o que o cliente pinado REALMENTE
+ *     envia, MEDIDO na captura D09 (seção `headers` da fixture). `x-stainless-*`
+ *     é o fingerprint do gerador do SDK
+ *     (lang/package-version/os/arch/runtime/runtime-version/retry-count/
+ *     read-timeout): a FAMÍLIA é estável, os valores não — por isso é prefixo, e
+ *     o teste confere que TODO header observado está coberto por esta lista.
+ *
+ * Autoridade NÃO viaja por header: `authorization` carrega só o grant de
+ * inferência (hash no banco), e qualquer header de autoridade alternativo
+ * (`openai-organization`, `x-maia-tenant`, `x-model`, `x-provider-base-url`,
+ * `x-session-id`) cai fora da lista e RECUSA. Ampliar a lista é uma decisão
+ * visível: exige a medição (o header na captura) e a linha aqui.
+ */
+export const INFERENCE_REQUEST_HEADERS_STANDARD: readonly string[] = [
+  'accept',
+  'accept-encoding',
+  'accept-language',
+  'authorization',
+  'cache-control',
+  'connection',
+  'content-length',
+  'content-type',
+  'expect',
+  'host',
+  'keep-alive',
+  'pragma',
+  /**
+   * MEDIDO: o `fetch` do runtime Node (undici) marca todo pedido com
+   * `sec-fetch-mode: cors`. Não carrega autoridade — é metadado do transporte,
+   * e sem ele qualquer chamador que use `fetch` legítimo levaria 400.
+   */
+  'sec-fetch-mode',
+  'te',
+  'transfer-encoding',
+  'user-agent',
+];
+
+/**
+ * Famílias de header do cliente pinado, admitidas por PREFIXO porque o VALOR
+ * muda (arquitetura, versão do pacote, contagem de retry) e a família não:
+ * `x-stainless-*` é o fingerprint do gerador do SDK. Os nomes exatos medidos
+ * ficam na seção `headers` da fixture D09, e o teste confere que TODO header
+ * observado é coberto por esta lista (nome exato do transporte OU prefixo).
+ */
+export const INFERENCE_REQUEST_HEADER_PREFIXES: readonly string[] = ['x-stainless-'];
+
+/** Lista efetiva admitida pela rota (e conferida contra a captura). */
+export const INFERENCE_REQUEST_HEADERS_ALLOWED: readonly string[] = [
+  ...INFERENCE_REQUEST_HEADERS_STANDARD,
+];
+
+/**
+ * NOMES de header que o cliente pinado REALMENTE emitiu na captura D09 — o par
+ * exato de `PINNED_SDK_TOP_LEVEL_FIELDS`: lá são os campos do corpo, aqui os
+ * headers. `x-stainless-*` entra NOME A NOME (arch, async, lang, os,
+ * package-version, read-timeout, retry-count, runtime, runtime-version) porque
+ * o gate compara o NOME medido contra a lista fechada; a FAMÍLIA é que é
+ * admitida por prefixo, para não quebrar quando só o valor muda.
+ *
+ * A readiness confere estes nomes contra a lista admitida: estreitar a lista
+ * abaixo do que o SDK já envia derruba inferência em produção silenciosamente,
+ * e é isso que o gate reprova antes.
+ */
+export const PINNED_SDK_REQUEST_HEADERS: readonly string[] = [
+  'accept',
+  'accept-encoding',
+  'authorization',
+  'connection',
+  'content-length',
+  'content-type',
+  'host',
+  'user-agent',
+  'x-stainless-arch',
+  'x-stainless-async',
+  'x-stainless-lang',
+  'x-stainless-os',
+  'x-stainless-package-version',
+  'x-stainless-read-timeout',
+  'x-stainless-retry-count',
+  'x-stainless-runtime',
+  'x-stainless-runtime-version',
+];
+
+export interface InferenceHeaderVerdictV1 {
+  ok: boolean;
+  /** Headers apresentados que a lista NÃO admite (nomes, sem valor). */
+  refused: readonly string[];
+}
+
+/**
+ * Confere os headers de um pedido contra a lista fechada. Devolve TODOS os
+ * recusados (não o primeiro): o relatório precisa da extensão da divergência.
+ * Comparação sem case (o Node já entrega minúsculo; header é case-insensitive).
+ */
+export function checkInferenceRequestHeaders(
+  headers: Readonly<Record<string, unknown>>,
+  options: {
+    allowed?: readonly string[];
+    prefixes?: readonly string[];
+  } = {},
+): InferenceHeaderVerdictV1 {
+  const allowed = new Set((options.allowed ?? INFERENCE_REQUEST_HEADERS_ALLOWED).map((h) => h.toLowerCase()));
+  const prefixes = (options.prefixes ?? INFERENCE_REQUEST_HEADER_PREFIXES).map((p) => p.toLowerCase());
+  const refused: string[] = [];
+  for (const nome of Object.keys(headers)) {
+    const h = nome.toLowerCase();
+    if (allowed.has(h)) continue;
+    if (prefixes.some((p) => h.startsWith(p))) continue;
+    refused.push(h);
+  }
+  return { ok: refused.length === 0, refused: refused.sort() };
+}
+
 /** Um request efetivo observado, já redigido (só estrutura). */
 export interface PinnedSdkObservedRequestV1 {
   top_level_fields: readonly string[];
@@ -118,6 +243,12 @@ export interface PinnedSdkSurfaceInputV1 {
   admitted_roles?: readonly string[];
   /** Rotas auxiliares permitidas fora do relay. */
   aux_allowed_outside_relay?: readonly string[];
+  /** Headers observados na captura (só NOMES). Vazio dispensa a checagem. */
+  observed_headers?: readonly string[];
+  /** Lista admitida de headers. Injetável pelo mesmo motivo dos campos. */
+  admitted_headers?: readonly string[];
+  /** Prefixos de header admitidos (famílias do SDK). */
+  admitted_header_prefixes?: readonly string[];
 }
 
 export type PinnedSdkDriftFindingV1 =
@@ -132,22 +263,32 @@ export type PinnedSdkDriftFindingV1 =
   /** Rota auxiliar habilitada fora do relay. */
   | { kind: 'aux_route_outside_relay'; route: string }
   /** A captura é de outro checkout: o pin não descreve o cliente. */
-  | { kind: 'hermes_sha_mismatch'; observed: string; pinned: string };
+  | { kind: 'hermes_sha_mismatch'; observed: string; pinned: string }
+  /**
+   * O cliente emite um header que a rota NÃO admite: a recusa de header
+   * derrubaria a chamada do SDK pinado (mesma classe do campo não admitido).
+   */
+  | { kind: 'observed_header_not_allowed'; header: string };
 
 export type PinnedSdkSurfaceVerdictV1 =
   | { ok: true; checked_requests: number }
   | { ok: false; findings: readonly PinnedSdkDriftFindingV1[] };
+
+/** Rótulo curto de um achado: tipo + o NOME do alvo, nunca conteúdo. */
+function driftTarget(f: PinnedSdkDriftFindingV1): string {
+  if ('field' in f) return f.field;
+  if ('role' in f) return f.role;
+  if ('route' in f) return f.route;
+  if ('header' in f) return f.header;
+  return f.observed;
+}
 
 export class PinnedSdkSurfaceDriftError extends Error {
   readonly findings: readonly PinnedSdkDriftFindingV1[];
 
   constructor(findings: readonly PinnedSdkDriftFindingV1[]) {
     // Mensagem SEM conteúdo de conversa: só tipos e nomes de campo.
-    super(
-      `pinned_sdk_surface_drift: ${findings
-        .map((f) => f.kind + ':' + ('field' in f ? f.field : 'role' in f ? f.role : 'route' in f ? f.route : f.observed))
-        .join(',')}`,
-    );
+    super(`pinned_sdk_surface_drift: ${findings.map((f) => f.kind + ':' + driftTarget(f)).join(',')}`);
     this.name = 'PinnedSdkSurfaceDriftError';
     this.findings = findings;
   }
@@ -164,8 +305,7 @@ export function checkPinnedSdkSurface(input: PinnedSdkSurfaceInputV1): PinnedSdk
   // Achado repetido não é achado novo: o mesmo campo pode aparecer na checagem
   // estática e na captura, e o relatório não deve engrossar por isso.
   const anotar = (f: PinnedSdkDriftFindingV1): void => {
-    const alvo = 'field' in f ? f.field : 'role' in f ? f.role : 'route' in f ? f.route : f.observed;
-    const chave = `${f.kind}:${alvo}`;
+    const chave = `${f.kind}:${driftTarget(f)}`;
     if (visto.has(chave)) return;
     visto.add(chave);
     findings.push(f);
@@ -209,6 +349,18 @@ export function checkPinnedSdkSurface(input: PinnedSdkSurfaceInputV1): PinnedSdk
     anotar({ kind: 'aux_route_outside_relay', route });
   }
 
+  // Headers: o cliente que emite um header fora da lista fechada seria RECUSADO
+  // pela rota (`checkInferenceRequestHeaders`). É a mesma classe de drift do
+  // campo não admitido — por isso mora no mesmo veredito, e por isso a captura
+  // D09 guarda os NOMES de header observados.
+  for (const raw of input.observed_headers ?? []) {
+    const verdict = checkInferenceRequestHeaders({ [raw]: true }, {
+      allowed: input.admitted_headers,
+      prefixes: input.admitted_header_prefixes,
+    });
+    if (!verdict.ok) anotar({ kind: 'observed_header_not_allowed', header: verdict.refused[0]! });
+  }
+
   return findings.length === 0
     ? { ok: true, checked_requests: requests.length }
     : { ok: false, findings };
@@ -219,12 +371,18 @@ export function checkPinnedSdkSurface(input: PinnedSdkSurfaceInputV1): PinnedSdk
  *
  * Roda no ponto em que a implantação sintética é aceita. A consistência interna
  * (sem captura) já é o suficiente para pegar a regressão que importa: alguém
- * estreitar `INFERENCE_ADMITTED_FIELDS` abaixo do que o cliente pinado JÁ envia
- * derruba inferência em produção silenciosamente; aqui isso reprova a
- * construção do runtime, com um erro de código fechado.
+ * estreitar `INFERENCE_ADMITTED_FIELDS` — ou a lista FECHADA de headers — abaixo
+ * do que o cliente pinado JÁ envia derruba inferência em produção
+ * silenciosamente; aqui isso reprova a construção do runtime, com um erro de
+ * código fechado. Os dois fatos medidos (`PINNED_SDK_TOP_LEVEL_FIELDS` e
+ * `PINNED_SDK_REQUEST_HEADERS`) entram por padrão; a injeção existe para o teste
+ * provar que o gate MORDE.
  */
 export function assertPinnedSdkSurfaceReady(
-  input?: Pick<PinnedSdkSurfaceInputV1, 'requests'>,
+  input?: Pick<
+    PinnedSdkSurfaceInputV1,
+    'requests' | 'observed_headers' | 'admitted_headers' | 'admitted_header_prefixes'
+  >,
 ): void {
   const verdict = checkPinnedSdkSurface({
     hermes_sha: HERMES_PINNED_SDK_SHA,
@@ -235,6 +393,11 @@ export function assertPinnedSdkSurfaceReady(
         message_roles: [...PINNED_SDK_MESSAGE_ROLES],
         output_limit_field: PINNED_SDK_DEFAULT_OUTPUT_LIMIT_FIELD,
       })),
+    observed_headers: input?.observed_headers ?? PINNED_SDK_REQUEST_HEADERS,
+    ...(input?.admitted_headers ? { admitted_headers: input.admitted_headers } : {}),
+    ...(input?.admitted_header_prefixes
+      ? { admitted_header_prefixes: input.admitted_header_prefixes }
+      : {}),
   });
   if (!verdict.ok) throw new PinnedSdkSurfaceDriftError(verdict.findings);
 }

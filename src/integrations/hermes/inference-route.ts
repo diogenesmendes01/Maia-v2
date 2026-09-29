@@ -5,7 +5,8 @@
  * É o único HTTP que o filho Hermes pode fazer. A ordem do handler é a do
  * §9.1, e cada passo fecha antes do seguinte:
  *
- *  1. rede interna, sem proxy — senão 404 antes de ler o corpo;
+ *  1. rede interna, sem proxy — senão 404 antes de ler o corpo; e a lista
+ *     FECHADA de headers (AC03: desconhecido recusa) — senão 400 antes do corpo;
  *  2. credencial → grant pela HASH, sem tenant; depois o ALS do grant;
  *  3. contrato do pedido (`parseInferenceRequest`), superfície por nome E
  *     schema, teto de saída;
@@ -61,6 +62,7 @@ import {
   validateInferenceGrant,
   type InferenceErrorCode,
 } from './inference-gateway.js';
+import { checkInferenceRequestHeaders } from './inference-sdk-surface.js';
 
 /** O ledger visto pela rota. Implementado por `inferenceRepo`. */
 export interface InferenceLedgerPortV1 {
@@ -135,6 +137,13 @@ export async function registerHermesInferenceRoute(
       ) {
         return reply.code(404).send();
       }
+      // Headers: lista FECHADA (§9.1, AC03). Um header desconhecido — inclusive
+      // um que tentasse carregar autoridade (`x-maia-tenant`, `x-model`,
+      // `openai-organization`) — recusa ANTES da credencial e antes do corpo,
+      // com o mesmo erro sanitizado do resto. Só `authorization` carrega
+      // credencial, e ela é conferida pela HASH do grant.
+      const headers = checkInferenceRequestHeaders(req.headers);
+      if (!headers.ok) return sendError(reply, 'invalid_request');
     });
 
     // Erros de parse do Fastify viram o vocabulário do §9.1, sanitizado.

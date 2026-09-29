@@ -29,28 +29,50 @@ import { describe, expect, it } from 'vitest';
 import { INFERENCE_ADMITTED_FIELDS } from '@/integrations/hermes/inference-gateway.js';
 import {
   HERMES_PINNED_SDK_SHA,
+  INFERENCE_REQUEST_HEADER_PREFIXES,
+  INFERENCE_REQUEST_HEADERS_ALLOWED,
   PINNED_SDK_AUX_ROUTES_ALLOWED_OUTSIDE_RELAY,
   PINNED_SDK_DEFAULT_OUTPUT_LIMIT_FIELD,
   PINNED_SDK_FAMILIES,
   PINNED_SDK_MESSAGE_ROLES,
   PINNED_SDK_OUTPUT_LIMIT_FIELDS,
+  PINNED_SDK_REQUEST_HEADERS,
   PINNED_SDK_TOP_LEVEL_FIELDS,
   PinnedSdkSurfaceDriftError,
   assertPinnedSdkSurfaceReady,
+  checkInferenceRequestHeaders,
   checkPinnedSdkSurface,
 } from '@/integrations/hermes/inference-sdk-surface.js';
+import { validate } from '../helpers/json-schema-validator.js';
 
 const REPO = resolve(process.cwd());
-const FIXTURE = resolve(REPO, 'tests/hermes-spike/fixtures/d09-sdk-requests.json');
+const FIXTURE = resolve(REPO, 'tests/fixtures/d09-sdk-requests.json');
 const PYTHON = process.env.MAIA_HERMES_WORKER_PYTHON;
 const UPSTREAM = process.env.MAIA_HERMES_UPSTREAM;
 const d = PYTHON && UPSTREAM ? describe : describe.skip;
 
-type Call = { class: string; top_level_fields: string[]; message_roles: string[]; output_limit_field: string | null };
+type Call = {
+  class: string;
+  top_level_fields: string[];
+  message_roles: string[];
+  output_limit_field: string | null;
+  headers: string[];
+  messages: Array<{ role: string; fields: string[]; types: Record<string, string[]> }>;
+  tool_object_fields: string[];
+  tool_function_fields: string[];
+  tool_call_fields: string[];
+  tool_call_function_fields: string[];
+  stream_options_fields: string[];
+};
 type Fixture = {
   version: number;
   hermes_sha: string;
   calls: Call[];
+  headers: {
+    observed: string[];
+    allowed: string[];
+    allowed_prefixes: string[];
+  };
   request_schema: { additionalProperties: boolean; required: string[]; properties: Record<string, unknown> };
   aux_routes: {
     allowed: unknown[];
@@ -67,6 +89,47 @@ type Fixture = {
 };
 
 const fixture = JSON.parse(readFileSync(FIXTURE, 'utf8')) as Fixture;
+
+/**
+ * Reconstrução ESTRUTURAL de um corpo a partir da captura redigida: preenche os
+ * campos que a fixture guardou (topo, mensagens por papel, tools, tool_calls,
+ * stream_options) com valores do TIPO observado. Não é o corpo original — o
+ * original tem texto de conversa e não é guardado —, mas tem a mesma FORMA, que
+ * é o que o `request_schema` describe.
+ */
+function corpoDaCall(call: Call): Record<string, unknown> {
+  const porCampo: Record<string, unknown> = {
+    model: 'maia-stub-model',
+    stream: true,
+    max_tokens: 64,
+    max_completion_tokens: 64,
+    stream_options: Object.fromEntries((call.stream_options_fields ?? []).map((f) => [f, true])),
+  };
+  const body: Record<string, unknown> = {};
+  for (const campo of call.top_level_fields) body[campo] = porCampo[campo] ?? {};
+  body.messages = call.messages.map((m) => {
+    const msg: Record<string, unknown> = { role: m.role };
+    for (const campo of m.fields) {
+      if (campo === 'role') continue;
+      const tipo = m.types[campo]?.[0];
+      if (campo === 'tool_calls') {
+        msg.tool_calls = [
+          { id: 'call_1', type: 'function', function: { name: 'fixture_echo', arguments: '{}' } },
+        ];
+      } else if (campo === 'tool_call_id') msg.tool_call_id = 'call_1';
+      else msg[campo] = tipo === 'string' ? 'texto redigido' : tipo === 'null' ? null : {};
+    }
+    return msg;
+  });
+  if (call.top_level_fields.includes('tools')) {
+    const fn: Record<string, unknown> = {};
+    for (const campo of call.tool_function_fields) {
+      fn[campo] = campo === 'parameters' ? {} : campo === 'name' ? 'fixture_echo' : 'Ecoa o texto.';
+    }
+    body.tools = [{ type: 'function', function: fn }];
+  }
+  return body;
+}
 
 /** Executa o worker Python e devolve `{status, stdout, stderr}` sem lançar. */
 function runWorkerCli(args: string[], stdin?: string): { status: number; stdout: string; stderr: string } {
@@ -122,6 +185,95 @@ describe('SC25-A — contrato D09 e lista auxiliar (puro)', () => {
     for (const field of PINNED_SDK_TOP_LEVEL_FIELDS) {
       expect(INFERENCE_ADMITTED_FIELDS as readonly string[]).toContain(field);
     }
+  });
+
+  it('AC04 — o `request_schema` da fixture ACEITA os corpos que ela capturou', () => {
+    // Reconstrução ESTRUTURAL de cada corpo a partir da própria fixture: o
+    // schema não pode recusar o que ele descreve (era exatamente o defeito:
+    // `messages.items` fechado em `{role}` recusava `content`/`tool_calls`).
+    for (const call of fixture.calls) {
+      const corpo = corpoDaCall(call);
+      const resultado = validate(fixture.request_schema, corpo);
+      expect(resultado.errors, `request_schema recusou a chamada ${call.class} #${call.top_level_fields.length}`).toEqual(
+        [],
+      );
+    }
+    // E o schema MORDE: campo a mais em cada nível fechado REPROVA.
+    const base = corpoDaCall(fixture.calls[0]!);
+    expect(validate(fixture.request_schema, { ...base, response_format: { type: 'json_object' } }).valid).toBe(false);
+    const mensagemMagra = {
+      ...base,
+      messages: [{ role: 'assistant', content: 'x', tool_call_id: 'call_1' }],
+    };
+    expect(validate(fixture.request_schema, mensagemMagra).valid).toBe(false);
+    const funcaoMagra = {
+      ...base,
+      tools: [{ type: 'function', function: { name: 'fixture_echo', parameters: {} } }],
+    };
+    expect(validate(fixture.request_schema, funcaoMagra).valid).toBe(false);
+    expect(
+      validate(fixture.request_schema, { ...base, messages: [{ role: 'orchestrator', content: 'x' }] }).valid,
+    ).toBe(false);
+  });
+
+  it('AC03 — a lista de headers é fechada, cobre o cliente pinado e RECUSA o resto', () => {
+    // A lista commitada é a do código: as duas não podem drifar sozinhas.
+    expect(fixture.headers.allowed).toEqual([...INFERENCE_REQUEST_HEADERS_ALLOWED].sort());
+    expect(fixture.headers.allowed_prefixes).toEqual([...INFERENCE_REQUEST_HEADER_PREFIXES].sort());
+    // TODO header observado no cliente pinado é admitido (nome exato ou prefixo).
+    const apresentados = Object.fromEntries(fixture.headers.observed.map((h) => [h, 'x']));
+    expect(checkInferenceRequestHeaders(apresentados)).toEqual({ ok: true, refused: [] });
+    expect(fixture.headers.observed).toContain('authorization');
+    expect(fixture.headers.observed.some((h) => h.startsWith('x-stainless-'))).toBe(true);
+    // O contrato ESTÁTICO (medido e commitado) é IGUAL ao que a captura guardou:
+    // o par de `PINNED_SDK_TOP_LEVEL_FIELDS`, agora para headers.
+    expect(fixture.headers.observed).toEqual([...PINNED_SDK_REQUEST_HEADERS].sort());
+    // Os headers que a QA usou para reprovar a AC03 são RECUSADOS — todos, e
+    // com o nome relatado (o achado é nomeado, não genérico).
+    const proibidos = ['x-maia-tenant', 'x-provider-base-url', 'x-model', 'openai-organization', 'x-session-id'];
+    const veredito = checkInferenceRequestHeaders({
+      'content-type': 'application/json',
+      authorization: 'Bearer x',
+      ...Object.fromEntries(proibidos.map((h) => [h, 'v'])),
+    });
+    expect(veredito.ok).toBe(false);
+    expect(veredito.refused).toEqual([...proibidos].sort());
+    // E o drift do cliente (header que a rota recusaria) entra no MESMO veredito.
+    expect(checkPinnedSdkSurface({ hermes_sha: HERMES_PINNED_SDK_SHA, observed_headers: ['x-model'] })).toEqual({
+      ok: false,
+      findings: [{ kind: 'observed_header_not_allowed', header: 'x-model' }],
+    });
+    expect(
+      checkPinnedSdkSurface({ hermes_sha: HERMES_PINNED_SDK_SHA, observed_headers: fixture.headers.observed }),
+    ).toEqual({ ok: true, checked_requests: 0 });
+  });
+
+  it('readiness: REPROVA quando um header do cliente pinado cai da lista fechada', () => {
+    expect(() => assertPinnedSdkSurfaceReady()).not.toThrow();
+    const estreitada = (INFERENCE_REQUEST_HEADERS_ALLOWED as readonly string[]).filter(
+      (h) => h !== 'user-agent',
+    );
+    let erro: unknown;
+    try {
+      assertPinnedSdkSurfaceReady({ admitted_headers: estreitada });
+    } catch (err) {
+      erro = err;
+    }
+    expect(erro).toBeInstanceOf(PinnedSdkSurfaceDriftError);
+    expect((erro as PinnedSdkSurfaceDriftError).findings).toEqual([
+      { kind: 'observed_header_not_allowed', header: 'user-agent' },
+    ]);
+    // Tirar a FAMÍLIA do SDK reprova os NOVE nomes `x-stainless-*` medidos.
+    let erroPrefixo: unknown;
+    try {
+      assertPinnedSdkSurfaceReady({ admitted_header_prefixes: [] });
+    } catch (err) {
+      erroPrefixo = err;
+    }
+    expect(erroPrefixo).toBeInstanceOf(PinnedSdkSurfaceDriftError);
+    const findings = (erroPrefixo as PinnedSdkSurfaceDriftError).findings;
+    expect(findings).toHaveLength(9);
+    expect(findings.every((f) => f.kind === 'observed_header_not_allowed')).toBe(true);
   });
 
   it('drift: gateway que deixou de admitir um campo do cliente REPROVA com achado nomeado', () => {

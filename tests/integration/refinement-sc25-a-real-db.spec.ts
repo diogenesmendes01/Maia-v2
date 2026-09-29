@@ -277,8 +277,10 @@ async function postar(
   token: string | null,
   body: unknown,
   path = INFERENCE_GATEWAY_COMPLETIONS_PATH,
+  /** Headers EXTRA do caso — é assim que se sonda a lista fechada da AC03. */
+  extra: Record<string, string> = {},
 ): Promise<Resposta> {
-  const headers: Record<string, string> = { 'content-type': 'application/json' };
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...extra };
   if (token !== null) headers.authorization = `Bearer ${token}`;
   const res = await fetch(`${base}${path}`, { method: 'POST', headers, body: JSON.stringify(body) });
   const text = await res.text();
@@ -683,6 +685,46 @@ d('SC25-A — grant relay restrito e captura SDK pinado (DB real)', () => {
     expect(redirecionador.requests.filter((r) => r.path.endsWith('/chat/completions'))).toHaveLength(1);
     const [t2] = await tentativas(run2);
     expect(t2).toMatchObject({ state: 'failed_after_send', accounting_status: 'unknown' });
+  });
+
+  // ═══ AC03 — headers: lista FECHADA, recusa antes de credencial e provider ══
+
+  it('AC03 — headers desconhecidos RECUSAM (400 sanitizado) sem tentativa e sem provider', async () => {
+    const escopo = await novoEscopo();
+    const run = await mkRun(escopo.tenant, escopo.agent);
+    await abrirConta(run);
+    const grant = await emitirGrant(run);
+    const stub = await startStubProvider({ script: [{ kind: 'text', content: 'ok' }] });
+    cleanup.push(() => stub.close());
+    const gw = await subirGateway({
+      relay: createChatCompletionsRelay({ provider: 'stub', apiKey: 'chave-provider-stub', baseURL: stub.baseUrl }),
+    });
+
+    // Os headers que a QA usou para reprovar a AC03 no head anterior: TODOS
+    // recusam com o mesmo erro sanitizado, sem citar o nome do header.
+    const proibidos = ['x-maia-tenant', 'x-provider-base-url', 'x-model', 'openai-organization', 'x-session-id'];
+    for (const header of proibidos) {
+      const r = await postar(gw.base, grant.token, corpo(), undefined, { [header]: 'valor-invadido' });
+      expect(r.status, header).toBe(400);
+      expect(codigo(r)).toBe('invalid_request');
+      expect(r.headers.get('x-should-retry')).toBe('false');
+      expect(JSON.stringify(r.body)).not.toContain(header);
+    }
+    // Nada disso chegou ao provider nem virou tentativa: a recusa é ANTES.
+    expect(stub.requests.filter((s) => s.path.endsWith('/chat/completions'))).toHaveLength(0);
+    expect(await tentativas(run)).toHaveLength(0);
+
+    // E o que o SDK pinado MANDA continua passando: a família `x-stainless-*`
+    // (medida na fixture D09) não muda o resultado do pedido.
+    const ok = await postar(gw.base, grant.token, corpo(), undefined, {
+      'x-stainless-lang': 'python',
+      'x-stainless-retry-count': '0',
+      'x-stainless-package-version': '2.24.0',
+      accept: 'application/json',
+    });
+    expect(ok.status).toBe(200);
+    const [t] = await tentativas(run);
+    expect(t).toMatchObject({ state: 'completed', accounting_status: 'settled' });
   });
 
   // ═══ AC06/AC02/D09 — o cliente PINADO contra relay+stub com ledger real ══
