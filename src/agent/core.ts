@@ -892,11 +892,54 @@ async function runAgentForMensagemInner(
     throw err;
   } finally {
     // The core owns the claim's lifetime, including preparation/readback errors.
-    // Release only possession: a durable run (including uncertain submission)
-    // remains authoritative, and recovery must route it rather than resubmit.
-    if (turn && isTerminalTurnStatus(turn.status)) turn.lease?.stop();
-    else await turn?.lease?.release();
+    // SC07 (§5.8.1) — o desfecho está em `cleanupTurnClaim`, e ele AGUARDA a
+    // batida em voo antes de declarar o encerramento (AC04) e devolve APENAS a
+    // posse quando não há terminal (AC05).
+    await cleanupTurnClaim(turn);
   }
+}
+
+/**
+ * SC07 (§5.8.1, AC04/AC05) — ENCERRAMENTO DA POSSE no `finally` do core.
+ *
+ * Dois desfechos, e a diferença entre eles é o que a AC05 protege:
+ *
+ *  - `stopped`: o turno já está em estado TERMINAL. A transição terminal que o
+ *    levou até ali commitou na mesma transação do CAS (o `claim_token` já não é
+ *    nosso), então não há posse a devolver — só o heartbeat a desligar.
+ *    `settle()` desliga o timer E AGUARDA a batida em voo (AC04): sem essa
+ *    espera a renovação que já saiu toca o banco depois de o turno ter acabado,
+ *    e a recusa do CAS viraria um `token_mismatch` FALSO no sinal de perda —
+ *    além de segurar uma conexão do pool até o teto do statement.
+ *  - `released`: a execução está saindo SEM terminal — erro de preparo, run
+ *    durável em voo (`outbound_pending`), submissão incerta/efeito desconhecido.
+ *    Aqui devolvemos SÓ A POSSE. `release()` vence a lease para um sucessor
+ *    reivindicar no próximo tick e NÃO grava transição nenhuma: nenhum
+ *    `retryable`/`queued`, nenhuma limpeza de run/request, nenhum "retry
+ *    seguro".
+ *
+ * É exatamente isso a AC05: o estado DURÁVEL (outbox, journal do run, marca de
+ * efeito desconhecido) continua sendo a única autoridade sobre o que já
+ * aconteceu; soltar a posse não declara que a tentativa pode ser refeita, e
+ * quem escolhe o desfecho é o recovery, lendo o estado em vez de reexecutar o
+ * pipeline. Manter a posse por mais tempo também não ajudaria: a lease vence de
+ * qualquer forma, e um dono zumbi escrevendo depois dela é o defeito que o
+ * fence existe para impedir.
+ *
+ * `null` (sem turno, ou turno sem lease — máquina de estados desligada/flag
+ * `FEATURE_TURN_CLAIM` off) é no-op, como todo guard do caminho legado.
+ */
+export async function cleanupTurnClaim(
+  turn: TurnHandle | null,
+): Promise<'none' | 'stopped' | 'released'> {
+  const lease = turn?.lease;
+  if (!turn || !lease) return 'none';
+  if (isTerminalTurnStatus(turn.status)) {
+    await lease.settle();
+    return 'stopped';
+  }
+  await lease.release();
+  return 'released';
 }
 
 /**

@@ -489,6 +489,28 @@ export type TurnClaim = {
    * espera real do usuário, e nunca zero.
    */
   wait_seconds: number;
+  /**
+   * SC07 (§5.8.1, AC03) — o ORÇAMENTO ABSOLUTO de execução do run, lido de
+   * `agent_turns.deadline_at` no MESMO `RETURNING` do claim.
+   *
+   * Ele é o teto que a lease NÃO pode esticar. `context().deadline` passa a ser
+   * `min(deadline_absoluto, horizonte_vigente_da_lease)`, e a diferença entre os
+   * dois é o defeito que isto fecha: sem um teto absoluto, um heartbeat saudável
+   * renova a lease indefinidamente e o turno nunca vê o prazo acabar —
+   * `renewTurnLease` empurra `lease_expires_at`, e o horizonte móvel empurraria
+   * `ctx.deadline` junto, para sempre.
+   *
+   * `null` significa "sem orçamento absoluto declarado" (o estado de hoje em
+   * produção: `deadline_at` é uma coluna nullable que nenhum caminho escreve), e
+   * o horizonte volta a ser só o da lease. Ler a coluna aqui — em vez de um novo
+   * parâmetro do caller — é o que faz o teto ser PERSISTIDO e sobreviver a um
+   * takeover: o sucessor herda o mesmo fim, não um novo.
+   *
+   * Vem do banco, e não de `Date.now()` deste processo, pela mesma razão de
+   * `wait_seconds`: comparar dois instantes de relógios diferentes mediria skew
+   * de NTP como se fosse orçamento.
+   */
+  deadline_at: Date | null;
 };
 
 /**
@@ -582,6 +604,78 @@ export const MAX_HEARTBEAT_TO_TTL_RATIO = 1 / 3;
  * da expiração", e abortar depois seria escrever com lease vencida.
  */
 export const MAX_HEARTBEAT_FAILURES = 2;
+
+/**
+ * SC07 (§5.8.1, AC02) — o teto de tempo da CONSULTA de renovação, derivado do
+ * intervalo de heartbeat.
+ *
+ * Por que ele é derivado e não um número solto: a única exigência que importa é
+ * RELATIVA — a consulta precisa terminar (ou ser cancelada) antes da próxima
+ * batida. Um timeout igual ou maior que o intervalo não limita nada: a batida
+ * seguinte já teria começado, e é justamente a sobreposição que a issue fecha.
+ *
+ * Metade do intervalo, com piso de 1 ms: metade deixa folga para o RTT e para o
+ * agendamento da próxima batida caberem dentro do intervalo (uma renovação que
+ * gasta o intervalo inteiro não tem onde agendar a seguinte), e o piso evita
+ * `statement_timeout = 0`, que no PostgreSQL significa "SEM teto" — o oposto
+ * do que este número existe para garantir.
+ *
+ * O limite é do STATEMENT, aplicado no servidor (`SET LOCAL statement_timeout`
+ * em `renewTurnLease`): um `Promise.race` no cliente abandonaria a promessa e
+ * deixaria a consulta e a conexão rodando, que é exatamente o que a AC02
+ * proíbe.
+ *
+ * Ele NÃO basta sozinho, e é por isso que existe `leaseQueryCancelMs` abaixo: o
+ * teto do servidor só chega ao processo se o processo estiver LENDO o socket.
+ */
+export function leaseQueryTimeoutMs(heartbeat_ms: number): number {
+  return Math.max(1, Math.floor(heartbeat_ms / 2));
+}
+
+/**
+ * SC07 (§5.8.1, AC02/AC06) — o teto do LADO DO CLIENTE: quanto a CONEXÃO da
+ * renovação pode ficar sem liquidar antes de ser destruída.
+ *
+ * Por que o teto do servidor não cobre isto: `statement_timeout` mata o
+ * STATEMENT no PostgreSQL e devolve `57014` — pela CONEXÃO. Numa conexão
+ * meio-aberta (o processo parou de ler o socket, uma partição de rede, um peer
+ * que congelou), a resposta do servidor nunca é processada e a promessa da
+ * renovação NUNCA liquida: a lease não percebe o próprio vencimento, o
+ * `finally` do core fica pendurado no `settle()`/`release()`, e o turno segue
+ * trabalhando depois de o banco já ter dado a posse a outro. Um teto do
+ * cliente é a única defesa contra isso, e ele precisa ser AÇÃO, não desistência:
+ * quem cancela destrói a conexão (`client.release(err)` ⇒ `stream.destroy()`),
+ * porque um `Promise.race` abandonado deixaria a consulta e o socket presos.
+ *
+ * O cronômetro é armado pelo REPOSITÓRIO, quando ele já tem a conexão na mão
+ * (`renewTurnLease`/`releaseTurnClaim`, parâmetro `client_timeout_ms`) — isto é,
+ * ele mede a fase em que a consulta pode ficar presa no socket, e não o
+ * trabalho que o caller faz ANTES de pedir a renovação. A distinção importa:
+ * uma batida lenta por outro motivo (fila do pool, trabalho no próprio
+ * heartbeat) não é um socket morto e não deve perder a conexão por isso.
+ *
+ * Ele é ESTRITAMENTE MAIOR que `leaseQueryTimeoutMs` e ESTRITAMENTE MENOR que o
+ * intervalo de heartbeat, e as duas desigualdades têm razão:
+ *
+ *  - maior que o do servidor: no caminho normal quem cancela é o PostgreSQL, e
+ *    o cliente lê o `57014` e devolve a conexão AO POOL. Se o teto do cliente
+ *    empatasse, todo statement cancelado no servidor viraria destruição de
+ *    conexão — trocar a limpeza normal por churn de socket;
+ *  - menor que o heartbeat: a batida seguinte só é agendada quando a anterior
+ *    termina; uma espera que ultrapassasse o intervalo transformaria
+ *    "no máximo uma renovação em voo" em "uma renovação em voo por vez, sempre
+ *    atrasada", e a cadência do heartbeat deixaria de ser a configurada.
+ *
+ * A folga é um oitavo do intervalo (piso de 1 ms), que é tempo de sobra para o
+ * `57014` chegar numa conexão saudável — localhost e rede local gastam
+ * microssegundos — e curto o bastante para a lease ser declarada perdida
+ * dentro do próprio TTL.
+ */
+export function leaseQueryCancelMs(heartbeat_ms: number): number {
+  const tetoDoServidor = leaseQueryTimeoutMs(heartbeat_ms);
+  const folga = Math.max(1, Math.floor(heartbeat_ms / 8));
+  return Math.min(Math.max(1, heartbeat_ms - 1), tetoDoServidor + folga);
+}
 
 export type LeaseTimingCheck =
   | { ok: true }

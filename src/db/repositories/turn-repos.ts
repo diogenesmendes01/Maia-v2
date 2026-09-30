@@ -23,7 +23,10 @@
  * governance/audit -> repositories -> turn-repos.
  */
 import { and, asc, eq, inArray, isNull, lte, or, sql, type SQL } from 'drizzle-orm';
-import { db, pgErrorCode, pgErrorConstraint, withTx } from '../client.js';
+import { drizzle } from 'drizzle-orm/node-postgres';
+import type pg from 'pg';
+import { db, pgErrorCode, pgErrorConstraint, pool, withTx } from '../client.js';
+import { recordDbQuery } from '../query-counter.js';
 import {
   agent_stream_blocks,
   agent_stream_sequences,
@@ -123,6 +126,8 @@ type ClaimRow = {
   state_version: number | string;
   /** #629 — a espera, medida pelo relógio do BANCO no mesmo `RETURNING`. */
   wait_seconds: number | string;
+  /** SC07 — o orçamento absoluto do run (`agent_turns.deadline_at`), nullable. */
+  deadline_at: string | null;
 };
 
 /**
@@ -374,6 +379,136 @@ export type TurnTransitionPatch = {
 
 export type TurnTransitionExecutor = typeof db;
 type Executor = TurnTransitionExecutor;
+
+/**
+ * SC07 (§5.8.1, AC02/AC06) — a conexão CANCELÁVEL, e por que ela existe.
+ *
+ * `withTx` não serve para o heartbeat porque o cancelamento do lado do cliente
+ * precisa da CONEXÃO, e `withTx` não a expõe. Aqui a conexão é obtida
+ * explicitamente e, num `AbortSignal` abortado, é DESTRUÍDA — `release(err)`
+ * faz o driver destruir o socket (`stream.destroy()`) e rejeitar a promessa
+ * pendente. É o ÚNICO caminho que interrompe um statement que o processo parou
+ * de LER: numa conexão meio-aberta o `statement_timeout` do servidor mata o
+ * statement, mas a resposta (`57014`) viaja pela mesma conexão que ninguém lê,
+ * e sem destruir o socket a promessa da renovação nunca liquida.
+ *
+ * A conexão NÃO volta ao pool depois de destruída: o desfecho de um statement
+ * cuja resposta se perdeu é AMBÍGUO (pode ter comitado), e reutilizar o socket
+ * seria reutilizar um estado que não se conhece. Quem paga o preço é uma
+ * reconexão — não a correção.
+ *
+ * A transação é do helper e não do caller (`transacao: false` para statements
+ * únicos, como a devolução da posse): assim a conexão nunca volta ao pool com
+ * transação aberta, nem por caminho de erro.
+ */
+async function comConexaoCancelavel<T>(args: {
+  /**
+   * Abort do caller: DESTRÓI a conexão (o caminho do heartbeat, onde quem
+   * encerra precisa derrubar a batida em voo). Opcional — um chamador que só
+   * quer o teto do cliente não tem o que abortar.
+   */
+  cancel_signal?: AbortSignal;
+  /**
+   * SC07 (§5.8.1, AC02) — teto do LADO DO CLIENTE para ESTA conexão: vencido, a
+   * conexão é DESTRUÍDA (não devolvida ao pool) e a promessa da consulta
+   * liquida. É a única defesa contra uma conexão que parou de ser lida: o
+   * `statement_timeout` do servidor mata o statement, mas a resposta (`57014`)
+   * viaja pela mesma conexão — meio-aberta, ela nunca chega, e sem este teto a
+   * renovação ficaria pendurada para sempre.
+   *
+   * O cronômetro começa AQUI, com a conexão já na mão: ele mede a fase em que a
+   * consulta pode ficar presa no socket, e não o tempo que o caller gastou
+   * antes de pedir a operação.
+   */
+  client_timeout_ms?: number;
+  /** `true` (default) envolve `usar` em BEGIN/COMMIT com ROLLBACK no erro. */
+  transacao?: boolean;
+  usar: (exec: Executor) => Promise<T>;
+}): Promise<T> {
+  const client = await pool.connect();
+  const exec = executorContado(client);
+  const emTransacao = args.transacao ?? true;
+  let encerrado = false;
+  let cancelado = false;
+
+  const encerrar = (erro?: Error): void => {
+    if (encerrado) return;
+    encerrado = true;
+    try {
+      // `release(err)` DESTRÓI a conexão; `release()` a devolve ao pool.
+      client.release(erro);
+    } catch {
+      /* idempotente: o encerramento nunca pode falhar por isto */
+    }
+  };
+  const aoCancelar = (): void => {
+    cancelado = true;
+    encerrar(new Error('turn.db_statement_cancelled'));
+  };
+
+  const tetoDoCliente =
+    args.client_timeout_ms === undefined || args.client_timeout_ms <= 0
+      ? null
+      : setTimeout(() => {
+          cancelado = true;
+          encerrar(new Error('turn.db_statement_client_timeout'));
+        }, Math.max(1, Math.trunc(args.client_timeout_ms)));
+  tetoDoCliente?.unref?.();
+
+  // Sinal de facto: sem `cancel_signal` do caller, este caminho é só o do teto
+  // do cliente, e um sinal que ninguém aborta mantém o resto do corpo idêntico.
+  const sinal = args.cancel_signal ?? new AbortController().signal;
+  sinal.addEventListener('abort', aoCancelar, { once: true });
+  try {
+    if (sinal.aborted) {
+      throw new Error('turn.db_statement_cancelled');
+    }
+    if (!emTransacao) return await args.usar(exec);
+    await client.query('BEGIN');
+    const resultado = await args.usar(exec);
+    await client.query('COMMIT');
+    return resultado;
+  } catch (err) {
+    // Sem ROLLBACK depois de a conexão ter sido destruída: o socket já foi
+    // fechado e a conexão não volta ao pool — não há transação a desfazer.
+    if (emTransacao && !cancelado) {
+      try {
+        await client.query('ROLLBACK');
+      } catch {
+        /* a conexão pode ter morrido por outro motivo; o release(err) abaixo resolve */
+      }
+    }
+    throw err;
+  } finally {
+    if (tetoDoCliente) clearTimeout(tetoDoCliente);
+    sinal.removeEventListener('abort', aoCancelar);
+    encerrar();
+  }
+}
+
+/**
+ * O executor desta conexão, CONTADO como o proxy de `client.ts` (issue #511).
+ *
+ * A instrumentação de lá não é exportada, então a contagem é reproduzida aqui:
+ * sem ela, os statements deste caminho sairiam em silêncio do orçamento de
+ * consultas do turno — exatamente a medida que a #511 existe para dar. Mesma
+ * forma e mesma granularidade (um `recordDbQuery()` por `client.query`), e o
+ * mesmo cuidado com os probes do drizzle (`constructor.name` e
+ * `instanceof Pool` atravessam o Proxy).
+ */
+function executorContado(client: pg.PoolClient): Executor {
+  const contado = new Proxy(client, {
+    get(target, prop, receiver): unknown {
+      const value: unknown = Reflect.get(target, prop, receiver);
+      if (prop !== 'query' || typeof value !== 'function') return value;
+      return function consultaContada(this: unknown, ...queryArgs: unknown[]): unknown {
+        recordDbQuery();
+        return (value as (...a: unknown[]) => unknown).apply(target, queryArgs);
+      };
+    },
+  });
+  return drizzle(contado) as unknown as Executor;
+}
 
 type RunTransitionArgs = {
   turn_id: string;
@@ -1032,17 +1167,64 @@ export const agentTurnsRepo = {
     );
   },
 
+  /**
+   * SC07 (§5.8.1, AC02/AC06) — a renovação agora tem um TETO de tempo real.
+   *
+   * `statement_timeout_ms` é aplicado no SERVIDOR (`SET LOCAL`, dentro de uma
+   * transação curta) e não como um `Promise.race` no cliente. A diferença não é
+   * estilística: um race abandonado deixa a consulta rodando, segurando a
+   * conexão e o lock da linha — o worker acharia que a batida terminou e
+   * agendaria a próxima enquanto a anterior ainda está em voo, que é
+   * exatamente a sobreposição que a AC01/AC02 proíbem. Com `SET LOCAL`, quem
+   * cancela é o PostgreSQL: a consulta morre, o erro volta como `57014` e a
+   * conexão é devolvida ao pool pelo `withTx` (ROLLBACK + release), sem
+   * transação aberta e sem statement pendurado.
+   *
+   * `SET LOCAL` e não `SET`: o escopo de sessão vazaria para a conexão do
+   * pool, e um teto de milissegundos herdado por outra consulta qualquer
+   * mataria trabalho alheio (o precedente do repositório é o do doctor, que
+   * usa `BEGIN READ ONLY` + `SET LOCAL` pelo mesmo motivo).
+   *
+   * Opcional de propósito: sem o parâmetro, o caminho segue sendo o statement
+   * único de sempre — quem escolhe o teto é o dono da lease, que conhece o
+   * intervalo de heartbeat (`leaseQueryTimeoutMs`). `0` (ou negativo) é
+   * elevado a `1`: em PostgreSQL, `statement_timeout = 0` significa SEM teto.
+   */
   async renewTurnLease(input: {
     turn_id: string;
     claim_token: string;
     lease_ms: number;
+    /** Teto do STATEMENT em ms, aplicado no servidor. Ausente = sem teto. */
+    statement_timeout_ms?: number;
+    /**
+     * SC07 (§5.8.1, AC02/AC06) — CANCELAMENTO do lado do cliente.
+     *
+     * Presente, a renovação roda numa conexão própria e um `abort` do sinal a
+     * DESTRÓI: é o que limita a batida quando a resposta do servidor nunca
+     * chega (conexão meio-aberta) e o que faz `settle()`/`release()` terem
+     * espera finita. Ausente, o caminho é o de sempre (`withTx`/statement
+     * único) — nenhum caller legado muda de comportamento.
+     */
+    cancel_signal?: AbortSignal;
+    /**
+     * SC07 (§5.8.1, AC02/AC06) — teto do LADO DO CLIENTE para a conexão da
+     * renovação (ver `leaseQueryCancelMs`). Só vale no caminho cancelável.
+     * Ausente = sem teto do cliente: a conexão só morre por `abort`.
+     */
+    client_timeout_ms?: number;
   }): Promise<LeaseRenewalResult> {
     const { tenant_id, agent_id } = scope();
     const leaseSeconds = input.lease_ms / 1000;
-    const result = await db.execute<{
-      lease_expires_at: string;
-      heartbeat_at: string;
-    }>(sql`
+    const statementTimeout =
+      input.statement_timeout_ms === undefined
+        ? null
+        : Math.max(1, Math.trunc(input.statement_timeout_ms));
+
+    const renovar = async (executor: Executor): Promise<LeaseRenewalResult> => {
+      const result = await executor.execute<{
+        lease_expires_at: string;
+        heartbeat_at: string;
+      }>(sql`
       UPDATE ${agent_turns}
          SET lease_expires_at = now() + make_interval(secs => ${leaseSeconds}),
              heartbeat_at     = now(),
@@ -1055,24 +1237,58 @@ export const agentTurnsRepo = {
          AND lease_expires_at > now()
       RETURNING lease_expires_at, heartbeat_at
     `);
-    const row = (
-      result.rows as unknown as Array<{
-        lease_expires_at: string;
-        heartbeat_at: string;
-      }>
-    )[0];
-    if (!row) {
-      incCounter('maia_turn_lease_heartbeat_total', {
-        result: 'token_mismatch',
-      });
-      return { ok: false, reason: 'token_mismatch' };
-    }
-    incCounter('maia_turn_lease_heartbeat_total', { result: 'renewed' });
-    return {
-      ok: true,
-      lease_expires_at: new Date(row.lease_expires_at),
-      heartbeat_at: new Date(row.heartbeat_at),
+      const row = (
+        result.rows as unknown as Array<{
+          lease_expires_at: string;
+          heartbeat_at: string;
+        }>
+      )[0];
+      if (!row) {
+        // ZERO rows tem DUAS causas, e o nome do resultado cobre as duas sem
+        // mentir: `claim_token` diferente (fomos tomados) e `lease_expires_at
+        // <= now()` (a lease venceu — um CAS recusado, não uma falha de
+        // heartbeat). Quem traduz para `expired` é quem tem o relógio da lease
+        // na mão (`TurnLease`), não este WHERE, que não consegue distinguir as
+        // duas a partir daqui.
+        incCounter('maia_turn_lease_heartbeat_total', {
+          result: 'token_mismatch',
+        });
+        return { ok: false, reason: 'token_mismatch' };
+      }
+      incCounter('maia_turn_lease_heartbeat_total', { result: 'renewed' });
+      return {
+        ok: true,
+        lease_expires_at: new Date(row.lease_expires_at),
+        heartbeat_at: new Date(row.heartbeat_at),
+      };
     };
+
+    if (!input.cancel_signal) {
+      if (statementTimeout === null) return renovar(db);
+      return withTx(async (tx) => {
+        // `sql.raw` porque `SET` não aceita parâmetro vinculado (`$1` é erro de
+        // sintaxe) — e o valor já está truncado para inteiro positivo acima.
+        await tx.execute(sql`SET LOCAL statement_timeout = ${sql.raw(String(statementTimeout))}`);
+        return renovar(tx);
+      });
+    }
+
+    // Caminho CANCELÁVEL (o do heartbeat): conexão própria, e um abort do sinal
+    // DESTRÓI a conexão em vez de abandonar a promessa.
+    return comConexaoCancelavel({
+      cancel_signal: input.cancel_signal,
+      ...(input.client_timeout_ms !== undefined
+        ? { client_timeout_ms: input.client_timeout_ms }
+        : {}),
+      usar: async (exec) => {
+        if (statementTimeout !== null) {
+          await exec.execute(
+            sql`SET LOCAL statement_timeout = ${sql.raw(String(statementTimeout))}`,
+          );
+        }
+        return renovar(exec);
+      },
+    });
   },
 
   /**
@@ -1096,9 +1312,25 @@ export const agentTurnsRepo = {
   async releaseTurnClaim(input: {
     turn_id: string;
     claim_token: string;
+    /**
+     * SC07 (§5.8.1, AC02/AC06) — CANCELAMENTO do lado do cliente, pela mesma
+     * razão de `renewTurnLease`: um statement pendurado numa conexão que parou
+     * de ser lida penduraria o `finally` do core. Abortado, a conexão é
+     * DESTRUÍDA e a lease vence sozinha em <= TTL (o sucessor espera o TTL, mas
+     * o fence continua recusando qualquer gravação de quem já não tem posse).
+     */
+    cancel_signal?: AbortSignal;
+    /**
+     * SC07 (§5.8.1, AC02/AC06) — teto do LADO DO CLIENTE para a conexão da
+     * devolução (ver `leaseQueryCancelMs`): vencido, a conexão é destruída. Sem
+     * ele, uma devolução presa no socket penduraria o `finally` do core.
+     */
+    client_timeout_ms?: number;
   }): Promise<{ released: boolean }> {
     const { tenant_id, agent_id } = scope();
-    const result = await db.execute<{ id: string }>(sql`
+
+    const liberar = async (executor: Executor): Promise<{ released: boolean }> => {
+      const result = await executor.execute<{ id: string }>(sql`
       UPDATE ${agent_turns}
          SET lease_expires_at = now(),
              updated_at       = now()
@@ -1109,7 +1341,22 @@ export const agentTurnsRepo = {
          AND status      IN (${statusList(FENCED_WRITE_STATUSES)})
       RETURNING id
     `);
-    return { released: result.rows.length === 1 };
+      return { released: result.rows.length === 1 };
+    };
+
+    // Um statement só: `transacao: false` mantém o path de devolução como era
+    // (autocommit), sem um BEGIN/COMMIT que não teria o que proteger.
+    if (input.cancel_signal !== undefined || input.client_timeout_ms !== undefined) {
+      return comConexaoCancelavel({
+        ...(input.cancel_signal !== undefined ? { cancel_signal: input.cancel_signal } : {}),
+        ...(input.client_timeout_ms !== undefined
+          ? { client_timeout_ms: input.client_timeout_ms }
+          : {}),
+        transacao: false,
+        usar: liberar,
+      });
+    }
+    return liberar(db);
   },
 
   /** `received | retryable -> queued` (wake-up do BullMQ confirmado). */
@@ -3067,6 +3314,12 @@ async function claimWithinStreamExclusion(
        AND ${streamNotHumanControlled(escopo)}
     RETURNING id, tenant_id, agent_id, status, attempt_count, claim_token,
               claimed_by, claimed_at, lease_expires_at, state_version,
+              -- SC07 -- o ORCAMENTO ABSOLUTO do run, no MESMO RETURNING do claim.
+              -- Vem daqui, e nao de uma segunda leitura, pela mesma razao de
+              -- wait_seconds logo abaixo: entre as duas leituras a linha pode
+              -- mudar, e o teto que o worker carregaria seria o de um estado que
+              -- ja nao existe. NULL = sem orcamento declarado (o caso de hoje).
+              deadline_at,
               -- #629 -- a ESPERA deste turno, do relogio do BANCO. E o que
               -- alimenta maia_stream_turn_wait_seconds, a serie de fairness que
               -- a issue-mae pede. GREATEST(...,0) porque um relogio que ande
@@ -3111,6 +3364,7 @@ async function claimWithinStreamExclusion(
       status: row.status as TurnStatus,
       state_version: Number(row.state_version),
       wait_seconds: Number(row.wait_seconds),
+      deadline_at: row.deadline_at ? new Date(row.deadline_at) : null,
     },
     ...trail,
   };
