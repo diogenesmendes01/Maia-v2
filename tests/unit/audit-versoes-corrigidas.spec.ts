@@ -11,6 +11,16 @@
  * dentro do range existente ou, no pin exato do Next, por bump explícito do
  * manifesto.
  *
+ * A terceira rodada (SC25-A, PR #791) fechou o `npm audit` do CI, que reprovava
+ * a PR sem que ela tocasse em dependência: `ip-address` (SSRF/trust boundary em
+ * classificadores IPv6 e no `isInSubnet`), `undici` (dezenas de advisories de
+ * DoS/validação de TLS na linha 7.x) e `brace-expansion` (DoS por recursão)
+ * foram bumps de lockfile dentro dos ranges existentes — os dois lockfiles, o
+ * do root e o do `src/admin-ui`; `fast-uri` voltou com dois advisories novos
+ * sobre a versão que já estava aqui; e `nodemailer` exigiu o único bump de
+ * MANIFESTO desta rodada (`^9.0.5` → `^10.0.9`), porque a linha 9.x não tem
+ * versão corrigida para os advisories novos.
+ *
  * O problema de uma correção que vive SÓ no lockfile é que ela não está
  * declarada em lugar nenhum. Como vários deles estão dentro de um range `^`/`>=`
  * que a versão VULNERÁVEL também satisfazia, qualquer regeneração de lockfile
@@ -86,19 +96,22 @@ const PISOS: readonly PisoCorrigido[] = [
   {
     projeto: '.',
     pkg: 'fast-uri',
-    piso: '3.1.6',
+    piso: '3.1.8',
     advisories: [
       'GHSA-5jgf-p345-68v8',
       'GHSA-f65p-4m7j-42xc',
       'GHSA-fph4-wmhf-6fwf',
       'GHSA-jqff-g426-hqxp',
+      'GHSA-hrr3-gc8f-f4qj',
     ],
     porque:
       'transitivo do `ajv` (`^3.0.1`), do `fast-json-stringify` (`^3.0.0`) e do ' +
-      '`@fastify/ajv-compiler` (`^3.0.0`); os quatro advisories cobrem `<3.1.6` e o ' +
-      'lockfile ficou em 3.1.7. Há uma segunda cópia, 4.1.4, aninhada sob ' +
-      '`fastify/fast-json-stringify`: ela está fora do range vulnerável e, sendo maior ' +
-      'que o piso, satisfaz a mesma asserção sem precisar de caso especial',
+      '`@fastify/ajv-compiler` (`^3.0.0`); os quatro primeiros cobrem `<3.1.6` e ' +
+      '`GHSA-hrr3-gc8f-f4qj` (normalização de host por octeto percent-encoded) cobre ' +
+      '`<3.1.8`, que passou a ser o piso da linha 3.x. A segunda cópia, aninhada sob ' +
+      '`fastify/fast-json-stringify`, foi para 4.2.1: ela fecha os dois advisories da ' +
+      'linha 4.x (`GHSA-hrr3-gc8f-f4qj` e `GHSA-jvvf-x445-j334`, ambos corrigidos em ' +
+      '4.1.5) e, sendo maior que o piso, satisfaz a mesma asserção sem caso especial',
   },
   {
     projeto: '.',
@@ -113,16 +126,78 @@ const PISOS: readonly PisoCorrigido[] = [
   {
     projeto: '.',
     pkg: 'nodemailer',
-    piso: '9.1.1',
+    piso: '10.0.9',
     advisories: [
       'GHSA-8m3c-c648-2xjj',
       'GHSA-wmmp-3585-3rmp',
       'GHSA-2x7j-588g-ccc2',
       'GHSA-cc9r-2j5m-2m83',
+      'GHSA-6vj9-mwq6-2f5v',
+      'GHSA-8vvx-rff5-p5rq',
+      'GHSA-g57g-f23g-4646',
+      'GHSA-v53p-9fqp-m79j',
     ],
     porque:
-      'dependência direta em `^9.0.5`; três correções chegaram em 9.1.0, mas o bypass ' +
-      'de `disableFileAccess`/`disableUrlAccess` cobre também 9.1.0 e exige 9.1.1',
+      'dependência direta; a rodada anterior parava em 9.1.1 (`^9.0.5`) e esta subiu o ' +
+      'MANIFESTO para `^10.0.9`, porque os quatro advisories novos não têm correção na ' +
+      'linha 9.x: `GHSA-6vj9-mwq6-2f5v` e `GHSA-8vvx-rff5-p5rq` exigem 10.0.2, ' +
+      '`GHSA-v53p-9fqp-m79j` (backtracking quadrático no addressparser) exige 10.0.6 e ' +
+      '`GHSA-g57g-f23g-4646` (local-part entre aspas) exige 10.0.9 — o maior dos quatro ' +
+      'é o piso. O lockfile ficou em 10.0.13',
+  },
+  {
+    projeto: '.',
+    pkg: 'ip-address',
+    piso: '10.7.1',
+    advisories: [
+      'GHSA-rpw4-54j3-4h4q',
+      'GHSA-2vr4-cq9g-pvrc',
+      'GHSA-j6r3-76f7-8jcv',
+      'GHSA-h3mg-xc3c-68pw',
+    ],
+    porque:
+      'transitivo de `@fastify/rate-limit` (`^10.2.0`) e de `express-rate-limit` (via ' +
+      '`@modelcontextprotocol/sdk`); os dois primeiros (classificador de link-local em ' +
+      '`fe80::/10` e faixa NAT64 local-use) cobrem `<=10.5.0`, e os dois últimos ' +
+      '(`isInSubnet`/`isHostInSubnet` comparando famílias diferentes e diagnóstico de ' +
+      'parse sem limite de tamanho) cobrem `<=10.7.0` — daí o piso 10.7.1. O lockfile ' +
+      'ficou em 10.7.2',
+  },
+  {
+    projeto: '.',
+    pkg: 'undici',
+    piso: '7.29.1',
+    advisories: [
+      'GHSA-3wwx-pv8p-q78v',
+      'GHSA-pmjh-fq2x-6v4x',
+      'GHSA-r53p-7pc4-xj5r',
+      'GHSA-rfgv-xxqx-mfg5',
+      'GHSA-3xpg-4rpp-hhhm',
+      'GHSA-2jfj-6hjv-fm6j',
+      'GHSA-2gqq-gqf2-x968',
+      'GHSA-w293-vg96-wgc3',
+      'GHSA-8436-99hf-9mmv',
+      'GHSA-rx4f-c7p8-82vq',
+    ],
+    porque:
+      'dependência de desenvolvimento, transitiva do `testcontainers@12` (que aceita ' +
+      '`undici@^7`); os dez advisories cobrem `<7.29.1` — DoS por `permessage-deflate`, ' +
+      'por corpo órfão do `RetryHandler`, por subprotocolo WebSocket e por descompressão ' +
+      'sem limite, além do bypass de validação de certificado no `BalancedPool` — e o ' +
+      'lockfile ficou em 7.30.0',
+  },
+  {
+    projeto: '.',
+    pkg: 'brace-expansion',
+    piso: '2.1.7',
+    advisories: ['GHSA-q2hr-2g5m-vwhr', 'GHSA-qhr7-859c-m2p7', 'GHSA-6j4f-fj2g-mc7p'],
+    porque:
+      'transitivo do `glob` e do `readdir-glob` (`^2.0.1`/`^2.0.2`); os três advisories ' +
+      '(expansão quadrática do rewrite e recursão sem controle) cobrem `<2.1.5`..`<2.1.7` ' +
+      'na linha 2.x, que é o piso desta entrada. A outra linha presente no lockfile é a ' +
+      '5.x, pedida pelo `glob` `^5.0.5`, com piso 5.0.12 — acima deste, então satisfaz a ' +
+      'mesma asserção sem caso especial. O lockfile ficou em 5.0.12 (hoisted) e 2.1.7 ' +
+      '(aninhado)',
   },
   {
     projeto: '.',
@@ -150,6 +225,18 @@ const PISOS: readonly PisoCorrigido[] = [
     porque:
       'dependência interna de `vitest`, pinada na mesma versão do runner; o bump do pacote ' +
       'pai para 4.1.11 traz o mocker com a validação de caminho corrigida',
+  },
+  {
+    projeto: 'src/admin-ui',
+    pkg: 'brace-expansion',
+    piso: '1.1.21',
+    advisories: ['GHSA-q2hr-2g5m-vwhr', 'GHSA-qhr7-859c-m2p7', 'GHSA-6j4f-fj2g-mc7p'],
+    porque:
+      'transitivo do `minimatch@3` do console (`^1.1.7`); os três advisories cobrem ' +
+      '`<1.1.19`..`<1.1.21` na linha 1.x, que é o piso desta entrada. A outra linha ' +
+      'presente no lockfile do console é a 5.x (pedida pelo `minimatch@10` usado por ' +
+      '`eslint` e `@typescript-eslint`), com piso 5.0.12 — acima deste, então satisfaz a ' +
+      'mesma asserção sem caso especial. O lockfile ficou em 1.1.21 e 5.0.12',
   },
   {
     projeto: 'src/admin-ui',
