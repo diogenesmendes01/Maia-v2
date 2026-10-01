@@ -1,0 +1,746 @@
+{
+  "version": 1,
+  "hermes_sha": "5d59366010640c1d6b8f170d8a4ee109db2bbdef",
+  "captured_by": "tests/integration/hermes-inference-d09-capture.spec.ts",
+  "tier": {
+    "client": "AIAgent REAL do checkout pinado (services/hermes_worker)",
+    "provider": "stub loopback (não é modelo)",
+    "boundary": "corpo admitido pelo gateway e entregue ao relay (não o socket do filho)"
+  },
+  "redaction": [
+    "valor do header Authorization (nunca registrado)",
+    "texto de mensagens, prompt de sistema e argumentos de tool",
+    "nome/valor de credencial de run ou de provider"
+  ],
+  "headers": {
+    "version": 1,
+    "observed": [
+      "accept",
+      "accept-encoding",
+      "authorization",
+      "connection",
+      "content-length",
+      "content-type",
+      "host",
+      "user-agent",
+      "x-stainless-arch",
+      "x-stainless-async",
+      "x-stainless-lang",
+      "x-stainless-os",
+      "x-stainless-package-version",
+      "x-stainless-read-timeout",
+      "x-stainless-retry-count",
+      "x-stainless-runtime",
+      "x-stainless-runtime-version"
+    ],
+    "allowed": [
+      "accept",
+      "accept-encoding",
+      "accept-language",
+      "authorization",
+      "cache-control",
+      "connection",
+      "content-length",
+      "content-type",
+      "expect",
+      "host",
+      "keep-alive",
+      "pragma",
+      "sec-fetch-mode",
+      "te",
+      "transfer-encoding",
+      "user-agent"
+    ],
+    "allowed_prefixes": [
+      "x-stainless-"
+    ],
+    "redaction": "apenas NOMES de header; nenhum valor é registrado (nem o bearer)"
+  },
+  "calls": [
+    {
+      "seq": 1,
+      "class": "principal",
+      "reason": "primeira chamada HTTP do run",
+      "top_level_fields": [
+        "max_tokens",
+        "messages",
+        "model",
+        "stream",
+        "stream_options",
+        "tools"
+      ],
+      "message_roles": [
+        "system",
+        "user"
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "fields": [
+            "content",
+            "role"
+          ],
+          "types": {
+            "content": [
+              "string"
+            ],
+            "role": [
+              "string"
+            ]
+          }
+        },
+        {
+          "role": "user",
+          "fields": [
+            "content",
+            "role"
+          ],
+          "types": {
+            "content": [
+              "string"
+            ],
+            "role": [
+              "string"
+            ]
+          }
+        }
+      ],
+      "tool_object_fields": [
+        "function",
+        "type"
+      ],
+      "tool_function_fields": [
+        "description",
+        "name",
+        "parameters"
+      ],
+      "tool_function_types": {
+        "description": [
+          "string"
+        ],
+        "name": [
+          "string"
+        ],
+        "parameters": [
+          "object"
+        ]
+      },
+      "tool_type_values": [
+        "function"
+      ],
+      "tool_call_fields": [],
+      "tool_call_function_fields": [],
+      "tool_call_function_types": {},
+      "tool_call_type_values": [],
+      "stream_options_fields": [
+        "include_usage"
+      ],
+      "stream_options_types": {
+        "include_usage": [
+          "boolean"
+        ]
+      },
+      "tool_names": [
+        "fixture_echo"
+      ],
+      "output_limit_field": "max_tokens",
+      "stream": true,
+      "content_kinds": [
+        "string"
+      ],
+      "headers": [
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "user-agent",
+        "x-stainless-arch",
+        "x-stainless-async",
+        "x-stainless-lang",
+        "x-stainless-os",
+        "x-stainless-package-version",
+        "x-stainless-read-timeout",
+        "x-stainless-retry-count",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version"
+      ]
+    },
+    {
+      "seq": 2,
+      "class": "retry",
+      "reason": "mesma chamada lógica repetida pelo SDK após 503 do gateway",
+      "top_level_fields": [
+        "max_tokens",
+        "messages",
+        "model",
+        "stream",
+        "stream_options",
+        "tools"
+      ],
+      "message_roles": [
+        "system",
+        "user"
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "fields": [
+            "content",
+            "role"
+          ],
+          "types": {
+            "content": [
+              "string"
+            ],
+            "role": [
+              "string"
+            ]
+          }
+        },
+        {
+          "role": "user",
+          "fields": [
+            "content",
+            "role"
+          ],
+          "types": {
+            "content": [
+              "string"
+            ],
+            "role": [
+              "string"
+            ]
+          }
+        }
+      ],
+      "tool_object_fields": [
+        "function",
+        "type"
+      ],
+      "tool_function_fields": [
+        "description",
+        "name",
+        "parameters"
+      ],
+      "tool_function_types": {
+        "description": [
+          "string"
+        ],
+        "name": [
+          "string"
+        ],
+        "parameters": [
+          "object"
+        ]
+      },
+      "tool_type_values": [
+        "function"
+      ],
+      "tool_call_fields": [],
+      "tool_call_function_fields": [],
+      "tool_call_function_types": {},
+      "tool_call_type_values": [],
+      "stream_options_fields": [
+        "include_usage"
+      ],
+      "stream_options_types": {
+        "include_usage": [
+          "boolean"
+        ]
+      },
+      "tool_names": [
+        "fixture_echo"
+      ],
+      "output_limit_field": "max_tokens",
+      "stream": true,
+      "content_kinds": [
+        "string"
+      ],
+      "headers": [
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "user-agent",
+        "x-stainless-arch",
+        "x-stainless-async",
+        "x-stainless-lang",
+        "x-stainless-os",
+        "x-stainless-package-version",
+        "x-stainless-read-timeout",
+        "x-stainless-retry-count",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version"
+      ]
+    },
+    {
+      "seq": 3,
+      "class": "principal",
+      "reason": "nova chamada lógica depois do tool.result",
+      "top_level_fields": [
+        "max_tokens",
+        "messages",
+        "model",
+        "stream",
+        "stream_options",
+        "tools"
+      ],
+      "message_roles": [
+        "assistant",
+        "system",
+        "tool",
+        "user"
+      ],
+      "messages": [
+        {
+          "role": "system",
+          "fields": [
+            "content",
+            "role"
+          ],
+          "types": {
+            "content": [
+              "string"
+            ],
+            "role": [
+              "string"
+            ]
+          }
+        },
+        {
+          "role": "user",
+          "fields": [
+            "content",
+            "role"
+          ],
+          "types": {
+            "content": [
+              "string"
+            ],
+            "role": [
+              "string"
+            ]
+          }
+        },
+        {
+          "role": "assistant",
+          "fields": [
+            "content",
+            "role",
+            "tool_calls"
+          ],
+          "types": {
+            "content": [
+              "string"
+            ],
+            "role": [
+              "string"
+            ],
+            "tool_calls": [
+              "array"
+            ]
+          }
+        },
+        {
+          "role": "tool",
+          "fields": [
+            "content",
+            "role",
+            "tool_call_id"
+          ],
+          "types": {
+            "content": [
+              "string"
+            ],
+            "role": [
+              "string"
+            ],
+            "tool_call_id": [
+              "string"
+            ]
+          }
+        }
+      ],
+      "tool_object_fields": [
+        "function",
+        "type"
+      ],
+      "tool_function_fields": [
+        "description",
+        "name",
+        "parameters"
+      ],
+      "tool_function_types": {
+        "description": [
+          "string"
+        ],
+        "name": [
+          "string"
+        ],
+        "parameters": [
+          "object"
+        ]
+      },
+      "tool_type_values": [
+        "function"
+      ],
+      "tool_call_fields": [
+        "function",
+        "id",
+        "type"
+      ],
+      "tool_call_function_fields": [
+        "arguments",
+        "name"
+      ],
+      "tool_call_function_types": {
+        "arguments": [
+          "string"
+        ],
+        "name": [
+          "string"
+        ]
+      },
+      "tool_call_type_values": [
+        "function"
+      ],
+      "stream_options_fields": [
+        "include_usage"
+      ],
+      "stream_options_types": {
+        "include_usage": [
+          "boolean"
+        ]
+      },
+      "tool_names": [
+        "fixture_echo"
+      ],
+      "output_limit_field": "max_tokens",
+      "stream": true,
+      "content_kinds": [
+        "string"
+      ],
+      "headers": [
+        "accept",
+        "accept-encoding",
+        "authorization",
+        "connection",
+        "content-length",
+        "content-type",
+        "host",
+        "user-agent",
+        "x-stainless-arch",
+        "x-stainless-async",
+        "x-stainless-lang",
+        "x-stainless-os",
+        "x-stainless-package-version",
+        "x-stainless-read-timeout",
+        "x-stainless-retry-count",
+        "x-stainless-runtime",
+        "x-stainless-runtime-version"
+      ]
+    }
+  ],
+  "request_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "title": "maia.hermes.pinned-sdk.chat-completions.request.v1",
+    "type": "object",
+    "additionalProperties": false,
+    "required": [
+      "max_tokens",
+      "messages",
+      "model",
+      "stream",
+      "stream_options",
+      "tools"
+    ],
+    "properties": {
+      "max_tokens": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "messages": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "anyOf": [
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "content",
+                "role",
+                "tool_calls"
+              ],
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "role": {
+                  "enum": [
+                    "assistant"
+                  ]
+                },
+                "tool_calls": {
+                  "type": "array",
+                  "minItems": 1,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "function",
+                      "id",
+                      "type"
+                    ],
+                    "properties": {
+                      "id": {
+                        "type": "string"
+                      },
+                      "type": {
+                        "enum": [
+                          "function"
+                        ]
+                      },
+                      "function": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": [
+                          "arguments",
+                          "name"
+                        ],
+                        "properties": {
+                          "arguments": {
+                            "type": "string"
+                          },
+                          "name": {
+                            "type": "string"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "content",
+                "role"
+              ],
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "role": {
+                  "enum": [
+                    "system"
+                  ]
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "content",
+                "role",
+                "tool_call_id"
+              ],
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "role": {
+                  "enum": [
+                    "tool"
+                  ]
+                },
+                "tool_call_id": {
+                  "type": "string"
+                }
+              }
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "content",
+                "role"
+              ],
+              "properties": {
+                "content": {
+                  "type": "string"
+                },
+                "role": {
+                  "enum": [
+                    "user"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "model": {
+        "type": "string"
+      },
+      "stream": {
+        "type": "boolean"
+      },
+      "stream_options": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "include_usage"
+        ],
+        "properties": {
+          "include_usage": {
+            "type": "boolean"
+          }
+        }
+      },
+      "tools": {
+        "type": "array",
+        "minItems": 1,
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "function",
+            "type"
+          ],
+          "properties": {
+            "type": {
+              "enum": [
+                "function"
+              ]
+            },
+            "function": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "description",
+                "name",
+                "parameters"
+              ],
+              "properties": {
+                "description": {
+                  "type": "string"
+                },
+                "name": {
+                  "type": "string"
+                },
+                "parameters": {
+                  "type": "object"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "aux_routes": {
+    "allowed": [],
+    "denied": [
+      {
+        "closed_value": false,
+        "off_literals": [
+          false
+        ],
+        "path": [
+          "compression",
+          "enabled"
+        ],
+        "posture": "disabled",
+        "route": "compression",
+        "why": "o compressor pede o modelo AUXILIAR, que constrói cliente próprio (agent/auxiliary_client.py:164-185) — fora do gateway"
+      },
+      {
+        "closed_value": "compressor",
+        "off_literals": [
+          "compressor"
+        ],
+        "path": [
+          "context",
+          "engine"
+        ],
+        "posture": "disabled",
+        "route": "context.engine",
+        "why": "o context engine (lcm_*) tem caminho de sumarização próprio, fora do relay"
+      },
+      {
+        "closed_value": "off",
+        "off_literals": [
+          "off",
+          "false",
+          "disabled"
+        ],
+        "path": [
+          "tools",
+          "tool_search",
+          "enabled"
+        ],
+        "posture": "disabled",
+        "route": "tools.tool_search",
+        "why": "o bridge de Tool Search troca a superfície efetiva e pede inferência própria (tools/tool_search.py:64,189-198)"
+      },
+      {
+        "closed_value": false,
+        "off_literals": [
+          false
+        ],
+        "path": [
+          "memory",
+          "memory_enabled"
+        ],
+        "posture": "disabled",
+        "route": "memory.memory_enabled",
+        "why": "memória nativa agrega inferência por caminho próprio e não é a coorte"
+      },
+      {
+        "closed_value": false,
+        "off_literals": [
+          false
+        ],
+        "path": [
+          "memory",
+          "user_profile_enabled"
+        ],
+        "posture": "disabled",
+        "route": "memory.user_profile_enabled",
+        "why": "perfil de usuário é dado de outra pessoa e não entra no piloto"
+      },
+      {
+        "closed_value": {},
+        "off_literals": [
+          {}
+        ],
+        "path": [
+          "mcp_servers"
+        ],
+        "posture": "disabled",
+        "route": "mcp_servers",
+        "why": "nenhum servidor MCP é autorizado no piloto (§6.6)"
+      }
+    ],
+    "version": 1
+  },
+  "aux_calls_observed": 0,
+  "families": {
+    "gpt-5": {
+      "model": "openai/gpt-5",
+      "output_limit_field": "max_completion_tokens",
+      "system_role": "developer",
+      "observed_by": "tests/integration/hermes-inference-d09-capture.spec.ts"
+    }
+  }
+}

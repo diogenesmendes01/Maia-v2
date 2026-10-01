@@ -173,6 +173,21 @@ describe('rota — rede e credencial', () => {
     expect(ledger.resolveGrantScope).not.toHaveBeenCalled();
   });
 
+  it('header fora da lista fechada: 400 sanitizado e nada toca o ledger (AC03)', async () => {
+    const { app, ledger } = await setup();
+    const r = await post(app, body(), { headers: { 'x-maia-tenant': 'tenant-invadido' } });
+    expect(r.statusCode).toBe(400);
+    expect(code(r)).toBe('invalid_request');
+    expect(r.headers['x-should-retry']).toBe('false');
+    // A recusa é de HEADER, não de credencial: nem resolve o grant.
+    expect(ledger.resolveGrantScope).not.toHaveBeenCalled();
+    // O header não aparece na resposta (erro sanitizado).
+    expect(JSON.stringify(r.json())).not.toContain('x-maia-tenant');
+    // E o que o SDK pinado envia continua passando (família x-stainless-*).
+    const ok = await post(app, body(), { headers: { 'x-stainless-lang': 'python', accept: 'application/json' } });
+    expect(ok.statusCode).toBe(200);
+  });
+
   it('sem bearer, token malformado ou desconhecido: 401 idêntico, terminal', async () => {
     const { app, ledger } = await setup();
     const semToken = await post(app, body(), { token: null });
