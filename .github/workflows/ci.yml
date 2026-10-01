@@ -1300,7 +1300,9 @@ jobs:
           # continuaria verde — que é exatamente como a quarentena passou
           # despercebida. `tests/unit/ci/admin-ui-e2e-gate.spec.ts` confere este
           # número contra a contagem de casos das specs FORA da quarentena.
-          TEST_ADMIN_UI_MIN_TESTS: '35'
+          # e2e do checklist de go-live (motor remoto indisponível não deixa o
+          # card sumir, SC03-AC04).
+          TEST_ADMIN_UI_MIN_TESTS: '36'
         # ─────────────────────────────────────────────────────────────────
         # O KEYRING É GERADO AQUI — nunca literal no bloco `env:` acima
         # ─────────────────────────────────────────────────────────────────
