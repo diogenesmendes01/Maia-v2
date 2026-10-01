@@ -30,6 +30,7 @@ import { TRPCError } from '@trpc/server';
 import { router, protectedProcedure } from '../server.js';
 import { resolveTenantId } from '../tenant-resolver.js';
 import { runWithTenantContext } from '../../../db/tenant-context.js';
+import { evaluateAgentReadiness, type EngineReadinessProjection } from '../../../onboarding/readiness.js';
 
 // Mirrors src/types/enums.ts SwitchBehavior + AnnounceMode (single source of
 // truth lives there; we declare a Zod equivalent here for input validation).
@@ -53,7 +54,39 @@ const ByContextGuardsSchema = z
 const ListChannelsInputSchema = z.object({
   tenantId: z.string().optional(),
   agentId: z.string(),
+  /**
+   * SC03-AC04 — pede a projeção do MOTOR REMOTO junto do overview.
+   *
+   * Opt-in porque a avaliação de readiness custa leitura de fatos (perfil,
+   * grant, papéis, canais, políticas) e só o checklist do agente a apresenta.
+   * Sem a flag o resto da resposta é idêntico e nenhuma avaliação roda.
+   */
+  includeEngine: z.boolean().optional(),
 });
+
+/**
+ * SC03-AC04 — a projeção `AgentReadiness.engine` do CONSOLE.
+ *
+ * A superfície é a do §8.3.3: o console CONSULTA o avaliador canônico do
+ * backend (`evaluateAgentReadiness`) e apresenta o veredito — não replica
+ * critério de readiness no React nem infere disponibilidade de estado local.
+ *
+ * Fail-closed: quando a avaliação não consegue responder (escopo inválido, erro
+ * de leitura), o retorno é `null` — o checklist trata isso como "não
+ * verificado", que BLOQUEIA o "tudo pronto". Um erro aqui nunca vira
+ * "nada pendente".
+ */
+async function engineProjectionOrNull(
+  tenant_id: string,
+  agent_id: string,
+): Promise<EngineReadinessProjection | null> {
+  try {
+    const readiness = await evaluateAgentReadiness({ tenant_id, agent_id });
+    return readiness.engine;
+  } catch {
+    return null;
+  }
+}
 
 const ListRolesInputSchema = z.object({
   tenantId: z.string().optional(),
@@ -135,6 +168,11 @@ export const channelPoliciesRouter = router({
    * Channels joined with their policy status, plus the agent's role count.
    * Feeds the go-live checklist on the agent detail page and the policy
    * column on /setup/channels without an N+1 of getByChannel calls.
+   *
+   * Com `includeEngine`, a resposta carrega também a projeção do MOTOR REMOTO
+   * do avaliador canônico (SC03-AC04): `requested`, `available` e
+   * `unavailable_reason`. `null` = não foi possível avaliar (fail-closed, o
+   * checklist não declara pronto); ausente = não pedido.
    */
   channelsOverview: protectedProcedure
     .input(ListChannelsInputSchema)
@@ -168,7 +206,17 @@ export const channelPoliciesRouter = router({
             };
           }),
         );
-        return { channels: withPolicy, roles_count: roles.length };
+        return {
+          channels: withPolicy,
+          roles_count: roles.length,
+          // SC03-AC04 — o veredito do motor sai do avaliador do backend, não
+          // do console. A chave só existe quando foi pedida: um consumidor que
+          // não a pediu (a tabela de /setup/channels) não paga a avaliação nem
+          // recebe `null`, que significaria "tentou e não conseguiu".
+          ...(input.includeEngine
+            ? { engine: await engineProjectionOrNull(tenantId, input.agentId) }
+            : {}),
+        };
       });
     }),
 

@@ -38,6 +38,7 @@ import { and, eq, inArray, sql } from 'drizzle-orm';
 import { db } from '@/db/client.js';
 import {
   admin_audit_log,
+  agent_engine_policies,
   agent_operational_profile_versions,
   capability_proposals,
   channel_line_state,
@@ -215,6 +216,13 @@ async function limpar(): Promise<void> {
     .delete(admin_audit_log)
     .where(and(eq(admin_audit_log.tenant_id, TENANT), inArray(admin_audit_log.resource_id, ids)));
   await db.delete(capability_proposals).where(inArray(capability_proposals.id, ids));
+  // SC03-AC04 — a linha de política de motor antes do canal: a FK composta
+  // `agent_engine_policies -> channels (tenant, agent, id)` a amarra.
+  await db
+    .delete(agent_engine_policies)
+    .where(
+      and(eq(agent_engine_policies.tenant_id, TENANT), eq(agent_engine_policies.agent_id, AGENTE)),
+    );
   // A linha primeiro, o canal depois: `channel_line_state.channel_id` referencia
   // `channels.id`.
   const canaisSemeados = LINHAS_DECLARADAS.map((l) => l.channel_id);
@@ -354,6 +362,28 @@ async function semearLinhasDeclaradas(): Promise<void> {
   }
 }
 
+/**
+ * SC03-AC04 (correção pós-QA239/240) — o agente do console PEDE o motor
+ * remoto.
+ *
+ * Sem esta linha o veredito do motor no checklist seria `not_applicable` e a
+ * jornada mediria o caso fácil. Com ela, a projeção canônica
+ * (`AgentReadiness.engine`, servida por `channelPolicies.channelsOverview`) diz
+ * `requested: true, available: false`, motivo `evidence_absent`: a ativação não
+ * tem atestação de implantação aprovada. É exatamente o estado em que o card do
+ * checklist NÃO pode sumir.
+ *
+ * SQL direto pelo mesmo motivo das linhas declaradas: o caminho de produção
+ * para gravar esta tabela é o console, e passar por ele faria a jornada de
+ * leitura depender da de escrita.
+ */
+async function semearPoliticaDeMotor(): Promise<void> {
+  await db.execute(sql`
+    INSERT INTO agent_engine_policies (tenant_id, agent_id, channel_id, engine, updated_by)
+    VALUES (${TENANT}, ${AGENTE}, ${LINHA_DECLARADA.channel_id}::uuid, 'hermes', 'e2e-seed')
+  `);
+}
+
 async function main(): Promise<void> {
   await limpar();
   await semearUsuarios();
@@ -361,12 +391,14 @@ async function main(): Promise<void> {
   await semearVersoesDePerfil();
   await semearTrace();
   await semearLinhasDeclaradas();
+  await semearPoliticaDeMotor();
   // eslint-disable-next-line no-console
   console.log(
     `fixtures e2e do console: ${USUARIOS.length} usuários, ${FIXTURES.length} propostas, ` +
-      `${VERSOES_PERFIL.length} versões de perfil, 1 trace e ` +
+      `${VERSOES_PERFIL.length} versões de perfil, 1 trace, ` +
       `${LINHAS_DECLARADAS.length} linhas whatsapp declaradas ` +
-      `(${LINHAS_DECLARADAS.map((l) => l.external_id).join(', ')}) no tenant ${TENANT}.`,
+      `(${LINHAS_DECLARADAS.map((l) => l.external_id).join(', ')}) e 1 linha de ` +
+      `política de motor (hermes) no tenant ${TENANT}.`,
   );
 }
 

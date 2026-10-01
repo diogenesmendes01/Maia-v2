@@ -748,9 +748,20 @@ describe('fingerprints', () => {
 
 describe('evaluateAgentReadiness — fail-closed no escopo', () => {
   const loader = async () => readyFacts();
+  /**
+   * SC03 — o avaliador passou a buscar as LINHAS DE POLÍTICA do motor pelo
+   * escopo. Um teste que injeta os fatos mas não a porta cairia no loader de
+   * banco (e no pool real): aqui a porta devolve "nenhuma linha", que é o
+   * estado de um agente que nunca pediu o motor remoto — o mesmo veredito
+   * `ready` que este bloco sempre afirmou.
+   */
+  const noEnginePolicies = async () => [];
 
   it('avalia um escopo válido usando o loader injetado', async () => {
-    const r = await evaluateAgentReadiness({ tenant_id: T, agent_id: A }, { loadFacts: loader });
+    const r = await evaluateAgentReadiness(
+      { tenant_id: T, agent_id: A },
+      { loadFacts: loader, loadEnginePolicies: noEnginePolicies },
+    );
     expect(r.ready).toBe(true);
   });
 

@@ -1508,6 +1508,17 @@ export const READINESS_CHECK_CODE_VALUES: readonly string[] = Object.freeze([
   'schema_ready',
   'governance_no_blocking_pending',
   'agent_activated',
+  // SC03 — os checks do MOTOR REMOTO (spec §4.1, §5.10.1, §9.4). Cinco
+  // do deployment (binding, bundle, política de dados, limites, pin de
+  // runtime) e um da ADMISSÃO (kill switch). O espelho é exato e pinado por
+  // `tests/unit/onboarding/metrics-taxonomy.spec.ts`; um código novo sem
+  // entrada aqui não pode emitir série (o emissor o colapsaria no fallback).
+  'engine_binding_valid',
+  'engine_bundle_approved',
+  'engine_data_policy_ready',
+  'engine_limits_configured',
+  'engine_runtime_compatible',
+  'engine_admission_open',
 ]);
 
 // ---------------------------------------------------------------------------
@@ -1708,8 +1719,9 @@ export const LABEL_CARDINALITY_BUDGET: Readonly<Record<string, number>> = Object
   stage: 60,
   span: 60,
   reason: 60,
-  // Vocabulários fechados e pequenos: 11 passos e 17 códigos de check. O
-  // budget é o teto do contrato, não uma estimativa.
+  // Vocabulários fechados e pequenos: 11 passos e 23 códigos de check (17 do
+  // onboarding + 6 do motor remoto, SC03). O budget é o teto do contrato, não
+  // uma estimativa: 23 códigos + o `other` do colapso = 24.
   step: 20,
   check_code: 24,
   // Issue #601: `EFFECT_BOUNDARY` tem 16 membros (15 emitem) + o `other` do
