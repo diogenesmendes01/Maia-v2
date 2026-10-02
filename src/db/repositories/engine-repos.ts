@@ -55,7 +55,7 @@
  *     declarada.
  *  3. `discarded` não é fechável por esta porta: ver `CloseDecisionV1`.
  */
-import { sql } from "drizzle-orm";
+import { sql, type SQL } from "drizzle-orm";
 import { canonicalDigest } from "@/integrations/hermes/canonical-json.js";
 import { incCounter } from "@/lib/metrics.js";
 import type {
@@ -82,6 +82,7 @@ import {
 } from "./conversation-control-sql.js";
 import {
   agent_turns,
+  approval_requests,
   conversation_controls,
   engine_run_events,
   engine_runs,
@@ -412,6 +413,46 @@ function conta(op: string, result: string): void {
   incCounter("maia_engine_run_ops_total", { op, result });
 }
 
+/**
+ * §5.5.1 / SPEC-L1406 (SC05) — O FENCE DA APROVAÇÃO no MARCADOR.
+ *
+ * O `claim_token` de uma aprovação é uma AUTORIZAÇÃO de uso único, e o marcador
+ * é o limite do efeito: é aqui que "pode executar" vira "está executando". Sem
+ * este `AND`, a autorização podia ser REVOGADA depois do marcador e o dono
+ * antigo executava assim mesmo — foi o que o QA reproduziu (QA-P4): a evidência
+ * voltava a `approved`, o dono antigo entrava no handler e a MESMA aprovação
+ * autorizava um segundo efeito no turno seguinte.
+ *
+ * A condição é uma só, e é a mesma que os CAS de consumo e de devolução usam:
+ * `status = 'claimed' AND claim_token = <o meu>`. Ela vive no `WHERE` do
+ * marcador — e não numa checagem anterior, em memória — porque precisa valer
+ * contra o estado do banco NO INSTANTE do UPDATE, sob `FOR UPDATE`.
+ *
+ * Quando o chamador não carrega token algum (caminho legado, sem aprovação
+ * humana, §5.6.4), não há autorização a cercar e o fragmento é vazio: o
+ * comportamento desses caminhos não muda.
+ *
+ * O `COALESCE` espelha o do `SET`: o pedido que vale é o que a linha JÁ tem,
+ * ou o que este UPDATE está gravando.
+ */
+function fenceDaAprovacaoDoMarcador(input: {
+  approval_claim_token: string | null | undefined;
+  approval_request_id: string | null | undefined;
+}): SQL {
+  const token = input.approval_claim_token ?? null;
+  if (token === null) return sql``;
+  const { tenant_id, agent_id } = scope();
+  return sql`AND EXISTS (
+    SELECT 1 FROM ${approval_requests} a
+     WHERE a.tenant_id = ${tenant_id}
+       AND a.agent_id = ${agent_id}
+       AND a.id = COALESCE(${input.approval_request_id ?? null}::uuid,
+                            ${engine_tool_calls}.approval_request_id)
+       AND a.status = 'claimed'
+       AND a.claim_token = ${token}
+  )`;
+}
+
 // ---------------------------------------------------------------------------
 // pinEngineAndPrepareRun
 // ---------------------------------------------------------------------------
@@ -721,7 +762,20 @@ export type FreezeIdentityResult =
     };
 
 export type RecordToolApprovalResult =
-  | { ok: true; state: EngineToolCallStateV1; row_version: number }
+  | {
+      ok: true;
+      state: EngineToolCallStateV1;
+      row_version: number;
+      /**
+       * §5.5.1 (SC05) — o `result_json` PERSISTIDO, devolvido para quem acabou de
+       * gravar. Em `approval_required` ele é a recusa do ledger (com o UUID e o
+       * `intent_hash` do pedido); em `claimed` é `null` (a call continua viva e
+       * não tem desfecho). Devolvê-lo aqui evita a segunda síntese em memória da
+       * mesma recusa — que é exatamente o que fazia a resposta ao motor divergir
+       * entre a primeira entrega e o replay.
+       */
+      result_json: Json | null;
+    }
   | TurnFenceConflict
   | ControlConflict
   | NotFound
@@ -742,6 +796,16 @@ export type HandlerStartedResult =
   | { ok: false; reason: "dispatch_token_mismatch" }
   /** §5.6.4 exige `idempotency_key`/`payload_hash` presentes ANTES do marcador. */
   | { ok: false; reason: "identity_not_frozen" }
+  /**
+   * §5.5.1 (SC05) — O FENCE DA APROVAÇÃO. O marcador carrega o `claim_token` da
+   * evidência humana que autoriza esta execução, e o UPDATE exige que ESSE token
+   * seja o VIGENTE no pedido (`status='claimed' AND claim_token=<o meu>`). Uma
+   * evidência que voltou a `approved` — numa corrida, ou por uma reconciliação
+   * de claim que provou não início — deixa de autorizar quem a tinha: sem este
+   * fence, o dono antigo executaria DEPOIS da devolução e a MESMA aprovação
+   * autorizaria dois efeitos.
+   */
+  | { ok: false; reason: "approval_claim_lost" }
   /**
    * A call JÁ tem carimbo de início. Distinto de `version_conflict`: ali o
    * chamador está com snapshot velho e reler resolve; aqui o handler pode já ter
@@ -2390,6 +2454,17 @@ export const engineRunsRepo = {
     approval_request_id: string;
     approval_claim_token: string | null;
     state: "pending" | "claimed";
+    /**
+     * §5.3.2 / §5.5.1 (SC05) — o `intent_hash` e a CLASSE do pedido.
+     *
+     * O `ref` (`AP-xxxxxxxx`) é identificador de UX e não prova nada: o hash do
+     * intent é o que amarra a recusa ao payload EXATO que foi aprovado, e a
+     * classe é o que diz quantas assinaturas ele exige. Opcionais para não
+     * quebrar chamadas antigas — quando ausentes, o `result_json` da recusa sai
+     * só com `error`/`ref`, como antes.
+     */
+    approval_intent_hash?: string | null;
+    approval_class?: string | null;
   }): Promise<RecordToolApprovalResult> {
     const { tenant_id, agent_id } = scope();
     return withTx(async (tx): Promise<RecordToolApprovalResult> => {
@@ -2434,7 +2509,7 @@ export const engineRunsRepo = {
       // terminal.
       const atualizado =
         input.state === "claimed"
-          ? linhas<{ state: string; row_version: string | number }>(
+          ? linhas<{ state: string; row_version: string | number; result_json: Json | null }>(
               await tx.execute(sql`
                 UPDATE ${engine_tool_calls}
                    SET approval_request_id = ${input.approval_request_id}::uuid,
@@ -2446,9 +2521,9 @@ export const engineRunsRepo = {
                    AND state = 'dispatching'
                    AND dispatch_token = ${input.dispatch_token}::uuid
                    AND row_version = ${input.expected_row_version}
-                 RETURNING state, row_version`),
+                 RETURNING state, row_version, result_json`),
             )
-          : linhas<{ state: string; row_version: string | number }>(
+          : linhas<{ state: string; row_version: string | number; result_json: Json | null }>(
               await tx.execute(sql`
                 UPDATE ${engine_tool_calls}
                    SET state = 'approval_required',
@@ -2456,7 +2531,12 @@ export const engineRunsRepo = {
                        approval_claim_token = ${input.approval_claim_token},
                        result_json = jsonb_build_object(
                          'error', 'approval_required',
-                         'ref', 'AP-' || substr(${input.approval_request_id}::text, 1, 8)),
+                         'ref', 'AP-' || substr(${input.approval_request_id}::text, 1, 8),
+                         'approval', jsonb_strip_nulls(jsonb_build_object(
+                           'request_id', ${input.approval_request_id}::text,
+                           'ref', 'AP-' || substr(${input.approval_request_id}::text, 1, 8),
+                           'intent_hash', ${input.approval_intent_hash ?? null}::text,
+                           'approval_class', ${input.approval_class ?? null}::text))),
                        finished_at = clock_timestamp(),
                        row_version = row_version + 1,
                        updated_at = clock_timestamp()
@@ -2465,7 +2545,7 @@ export const engineRunsRepo = {
                    AND state = 'dispatching'
                    AND dispatch_token = ${input.dispatch_token}::uuid
                    AND row_version = ${input.expected_row_version}
-                 RETURNING state, row_version`),
+                 RETURNING state, row_version, result_json`),
             );
 
       const linha = atualizado[0];
@@ -2537,6 +2617,7 @@ export const engineRunsRepo = {
         ok: true,
         state: linha.state as EngineToolCallStateV1,
         row_version: Number(linha.row_version),
+        result_json: (linha.result_json ?? null) as Json | null,
       };
     });
   },
@@ -2674,6 +2755,10 @@ export const engineRunsRepo = {
              AND idempotency_key IS NOT NULL
              AND idempotency_payload_hash IS NOT NULL
              AND row_version = ${input.expected_row_version}
+             ${fenceDaAprovacaoDoMarcador({
+               approval_claim_token: input.approval_claim_token,
+               approval_request_id: input.approval_request_id,
+             })}
            RETURNING row_version`),
       );
       const marcado = atualizado[0];
@@ -2684,10 +2769,12 @@ export const engineRunsRepo = {
           dispatch_token: string | null;
           idempotency_key: string | null;
           handler_started_at: string | null;
+          approval_request_id: string | null;
         }>(
           await tx.execute(sql`
             SELECT state, row_version, dispatch_token::text AS dispatch_token,
-                   idempotency_key, handler_started_at
+                   idempotency_key, handler_started_at,
+                   approval_request_id::text AS approval_request_id
               FROM ${engine_tool_calls}
              WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
                AND run_id = ${input.run_id} AND call_id = ${input.call_id}`),
@@ -2712,6 +2799,31 @@ export const engineRunsRepo = {
         if (linha.idempotency_key === null) {
           conta("handler_started", "identity_not_frozen");
           return { ok: false, reason: "identity_not_frozen" };
+        }
+        /**
+         * §5.5.1 (SC05) — o motivo do fence da APROVAÇÃO é lido e devolvido
+         * separado dos demais: ele diz a quem chamou que a autorização humana
+         * deixou de ser dele (e não que o journal está fora de forma), então a
+         * reação certa é NÃO iniciar — sem reler e sem tentar de novo.
+         */
+        if (input.approval_claim_token != null) {
+          const aprov = linhas<{ status: string; claim_token: string | null }>(
+            await tx.execute(sql`
+              SELECT status, claim_token
+                FROM ${approval_requests}
+               WHERE tenant_id = ${tenant_id} AND agent_id = ${agent_id}
+                 AND id = COALESCE(${input.approval_request_id ?? null}::uuid,
+                                   ${linha.approval_request_id}::uuid)`),
+          );
+          const vigente = aprov[0];
+          if (
+            !vigente ||
+            vigente.status !== "claimed" ||
+            vigente.claim_token !== input.approval_claim_token
+          ) {
+            conta("handler_started", "approval_claim_lost");
+            return { ok: false, reason: "approval_claim_lost" };
+          }
         }
         if (linha.handler_started_at !== null) {
           // Estado, token e identidade batem: o que sobra é que o marcador JÁ
